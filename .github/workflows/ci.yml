@@ -304,7 +304,7 @@ jobs:
       # to ubuntu-latest, where that tool cache is exactly what the action is
       # built to write — so the action is now the right way to pin 3.11, and
       # the bare `python3` below resolves to it.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: env.RUN == '1'
         with:
           python-version: '3.11'
@@ -768,7 +768,7 @@ jobs:
             echo '::notice title=e2e/_support unit tests skipped::no path this job filters on changed'
             echo '`e2e/_support unit tests` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: env.RUN == '1'
         with:
           python-version: '3.11'
@@ -980,7 +980,7 @@ jobs:
             echo '::notice title=Frontend skipped::no path this job filters on changed'
             echo '`Frontend` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: env.RUN == '1'
         with:
           # MUST equal the major in frontend/Dockerfile (node:26-alpine in all
@@ -1229,7 +1229,7 @@ jobs:
             echo '::notice title=Frontend a11y (axe-core) skipped::no path this job filters on changed'
             echo '`Frontend a11y (axe-core)` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: env.RUN == '1'
         with:
           # Kept in lockstep with the frontend job above — the two share one
@@ -1317,7 +1317,7 @@ jobs:
         run: npm run test:a11y
       - name: Upload report on failure
         if: env.RUN == '1' && (always())
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-a11y-report
           path: frontend/playwright-a11y-report
