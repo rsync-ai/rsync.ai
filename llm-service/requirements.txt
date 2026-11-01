@@ -10,29 +10,29 @@
 # for why that distinction matters in this file.
 fastapi==0.137.1
 starlette==1.3.1
-uvicorn[standard]>=0.53.0
+uvicorn[standard]>=0.54.0
 
 # AI/LLM
-openai>=3.19.0
+openai>=3.41.0
 tiktoken>=0.14.0
-langgraph>=1.2.12
+langgraph>=1.2.18
 
 # HTTP & Networking
 requests>=2.34.2
 httpx>=0.28.1
 redis>=8.1.0
-inflect>=7.5.0
+inflect>=7.6.0
 
 # Docker SDK for container management
 docker>=7.2.0
 
 # Data & Validation
-pydantic>=2.13.5
+pydantic>=2.14.2
 pyyaml>=6.0.3
 jinja2>=3.1.6
 
 # Messaging & Data
-kafka-python>=3.0.11
+kafka-python>=3.0.12
 psycopg2-binary>=2.9.13
 
 # Security
@@ -68,8 +68,8 @@ psycopg2-binary>=2.9.13
 cryptography>=48.0.1,<49.0.0
 
 # PII Detection - Microsoft Presidio
-presidio-analyzer>=2.2.364
-spacy>=3.8.16
+presidio-analyzer>=2.2.366
+spacy>=3.8.18
 # The en_core_web_sm spaCy model is installed in the Dockerfile via
 # `python -m spacy download en_core_web_sm` so cold-start doesn't trigger
 # a runtime download that blocks the first /suggestions/generate call.
@@ -85,4 +85,4 @@ opentelemetry-instrumentation-requests==0.46b0
 prometheus-client>=0.26.0
 
 # SQL Parsing & Transpilation
-sqlglot>=30.19.0
+sqlglot>=30.25.0
