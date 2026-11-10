@@ -72,7 +72,8 @@ describe("buildModelLineage", () => {
     expect(g.edges.map((e) => `${e.from}>${e.to}`).sort()).toEqual(
       [`${m("a")}>${m("b")}`, `${m("b")}>${m("root")}`, `${m("root")}>${m("c")}`, `${m("c")}>${m("d")}`].sort(),
     )
-    expect(g).toMatchObject({ upstreamsFound: 2, downstreamsFound: 2, omitted: 0 })
+    // a is an upstream of root, but root's schedule waits only on b.
+    expect(g).toMatchObject({ upstreamsFound: 2, downstreamsFound: 2, directUpstreams: 1, directDownstreams: 1, omitted: 0 })
   })
 
   it("points every edge from the upstream to the model it wakes", () => {
@@ -161,7 +162,8 @@ describe("buildModelLineage", () => {
     // 60 direct upstreams listed before the one direct downstream: the downstream still gets a place.
     const lopsided = buildModelLineage("root", [...ups, after("root", upKeys), after("d0", ["root"])], { maxNodes: 50 })
     expect(keys(lopsided.nodes)).toContain(m("d0"))
-    expect(lopsided).toMatchObject({ upstreamsFound: 60, downstreamsFound: 1, omitted: 12 })
+    // The direct count is counted before the cap, like the totals.
+    expect(lopsided).toMatchObject({ upstreamsFound: 60, downstreamsFound: 1, directUpstreams: 60, directDownstreams: 1, omitted: 12 })
 
     const downs = Array.from({ length: 30 }, (_, i) => after(`d${i}`, ["root"]))
     const even = buildModelLineage("root", [...ups.slice(0, 30), after("root", upKeys.slice(0, 30)), ...downs], {
@@ -240,6 +242,8 @@ describe("buildModelLineage", () => {
       edges: [],
       upstreamsFound: 0,
       downstreamsFound: 0,
+      directUpstreams: 0,
+      directDownstreams: 0,
       omitted: 0,
     })
   })
@@ -379,7 +383,7 @@ describe("describeLineageNode: what a model may say", () => {
 
   it("shows the claimed name and a link once the model's runs answered 2xx", () => {
     const v = describeLineageNode(node("q 2", { claimedName: "orders_daily" }), runs({ status: "succeeded" }), CTX)
-    expect(v).toMatchObject({ title: "orders_daily", named: true, href: "/explorer/schedules/q%202?tab=graph" })
+    expect(v).toMatchObject({ title: "orders_daily", named: true, href: "/models/q%202?tab=graph" })
   })
 
   it("says Unnamed model when a visible model has no name to show", () => {
@@ -392,7 +396,7 @@ describe("describeLineageNode: what a model may say", () => {
 
   it("names a model from its own schedule row even when its runs could not be loaded", () => {
     const v = describeLineageNode(node("q", { schedule: sched("q", { name: "orders_kpi" }) }), { status: "unavailable" }, CTX)
-    expect(v).toMatchObject({ title: "orders_kpi", named: true, href: "/explorer/schedules/q?tab=graph" })
+    expect(v).toMatchObject({ title: "orders_kpi", named: true, href: "/models/q?tab=graph" })
     expect(v).toMatchObject({ tone: "neutral", status: "Status unavailable", retryable: true })
   })
 
@@ -425,6 +429,8 @@ describe("describeLineageNode: a model's status", () => {
       ["upstream_failed", "Skipped: upstream failed"],
       ["upstream_skipped", "Skipped: upstream skipped"],
       ["chain_depth_exceeded", "Skipped: hop limit"],
+      ["trigger_lost", "Skipped: trigger lost"],
+      ["upstream_check_failed", "Skipped: upstream check failed"],
       ["something_new", "Skipped: something_new"],
       [undefined, "Skipped"],
     ]

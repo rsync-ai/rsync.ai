@@ -90,32 +90,104 @@ def test_validate_config_rejects_no_credentials():
 
 # ============================ READ: pagination ==============================
 
-def test_export_keyset_returns_next_cursor_and_has_more():
-    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 1}, {"ID": 2}, {"ID": 3}])
+# What a sweep reads before its first page: the columns, then the point to pin
+# every page to. PAYLOAD is a VARIANT, which Snowflake cannot order by.
+SF_COLUMNS = ("INFORMATION_SCHEMA.COLUMNS", [
+    {"COLUMN_NAME": "ID", "DATA_TYPE": "NUMBER"},
+    {"COLUMN_NAME": "PAYLOAD", "DATA_TYPE": "VARIANT"},
+    {"COLUMN_NAME": "NAME", "DATA_TYPE": "TEXT"},
+])
+SF_NOW = ("EPOCH_MILLISECOND", [{"NOW": 1700000000000}])
+SF_PIN = 'AT(TIMESTAMP => TO_TIMESTAMP_LTZ(1700000000000, 3))'
+
+
+def test_export_sweep_orders_every_column_at_one_snapshot():
+    """KI-WAREHOUSE-BATCH-PAGING-UNORDERED: the executor asks for stable paging
+    and never names a column. Snowflake does not enforce a declared key, so
+    the page orders by every orderable column and reads the table AT the point
+    the first page took; the cursor carries that point and the next offset."""
+    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 1}, {"ID": 2}, {"ID": 3}],
+                                       answers=[SF_COLUMNS, SF_NOW])
+    out = s.export({**CFG, "table": "T", "use_keyset_paging": True, "limit": 3})
+    assert out["success"] is True, out
+    assert out["paging_mode"] == "snapshot" and out["has_more"] is True, out
+    assert out["next_cursor"] == {"snapshot": 1700000000000, "offset": 3}, out
+    sql = conn.all_sql()[-1]
+    assert sql == f'SELECT * FROM "PUBLIC"."T" {SF_PIN} ORDER BY "ID", "NAME" LIMIT 3 OFFSET 0', sql
+    catalog = next(e for e in conn.all_execs() if "INFORMATION_SCHEMA.COLUMNS" in e["sql"])
+    assert catalog["params"] == ("PUBLIC", "T"), catalog    # bound, not inlined
+
+
+def test_export_sweep_continues_at_the_cursors_snapshot():
+    # The point crossed the executor's JSON, so it may come back a float.
+    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 4}], answers=[SF_COLUMNS, SF_NOW])
+    out = s.export({**CFG, "table": "T", "use_keyset_paging": True, "limit": 3, "offset": 0,
+                    "cursor": {"snapshot": 1.7e12, "offset": 3}})
+    assert out["success"] is True and out["has_more"] is False, out
+    assert out["paging_mode"] == "snapshot" and out["next_cursor"] is None, out
+    assert not any("EPOCH_MILLISECOND" in q for q in conn.all_sql()), conn.all_sql()
+    assert conn.all_sql()[-1].endswith(f'{SF_PIN} ORDER BY "ID", "NAME" LIMIT 3 OFFSET 3'), conn.all_sql()
+
+
+def test_export_sweep_names_cursor_column_first():
+    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 1}], answers=[SF_COLUMNS, SF_NOW])
+    out = s.export({**CFG, "table": "T", "cursor_column": "name", "limit": 3})
+    assert out["success"] is True, out
+    # Matched to the catalog's own spelling.
+    assert 'ORDER BY "NAME", "ID" LIMIT 3' in conn.all_sql()[-1], conn.all_sql()
+
+
+def test_export_sweep_without_time_travel_steps_the_offset():
+    """A table that refuses AT (a view, zero retention) reads its first page
+    unpinned and reports plain offset paging, so the executor steps it."""
+    s, conn = _sf_fakes.make_connector(
+        sf, rows=[{"ID": 1}, {"ID": 2}],
+        answers=[SF_COLUMNS, SF_NOW, ("AT(TIMESTAMP", RuntimeError("time travel not available"))])
+    out = s.export({**CFG, "table": "T", "use_keyset_paging": True, "limit": 2})
+    assert out["success"] is True, out
+    assert out["paging_mode"] == "offset" and out["next_cursor"] is None and out["has_more"] is True, out
+    assert conn.all_sql()[-1] == 'SELECT * FROM "PUBLIC"."T" ORDER BY "ID", "NAME" LIMIT 2 OFFSET 0'
+
+
+def test_export_sweep_that_loses_its_snapshot_goes_on_unpinned():
+    """Retention passed mid-sweep: the page reads unpinned from the cursor's
+    offset and keeps the offset in the cursor, with no point."""
+    s, conn = _sf_fakes.make_connector(
+        sf, rows=[{"ID": 4}, {"ID": 5}, {"ID": 6}],
+        answers=[SF_COLUMNS, SF_NOW, ("AT(TIMESTAMP", RuntimeError("beyond retention"))])
+    out = s.export({**CFG, "table": "T", "use_keyset_paging": True, "limit": 3,
+                    "cursor": {"snapshot": 1700000000000, "offset": 3}})
+    assert out["success"] is True, out
+    assert out["paging_mode"] == "snapshot", out
+    assert out["next_cursor"] == {"snapshot": None, "offset": 6}, out
+    assert conn.all_sql()[-1] == 'SELECT * FROM "PUBLIC"."T" ORDER BY "ID", "NAME" LIMIT 3 OFFSET 3'
+
+
+def test_export_unreadable_catalog_pages_by_the_named_column():
+    s, conn = _sf_fakes.make_connector(
+        sf, rows=[{"ID": 1}, {"ID": 2}, {"ID": 3}],
+        answers=[("INFORMATION_SCHEMA", RuntimeError("insufficient privileges"))])
     out = s.export({**CFG, "table": "T", "cursor_column": "ID", "limit": 3})
     assert out["success"] is True, out
     assert out["paging_mode"] == "keyset", out
     assert out["next_cursor"] == 3 and out["has_more"] is True, out
-    sql = conn.all_sql()[-1]
-    assert 'ORDER BY "ID" ASC' in sql and "LIMIT 3" in sql, sql
-    assert '"PUBLIC"."T"' in sql, sql
+    assert conn.all_sql()[-1] == 'SELECT * FROM "PUBLIC"."T" ORDER BY "ID" LIMIT 3', conn.all_sql()
 
-
-def test_export_keyset_continuation_uses_bound_param():
-    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 9}])
-    out = s.export({**CFG, "table": "T", "cursor_column": "ID",
-                    "cursor_value": 8, "limit": 10})
+    out = s.export({**CFG, "table": "T", "cursor_column": "ID", "cursor_value": 8, "limit": 10})
     assert out["success"] is True, out
     e = conn.all_execs()[-1]
-    assert 'WHERE "ID" > %s' in e["sql"], e["sql"]
-    assert e["params"] == [8], e["params"]           # parameterized, not inlined
+    assert 'WHERE "ID" > %s ORDER BY "ID" LIMIT 10' in e["sql"], e["sql"]
+    assert e["params"] == (8,), e["params"]           # parameterized, not inlined
 
 
 def test_export_three_level_qualification():
-    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 1}])
-    out = s.export({**CFG, "table": "OTHERDB.SALES.ORDERS", "limit": 5})
+    s, conn = _sf_fakes.make_connector(sf, rows=[{"ID": 1}], answers=[SF_COLUMNS, SF_NOW])
+    out = s.export({**CFG, "table": "OTHERDB.SALES.ORDERS", "use_keyset_paging": True, "limit": 5})
     assert out["success"] is True, out
     assert '"OTHERDB"."SALES"."ORDERS"' in conn.all_sql()[-1], conn.all_sql()
+    catalog = next(e for e in conn.all_execs() if "INFORMATION_SCHEMA.COLUMNS" in e["sql"])
+    assert catalog["sql"].startswith('SELECT COLUMN_NAME, DATA_TYPE FROM "OTHERDB".INFORMATION_SCHEMA.COLUMNS'), catalog
+    assert catalog["params"] == ("SALES", "ORDERS"), catalog
 
 
 def test_export_offset_mode_emits_no_cursor_but_signals_has_more():
@@ -390,6 +462,66 @@ def test_discover_defaults_to_every_table_when_max_tables_is_unset():
     out = s.discover_schema(CFG)
     # The connector's own default stays 100; the orchestrator sends max_tables.
     assert out["total_tables_discovered"] == 100 and out["total_tables_available"] == 150, out
+
+
+# ============================ execute (models) ==============================
+
+def test_execute_runs_one_statement_with_the_timeout_and_returns_rowcount():
+    s, conn = _sf_fakes.make_connector(sf, rowcount=7)
+    sql = 'INSERT INTO "DB"."PUBLIC"."T" SELECT * FROM "DB"."PUBLIC"."S"'
+    out = s.execute({**CFG, "query": sql, "timeout_seconds": 90})
+    assert out["success"] is True, out
+    assert out["rows_affected"] == 7, out
+    execs = conn.all_execs()
+    assert len(execs) == 1, execs  # exactly one statement, never retried
+    assert execs[0]["sql"] == sql, execs  # verbatim
+    assert execs[0]["timeout"] == 90, execs  # server-side abort deadline
+    assert conn.committed == 1, "DML must be committed"
+    assert conn.closed is True
+
+
+def test_execute_reads_sql_or_statement_and_omits_timeout_when_unset():
+    s, conn = _sf_fakes.make_connector(sf)
+    out = s.execute({**CFG, "query": "", "sql": "", "statement": "DROP TABLE IF EXISTS X"})
+    assert out["success"] is True, out
+    assert out["rows_affected"] is None, out  # driver gave no rowcount
+    assert conn.all_execs() == [{"sql": "DROP TABLE IF EXISTS X", "params": None,
+                                 "timeout": None}], conn.all_execs()
+
+
+def test_execute_failure_returns_the_engine_error_without_retrying():
+    err = RuntimeError("002003 (42S02): SQL compilation error: Object 'T' does not exist")
+    s, conn = _sf_fakes.make_connector(sf, answers=[("CREATE", err)])
+    out = s.execute({**CFG, "query": "CREATE TABLE T AS SELECT 1 AS A", "timeout_seconds": 5})
+    assert out["success"] is False, out
+    assert "does not exist" in out["error"], out
+    assert len(conn.all_execs()) == 1, conn.all_execs()
+    assert conn.committed == 0 and conn.closed is True
+
+
+def test_execute_requires_a_statement():
+    s, conn = _sf_fakes.make_connector(sf)
+    out = s.execute({**CFG})
+    assert out["success"] is False and conn.all_execs() == [], out
+
+
+def test_execute_is_advertised_and_routed():
+    caps = sf.SnowflakeMCPServer().get_capabilities()
+    assert "execute" in [op["name"] for op in caps["operations"]], caps["operations"]
+    import json
+    with open(os.path.join(_HERE, "metadata.json")) as f:
+        meta = json.load(f)
+    assert "execute" in [op["name"] for op in meta["operations"]], meta["operations"]
+
+
+def test_export_query_mode_applies_the_limit_and_returns_columns():
+    s, conn = _sf_fakes.make_connector(sf, rows=_rows(10))
+    out = s.export({**CFG, "query": "SELECT ID, V FROM T", "limit": 3})
+    assert out["success"] is True, out
+    assert out["data"] == _rows(3), out
+    assert out["columns"] == ["ID", "V"], out
+    assert out["truncated"] is True and out["paging_mode"] == "query", out
+    assert conn.all_sql() == ["SELECT ID, V FROM T"], conn.all_sql()  # verbatim
 
 
 # ================================= runner ===================================

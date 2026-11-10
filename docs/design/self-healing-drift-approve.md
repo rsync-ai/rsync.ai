@@ -2,6 +2,7 @@
 
 **Status:** Build doc / design proposal. NOT YET IMPLEMENTED. Every step cites `file:line` against the current tree.
 **Provenance:** authored from a code-grounded extraction pass, then revised against an adversarial design review. The 8 review findings (2 critical, 3 major, 3 minor) are folded in below and marked `[RT-fix]` where they changed the plan.
+**Superseded in part, 2026-09-28:** the product decision is now that only a dropped table waits for a person, for batch and CDC alike. A new column, a new table or a type change is applied (PostgreSQL and MySQL destinations) or recorded (others) without approval; a dropped column is kept in the destination and recorded; a dropped table waits, and either decision removes it from the pipeline, while approving also drops the destination table. `RSYNC_SCHEMA_DRIFT_AUTOAPPLY` and the LLM analysis step are retired. The policy lives in one function, `routeSchemaChange` in `backend-orchestrator/internal/agents/healer/healer.go`. Where this plan says a change is approve-only or not auto-applied, that describes the plan as first built, not the product today.
 **Author intent:** ship the proactive schema-drift loop by *activating machinery that already exists* — the dormant `healer.Agent`, the live `schema_change_approvals` store + approval API, and the batch `DiscoverSchema` seam. Exactly **one** genuinely new subsystem (the detector + baseline store). Everything else is wiring.
 
 ---
@@ -14,7 +15,7 @@ rsync.ai detects schema drift between a pipeline's source and its destination, r
 
 **Non-goals (this build):**
 - **No autonomous destructive DDL. Ever.**
-- **No additive auto-apply on the critical path** `[RT-fix #4]` — deferred to a separately-approved phase; `RSYNC_SCHEMA_DRIFT_AUTOAPPLY` stays off and out of P0–P3.
+- ~~**No additive auto-apply on the critical path** `[RT-fix #4]` — deferred to a separately-approved phase; `RSYNC_SCHEMA_DRIFT_AUTOAPPLY` stays off and out of P0–P3.~~ Superseded 2026-09-28: additive changes apply without approval and the flag is retired.
 - **No CDC real-time drift in P0–P3.** Debezium schema-history (`include.schema.changes=true` → `schemahistory.<name>`, `debezium/versions/v1.0.0/connector.py:250-254`) currently has **no consumer**; CDC drift is **P4**. The batch detector (P1) does **not** cover CDC.
 - **No Slack/email delivery.** Notifier producers exist but **no consumer subscribes** (`healer.go:33-41`). User-visible surface is the in-app `/schema-changes` poll + deep-link only.
 - **No DDL apply for object-storage / warehouse / blob dests.** `applyMigration` supports **only** `postgres` + `mysql` (`healer.go:904-910`). Non-RDBMS dests can only ever go `pending_approval`; the UI must not present "Approve" as auto-appliable for them.
@@ -29,10 +30,10 @@ Three distinct "healer" types exist. We commit to exactly one for schema drift a
 | Type | Package / file | Responsibility | Touched? |
 |---|---|---|---|
 | **`healer.Agent`** | `backend-orchestrator/internal/agents/healer/healer.go:116` | Schema-change consume → analysis → `schema_change_approvals` write → apply on approve. **DORMANT** (`.Start()` has zero callers). | **YES — the spine.** |
-| `sentinel.Healer` | `internal/agents/sentinel/healer.go:28`, started `sentinel.go:117` | CDC Kafka-Connect task watchdog. Different struct/topics/job. | **NO.** |
+| `sentinel.Healer` | `internal/agents/sentinel/healer.go:28`, started `sentinel.go:110` | CDC Kafka-Connect task watchdog. Different struct/topics/job. | **NO.** |
 | `heal.HealWorker` | `internal/agents/heal/worker.go:70`, wired `cmd/orchestrator/main.go:743` | Reactive execution-failure healing (AutoBand/HITLBand). | **NO** `[RT-fix #2]` (CDC-hook fix removed from this build — see below). |
 
-**The spine = `healer.Agent` + `schema_change_approvals` table + the live approval API.** The store (`api-gateway/migrations/051_schema_evolution.sql`), the owner-gated GET/approve/reject handlers (`schema_evolution.go:40-192`), the routes (`cmd/server/main.go:443,669-671`), and the approve→`ApprovedChangeTopic`→`handleApprovedChange`→`applyMigration` round-trip **already exist and are wired**. We activate a built-but-dormant path; we do not build approval plumbing.
+**The spine = `healer.Agent` + `schema_change_approvals` table + the live approval API.** The store (`api-gateway/migrations/051_schema_evolution.sql`), the owner-gated GET/approve/reject handlers (`schema_evolution.go:40-192`), the routes (`cmd/server/main.go:712,1083-1085`), and the approve→`ApprovedChangeTopic`→`handleApprovedChange`→`applyMigration` round-trip **already exist and are wired**. We activate a built-but-dormant path; we do not build approval plumbing.
 
 ---
 
@@ -85,11 +86,11 @@ type SchemaChange struct {
 
 **Goal:** make the existing schema-change + approved-change consumers run, **without** activating the DLQ reactive path (avoids double-processing).
 
-**`[RT-fix #8]` The Start()-split is verified collision-free.** `executeWithHealer` (`workers/executor.go:758-828`) calls `w.executorAgent.ExecuteTask` + `w.suggestRecoveryAction` (a *worker* method, `:831`) — it never calls a `healer.Agent` method. The healer's DLQ consumers are a *separate* dormant path that would double-react to executor failures if the full `Start()` ran. **`handleSchemaChangeMessage` has no synchronous twin**, so subscribing only the two schema topics is safe. Add `StartSchemaOnly()` that subscribes to **only** `HealerTopic` + `ApprovedChangeTopic` and drops the two DLQ subscriptions.
+**`[RT-fix #8]` The Start()-split is verified collision-free.** `executeWithHealer` (`workers/executor.go:1033-1116`) calls `w.executorAgent.ExecuteTask` + `w.suggestRecoveryAction` (a *worker* method, `:1187`) — it never calls a `healer.Agent` method. The healer's DLQ consumers are a *separate* dormant path that would double-react to executor failures if the full `Start()` ran. **`handleSchemaChangeMessage` has no synchronous twin**, so subscribing only the two schema topics is safe. Add `StartSchemaOnly()` that subscribes to **only** `HealerTopic` + `ApprovedChangeTopic` and drops the two DLQ subscriptions.
 
 **`[RT-fix #2]` The CDC-cleanup hook fix is REMOVED from P0.** It is orthogonal to schema drift (the schema path never touches `HealWorker`), the original sketch used a non-existent field, and there is a documented import-cycle constraint. See "Task T-hook" below — do not bundle it here.
 
-**Files:** `healer.go` (add `StartSchemaOnly`), `workers/executor.go` (call it after `NewAgent` at `:63`).
+**Files:** `healer.go` (add `StartSchemaOnly`), `workers/executor.go` (call it after `NewAgent` at `:65`).
 
 ```go
 // healer.go — alongside Start() at :133. Subscribes ONLY the schema topics; omits the two DLQ ConsumeWithContext calls.
@@ -104,7 +105,7 @@ func (a *Agent) StartSchemaOnly() error {
 }
 ```
 ```go
-// workers/executor.go — right after :63 healerAgent := healer.NewAgent(kafkaManager, db)
+// workers/executor.go — right after :65 healerAgent := healer.NewAgent(kafkaManager, db, toolsDir)
 if os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true" {
     if err := healerAgent.StartSchemaOnly(); err != nil {
         log.WithError(err).Warn("healer schema consumer failed to start (non-fatal)")
@@ -129,7 +130,7 @@ Wire the inert CDC cleanup hook. The real struct is `heal.AutoHealHooks{ Cleanup
 
 **Goal:** persist a per-pipeline schema **baseline**, diff it against the live `DiscoverSchema` result each batch run, and emit `SchemaChangeEvent`s. This is the only net-new subsystem.
 
-**Files:** `api-gateway/migrations/068_schema_baselines.sql` (NEW — 067 is current highest, confirmed); `executor.go` (snapshot + diff at the `DiscoverSchema` call-site `:3310`; helpers near `loadNominatedKeys` `:178`).
+**Files:** `api-gateway/migrations/068_schema_baselines.sql` (NEW — 067 is current highest, confirmed); `executor.go` (snapshot + diff at the schema-discovery call-site `:4068`, now `discoverSchemaWithTotals`; helpers near `loadNominatedKeys` `:181`).
 
 **Migration (068_schema_baselines.sql):**
 ```sql
@@ -147,9 +148,9 @@ CREATE TABLE IF NOT EXISTS schema_baselines (
 CREATE INDEX IF NOT EXISTS idx_schema_baselines_pipeline ON schema_baselines(pipeline_id);
 ```
 
-**`[RT-fix #1]` Execution ID:** `ExecutorTask` (`executor.go:378-386`) has **no `ExecutionID` field** — `task.ExecutionID` does not compile. Thread the local var derived in `executeBatchDataTransfer` (~`:3170`: `executionID, _ := task.Params["execution_id"].(string)`) into `storeSchemaBaseline`.
+**`[RT-fix #1]` Execution ID:** `ExecutorTask` (`executor.go:476-484`) has **no `ExecutionID` field** — `task.ExecutionID` does not compile. Thread the local var derived in `executeBatchDataTransfer` (~`:3865`: `executionID`, read from `task.Params["execution_id"]`) into `storeSchemaBaseline`.
 
-**`[RT-fix #3]` Scope to the pipeline's SELECTED tables.** `DiscoverSchema` returns the **entire source database** (no table filter — `executor.go:6474`). A pipeline syncing 2 of 50 tables would baseline all 50 and emit spurious proposals for the other 48. Before `storeSchemaBaseline` and before diffing, **filter `discovered` to the pipeline's selected-table set** (the same set persisted by the source `table_selection` HITL / plan steps). Add a unit case proving an out-of-scope table change emits no event.
+**`[RT-fix #3]` Scope to the pipeline's SELECTED tables.** `DiscoverSchema` returns the **entire source database** (no table filter — `executor.go:9113`). A pipeline syncing 2 of 50 tables would baseline all 50 and emit spurious proposals for the other 48. Before `storeSchemaBaseline` and before diffing, **filter `discovered` to the pipeline's selected-table set** (the same set persisted by the source `table_selection` HITL / plan steps). Add a unit case proving an out-of-scope table change emits no event.
 
 **Helpers (mirror `loadNominatedKeys` `:178-195` for READ; per-table UPSERT for WRITE):**
 ```go
@@ -171,7 +172,7 @@ func storeSchemaBaseline(ctx context.Context, db *sql.DB, pipelineID, executionI
 func loadSchemaBaseline(ctx context.Context, db *sql.DB, pipelineID string) map[string]TableMetadata { /* QueryContext; key schema.table; json.Unmarshal */ }
 ```
 
-**Snapshot + diff insertion:** the batch metadata pass is `executor.go:3310` (`discovered, err := a.DiscoverSchema(...)`); the success branch (`else {`) iterates tables building `pkByTable`/`colTypesByTable` (`:3315-3324`). Insert **inside the `else` (discovery-success) branch only** — never the error branch (`:3311-3312`), which continues without PKs/types and would synthesize false drop-everything deltas.
+**Snapshot + diff insertion:** the batch metadata pass is `executor.go:4068` (`discovered, totals, err := a.discoverSchemaWithTotals(...)`); the success branch (`else {`) iterates tables building `pkByTable`/`colTypesByTable` (`:4080-4109`). Insert **inside the `else` (discovery-success) branch only** — never the error branch (`:4069-4070`), which continues without PKs/types and would synthesize false drop-everything deltas.
 
 1. **DIFF + EMIT** at `:3313` (before the existing `for _, tbl := range discovered`):
    - `prior := loadSchemaBaseline(ctx, a.db, task.PipelineID)`; if `prior==nil` (first run) skip diff (baseline only).
@@ -192,7 +193,7 @@ func loadSchemaBaseline(ctx context.Context, db *sql.DB, pipelineID string) map[
 | Table removed | `drop_table` | **APPROVE-only** |
 | Table added | `create_table` | **Pending/informational record** — NOT auto-applied |
 
-**Flag:** entire detector behind `RSYNC_SCHEMA_DRIFT_ENABLED`. (`RSYNC_SCHEMA_DRIFT_AUTOAPPLY` exists but stays OFF and out of P0–P3 — §6.)
+**Flag:** entire detector behind `RSYNC_SCHEMA_DRIFT_ENABLED`. (`RSYNC_SCHEMA_DRIFT_AUTOAPPLY` was retired 2026-09-28 — §6.)
 
 **Tests:** unit `diffSchemas(prior,current) []SchemaChange` table-driven (add/drop/retype/create/drop-table + schema-prefix-normalization + **out-of-scope-table-no-event** `[RT-fix #3]`); `store/loadSchemaBaseline` round-trip (UPSERT idempotency). Integration: run twice, `ADD COLUMN`+`DROP COLUMN` between runs, assert one informational `add_column` + one `drop_column` pending row, third unchanged run emits nothing. e2e: `e2e/test_schema_drift_batch.sh`.
 
@@ -243,7 +244,7 @@ func emitSchemaChangeEvent(ctx context.Context, w *kafka.Writer, pipelineID, tab
 **Files (mirror the exact PR-D pattern):**
 - `frontend/src/app/(dashboard)/pipelines/[id]/schema-changes/page.tsx` — NEW route.
 - `frontend/src/components/pipeline/SchemaDriftApprovalModal.tsx` — NEW, modeled on `PreMigrationAssessmentModal.tsx:212-425` (Dialog + per-finding ack checkbox `acked` `:219-266`).
-- `frontend/src/lib/api/pipelines.ts` — add `listSchemaChanges/approveSchemaChange/rejectSchemaChange` + a `SchemaChangeApproval` interface. Endpoints **already exist** unused in `frontend/src/lib/config/api.ts:267-271`.
+- `frontend/src/lib/api/pipelines.ts` — add `listSchemaChanges/approveSchemaChange/rejectSchemaChange` + a `SchemaChangeApproval` interface. Endpoints **already exist** unused in `frontend/src/lib/config/api.ts:268-272`.
 - `frontend/src/components/pipeline/PipelineActions.tsx` — host the modal + an "N pending" badge (mirror `assessmentReport` host `:40-41,324-338`).
 
 **Modal UX (the rule P3 enforces):**
@@ -293,7 +294,7 @@ The hard line: **destructive == approval-only**, and the DROP/TRUNCATE backstop 
 | Flag | Scope | Default | Effect |
 |---|---|---|---|
 | `RSYNC_SCHEMA_DRIFT_ENABLED` | orchestrator | `false` | Gates `StartSchemaOnly` (P0) + detector (P1). Off → fully dormant. |
-| `RSYNC_SCHEMA_DRIFT_AUTOAPPLY` | orchestrator | `false` | **Off and OUT OF P0–P3** `[RT-fix #4]`. Controls additive auto-apply only; do NOT enable without explicit product sign-off. Destructive classes ignore it entirely. |
+| ~~`RSYNC_SCHEMA_DRIFT_AUTOAPPLY`~~ | ~~orchestrator~~ | — | **Retired 2026-09-28.** Read by no code and set by no compose file: every change except a dropped table now applies or records without approval, so there is nothing left for it to gate. |
 | ~~`RSYNC_SINK_DRIFT_EMIT`~~ | ~~sink~~ | — | **NEVER IMPLEMENTED — do not look for it.** Read by no Go code, set by no compose file (verified 2026-07-31). The sink's drift emit shipped ungated; see the correction under P2. |
 
 **Rollout:** (1) `RSYNC_SCHEMA_DRIFT_ENABLED=true`, autoapply off → detector populates `schema_baselines` + (via consumer) `schema_change_approvals`; **nothing applies**; soak; confirm zero false positives (esp. selected-table scoping + schema-prefix edge). (2) Build the approve UX (P3); humans drive all destructive decisions. (3) Only after a separate product decision, consider additive auto-apply. (4) ~~`RSYNC_SINK_DRIFT_EMIT=true` for CDC immediacy.~~ — superseded: the sink emit is unconditional, so there is no step 4 to perform.
@@ -331,11 +332,11 @@ Critical path: **P0 → P1 → P3.** P2, P4, T-hook are parallelizable/deferrabl
 ## Key file references
 
 - Spine: `backend-orchestrator/internal/agents/healer/healer.go` (struct `:68-91`, `Start` `:133-169`, `processAnalysis` `:817-857`, `applyMigration` `:859-912`, guard `:869-874`, `storePendingApproval` `:990-1012`)
-- Activation: `backend-orchestrator/internal/workers/executor.go:63`
-- Detector seam: `backend-orchestrator/internal/agents/executor/executor.go:3310` (snapshot `:3343`, diff `:3313`), helpers near `:178`, `executionID` ~`:3170`, `DiscoverSchema` `:6474`, `ExecutorTask` `:378-386`
+- Activation: `backend-orchestrator/internal/workers/executor.go:65`
+- Detector seam: `backend-orchestrator/internal/agents/executor/executor.go:4068` (snapshot + diff now in `detectAndEmitSchemaDrift`, called at `:4119`), helpers near `:181`, `executionID` ~`:3865`, `DiscoverSchema` `:9113`, `ExecutorTask` `:476-484`
 - Migration: `api-gateway/migrations/068_schema_baselines.sql` (NEW; 067 current highest)
 - Sink: `shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go` (drop detect `:6442-6465`, emit point `:6456-6461`, callers `:4323`+`:1257`, exit `:3094-3099`, producer `:2729-2736`)
-- Approval API (live): `api-gateway/internal/handlers/schema_evolution.go:40-192`; routes `cmd/server/main.go:443,669-671`; table `migrations/051_schema_evolution.sql:4-38`
-- Frontend (PR-D pattern): `frontend/src/components/pipeline/PreMigrationAssessmentModal.tsx:212-425`, `PipelineActions.tsx:40-41,324-338`, `frontend/src/lib/api/pipelines.ts:268-329`, `frontend/src/lib/config/api.ts:267-271`
+- Approval API (live): `api-gateway/internal/handlers/schema_evolution.go:40-192`; routes `cmd/server/main.go:712,1083-1085`; table `migrations/051_schema_evolution.sql:4-38`
+- Frontend (PR-D pattern): `frontend/src/components/pipeline/PreMigrationAssessmentModal.tsx:212-425`, `PipelineActions.tsx:40-41,324-338`, `frontend/src/lib/api/pipelines.ts:268-329`, `frontend/src/lib/config/api.ts:268-272`
 - CDC (P4): `shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py:250-254`
 - Hook (T-hook): `backend-orchestrator/internal/agents/heal/worker.go:49-61`; wire in `cmd/orchestrator/main.go:743`

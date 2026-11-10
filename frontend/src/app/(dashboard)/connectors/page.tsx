@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useRef } from "react"
 import { isLeakedLocalhostUrl } from "@/lib/config/api"
-import { motion, AnimatePresence } from "framer-motion"
-import { PageHeader } from "@/components/layout"
+import { motion, MotionConfig } from "framer-motion"
+import { PageHeader } from "@/components/layout/PageHeader"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
@@ -13,21 +13,16 @@ import {
   Puzzle,
   Search,
   Plus,
-  ArrowRight,
-  RefreshCw,
   Zap,
   ArrowUpRight,
   ArrowDownRight,
   FileJson,
   Activity,
   Sparkles,
-  User,
-  Container,
-  Circle,
   ExternalLink,
-  AlertTriangle,
+  type LucideIcon,
 } from "lucide-react"
-import { MCPConnector, getConnectorEmoji, getCategoryColor, getConnectorStatusBadge, getConnectorConfidenceBadge, getConnectorConfidenceReasons } from "@/lib/types/mcp-connector"
+import { MCPConnector, getConnectorStatusBadge, getConnectorConfidenceBadge, getConnectorConfidenceReasons } from "@/lib/types/mcp-connector"
 
 // Category type matching the connector type definition
 type ConnectorCategory = "database" | "storage" | "api" | "analytics" | "messaging" | "streaming" | "file" | "other"
@@ -41,9 +36,15 @@ import { ErrorBanner } from "@/components/ui/error-banner"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { canGenerateConnectors } from "@/contexts/CurrentUserContext"
 import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
+import { notifyTableCheck } from "@/components/connectors/ConnectionTablesCheck"
+import { staggerDelay } from "@/components/kit/motion"
+import { FilterChips } from "@/components/kit/FilterChips"
+import { StatusPill, type PillTone } from "@/components/kit/StatusPill"
+import { ListCardsSkeleton } from "@/components/kit/PageSkeleton"
+import { EmptyState } from "@/components/kit/EmptyState"
 
 // Category icons mapping
-const categoryIcons: Record<string, React.ElementType> = {
+const categoryIcons: Record<string, LucideIcon> = {
   database: Database,
   storage: Cloud,
   api: Zap,
@@ -52,8 +53,35 @@ const categoryIcons: Record<string, React.ElementType> = {
   other: Puzzle,
 }
 
-// Docker filter options
-type DockerFilter = "all" | "running" | "deployed" | "local"
+// Where a connector's container is. "ready" has an image and no container yet:
+// the first connection that uses it starts one (docker_status auto_deploys_on_use).
+type RunState = "running" | "restarting" | "stopped" | "ready" | "local"
+
+const RUN_STATES: RunState[] = ["running", "restarting", "stopped", "ready", "local"]
+
+const RUN_STATE: Record<RunState, { tone: PillTone; label: string; title: string }> = {
+  running: { tone: "ok", label: "Running", title: "Its container is up" },
+  restarting: { tone: "wait", label: "Restarting", title: "Its container is restarting" },
+  stopped: { tone: "fail", label: "Stopped", title: "Its container is deployed and stopped" },
+  ready: { tone: "skip", label: "Ready", title: "Starts the first time a connection uses it" },
+  local: { tone: "skip", label: "Local", title: "No container image is built for it" },
+}
+
+function runState(c: MCPConnector): RunState {
+  if (c.docker_deployed && c.docker_status === "running") return "running"
+  if (c.docker_deployed && c.docker_status === "restarting") return "restarting"
+  if (c.docker_deployed && c.docker_status === "stopped") return "stopped"
+  return c.has_dockerfile ? "ready" : "local"
+}
+
+function RunStatePill({ connector }: { connector: MCPConnector }) {
+  const { tone, label, title } = RUN_STATE[runState(connector)]
+  return (
+    <StatusPill tone={tone} title={title}>
+      {label}
+    </StatusPill>
+  )
+}
 
 export default function ConnectorsPage() {
   const router = useRouter()
@@ -66,8 +94,11 @@ export default function ConnectorsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<AppError | null>(null)
   const [searchQuery, setSearchQuery] = useState("")
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
-  const [dockerFilter, setDockerFilter] = useState<DockerFilter>("all")
+  const [selectedCategory, setSelectedCategory] = useState<"all" | ConnectorCategory>("all")
+  const [statusFilter, setStatusFilter] = useState<"all" | RunState>("all")
+  // Cards fade in on the first load only. Once the user narrows the grid, the
+  // cards a filter brings back appear at once.
+  const [fadeIn, setFadeIn] = useState(true)
   const [selectedConnector, setSelectedConnector] = useState<MCPConnector | null>(null)
   const [configModalOpen, setConfigModalOpen] = useState(false)
 
@@ -183,34 +214,53 @@ export default function ConnectorsPage() {
   const allMappedCategories = [...new Set(connectors.map((c) => mapCategory(c.category)))]
   const categories = categoryOrder.filter(cat => allMappedCategories.includes(cat))
 
-  // Docker status counts
-  const runningCount = connectors.filter((c) => c.docker_status === "running").length
-  const deployedCount = connectors.filter((c) => c.docker_deployed || c.has_dockerfile).length
-  const localCount = connectors.filter((c) => !c.has_dockerfile).length
-
-  // Filter connectors
-  const filteredConnectors = connectors.filter((c) => {
-    // Text search
-    const matchesSearch =
+  // Text search
+  const searched = connectors.filter(
+    (c) =>
       c.display_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.description?.toLowerCase().includes(searchQuery.toLowerCase())
+  )
+  const inCategory = (c: MCPConnector) => selectedCategory === "all" || mapCategory(c.category) === selectedCategory
+  const inStatus = (c: MCPConnector) => statusFilter === "all" || runState(c) === statusFilter
+  const filteredConnectors = searched.filter((c) => inCategory(c) && inStatus(c))
 
-    // Category filter (use mapped category)
-    const matchesCategory = !selectedCategory || mapCategory(c.category) === selectedCategory
-
-    // Docker status filter
-    let matchesDocker = true
-    if (dockerFilter === "running") {
-      matchesDocker = c.docker_status === "running"
-    } else if (dockerFilter === "deployed") {
-      matchesDocker = c.docker_deployed || c.has_dockerfile
-    } else if (dockerFilter === "local") {
-      matchesDocker = !c.has_dockerfile
-    }
-
-    return matchesSearch && matchesCategory && matchesDocker
-  })
+  // The grid shows the catalog once it has loaded; a refetch keeps the cards,
+  // and so their counts. "All 0" beside the loading blocks or an error reads as
+  // an empty catalog.
+  const listed = !error && !(loading && connectors.length === 0)
+  const counted = (n: number) => (listed ? n : undefined)
+  // Each chip counts what picking it would show: the search and the other
+  // filter applied, its own filter swapped for the chip.
+  const categoryChips = [
+    { value: "all" as const, label: "All", count: counted(searched.filter(inStatus).length) },
+    ...categories.map((category) => ({
+      value: category,
+      label: categoryLabels[category],
+      icon: categoryIcons[category] ?? Puzzle,
+      count: counted(searched.filter((c) => inStatus(c) && mapCategory(c.category) === category).length),
+    })),
+  ]
+  // Only the states some connector is in, so the toggle never offers an empty
+  // "Stopped"; the picked one stays even after it empties.
+  const statusChips = [
+    { value: "all" as const, label: "All", count: counted(searched.filter(inCategory).length) },
+    ...RUN_STATES.map((state) => ({
+      value: state,
+      label: RUN_STATE[state].label,
+      count: counted(searched.filter((c) => inCategory(c) && runState(c) === state).length),
+      present: connectors.some((c) => runState(c) === state),
+    }))
+      .filter((chip) => chip.present || chip.value === statusFilter)
+      .map(({ present: _present, ...chip }) => chip),
+  ]
+  const filtered = searchQuery !== "" || selectedCategory !== "all" || statusFilter !== "all"
+  const clearFilters = () => {
+    setFadeIn(false)
+    setSearchQuery("")
+    setSelectedCategory("all")
+    setStatusFilter("all")
+  }
 
   // Group by mapped category
   const groupedConnectors = filteredConnectors.reduce<Record<string, MCPConnector[]>>(
@@ -252,11 +302,12 @@ export default function ConnectorsPage() {
   const handleSaveConnection = async (config: Record<string, unknown>) => {
     try {
       // Save connection to backend
-      const result = await saveConnection(config)
+      const saved = await saveConnection(config)
       
       toast.success("Connection saved successfully", {
         description: `Connection "${(config.name as string) || "Unnamed"}" has been created`,
       })
+      notifyTableCheck(saved)
       
     setConfigModalOpen(false)
     setSelectedConnector(null)
@@ -271,7 +322,9 @@ export default function ConnectorsPage() {
   }
 
   return (
-    <div className="flex flex-col h-full">
+    // Cards fade in; someone who asked their system for less motion gets none.
+    <MotionConfig reducedMotion="user">
+    <div className="space-y-5">
       <PageHeader
         heading="Data Connectors"
         description="Manage your active MCP connectors and generate new ones"
@@ -302,94 +355,51 @@ export default function ConnectorsPage() {
         </div>
       </PageHeader>
 
-      <div className="flex-1 space-y-6 overflow-auto">
-            {/* Docker Status Filter */}
-            <div className="flex flex-wrap items-center gap-2 p-3 bg-zinc-50 dark:bg-zinc-900/50 rounded-lg border border-zinc-200 dark:border-zinc-800">
-              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300 mr-2">
-                <Container className="h-4 w-4 inline mr-1" />
-                Status:
+      <div className="space-y-5">
+        {/* One row: what kind of connector, where its container is, and a search. */}
+        <div className="flex flex-col gap-3 @3xl:flex-row @3xl:items-center @3xl:justify-between">
+          <FilterChips
+            label="Category"
+            chips={categoryChips}
+            value={selectedCategory}
+            onChange={(next) => {
+              setFadeIn(false)
+              setSelectedCategory(next)
+            }}
+          />
+          <div className="flex flex-col gap-3 @xl:flex-row @xl:items-center @3xl:shrink-0">
+            <div className="flex items-center gap-2">
+              <span aria-hidden className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
+                Status
               </span>
-              <Button
-                variant={dockerFilter === "all" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setDockerFilter("all")}
-                className="h-7 text-xs"
-              >
-                All ({connectors.length})
-              </Button>
-              <Button
-                variant={dockerFilter === "running" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setDockerFilter("running")}
-                className="h-7 text-xs gap-1"
-              >
-                <Circle className="h-2 w-2 fill-emerald-500 text-emerald-500" />
-                Running ({runningCount})
-              </Button>
-              <Button
-                variant={dockerFilter === "deployed" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setDockerFilter("deployed")}
-                className="h-7 text-xs"
-              >
-                Available ({deployedCount})
-              </Button>
-              <Button
-                variant={dockerFilter === "local" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setDockerFilter("local")}
-                className="h-7 text-xs"
-              >
-                Unavailable ({localCount})
-              </Button>
+              <FilterChips
+                label="Status"
+                chips={statusChips}
+                value={statusFilter}
+                onChange={(next) => {
+                  setFadeIn(false)
+                  setStatusFilter(next)
+                }}
+              />
             </div>
-
-            {/* Search and Category Filter */}
-            <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">
-              {/* Category filters */}
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant={selectedCategory === null ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setSelectedCategory(null)}
-                >
-                  All Categories
-                </Button>
-                {categories.map((category) => {
-                  const Icon = categoryIcons[category] || Puzzle
-                  const count = filteredConnectors.filter((c) => mapCategory(c.category) === category).length
-                  return (
-                    <Button
-                      key={category}
-                      variant={selectedCategory === category ? "default" : "outline"}
-                      size="sm"
-                      onClick={() => setSelectedCategory(category)}
-                    >
-                      <Icon className="h-4 w-4 mr-1" />
-                      {categoryLabels[category] ?? category} ({count})
-                    </Button>
-                  )
-                })}
-              </div>
-
-              {/* Search */}
-              <div className="relative w-full sm:w-80">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
-                <Input
-                  placeholder="Search connectors..."
-                  value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-10"
-            />
+            <div className="relative w-full @xl:w-64">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
+              <Input
+                aria-label="Search connectors"
+                placeholder="Search connectors..."
+                value={searchQuery}
+                onChange={(e) => {
+                  setFadeIn(false)
+                  setSearchQuery(e.target.value)
+                }}
+                className="pl-10"
+              />
+            </div>
           </div>
         </div>
 
-        {/* Loading state */}
-        {loading && (
-          <div className="flex items-center justify-center py-12">
-            <RefreshCw className="h-8 w-8 animate-spin text-zinc-400" />
-          </div>
-        )}
+        {/* First load. A refetch keeps the cards on screen. */}
+        {loading && connectors.length === 0 && <ListCardsSkeleton count={6} label="Loading connectors…" />}
 
         {/* Error state */}
         {error && !loading && (
@@ -397,46 +407,47 @@ export default function ConnectorsPage() {
         )}
 
         {/* Connectors grid */}
-        {!loading && !error && (
-          <AnimatePresence mode="popLayout">
-            {Object.keys(groupedConnectors).length === 0 ? (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="text-center py-12"
-              >
-                <Database className="h-12 w-12 mx-auto text-zinc-300 dark:text-zinc-700 mb-4" />
-                <p className="text-zinc-500 dark:text-zinc-400">
-                  No connectors found matching your criteria
-                </p>
-              </motion.div>
-            ) : (
+        {listed && (
+          filteredConnectors.length === 0 ? (
+            <EmptyState
+              icon={filtered ? Search : Database}
+              title="No connectors found"
+              description={filtered ? "Nothing matches this category, status and search." : "The connector catalog is empty."}
+              action={
+                filtered ? (
+                  <Button variant="outline" size="sm" onClick={clearFilters}>
+                    Clear filters
+                  </Button>
+                ) : undefined
+              }
+            />
+          ) : (
               <div className="space-y-8">
                 {Object.entries(sortedGroupedConnectors).map(([category, items]) => {
                   const Icon = categoryIcons[category] || Puzzle
+                  const label = categoryLabels[category as ConnectorCategory] ?? category
                   return (
-                    <motion.div
-                      key={category}
-                      initial={{ opacity: 0, y: 20 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -20 }}
-                    >
+                    <section key={category} aria-label={label}>
                       <div className="flex items-center gap-2 mb-4">
                         <Icon className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
-                        <h3 className="text-lg font-semibold text-zinc-900 dark:text-white">
-                          {categoryLabels[category as ConnectorCategory] ?? category}
-                        </h3>
+                        <h2 className="text-lg font-semibold text-zinc-900 dark:text-white">
+                          {label}
+                        </h2>
                         <Badge variant="secondary">{items.length}</Badge>
                       </div>
 
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {/* As many 17rem columns as the page's own width holds. */}
+                      <div className="grid grid-cols-[repeat(auto-fill,minmax(min(17rem,100%),1fr))] gap-4">
                         {items.map((connector, index) => (
+                          // One short fade, the first six staggered, on the first load only.
+                          // The hover transition names its properties: `transition-all`
+                          // also eased the opacity the fade sets.
                           <motion.div
                             key={connector.name}
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            transition={{ delay: index * 0.05 }}
-                            className="group relative p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-violet-300 dark:hover:border-violet-700 hover:shadow-lg hover:shadow-violet-500/10 transition-all cursor-pointer"
+                            initial={fadeIn ? { opacity: 0 } : false}
+                            animate={{ opacity: 1 }}
+                            transition={{ duration: 0.15, delay: staggerDelay(index, 0.03) }}
+                            className="group relative p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-violet-300 dark:hover:border-violet-700 hover:shadow-lg hover:shadow-violet-500/10 transition-[border-color,box-shadow] cursor-pointer"
                             onClick={() => handleConfigure(connector)}
                           >
                             {/* Connector icon, name, and status chip */}
@@ -445,12 +456,12 @@ export default function ConnectorsPage() {
                               <div className="flex-1 min-w-0">
                                 {/* Wraps to two lines before clipping: one-line `truncate`
                                     cut names that had room below them (#50). */}
-                                <h4
+                                <h3
                                   title={connector.display_name}
                                   className="font-semibold leading-snug text-zinc-900 dark:text-white line-clamp-2 break-words"
                                 >
                                   {connector.display_name}
-                                </h4>
+                                </h3>
                                 {/* Canonical connector id/slug — disambiguates same-titled
                                     connectors (e.g. stripe vs stripe-demo) and is the
                                     connector_type users need for config. */}
@@ -460,7 +471,12 @@ export default function ConnectorsPage() {
                                 >
                                   {connector.name}
                                 </p>
-                                <div className="flex items-center gap-2 mt-1">
+                                {/* Wraps instead of overflowing: on a narrow card (the assistant
+                                    docked beside the page) the chips take a second line. The
+                                    container chip lives here, not beside the name, so it never
+                                    squeezes the name to a letter. */}
+                                <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                                  <RunStatePill connector={connector} />
                                   <Badge variant="secondary" className="text-xs">
                                     v{connector.version}
                                   </Badge>
@@ -521,31 +537,6 @@ export default function ConnectorsPage() {
                                   )}
                                 </div>
                               </div>
-
-                              {/* Docker status chip — flex sibling so long names truncate instead of hiding under it */}
-                              <div className="shrink-0 flex items-center gap-1">
-                                {connector.docker_deployed && connector.docker_status === "running" ? (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/40 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
-                                    <Circle className="h-2 w-2 fill-emerald-500" />
-                                    Running
-                                  </span>
-                                ) : connector.docker_deployed && connector.docker_status === "stopped" ? (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/40 text-[10px] font-medium text-red-700 dark:text-red-400">
-                                    <Circle className="h-2 w-2 fill-red-500" />
-                                    Stopped
-                                  </span>
-                                ) : connector.has_dockerfile ? (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                                    <Container className="h-2.5 w-2.5" />
-                                    Ready
-                                  </span>
-                                ) : (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-[10px] font-medium text-zinc-500 dark:text-zinc-400">
-                                    <Circle className="h-2 w-2 fill-zinc-400" />
-                                    Local
-                                  </span>
-                                )}
-                              </div>
                             </div>
 
                             {/* Description */}
@@ -597,12 +588,11 @@ export default function ConnectorsPage() {
                           </motion.div>
                         ))}
                       </div>
-                    </motion.div>
+                    </section>
                   )
                 })}
               </div>
-            )}
-          </AnimatePresence>
+            )
         )}
       </div>
 
@@ -614,5 +604,6 @@ export default function ConnectorsPage() {
               onSave={handleSaveConnection}
             />
     </div>
+    </MotionConfig>
   )
 }

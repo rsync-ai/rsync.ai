@@ -42,7 +42,7 @@ func TestProcessCDCEventTransientFailureIsRetryable(t *testing.T) {
 	metrics := &Metrics{}
 	var ins, upd, del, bytes sync.Map
 
-	commit, err := processCDCEvent(ctx, hw, nil, client, cfg, ddl, nil, dlqWriter, msg, sm, metrics,
+	commit, err := processCDCEvent(ctx, newCommitGate(nil, hw), nil, client, cfg, ddl, nil, dlqWriter, msg, sm, metrics,
 		&ins, &upd, &del, &bytes, time.Minute)
 
 	if err == nil {

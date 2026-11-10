@@ -229,7 +229,7 @@ func TestMongoDBAssessor_ConnectionFailures(t *testing.T) {
 func TestRegistry_MongoDBHasADedicatedAssessor(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register(NewMongoDBAssessor(nil))
-	if !reg.HasDedicated("mongodb") {
+	if _, ok := reg.byType["mongodb"]; !ok {
 		t.Fatal("mongodb is not registered under its connection type")
 	}
 }

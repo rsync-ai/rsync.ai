@@ -88,6 +88,57 @@ func TestOwnsTopic(t *testing.T) {
 	}
 }
 
+// Bug class: a topic Debezium names by its OWN default, outside the namespace and
+// the id-anchored prefix every name above shares. Debezium puts its heartbeats on
+// <topic.heartbeat.prefix>.<topic.prefix>, default "__debezium-heartbeat". #1098
+// set only the legacy heartbeat.topics.prefix key, so the MongoDB connectors it
+// created wrote to __debezium-heartbeat.<topic.prefix> until #1101 set the real
+// key (connector.py _enable_heartbeat). Those topics outlive the fix: nothing
+// renames a live topic, so ownsTopic must claim the default spelling too or every
+// such pipeline strands one topic on delete.
+//
+// The other topics Debezium can name by default are already inside the anchored
+// prefix or never minted: the transaction topic is <topic.prefix>.transaction,
+// schema history and the Kafka signal channel are always named explicitly, and
+// notifications are not enabled.
+func TestOwnsDebeziumDefaultHeartbeatTopic(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
+	n := testNames()
+
+	owned := []string{
+		// topic.prefix in its qualified spelling, as the executor mints it today.
+		"__debezium-heartbeat.rsync.cdc-" + testPipelineID8,
+		// topic.prefix in its pre-namespace spelling.
+		"__debezium-heartbeat.cdc-" + testPipelineID8,
+	}
+	for _, topic := range owned {
+		if !n.ownsTopic(topic) {
+			t.Errorf("ownsTopic(%q) = false, want true (Debezium default heartbeat topic would leak)", topic)
+		}
+	}
+
+	// The default prefix is shared by every connector on the cluster, so the
+	// match has to stay exact: anything but this pipeline's topic.prefix is
+	// another connector's heartbeat.
+	notOwned := []string{
+		"__debezium-heartbeat",
+		"__debezium-heartbeat.rsync.cdc-" + otherPipelineID8,
+		"__debezium-heartbeat.cdc-" + otherPipelineID8,
+		"__debezium-heartbeat.rsync.cdc-" + testPipelineID8 + "e",
+		"__debezium-heartbeat.cdc-" + testPipelineID8 + "e",
+		"__debezium-heartbeat.rsync.cdc-" + testPipelineID8 + ".x",
+		"__debezium-heartbeat.rsync.rsync.cdc-" + testPipelineID8,
+		"rsync.__debezium-heartbeat.rsync.cdc-" + testPipelineID8,
+		// Another product's connector with its own topic.prefix.
+		"__debezium-heartbeat.dbserver1",
+	}
+	for _, topic := range notOwned {
+		if n.ownsTopic(topic) {
+			t.Errorf("ownsTopic(%q) = true, want false (would delete another connector's heartbeat topic)", topic)
+		}
+	}
+}
+
 func TestOwnsGroup(t *testing.T) {
 	n := testNames()
 

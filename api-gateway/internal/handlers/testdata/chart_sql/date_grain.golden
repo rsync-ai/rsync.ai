@@ -1,0 +1,105 @@
+# dialect grain week_start fiscal_month: the expression
+
+-- postgres
+day w1 f1: DATE_TRUNC('day', e)
+week w1 f1: DATE_TRUNC('week', e)
+week w3 f1: DATE_TRUNC('week', e + INTERVAL '5 days') - INTERVAL '5 days'
+week w7 f1: DATE_TRUNC('week', e + INTERVAL '1 days') - INTERVAL '1 days'
+month w1 f1: DATE_TRUNC('month', e)
+quarter w1 f1: DATE_TRUNC('quarter', e)
+quarter w1 f4: DATE_TRUNC('quarter', e - INTERVAL '3 months') + INTERVAL '3 months'
+quarter w1 f10: DATE_TRUNC('quarter', e - INTERVAL '9 months') + INTERVAL '9 months'
+year w1 f1: DATE_TRUNC('year', e)
+year w1 f4: DATE_TRUNC('year', e - INTERVAL '3 months') + INTERVAL '3 months'
+year w1 f10: DATE_TRUNC('year', e - INTERVAL '9 months') + INTERVAL '9 months'
+
+-- mysql
+day w1 f1: DATE(e)
+week w1 f1: DATE_SUB(DATE(e), INTERVAL WEEKDAY(e) DAY)
+week w3 f1: DATE_SUB(DATE(e), INTERVAL MOD(WEEKDAY(e) + 5, 7) DAY)
+week w7 f1: DATE_SUB(DATE(e), INTERVAL MOD(WEEKDAY(e) + 1, 7) DAY)
+month w1 f1: MAKEDATE(YEAR(e), 1) + INTERVAL (MONTH(e) - 1) MONTH
+quarter w1 f1: MAKEDATE(YEAR(e), 1) + INTERVAL (QUARTER(e) - 1) QUARTER
+quarter w1 f4: (MAKEDATE(YEAR((e - INTERVAL 3 MONTH)), 1) + INTERVAL (QUARTER((e - INTERVAL 3 MONTH)) - 1) QUARTER) + INTERVAL 3 MONTH
+quarter w1 f10: (MAKEDATE(YEAR((e - INTERVAL 9 MONTH)), 1) + INTERVAL (QUARTER((e - INTERVAL 9 MONTH)) - 1) QUARTER) + INTERVAL 9 MONTH
+year w1 f1: MAKEDATE(YEAR(e), 1)
+year w1 f4: (MAKEDATE(YEAR((e - INTERVAL 3 MONTH)), 1)) + INTERVAL 3 MONTH
+year w1 f10: (MAKEDATE(YEAR((e - INTERVAL 9 MONTH)), 1)) + INTERVAL 9 MONTH
+
+-- sqlserver
+day w1 f1: CAST(e AS date)
+week w1 f1: DATEADD(day, -((DATEDIFF(day, '19000101', e) % 7 + 7) % 7), CAST(e AS date))
+week w3 f1: DATEADD(day, -((DATEDIFF(day, '19000103', e) % 7 + 7) % 7), CAST(e AS date))
+week w7 f1: DATEADD(day, -((DATEDIFF(day, '19000107', e) % 7 + 7) % 7), CAST(e AS date))
+month w1 f1: DATEFROMPARTS(YEAR(e), MONTH(e), 1)
+quarter w1 f1: DATEFROMPARTS(YEAR(e), (DATEPART(quarter, e) - 1) * 3 + 1, 1)
+quarter w1 f4: DATEADD(month, 3, DATEFROMPARTS(YEAR(DATEADD(month, -3, e)), (DATEPART(quarter, DATEADD(month, -3, e)) - 1) * 3 + 1, 1))
+quarter w1 f10: DATEADD(month, 9, DATEFROMPARTS(YEAR(DATEADD(month, -9, e)), (DATEPART(quarter, DATEADD(month, -9, e)) - 1) * 3 + 1, 1))
+year w1 f1: DATEFROMPARTS(YEAR(e), 1, 1)
+year w1 f4: DATEADD(month, 3, DATEFROMPARTS(YEAR(DATEADD(month, -3, e)), 1, 1))
+year w1 f10: DATEADD(month, 9, DATEFROMPARTS(YEAR(DATEADD(month, -9, e)), 1, 1))
+
+-- bigquery
+day w1 f1: DATE(e)
+week w1 f1: DATE_TRUNC(DATE(e), WEEK(MONDAY))
+week w3 f1: DATE_TRUNC(DATE(e), WEEK(WEDNESDAY))
+week w7 f1: DATE_TRUNC(DATE(e), WEEK(SUNDAY))
+month w1 f1: DATE_TRUNC(DATE(e), MONTH)
+quarter w1 f1: DATE_TRUNC(DATE(e), QUARTER)
+quarter w1 f4: DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(e), INTERVAL 3 MONTH), QUARTER), INTERVAL 3 MONTH)
+quarter w1 f10: DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(e), INTERVAL 9 MONTH), QUARTER), INTERVAL 9 MONTH)
+year w1 f1: DATE_TRUNC(DATE(e), YEAR)
+year w1 f4: DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(e), INTERVAL 3 MONTH), YEAR), INTERVAL 3 MONTH)
+year w1 f10: DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(e), INTERVAL 9 MONTH), YEAR), INTERVAL 9 MONTH)
+
+-- snowflake
+day w1 f1: DATE_TRUNC('DAY', e)
+week w1 f1: DATEADD('DAY', -MOD(DAYOFWEEKISO(e) + 6, 7), DATE_TRUNC('DAY', e))
+week w3 f1: DATEADD('DAY', -MOD(DAYOFWEEKISO(e) + 4, 7), DATE_TRUNC('DAY', e))
+week w7 f1: DATEADD('DAY', -MOD(DAYOFWEEKISO(e) + 0, 7), DATE_TRUNC('DAY', e))
+month w1 f1: DATE_TRUNC('MONTH', e)
+quarter w1 f1: DATE_TRUNC('QUARTER', e)
+quarter w1 f4: DATEADD('MONTH', 3, DATE_TRUNC('QUARTER', DATEADD('MONTH', -3, e)))
+quarter w1 f10: DATEADD('MONTH', 9, DATE_TRUNC('QUARTER', DATEADD('MONTH', -9, e)))
+year w1 f1: DATE_TRUNC('YEAR', e)
+year w1 f4: DATEADD('MONTH', 3, DATE_TRUNC('YEAR', DATEADD('MONTH', -3, e)))
+year w1 f10: DATEADD('MONTH', 9, DATE_TRUNC('YEAR', DATEADD('MONTH', -9, e)))
+
+-- databricks
+day w1 f1: DATE_TRUNC('DAY', e)
+week w1 f1: DATE_TRUNC('WEEK', e)
+week w3 f1: DATE_TRUNC('WEEK', e + INTERVAL 5 DAYS) - INTERVAL 5 DAYS
+week w7 f1: DATE_TRUNC('WEEK', e + INTERVAL 1 DAYS) - INTERVAL 1 DAYS
+month w1 f1: DATE_TRUNC('MONTH', e)
+quarter w1 f1: DATE_TRUNC('QUARTER', e)
+quarter w1 f4: ADD_MONTHS(DATE_TRUNC('QUARTER', ADD_MONTHS(e, -3)), 3)
+quarter w1 f10: ADD_MONTHS(DATE_TRUNC('QUARTER', ADD_MONTHS(e, -9)), 9)
+year w1 f1: DATE_TRUNC('YEAR', e)
+year w1 f4: ADD_MONTHS(DATE_TRUNC('YEAR', ADD_MONTHS(e, -3)), 3)
+year w1 f10: ADD_MONTHS(DATE_TRUNC('YEAR', ADD_MONTHS(e, -9)), 9)
+
+-- clickhouse
+day w1 f1: toDate(e)
+week w1 f1: toDate(e) - ((toDayOfWeek(e) + 6) % 7)
+week w3 f1: toDate(e) - ((toDayOfWeek(e) + 4) % 7)
+week w7 f1: toDate(e) - ((toDayOfWeek(e) + 0) % 7)
+month w1 f1: toStartOfMonth(e)
+quarter w1 f1: toStartOfQuarter(e)
+quarter w1 f4: addMonths(toStartOfQuarter(subtractMonths(toDate(e), 3)), 3)
+quarter w1 f10: addMonths(toStartOfQuarter(subtractMonths(toDate(e), 9)), 9)
+year w1 f1: toStartOfYear(e)
+year w1 f4: addMonths(toStartOfYear(subtractMonths(toDate(e), 3)), 3)
+year w1 f10: addMonths(toStartOfYear(subtractMonths(toDate(e), 9)), 9)
+
+-- oracle
+day w1 f1: TRUNC(e, 'DD')
+week w1 f1: TRUNC(e, 'IW')
+week w3 f1: TRUNC(e + 5, 'IW') - 5
+week w7 f1: TRUNC(e + 1, 'IW') - 1
+month w1 f1: TRUNC(e, 'MM')
+quarter w1 f1: TRUNC(e, 'Q')
+quarter w1 f4: ADD_MONTHS(TRUNC(ADD_MONTHS(e, -3), 'Q'), 3)
+quarter w1 f10: ADD_MONTHS(TRUNC(ADD_MONTHS(e, -9), 'Q'), 9)
+year w1 f1: TRUNC(e, 'YYYY')
+year w1 f4: ADD_MONTHS(TRUNC(ADD_MONTHS(e, -3), 'YYYY'), 3)
+year w1 f10: ADD_MONTHS(TRUNC(ADD_MONTHS(e, -9), 'YYYY'), 9)

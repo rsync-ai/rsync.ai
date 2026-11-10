@@ -74,9 +74,11 @@ const driftRow: Partial<AppNotification> = {
   type: "structured_error_notification",
   severity: "warning",
   title: "Approval needed: your source schema changed",
-  message: 'A new column "status" was added to pipeline_test.categories.',
+  message:
+    "Source table pipeline_test.categories was dropped. Approve drops the destination table, Reject keeps it, and either way the table leaves this pipeline.",
   pipeline_name: "orders-sync",
-  impact: "Your existing data keeps syncing. The change won't be applied until you approve it.",
+  impact:
+    "A dropped source table waits for your decision. Nothing is dropped from the destination until you approve it.",
   action_label: "Review change",
   reference_code: "SCHEMA_DRIFT_DETECTED",
   action_url: "/pipelines/pl-1/schema-changes",

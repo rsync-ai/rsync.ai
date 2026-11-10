@@ -54,7 +54,7 @@ func TestOrchestratorServesNoConnectorMetadataRoutes(t *testing.T) {
 	}
 	defer db.Close()
 
-	router := setupRouter(nil, &kafka.TopologyManager{}, nil, nil, nil, db, nil, nil)
+	router := setupRouter(nil, &kafka.TopologyManager{}, nil, nil, nil, db, nil, nil, nil)
 	routes := router.Routes()
 
 	// The prefix the deleted routes were registered under: they were

@@ -81,39 +81,6 @@ func (m *HealthMonitor) UnregisterConsumer(consumerID string) {
 	log.Printf("[HealthMonitor] Unregistered consumer: %s", consumerID)
 }
 
-// RecordHeartbeat records a heartbeat for a consumer
-func (m *HealthMonitor) RecordHeartbeat(consumerID string) {
-	m.mu.RLock()
-	health, exists := m.consumers[consumerID]
-	m.mu.RUnlock()
-
-	if !exists {
-		return
-	}
-
-	previousStatus := health.Status
-	health.RecordHeartbeat()
-
-	// Check if recovered
-	if previousStatus == HealthUnhealthy || previousStatus == HealthDegraded {
-		health.Status = HealthHealthy
-		if m.onRecovered != nil {
-			go m.onRecovered(health)
-		}
-	}
-}
-
-// UpdateMetrics updates metrics for a consumer
-func (m *HealthMonitor) UpdateMetrics(consumerID string, lag int64, processed int64, throughput float64) {
-	m.mu.RLock()
-	health, exists := m.consumers[consumerID]
-	m.mu.RUnlock()
-
-	if exists {
-		health.UpdateMetrics(lag, processed, throughput)
-	}
-}
-
 // monitorLoop is the main monitoring loop
 func (m *HealthMonitor) monitorLoop() {
 	defer m.wg.Done()
@@ -226,34 +193,6 @@ func (m *HealthMonitor) GetConsumerHealth(consumerID string) *ConsumerHealth {
 	defer m.mu.RUnlock()
 
 	return m.consumers[consumerID]
-}
-
-// GetConsumersByStatus gets all consumers with a specific status
-func (m *HealthMonitor) GetConsumersByStatus(status HealthStatus) []*ConsumerHealth {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var result []*ConsumerHealth
-	for _, h := range m.consumers {
-		if h.Status == status {
-			result = append(result, h)
-		}
-	}
-	return result
-}
-
-// GetConsumersForTopic gets all consumers for a topic
-func (m *HealthMonitor) GetConsumersForTopic(topic string) []*ConsumerHealth {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var result []*ConsumerHealth
-	for _, h := range m.consumers {
-		if h.Topic == topic {
-			result = append(result, h)
-		}
-	}
-	return result
 }
 
 // GetTotalLag gets total lag across all consumers

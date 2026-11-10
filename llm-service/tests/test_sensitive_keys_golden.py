@@ -2,7 +2,7 @@
 
 api-gateway and backend-orchestrator each keep a Go ``SensitiveKeys`` list and pin it
 to the same file (``internal/security/masking_golden_test.go``). This copy is the
-credential group alone, on purpose: ``mask_dict``/``config_summary`` mask connector
+credential group alone, on purpose: ``mask_dict`` masks connector
 configs by substring, where a PII key such as ``address`` would also hide
 ``host_address``. A credential key added in Go and not here would leak that field
 from this service's logs.

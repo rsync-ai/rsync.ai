@@ -7,6 +7,7 @@ import (
 	"github.com/rsync-ai/shared/crypto"
 	"github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/memlimit"
+	"github.com/rsync-ai/shared/transforms"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"api-gateway/internal/agentgw"
+	"api-gateway/internal/assistant"
 	"api-gateway/internal/cache"
 	"api-gateway/internal/chat"
 	"api-gateway/internal/config"
@@ -106,6 +109,9 @@ func corsMiddleware() gin.HandlerFunc {
 		allowHeaders += ", X-CSRF-Token"
 		// Active-workspace selector (membership-verified server-side).
 		allowHeaders += ", X-Workspace-ID"
+		// Sent by a browser MCP client on every request after initialize
+		// (the agent MCP route, /api/agent/v1/mcp).
+		allowHeaders += ", MCP-Protocol-Version"
 		c.Writer.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Expose-Headers", "X-Trace-ID, traceparent, tracestate")
@@ -363,6 +369,9 @@ func main() {
 	// feature: one ERROR line each, naming the setting and what will not work.
 	// Before db.Init, so the lines appear even when the database never comes up.
 	reportStartupSettingProblems(log.StandardLogger(), os.Getenv)
+	if !transforms.PIIHashKeyConfigured() {
+		log.Warn(startupCheckLogPrefix + transforms.PIIHashKeyUnsetWarning)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -550,6 +559,10 @@ func main() {
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
 
+	// Connector generation runs a restart interrupted read failed, not
+	// running forever (connector_generations.go).
+	go handlers.RunConnectorGenerationSweeper(appCtx)
+
 	go consumer.Start(appCtx, func(ctx context.Context, response kafka.AgentResponse) error {
 		if response.Agent != "pii_scanner" {
 			log.Warnf("pii.scan.response: ignoring message from unexpected agent %q (trace_id=%s)", response.Agent, response.TraceID)
@@ -584,12 +597,28 @@ func main() {
 	//
 	// Assigned before Start(), so no event can arrive between the two and find the
 	// hook nil.
-	eventProjector.OnPipelineCompleted = handlers.FireModelsAfterPipeline
-	// CDC pipelines never complete, so their "run after pipeline" models fire when the
-	// sink reports rows landed, once per window (CDC_AFTER_PIPELINE_INTERVAL_MINUTES,
-	// default 15). The window label stands in for the execution id and keeps the
-	// fan-out idempotent. See projector/cdc_data_landed.go.
-	eventProjector.OnPipelineDataLanded = handlers.FireModelsAfterPipeline
+	//
+	// Workflows that run after a pipeline (handlers/workflow_runs_temporal.go) fire from
+	// the same PIPELINE_COMPLETED. FireWorkflowsAfterPipeline returns at once, fires each
+	// workflow once per execution id, however often the event is re-delivered, and
+	// hands the runs to Temporal.
+	//
+	// A CDC pipeline never completes: its models and workflows fire on a window's
+	// trailing edge instead, from the sweep at /internal/cdc/trailing-edge/sweep
+	// (handlers/cdc_trailing_edge.go).
+	eventProjector.OnPipelineCompleted = func(ctx context.Context, pipelineID, executionID string) {
+		handlers.FireModelsAfterPipeline(ctx, pipelineID, executionID)
+		handlers.FireWorkflowsAfterPipeline(ctx, pipelineID, executionID)
+	}
+	// Run notices (handlers/run_notices.go): a pipeline stopped or cancelled by hand, a
+	// scheduled run waiting for an answer, and a scheduled or triggered model or
+	// workflow run that failed. Delivered in-process through the notifier (bell and
+	// Slack/email, run status category), like the assessment alerts below, and set
+	// before the projector starts so its first wait finds it.
+	handlers.SetRunNoticeNotifier(notifier.NewEmitter(db.GetDB()))
+	// A scheduled run that stopped to ask a question tells its owner, once per wait
+	// (handlers/pipeline_wait_alert.go).
+	eventProjector.OnPipelineWaiting = handlers.NotifyPipelineAwaitingInput
 
 	if err := eventProjector.Start(); err != nil {
 		log.Warnf("⚠️  Failed to start event projector: %v", err)
@@ -598,23 +627,33 @@ func main() {
 		log.Info("✅ Event Projector started (consuming pipeline.domain.events)")
 	}
 
-	// Optional: retention cleanup for monitoring tables (best-effort; default off).
-	// Enable with ENABLE_PIPELINE_RUN_RETENTION=true.
+	// On by default: trims finished batch runs' events, metric ticks and run metrics
+	// older than PIPELINE_RUN_RETENTION_DAYS (default 90, at least 14);
+	// ENABLE_PIPELINE_RUN_RETENTION=false keeps every row.
 	retention.StartPipelineRunRetention(appCtx, db.GetDB())
+
+	// Always on: folds per-event CDC acks into the counter tables (migration 146) and
+	// prunes finished batch runs' acks after RSYNC_BATCH_ACK_RETENTION_DAYS (default 30).
+	retention.StartBatchAckJanitor(appCtx, db.GetDB())
+
+	// Always on: trims audit_logs and connection_access_logs rows older than
+	// RSYNC_AUDIT_LOG_RETENTION_DAYS (default 365; 0 keeps every row).
+	retention.StartAuditLogRetention(appCtx, db.GetDB())
 
 	// Initialize Domain Event Manager for NL Pipeline HITL checkpoints
 	//
-	// Error, not Warn: nothing retries this, so a failure here is permanent for
-	// the life of the process, and its only symptom is HITL checkpoints that
-	// never reach the browser — the #1 false "pipelines don't work" report. The
-	// process still comes up, because the rest of the API is unaffected and an
-	// unreachable-at-boot Kafka self-heals while a crash loop would take the
-	// whole gateway down with it; a security config that can never work has
-	// already aborted startup inside the shared Kafka security path.
+	// A Kafka that is not up yet is not an error here: the consumer dials in its
+	// own goroutine until Kafka answers (rsynckafka.ConnectConsumerGroup), so a
+	// gateway that boots first still delivers checkpoints. On the 2026-10-25 cold
+	// boot it dialled once, was refused, and stayed off until a restart. What can
+	// still fail here is a Kafka security config this consumer cannot use. Error,
+	// not Warn: nothing retries that, and its only symptom is HITL checkpoints
+	// that never reach the browser — the #1 false "pipelines don't work" report.
+	// The process still comes up, because the rest of the API is unaffected.
 	if err := handlers.InitDomainEventManager(appCtx, brokerList); err != nil {
 		log.Errorf("❌ Domain event manager NOT started: %v — NL pipeline HITL checkpoints will not reach the UI", err)
 	} else {
-		log.Info("✅ Domain event manager initialized")
+		log.Info("✅ Domain event manager initialized; its consumer connects to Kafka in the background")
 	}
 
 	// G1 / F-Obs-1: notifier consumer — subscribes to rsync.notifications,
@@ -622,14 +661,15 @@ func main() {
 	// (notifier.resolveNotifierTopics), and persists each event into
 	// pipeline_notifications + delivers via Slack/email per env.
 	//
-	// Error, not Warn, for the same reason as the domain event manager above —
-	// and one worse: this consumer is the delivery path for every Slack/email
-	// alert, so a warning about it is the one log line nothing will page on.
+	// It waits for Kafka the same way as the domain event manager above, and an
+	// error is Error, not Warn, for the same reason — and one worse: this
+	// consumer is the delivery path for every Slack/email alert, so a warning
+	// about it is the one log line nothing will page on.
 	notifierSvc, err := notifier.Start(appCtx, db.GetDB(), brokerList)
 	if err != nil {
 		log.Errorf("❌ Notifier consumer NOT started: %v — no Slack or email alert will be delivered", err)
 	} else {
-		log.Info("✅ Notifier consumer started")
+		log.Info("✅ Notifier consumer started; it connects to Kafka in the background")
 	}
 
 	// Pipeline Assessment tab: a run that finds a new Critical or High issue
@@ -639,10 +679,25 @@ func main() {
 	handlers.SetAssessmentNotifier(notifier.NewEmitter(db.GetDB()))
 	handlers.StartAssessmentScheduler(appCtx, db.GetDB())
 
+	// The Lineage page's run history: every minute, the model runs and batch pipeline
+	// runs that ended are recorded as lineage events (CDC windows are recorded as they
+	// fire), and once a day events past LINEAGE_EVENT_RETENTION_DAYS are deleted.
+	handlers.StartLineageRecorder(appCtx, db.GetDB())
+
+	// A model's data checks: a run a check held back, or one a warning check failed on,
+	// tells the model's owner in-process the same way (data_quality category).
+	handlers.SetModelCheckNotifier(notifier.NewEmitter(db.GetDB()))
+
 	// The two outages the orchestrator's sentinel cannot alert on: its own, and
 	// Kafka's, whose alert would travel over Kafka. Delivered in-process, like the
 	// assessment alerts above, so neither needs the broker or the orchestrator.
 	handlers.StartCoreServiceWatch(appCtx, notifier.NewEmitter(db.GetDB()))
+
+	// Workflows on a schedule run from a Temporal schedule each (workflows-design.md
+	// § 4.1), made when one is turned on or edited. This makes sure every active one
+	// has its schedule — the ones turned on before step 4, and any whose create was
+	// lost — retrying in the background until Temporal answers.
+	handlers.ReconcileWorkflowSchedules(appCtx)
 
 	// Initialize OAuth, Schema Registry, and Auth handlers
 	oauthHandler := handlers.NewOAuthHandler(db.GetDB())
@@ -870,6 +925,30 @@ func main() {
 	)
 	r.POST("/api/v1/slack/interactions", handlers.AuthRateLimitMiddleware(), slackInteractions.HandleInteractions)
 
+	// Agent gateway: rsync.ai's MCP server (docs/api/agent-gateway.md). OUTSIDE the
+	// /api/v1 group on purpose: an agent authenticates with a workspace agent
+	// token in the Authorization header, never a session or cookie, so the
+	// group's session auth and CSRF (which has no bearer exemption) do not
+	// apply. AgentTokenMiddleware pins the token's user, workspace and scopes;
+	// every tool reads through the REST handlers as that user. On unless
+	// RSYNC_AGENT_GATEWAY_ENABLED=false; while off, the route does not exist.
+	agentGatewayOn := config.LoadFeatures().AgentGateway
+	if agentGatewayOn {
+		gw, err := agentgw.New(agentgw.Options{
+			Handlers: agentgw.DefaultHandlers(),
+			Actor:    handlers.AgentActor,
+			Audit:    handlers.LogAgentToolCall,
+			Spend:    handlers.AgentTokenSpend,
+			Version:  "1.0.0",
+		})
+		if err != nil {
+			log.WithError(err).Fatal("agent gateway: invalid tool registry")
+		}
+		r.POST("/api/agent/v1/mcp", handlers.AgentTokenMiddleware(), gw.Handle)
+		r.GET("/api/agent/v1/mcp", agentgw.MethodNotAllowed)
+		log.Info("agent gateway enabled at /api/agent/v1/mcp")
+	}
+
 	api := r.Group("/api/v1")
 	{
 		// Feature flags endpoint (public, but under CORS middleware)
@@ -910,9 +989,81 @@ func main() {
 		api.GET("/pipelines", handlers.ListPipelines)
 		api.GET("/pipelines/stats", handlers.GetPipelineStats)
 		api.GET("/pipelines/:id", handlers.GetPipeline)
+		// Why a pipeline is stale, in one read: state, the one blocking cause
+		// with a fixed hint, last run, last success, schedule. Error class, never
+		// error text. The agent gateway's get_pipeline_health reads this too.
+		api.GET("/pipelines/:id/health", handlers.GetPipelineHealth)
 		api.PATCH("/pipelines/:id", handlers.UpdatePipeline)
 		api.POST("/pipelines", handlers.CreatePipeline)
 		api.POST("/pipelines/:id/run", handlers.PipelineRunRateLimitMiddleware(), handlers.RunPipeline)
+		// A pipeline Ask rsync.ai or an agent token proposed (plan_pipeline). Only
+		// the person it was proposed for reads or applies it, with their session;
+		// applying is checked as create and run. Agent tokens never reach /api/v1.
+		api.GET("/pipeline-plans/:id", handlers.GetPipelinePlan)
+		api.POST("/pipeline-plans/:id/apply", handlers.PipelineRunRateLimitMiddleware(), handlers.ApplyPipelinePlan)
+		// Workflows (handlers/workflows.go): Ask rsync.ai or an agent token drafts one
+		// (plan_workflow), or a person builds a query, its conditions and their
+		// messages in the editor (POST /workflows); the person edits, tests, turns
+		// on, runs, pauses or deletes it here with their session. Reads are
+		// viewer-level; every write is owner or admin. Delivery channels are where
+		// workflows send; only an owner or admin adds them, and no route returns a
+		// webhook URL.
+		api.GET("/workflows", handlers.ListWorkflows)
+		api.POST("/workflows", handlers.CreateWorkflow)
+		api.GET("/workflows/:id", handlers.GetWorkflow)
+		api.GET("/workflows/:id/runs", handlers.ListWorkflowRuns)
+		api.POST("/workflows/:id/test", handlers.TestWorkflow)
+		api.PUT("/workflows/:id", handlers.UpdateWorkflow)
+		api.POST("/workflows/:id/activate", handlers.ActivateWorkflow)
+		api.POST("/workflows/:id/pause", handlers.PauseWorkflow)
+		api.POST("/workflows/:id/run", handlers.RunWorkflowNow)
+		api.POST("/workflows/:id/runs/:runId/stop", handlers.StopWorkflowRun)
+		api.DELETE("/workflows/:id", handlers.DeleteWorkflow)
+		// A change to a workflow's branches that Ask rsync.ai or an agent token
+		// proposed (plan_workflow_change, handlers/workflow_changes.go): only the
+		// person it was proposed for sees it, and Apply saves it as their edit.
+		api.GET("/workflow-changes/:id", handlers.GetWorkflowChange)
+		api.POST("/workflow-changes/:id/apply", handlers.ApplyWorkflowChange)
+		api.GET("/delivery-channels", handlers.ListDeliveryChannels)
+		api.POST("/delivery-channels", handlers.CreateDeliveryChannel)
+		api.PUT("/delivery-channels/:id", handlers.UpdateDeliveryChannel)
+		api.DELETE("/delivery-channels/:id", handlers.DeleteDeliveryChannel)
+		api.POST("/delivery-channels/:id/test", handlers.TestDeliveryChannel)
+		// Charts and dashboards (handlers/charts_api.go, dashboards_api.go,
+		// dashboard_proposals.go, dashboard_changes.go; dashboards-design.md § 4, § 7).
+		// Every member sees the workspace's shared ones and their own; only an owner
+		// or admin saves, shares or deletes one. A chart is drawn live with the
+		// viewer's rights, read-only, capped at 10,000 rows. A dashboard Ask rsync.ai
+		// or an agent token drafted (plan_dashboard), or a change to one tile
+		// (plan_dashboard_change), is read and saved here only by its person. Every
+		// save keeps the dashboard as it was; its versions list them.
+		api.GET("/charts/sources", handlers.ListChartSources)
+		api.GET("/charts/sources/:id/columns", handlers.GetChartSourceColumns)
+		api.POST("/charts/preview", handlers.PreviewChart)
+		api.GET("/charts", handlers.ListCharts)
+		api.POST("/charts", handlers.CreateChart)
+		api.GET("/charts/:id", handlers.GetChart)
+		api.PUT("/charts/:id", handlers.UpdateChart)
+		api.DELETE("/charts/:id", handlers.DeleteChart)
+		api.POST("/charts/:id/draw", handlers.DrawChart)
+		api.GET("/dashboards", handlers.ListDashboards)
+		api.POST("/dashboards", handlers.CreateDashboard)
+		api.GET("/dashboards/:id", handlers.GetDashboard)
+		api.PUT("/dashboards/:id", handlers.UpdateDashboard)
+		api.DELETE("/dashboards/:id", handlers.DeleteDashboard)
+		api.POST("/dashboards/:id/tiles/:tileId/draw", handlers.DrawDashboardTile)
+		api.GET("/dashboards/:id/filters/:filterId/values", handlers.GetDashboardFilterValues)
+		api.GET("/dashboard-proposals/:id", handlers.GetDashboardProposal)
+		api.POST("/dashboard-proposals/:id/save", handlers.SaveDashboardProposal)
+		api.GET("/dashboard-changes/:id", handlers.GetDashboardChange)
+		api.POST("/dashboard-changes/:id/apply", handlers.ApplyDashboardChange)
+		api.GET("/dashboards/:id/versions", handlers.ListDashboardVersions)
+		// A workspace's own model layers (handlers/workspace_layers.go): anyone
+		// in the workspace lists them; an owner or admin changes them.
+		api.GET("/model-layers", handlers.ListWorkspaceLayers)
+		api.POST("/model-layers", handlers.CreateWorkspaceLayer)
+		api.PATCH("/model-layers/:id", handlers.UpdateWorkspaceLayer)
+		api.DELETE("/model-layers/:id", handlers.DeleteWorkspaceLayer)
 		api.POST("/pipelines/:id/assess", handlers.AssessPipeline)
 		api.GET("/pipelines/:id/assessments", handlers.ListPipelineAssessments)
 		api.GET("/pipelines/:id/assessments/:run_id", handlers.GetPipelineAssessment)
@@ -1017,6 +1168,10 @@ func main() {
 		// ========================================================================
 		// EXECUTIONS - Pipeline Run History
 		// ========================================================================
+		// The Runs page: pipeline, scheduled-query and workflow runs in one list.
+		api.GET("/activity", handlers.ListActivity)
+		// Its charts: runs, run time, rows written and checks per day.
+		api.GET("/activity/metrics", handlers.ActivityMetricsHandler)
 		api.GET("/executions", handlers.ListExecutions)
 		api.GET("/executions/:id", handlers.GetExecution)
 		api.GET("/executions/:id/transforms", handlers.GetExecutionTransformLogs)
@@ -1032,6 +1187,9 @@ func main() {
 		// Read-only catalog endpoints — any authed user can browse.
 		api.GET("/connectors", handlers.ListMCPConnectors)
 		api.GET("/connectors/namespace-models", handlers.GetConnectorNamespaceModels)
+		// A generation run of the active workspace (agent, Ask rsync.ai, chat or
+		// the Generate page). Viewer and up: it carries metadata only.
+		api.GET("/connectors/generations/:id", handlers.GetConnectorGeneration)
 		api.GET("/connectors/:name", handlers.GetMCPConnector)
 		api.GET("/connectors/:name/logo", handlers.GetMCPConnectorLogo)
 		api.POST("/connectors/detect-category", handlers.DetectCategory)
@@ -1049,6 +1207,10 @@ func main() {
 		// first, so the caller's workspace role is already pinned in context.
 		api.POST("/connectors/validate", handlers.WorkspaceGeneratorMiddleware(), handlers.ValidateConnector)
 		api.POST("/connectors/generate", handlers.WorkspaceGeneratorMiddleware(), handlers.ConnectorGenRateLimitMiddleware(), handlers.GenerateConnector)
+		// Move this workspace's connections of a connector to one version, all or
+		// none (the Generate page's prompt after a regeneration). Member and up,
+		// like a version change on one connection.
+		api.POST("/connectors/:name/connections/version", handlers.MoveConnectionsToConnectorVersion)
 
 		// Tool-generator discovery proxy. The frontend used to hit port 5010
 		// directly which broke under browser CORS preflight whenever the
@@ -1091,6 +1253,8 @@ func main() {
 		api.POST("/connections/test", handlers.TestConnection)            // Test before creating
 		api.POST("/connections/:id/test", handlers.TestConnection)        // Test existing connection
 		api.GET("/connections/:id/sample", handlers.SampleConnectionData) // Sample data for preview
+		// Read one page of every table of an API connection, keep no row ("Check tables")
+		api.POST("/connections/:id/check-tables", handlers.CheckConnectionTables)
 		// Schema discovery (tables + columns + counts) via orchestrator agent
 		api.GET("/connections/:id/metadata", handlers.GetConnectionMetadata)
 		// Schemas / databases / datasets one level above the tables, listed by the connector
@@ -1140,7 +1304,7 @@ func main() {
 		//
 		// Narrowing this costs no caller: the product has none. Nothing under
 		// frontend/ calls /api/v1/schemas, and CDC never populates the registry at
-		// all — every connector config in this repo (docker-compose.yml:584,
+		// all — every connector config in this repo (docker-compose.yml:585,
 		// docker-compose.quickstart.yml:1558, deploy/helm/.../cdc.yaml:193 and
 		// cdc_config_generator.py:342) uses JsonConverter, which embeds the schema
 		// inline per message and never dials a registry. The exposure is latent
@@ -1245,18 +1409,73 @@ func main() {
 			admin.POST("/workspaces/:id/plan", handlers.AdminSetWorkspacePlan)
 		}
 
+		// In-app assistant ("Ask rsync.ai", docs/api/assistant.md): a question
+		// answered by the picked model with the agent gateway's tools, run
+		// in-process as the signed-in user (assistant actor: the fixed
+		// services.AssistantScopes, the role rule still applies; its tool calls
+		// and the handler rows they write are audited as actor_kind=assistant).
+		// Model keys a platform admin sets
+		// under /admin/assistant/models override the environment keys. On
+		// unless RSYNC_ASSISTANT_ENABLED=false; while off, no route exists.
+		if config.LoadFeatures().Assistant {
+			assistantTools, err := agentgw.New(agentgw.Options{
+				Handlers: agentgw.DefaultHandlers(),
+				Actor:    handlers.AssistantActor,
+				Audit:    handlers.LogAssistantToolCall,
+				Mark:     handlers.MarkAssistantCall,
+				Version:  "1.0.0",
+			})
+			if err != nil {
+				log.WithError(err).Fatal("assistant: invalid tool registry")
+			}
+			var conversations assistant.Store = assistant.NoStore{}
+			if schemaCache != nil {
+				conversations = assistant.RedisStore{Client: schemaCache.GetClient()}
+			} else {
+				log.Warn("assistant: Redis unavailable; every question starts a new conversation")
+			}
+			if _, err := assistant.Mount(api, admin, assistant.Options{
+				Tools:     assistantTools,
+				LLM:       &assistant.HTTPStepper{},
+				Keys:      assistant.DBKeys{DB: db.GetDB},
+				Store:     conversations,
+				Actor:     handlers.AssistantActor,
+				QuotaOK:   handlers.UserCostQuotaOK,
+				Audit:     handlers.LogAudit,
+				RateLimit: handlers.ChatRateLimitMiddleware(),
+				// Sample rows: off until an admin approves a model and the
+				// workspace owner turns them on (docs/security/llm-egress.md).
+				Samples: handlers.AssistantSamples{},
+				// generate_sql: the Explorer's two steps, so its guard,
+				// quota and Usage count (docs/internal/dashboards-design.md § 7.5).
+				SQL: handlers.AssistantSQL{},
+				// A workflow's or model's SQL the model wrote counts on the
+				// Usage page as an Explorer generation does.
+				MeterSQL: handlers.RecordNLQueryUsage,
+			}); err != nil {
+				log.WithError(err).Fatal("assistant: invalid options")
+			}
+			api.GET("/workspace/llm-data", handlers.GetWorkspaceLLMData) // any member: whether Ask rsync.ai may read sample rows here
+			api.PUT("/workspace/llm-data", handlers.SetWorkspaceLLMData) // owner only: names_only | sample_rows
+			log.Info("assistant enabled at /api/v1/assistant/messages")
+		}
+
 		// ========================================================================
 		// EXPLORER - Natural Language SQL & Query Execution
 		// ========================================================================
 		api.POST("/sql/generate", handlers.GenerateSQL)                                                  // NL → SQL
 		api.POST("/explorer/query", handlers.ExecuteExplorerQuery)                                       // Execute SQL: SELECT reads (all roles) + role-gated writes (admin=DML/DDL, owner=DROP/TRUNCATE)
 		api.POST("/explorer/documents/find", handlers.FindExplorerDocuments)                             // Document browse (MongoDB): allowlisted read-only find via the connector
+		api.POST("/explorer/documents/aggregate", handlers.AggregateExplorerDocuments)                   // Document mode (MongoDB): read-only pipeline preview; $out/$merge refused
 		api.POST("/explorer/connections/:id/tables/recommend", handlers.GetRecommendedTablesForExplorer) // Table recommendations
-		api.POST("/explorer/metabase/dashboard", handlers.CreateMetabaseDashboard)                       // Create Metabase dashboard from SQL
 
 		// Schema Index (with caching + fingerprint)
 		api.GET("/explorer/connections/:id/schema-index", handlers.GetSchemaIndex)              // Get cached schema index
 		api.POST("/explorer/connections/:id/schema-index/refresh", handlers.RefreshSchemaIndex) // Force refresh schema index
+		// The silver model for one bronze table, generated from its catalog (names and
+		// types only). Writes nothing — it becomes a model through the admin-gated
+		// routes below — so it is viewer-level like the schema index it reads.
+		api.POST("/explorer/connections/:id/silver-sql", handlers.GetSilverSQL)
 
 		// Table Retrieval (for large schema handling)
 		api.POST("/explorer/tables/retrieve", handlers.RetrieveTables) // Retrieve top-K tables matching question
@@ -1266,10 +1485,10 @@ func main() {
 		api.POST("/explorer/nl/resolve-columns", handlers.ResolveExplorerColumns) // NL → column mapping (with HITL gating)
 		api.POST("/explorer/nl/next-steps", handlers.GetExplorerNextSteps)        // Query results → next action suggestions
 
-		// Action Execution (CSV, Slack, Email)
+		// Export (csv/tsv/json). A result goes to Slack through a workflow's
+		// stored delivery channel, never a webhook pasted per send.
 		api.GET("/explorer/export.csv", handlers.ExportCSVHandler) // Legacy: direct GET CSV export (kept for any deep links)
 		api.POST("/explorer/export", handlers.ExportQueryHandler)  // D4: multi-format export (csv/tsv/json) for the Download dropdown
-		api.POST("/explorer/share/slack", handlers.ShareToSlack)   // Share to Slack via webhook
 
 		// Saved Queries (migration 084) — replaces the per-browser localStorage
 		// history with a workspace-scoped, shareable, versioned resource.
@@ -1324,6 +1543,23 @@ func main() {
 		// mutation on a model's configuration, because widening a deadline is how an
 		// alert gets silenced without anything being fixed.
 		api.PUT("/explorer/saved/:id/freshness", handlers.SetSavedQueryFreshness)
+		// The deadline plus the longest the schedule leaves between rebuilds, so the
+		// page can warn when the deadline is shorter. Viewer-readable, like the model.
+		api.GET("/explorer/saved/:id/freshness", handlers.GetSavedQueryFreshness)
+
+		// Data checks (migration 138) — assertions on a model's table, run inside the
+		// model's own run. Reading them is viewer-level; changing one is the model's
+		// creator or an admin, like editing its SQL. A custom_sql check on a SCHEDULED
+		// model waits in the same approval queue as a SQL edit, decided by an admin.
+		// Test now runs the saved checks against the live table and records nothing.
+		api.GET("/explorer/saved/:id/checks", handlers.ListModelChecks)                                   // Checks, recent results, open proposals
+		api.POST("/explorer/saved/:id/checks", handlers.CreateModelCheck)                                 // Add (or propose) a check
+		api.POST("/explorer/saved/:id/checks/test", handlers.TestModelChecks)                             // Run them now; records nothing
+		api.PUT("/explorer/saved/:id/checks/:checkId", handlers.UpdateModelCheck)                         // Change (or propose) a check
+		api.DELETE("/explorer/saved/:id/checks/:checkId", handlers.DeleteModelCheck)                      // Remove a check
+		api.POST("/explorer/saved/:id/checks/pending/:pendingId/approve", handlers.ApproveModelCheckEdit) // Apply a proposed check (admin)
+		api.POST("/explorer/saved/:id/checks/pending/:pendingId/reject", handlers.RejectModelCheckEdit)   // Discard it (admin)
+		api.GET("/explorer/saved/:id/runs/:runId/checks", handlers.ListModelRunChecks)                    // What each check saw on one run
 
 		// The misses. Every other signal in the explorer fires when something happens;
 		// this one is a record of a rebuild that never came, which nothing else in the
@@ -1352,6 +1588,24 @@ func main() {
 		// and which of a model's upstreams actually cause it to refresh. Derivation
 		// only — it writes nothing and triggers nothing.
 		api.GET("/explorer/asset-graph", handlers.GetWorkspaceAssetGraph)
+
+		// A Lineage page node's run history: the recorded runs that read or wrote it,
+		// and for a model how its columns changed. Viewer-level, as the graph is.
+		api.GET("/lineage/history", handlers.GetLineageHistory)
+
+		// The OpenLineage export: an admin's pull of the workspace's events and its
+		// push target. Its one registration point, so an edition can leave it out.
+		handlers.RegisterOpenLineage(appCtx, api)
+
+		// Agent tokens for the agent gateway. A session route: a person creates
+		// and revokes tokens in Settings; an agent token can never reach here.
+		// Any member lists and revokes their own; an admin sees and revokes every
+		// token in the workspace.
+		if agentGatewayOn {
+			api.GET("/agent-tokens", handlers.ListAgentTokens)
+			api.POST("/agent-tokens", handlers.CreateAgentToken)
+			api.DELETE("/agent-tokens/:id", handlers.RevokeAgentToken)
+		}
 	}
 
 	// Internal service-to-service endpoints — no user auth, service secret required.
@@ -1364,6 +1618,12 @@ func main() {
 		// Temporal enqueue as /run, minus the per-user cost quota + CSRF; the
 		// per-workspace plan gates + run cooldown are kept (KI-HEAL-RERUN-UNAUTH).
 		internal.POST("/pipelines/:id/run", handlers.RunPipelineInternal)
+
+		// Asked by the adapter's ScheduledPipelineRunWorkflow before each tick:
+		// the Run button's billing, draft and API-Reload checks, as the
+		// pipeline's creator. 200 with {allowed, reason, message}; 500 when it
+		// cannot decide, and the tick then runs.
+		internal.POST("/pipelines/:id/scheduled-run/check", handlers.CheckScheduledRunInternal)
 
 		// Fires one scheduled model rebuild. Called by ScheduledModelRunWorkflow,
 		// which has no user session — so this endpoint re-resolves the schedule's
@@ -1379,12 +1639,43 @@ func main() {
 		// activity retry never adds a second row.
 		internal.POST("/explorer/models/:id/run-failed", handlers.RecordSavedQueryModelRunFailureInternal)
 
+		// Lists what a finished run of a model wakes, for the run's own workflow, which
+		// starts the fan-out itself (ListDownstreamModelsActivity, workflows-design.md
+		// § 4.2). Answers from the run's history row; a failed run records the skips
+		// below it instead, once per run, so an activity retry writes nothing twice.
+		internal.POST("/explorer/models/:id/downstream", handlers.ListSavedQueryModelDownstreamInternal)
+
 		// Checks every model carrying a freshness deadline and records the ones whose
 		// rebuild never came. Called by ModelFreshnessWorkflow's durable timer, which
 		// has no user session and no workspace — and could not have one, because the
 		// models most worth catching are the ones nobody is looking at. Idempotent, so
 		// an activity retry after a timeout that actually succeeded is harmless.
 		internal.POST("/explorer/freshness/sweep", handlers.SweepModelFreshnessInternal)
+
+		// "Run after pipeline" for CDC pipelines, which never complete: fires each
+		// one's models and workflows at the first window boundary after rows landed
+		// (handlers/cdc_trailing_edge.go). Called by CDCTrailingEdgeWorkflow's timer,
+		// cross-workspace for the freshness sweep's reason. Idempotent: a repeated
+		// fire carries the same window label, which the fan-out and workflow_runs drop.
+		internal.POST("/cdc/trailing-edge/sweep", handlers.SweepCDCTrailingEdgeInternal)
+
+		// A workflow run's steps (handlers/workflow_runs_temporal.go). Called by
+		// temporal-adapter's WorkflowRunWorkflow on the `workflow-runs` queue, which
+		// has no user session: the run carries its own run-as user, checked again at
+		// each send. Each is safe to retry — begin finds the run its Temporal id
+		// already inserted, evaluate returns a plan already written, send claims its
+		// sends-ledger row before it posts, and finish records the run once.
+		internal.POST("/workflows/:id/runs/begin", handlers.BeginWorkflowRunInternal)
+		internal.POST("/workflow-runs/:id/evaluate", handlers.EvaluateWorkflowRunInternal)
+		internal.POST("/workflow-runs/:id/send", handlers.SendWorkflowRunInternal)
+		internal.POST("/workflow-runs/:id/finish", handlers.FinishWorkflowRunInternal)
+		// A run of the steps graph (handlers/workflow_graph_runs.go, build step 5):
+		// graph gives the adapter the steps, each step's actions go through
+		// steps/:step/:action (its workflow_step_runs row says what it already did,
+		// so a retry repeats nothing), and complete records the run once.
+		internal.POST("/workflow-runs/:id/graph", handlers.GraphWorkflowRunInternal)
+		internal.POST("/workflow-runs/:id/steps/:step/:action", handlers.StepWorkflowRunInternal)
+		internal.POST("/workflow-runs/:id/complete", handlers.CompleteWorkflowRunInternal)
 
 		// Lets the executor resolve + lock the destination namespace at the WRITE
 		// boundary, once it knows the final table set. Before this existed the

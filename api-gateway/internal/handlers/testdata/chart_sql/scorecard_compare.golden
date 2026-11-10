@@ -1,0 +1,59 @@
+# settings: {"type":"scorecard","measure":{"aggregate":"count"},"compare":{"column":"day","days":7}}
+
+-- postgres
+SELECT COUNT(CASE WHEN src."day" >= $1 AND src."day" < $2 THEN 1 END) AS "count", COUNT(CASE WHEN src."day" >= $3 AND src."day" < $4 THEN 1 END) AS "previous"
+FROM "gold"."orders" src
+WHERE src."day" >= $5 AND src."day" < $6 AND src."region" IN ($7, $8)
+LIMIT 10001
+-- args: ["2026-09-29" "2026-10-06" "2026-09-22" "2026-09-29" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT COUNT(CASE WHEN src.`day` >= ? AND src.`day` < ? THEN 1 END) AS `count`, COUNT(CASE WHEN src.`day` >= ? AND src.`day` < ? THEN 1 END) AS `previous`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+LIMIT 10001
+-- args: ["2026-09-29" "2026-10-06" "2026-09-22" "2026-09-29" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) COUNT_BIG(CASE WHEN src.[day] >= @p1 AND src.[day] < @p2 THEN 1 END) AS [count], COUNT_BIG(CASE WHEN src.[day] >= @p3 AND src.[day] < @p4 THEN 1 END) AS [previous]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p5 AND src.[day] < @p6 AND src.[region] IN (@p7, @p8)
+-- args: ["2026-09-29" "2026-10-06" "2026-09-22" "2026-09-29" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT COUNT(CASE WHEN src.`day` >= '2026-09-29' AND src.`day` < '2026-10-06' THEN 1 END) AS `count`, COUNT(CASE WHEN src.`day` >= '2026-09-22' AND src.`day` < '2026-09-29' THEN 1 END) AS `previous`
+FROM `gold`.`orders` src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT COUNT(CASE WHEN src."DAY" >= '2026-09-29' AND src."DAY" < '2026-10-06' THEN 1 END) AS "COUNT", COUNT(CASE WHEN src."DAY" >= '2026-09-22' AND src."DAY" < '2026-09-29' THEN 1 END) AS "PREVIOUS"
+FROM "GOLD"."ORDERS" src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT COUNT(CASE WHEN src.`day` >= :p1 AND src.`day` < :p2 THEN 1 END) AS `count`, COUNT(CASE WHEN src.`day` >= :p3 AND src.`day` < :p4 THEN 1 END) AS `previous`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p5 AND src.`day` < :p6 AND src.`region` IN (:p7, :p8)
+LIMIT 10001
+-- param p1 STRING: "2026-09-29"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "2026-09-22"
+-- param p4 STRING: "2026-09-29"
+-- param p5 STRING: "2026-10-01"
+-- param p6 STRING: "2026-10-06"
+-- param p7 STRING: "US"
+-- param p8 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT COUNT(CASE WHEN src.`day` >= '2026-09-29' AND src.`day` < '2026-10-06' THEN 1 END) AS `count`, COUNT(CASE WHEN src.`day` >= '2026-09-22' AND src.`day` < '2026-09-29' THEN 1 END) AS `previous`
+FROM `gold`.`orders` src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT COUNT(CASE WHEN src."DAY" >= DATE '2026-09-29' AND src."DAY" < DATE '2026-10-06' THEN 1 END) AS "COUNT", COUNT(CASE WHEN src."DAY" >= DATE '2026-09-22' AND src."DAY" < DATE '2026-09-29' THEN 1 END) AS "PREVIOUS"
+FROM "GOLD"."ORDERS" src
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

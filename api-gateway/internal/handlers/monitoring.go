@@ -23,39 +23,16 @@ import (
 
 // MonitoringOverview aggregates all monitoring layers for a pipeline
 type MonitoringOverview struct {
-	PipelineID          string                 `json:"pipeline_id"`
-	TimeRange           TimeRange              `json:"time_range"`
-	AgentReasoning      *AgentReasoningSummary `json:"agent_reasoning,omitempty"`
-	AgentReasoningError string                 `json:"agent_reasoning_error,omitempty"`
-	DataPlane           *DataPlaneSummary      `json:"data_plane,omitempty"`
-	DataPlaneError      string                 `json:"data_plane_error,omitempty"`
+	PipelineID     string            `json:"pipeline_id"`
+	TimeRange      TimeRange         `json:"time_range"`
+	DataPlane      *DataPlaneSummary `json:"data_plane,omitempty"`
+	DataPlaneError string            `json:"data_plane_error,omitempty"`
 }
 
 // TimeRange represents the query time window
 type TimeRange struct {
 	Since time.Time `json:"since"`
 	Until time.Time `json:"until"`
-}
-
-// AgentReasoningSummary summarizes agent decision-making
-type AgentReasoningSummary struct {
-	TotalDecisions   int             `json:"total_decisions"`
-	HighConfidence   int             `json:"high_confidence"`   // >= 0.9
-	MediumConfidence int             `json:"medium_confidence"` // 0.7-0.89
-	LowConfidence    int             `json:"low_confidence"`    // < 0.7
-	AvgConfidence    float64         `json:"avg_confidence"`
-	RecentDecisions  []AgentDecision `json:"recent_decisions,omitempty"`
-}
-
-// AgentDecision represents a single agent decision event
-type AgentDecision struct {
-	EventID    string    `json:"event_id"`
-	Timestamp  time.Time `json:"timestamp"`
-	StageID    string    `json:"stage_id,omitempty"`
-	Decision   string    `json:"decision"`
-	Rationale  string    `json:"rationale,omitempty"`
-	Confidence *float64  `json:"confidence,omitempty"`
-	TraceID    string    `json:"trace_id,omitempty"`
 }
 
 // DataPlaneSummary summarizes pipeline data movement
@@ -166,14 +143,6 @@ func GetPipelineMonitoringOverview(c *gin.Context) {
 	overview := MonitoringOverview{
 		PipelineID: pipelineID,
 		TimeRange:  timeRange,
-	}
-
-	// Fetch agent reasoning summary (graceful degradation)
-	if reasoning, err := fetchAgentReasoning(database, pipelineID, timeRange); err != nil {
-		overview.AgentReasoningError = err.Error()
-		log.Warnf("Failed to fetch agent reasoning for pipeline %s: %v", pipelineID, err)
-	} else {
-		overview.AgentReasoning = reasoning
 	}
 
 	// Fetch data plane summary (graceful degradation)
@@ -510,93 +479,6 @@ func parseTimeRange(c *gin.Context) TimeRange {
 // requirePipelineWorkspaceRole, which binds (resource, user, active workspace)
 // in one query and 404s rather than confirming a foreign resource exists.
 // Do not reintroduce a membership-only pipeline gate.
-
-func fetchAgentReasoning(database *sql.DB, pipelineID string, timeRange TimeRange) (*AgentReasoningSummary, error) {
-	query := `
-		SELECT 
-			event_id, occurred_at, stage_id, trace_id, payload
-		FROM pipeline_run_events
-		WHERE pipeline_id = $1
-		  AND occurred_at BETWEEN $2 AND $3
-		  AND event_type IN ('AGENT_DECISION', 'PLANNER_DECISION', 'DECISION_MADE')
-		ORDER BY occurred_at DESC
-		LIMIT 20
-	`
-
-	rows, err := database.Query(query, pipelineID, timeRange.Since, timeRange.Until)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	decisions := make([]AgentDecision, 0)
-	var totalConfidence float64
-	var confidenceCount int
-	highConf, medConf, lowConf := 0, 0, 0
-
-	for rows.Next() {
-		var decision AgentDecision
-		var occurredAt sql.NullTime
-		var stageID, traceID sql.NullString
-		var payloadBytes []byte
-
-		if err := rows.Scan(&decision.EventID, &occurredAt, &stageID, &traceID, &payloadBytes); err != nil {
-			continue
-		}
-
-		if occurredAt.Valid {
-			decision.Timestamp = occurredAt.Time
-		}
-		if stageID.Valid {
-			decision.StageID = stageID.String
-		}
-		if traceID.Valid {
-			decision.TraceID = traceID.String
-		}
-
-		// Parse payload for decision details
-		var payload map[string]interface{}
-		if len(payloadBytes) > 0 {
-			json.Unmarshal(payloadBytes, &payload)
-
-			if d, ok := payload["decision"].(string); ok {
-				decision.Decision = d
-			}
-			if r, ok := payload["rationale"].(string); ok {
-				decision.Rationale = r
-			}
-			if c, ok := payload["confidence"].(float64); ok {
-				decision.Confidence = &c
-				totalConfidence += c
-				confidenceCount++
-
-				if c >= 0.9 {
-					highConf++
-				} else if c >= 0.7 {
-					medConf++
-				} else {
-					lowConf++
-				}
-			}
-		}
-
-		decisions = append(decisions, decision)
-	}
-
-	avgConfidence := 0.0
-	if confidenceCount > 0 {
-		avgConfidence = totalConfidence / float64(confidenceCount)
-	}
-
-	return &AgentReasoningSummary{
-		TotalDecisions:   len(decisions),
-		HighConfidence:   highConf,
-		MediumConfidence: medConf,
-		LowConfidence:    lowConf,
-		AvgConfidence:    avgConfidence,
-		RecentDecisions:  decisions,
-	}, nil
-}
 
 func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRange) (*DataPlaneSummary, error) {
 	query := `

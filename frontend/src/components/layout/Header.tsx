@@ -25,12 +25,10 @@ import {
 } from "@/components/ui/dialog"
 import {
   Bell,
-  Search,
   Settings,
   User,
   Moon,
   Sun,
-  Command,
   LogOut,
   Building2,
   Check,
@@ -41,7 +39,7 @@ import {
   Cable,
   ArrowRight,
 } from "lucide-react"
-import { cn, formatDate } from "@/lib/utils"
+import { cn, formatDate, formatRelativeTime } from "@/lib/utils"
 import { logout, getUserEmail } from "@/lib/auth"
 import { authFetch } from "@/lib/api/auth-fetch"
 import {
@@ -53,6 +51,8 @@ import {
 import { toWorkspaceSlug } from "@/lib/workspace/slug"
 import { resolveWorkspaceSwitchTarget } from "@/lib/workspace/scoped-routes"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { useFeatureFlags } from "@/config/features"
+import { AssistantLauncher } from "@/components/assistant/AssistantLauncher"
 import {
   listNotifications,
   getUnreadCount,
@@ -103,29 +103,27 @@ function isCritical(severity: string): boolean {
   return s === "critical" || s === "error" || s === "fatal"
 }
 
-/** Compact relative time ("just now", "5m ago", "3h ago", "2d ago", or a date). */
-function formatRelativeTime(iso: string): string {
+/** A notification's age ("5m ago", "2d ago"), or its date once it is a week old. */
+function notificationAge(iso: string): string {
   const then = new Date(iso).getTime()
   if (Number.isNaN(then)) return ""
-  const diffMs = Date.now() - then
-  const mins = Math.floor(diffMs / 60_000)
-  if (mins < 1) return "just now"
-  if (mins < 60) return `${mins}m ago`
-  const hrs = Math.floor(mins / 60)
-  if (hrs < 24) return `${hrs}h ago`
-  const days = Math.floor(hrs / 24)
-  if (days < 7) return `${days}d ago`
-  return formatDate(iso)
+  if (Date.now() - then >= 7 * 86_400_000) return formatDate(iso)
+  return formatRelativeTime(iso)
 }
 
 export function Header({ user }: HeaderProps) {
   const router = useRouter()
   const pathname = usePathname()
-  const { theme, setTheme, resolvedTheme } = useTheme()
+  const { setTheme, resolvedTheme } = useTheme()
   const [mounted, setMounted] = useState(false)
+  const { assistant, singleWorkspace } = useFeatureFlags()
+  // Single-workspace installs: the gateway refuses a second workspace (the real
+  // gate), so the header stops offering one. Until /features answers, the flag
+  // reads as cloud. One workspace is then a label, with nothing to switch to; an
+  // upgraded user who holds several keeps the switcher.
+  const canCreateWorkspace = !singleWorkspace
   const collapsed = useUIStore((state) => state.sidebarCollapsed)
   const setSidebarOpen = useUIStore((state) => state.setSidebarOpen)
-  const toggleCommandPalette = useUIStore((state) => state.toggleCommandPalette)
   // Notification bell — polls the unread count on an interval and lazily loads
   // the full list when the dropdown opens. Rows come from the notifier consumer
   // via /api/v1/notifications (schema-drift approvals, heal alerts, run failures).
@@ -377,7 +375,16 @@ export function Header({ user }: HeaderProps) {
       </div>
 
       {/* Workspace Switcher */}
-      {mounted && workspaces.length > 0 && (
+      {mounted && singleWorkspace && workspaces.length === 1 && (
+        <div
+          title={activeWorkspace?.name}
+          className="flex items-center gap-1.5 max-w-[160px] sm:max-w-[320px] px-2 text-xs"
+        >
+          <Building2 className="h-3.5 w-3.5 shrink-0 text-violet-500" />
+          <span className="truncate">{activeWorkspace?.name ?? workspaces[0].name}</span>
+        </div>
+      )}
+      {mounted && workspaces.length > 0 && !(singleWorkspace && workspaces.length === 1) && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             {/* 200px cut ordinary workspace names short (#56); the header row has
@@ -410,7 +417,7 @@ export function Header({ user }: HeaderProps) {
                 <Building2 className="h-3.5 w-3.5 text-zinc-400" />
                 <span className="flex-1 truncate text-sm" title={ws.name}>{ws.name}</span>
                 {ws.is_personal && (
-                  <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                  <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
                     Personal
                   </span>
                 )}
@@ -422,10 +429,12 @@ export function Header({ user }: HeaderProps) {
               <Settings className="h-3.5 w-3.5 text-zinc-400" />
               <span className="text-sm">Workspace settings</span>
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => setShowCreateDialog(true)} className="gap-2 text-violet-600">
-              <Plus className="h-3.5 w-3.5" />
-              <span className="text-sm">New workspace</span>
-            </DropdownMenuItem>
+            {canCreateWorkspace && (
+              <DropdownMenuItem onClick={() => setShowCreateDialog(true)} className="gap-2 text-violet-600">
+                <Plus className="h-3.5 w-3.5" />
+                <span className="text-sm">New workspace</span>
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       )}
@@ -446,6 +455,9 @@ export function Header({ user }: HeaderProps) {
           )}
           <span className="sr-only">Toggle theme</span>
         </Button>
+
+        {/* In-app assistant - after mount, like the bell: the flag arrives from the API */}
+        {mounted && assistant && <AssistantLauncher />}
 
         {/* Notifications - only render after mount to avoid hydration mismatch */}
         {mounted ? (
@@ -521,7 +533,7 @@ export function Header({ user }: HeaderProps) {
                             {" · "}
                           </>
                         ) : null}
-                        {formatRelativeTime(n.created_at)}
+                        {notificationAge(n.created_at)}
                       </p>
                       {n.message ? (
                         <p className="mt-1 line-clamp-3 text-xs text-zinc-500 dark:text-zinc-400">{n.message}</p>
@@ -621,7 +633,7 @@ export function Header({ user }: HeaderProps) {
     </header>
 
     {/* Create Workspace Dialog */}
-    <Dialog open={showCreateDialog} onOpenChange={handleCreateDialogChange}>
+    <Dialog open={canCreateWorkspace && showCreateDialog} onOpenChange={handleCreateDialogChange} closeOnOutsideClick={false}>
       <DialogContent className="sm:max-w-md">
         {createdWorkspace ? (
           // ── Post-create: next steps ──────────────────────────────────────────

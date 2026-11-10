@@ -29,9 +29,13 @@ import (
 //
 // Duplicate suppression is the notifier's job, not ours: these loops re-detect
 // the same condition every tick, and the api-gateway drops a repeat of the
-// same (pipeline, code, action_url) inside a 60-minute window
-// (notifier.go dedupWindowMinutes). Re-emitting every tick is what keeps the
-// alert alive after the user clears it and the problem is still there.
+// same (pipeline, code, action_url) for as long as the alert's episode lasts
+// (notifier.go recentDuplicate). The episode is the issue row: a raise carries
+// its detected_at as opened_at, and the row is deleted when the alert closes,
+// so a relapse opens a new one and is pushed again. Re-emitting every tick is
+// what gets an alert through when its first notification was lost. A raise
+// without opened_at (episodeExempt, or a row that could not be written) keeps
+// the 60-minute repeat (dedupWindowMinutes).
 
 // sentinelNotifyTopic is the one topic the api-gateway's notifier consumes for
 // user alerts. Spelled here rather than imported because the qualification to
@@ -98,7 +102,7 @@ var notifiableIssueTypes = map[IssueType]sentinelAlert{
 			if label != "" {
 				msg = "The " + label + " service this deployment depends on is not responding"
 			}
-			return msg + ". Pipelines cannot move data while it is down, and nothing will resume on its own once it is back."
+			return msg + ". " + dataPathImpact
 		},
 	},
 	IssueTypeMissingHeartbeat: {
@@ -151,6 +155,24 @@ var notifiableIssueTypes = map[IssueType]sentinelAlert{
 				"but the rows are queueing up instead of landing. The run will not fail on its own — it will go quiet."
 		},
 	},
+	IssueTypeRowsParked: {
+		code: "CDC_ROWS_PARKED",
+		message: func(m map[string]interface{}) string {
+			msg := "Some changes from your source were set aside instead of being written to the destination"
+			if n := metaInt(m, "new_dlq_rows"); n > 0 {
+				msg = fmt.Sprintf("%d change(s) from your source were set aside instead of being written to the destination", n)
+			}
+			if tables := metaStrings(m, "tables"); len(tables) > 0 {
+				msg += " (" + strings.Join(tables, ", ")
+				if more := metaInt(m, "more_tables"); more > 0 {
+					msg += fmt.Sprintf(" and %d more", more)
+				}
+				msg += ")"
+			}
+			return msg + ". The destination is missing them, and they will not arrive on their own: " +
+				"the pipeline has moved on past them."
+		},
+	},
 	IssueTypeSinkWriteRejected: {
 		code: "SINK_WRITE_REJECTED",
 		message: func(m map[string]interface{}) string {
@@ -171,6 +193,49 @@ var notifiableIssueTypes = map[IssueType]sentinelAlert{
 // can say and it rides in through emitLagIssue as a warning
 // (cdc_sink_autorestart.go:190), so severity alone would never surface it.
 var notifiableAlertTypes = map[string]sentinelAlert{
+	// The sink-drain alarm escalated: its high_lag issue turns critical once the sink has
+	// committed nothing for DefaultSinkDrainNotifyAfter (cdc_sink_drain.go). Keyed on the
+	// alert type rather than added to notifiableIssueTypes because high_lag is shared with
+	// the source-lag and auto-restart alarms, which must not inherit this copy.
+	//
+	// No consumer group in the copy, unlike the issue's description: a reader of an email
+	// cannot act on a Kafka group name.
+	"sink_not_draining": {
+		code: "CDC_SINK_NOT_DRAINING",
+		message: func(m map[string]interface{}) string {
+			msg := "Changes from your source have stopped reaching the destination"
+			if d := humanDuration(metaInt(m, "stalled_for_seconds")); d != "" {
+				msg = "No changes from your source have reached the destination for " + d
+			}
+			msg += ". They are still being captured and are held safely"
+			if n := metaInt(m, "total_lag"); n > 0 {
+				msg += fmt.Sprintf(" (%d waiting)", n)
+			}
+			return msg + ", but nothing is writing them, and they will keep building up until the writer is running again."
+		},
+	},
+	// The source-lag alarm escalated: its high_lag issue turns critical once source-side lag
+	// has lasted, with the connector's committed position frozen, for
+	// DefaultSourceLagNotifyAfter (cdc_source_lag.go). The duration is how long the position
+	// has not moved, not how long the lag has been over its threshold: a connector that was
+	// reading slowly before it stopped has been stuck for the shorter of the two.
+	//
+	// No slot or connector name, and no promise that nothing is lost: a MySQL server can
+	// discard binlog that has not been read yet.
+	"source_lag_sustained": {
+		code: "CDC_SOURCE_LAG_HIGH",
+		message: func(m map[string]interface{}) string {
+			msg := "rsync.ai has stopped reading new changes from your source database"
+			if d := humanDuration(metaInt(m, "frozen_for_seconds")); d != "" {
+				msg = "rsync.ai has not read any new changes from your source database for " + d
+			}
+			msg += ", while changes there keep building up"
+			if mb := metaInt(m, "lag_mb"); mb > 0 {
+				msg += fmt.Sprintf(" (about %d MB so far)", mb)
+			}
+			return msg + ". Until reading resumes, they do not reach the destination."
+		},
+	},
 	"sink_wedged_escalation": {
 		code: "CDC_SINK_WEDGED",
 		message: func(m map[string]interface{}) string {
@@ -180,6 +245,20 @@ var notifiableAlertTypes = map[string]sentinelAlert{
 			}
 			return msg + ". Your changes are still being captured safely, but they are not reaching the destination " +
 				"and will keep building up until somebody looks at it."
+		},
+	},
+	// The respawn rung's terminal verdict (cdc_sink_respawn.go sinkRespawnEscalate): the sink
+	// container holds no worker for this pipeline and restarting it did not bring one back.
+	// Filed as a high_lag warning, so like the wedge it reaches a user only through this entry.
+	"sink_absent": {
+		code: "CDC_SINK_ABSENT",
+		message: func(m map[string]interface{}) string {
+			msg := "Nothing is writing this pipeline's changes to the destination"
+			if n := metaInt(m, "attempts"); n > 0 {
+				msg += fmt.Sprintf(", and %d automatic restarts did not bring the writer back", n)
+			}
+			return msg + ". Your changes are still being captured safely, but none reach the destination " +
+				"until the writer is started again."
 		},
 	},
 }
@@ -209,22 +288,58 @@ func sentinelAlertFor(issueType IssueType, alertType string, severity IssueSever
 
 // publishSentinelAlert emits one user notification for an issue, if that issue
 // is one a user should hear about. Every argument but the manager comes
-// straight from the issue the caller just persisted.
+// straight from the issue the caller just persisted; openedAt is its row's
+// detected_at, zero when the row could not be written, or when the caller
+// knows the episode opened (emitCDCIssueOpenedAt).
 func publishSentinelAlert(
 	mgr *kafka.Manager,
 	issueType IssueType,
 	severity IssueSeverity,
 	alertType, pipelineID, description string,
 	metadata map[string]interface{},
+	openedAt time.Time,
 ) {
-	if mgr == nil || strings.TrimSpace(pipelineID) == "" {
+	if strings.TrimSpace(pipelineID) == "" {
 		return
 	}
 	notification, ok := buildSentinelNotification(issueType, severity, alertType, pipelineID, description, metadata)
 	if !ok {
 		return
 	}
+	stampEpisodeOpened(notification, openedAt)
 	emitNotification(mgr, pipelineID, issueType, notification)
+}
+
+// episodeExempt are the alerts whose every raise is news, so each keeps the
+// api-gateway's 60-minute repeat instead of being pushed once per episode. Keyed
+// by what the gateway dedups on: the catalog code, or the event type without one.
+// Every entry is a curated code with a reason (TestEpisodeExemptAlertsAreCuratedAndSayWhy).
+var episodeExempt = map[string]string{
+	"CDC_ROWS_PARKED": "raised again only when the parked total grows (checkRowsParked), " +
+		"so each repeat is more changes missing from the destination",
+	"CDC_CONNECTOR_DOWN": "raised once per escalation already (restart state's escalated flag), " +
+		"and its row is kept across Stop and Resume (alertsClosedOnStop), so its detected_at " +
+		"would date a failure after Resume to the episode before it",
+	"CDC_SINK_WEDGED": "raised once per escalation already (sinkRestartEscalate), " +
+		"and its row is kept across Stop and Resume (alertsClosedOnStop), so its detected_at " +
+		"would date a wedge after Resume to the episode before it",
+}
+
+// stampEpisodeOpened says when the alert's episode opened, so the api-gateway
+// drops its re-raises for the whole episode rather than for an hour. The zero time
+// (the row was not written) and an exempt alert are left without one.
+func stampEpisodeOpened(notification map[string]interface{}, openedAt time.Time) {
+	if openedAt.IsZero() {
+		return
+	}
+	code, _ := notification["_code"].(string)
+	if code == "" {
+		code, _ = notification["type"].(string)
+	}
+	if _, exempt := episodeExempt[code]; exempt {
+		return
+	}
+	notification["opened_at"] = openedAt.UTC().Format(time.RFC3339)
 }
 
 // publishInstanceIssueAlert is the sentinel agent's side of the instance lane:
@@ -245,7 +360,7 @@ func (a *Agent) publishInstanceIssueAlert(issue *Issue) {
 // alert with no pipeline is a bug. Component issues have no pipeline by nature,
 // so they take the instance scope instead and land on every admin's bell.
 func publishInstanceAlert(mgr *kafka.Manager, issue *Issue) {
-	if mgr == nil || issue == nil {
+	if issue == nil {
 		return
 	}
 
@@ -280,12 +395,18 @@ func publishInstanceAlert(mgr *kafka.Manager, issue *Issue) {
 }
 
 // emitNotification marshals and produces one notification, and swallows its own
-// failures.
+// failures. A nil manager is the unit-test shape (and the pre-wiring startup
+// window), and sends nothing.
 //
 // Failures here are logged and swallowed: the durable record is the row the
 // caller already wrote, and a sentinel loop must not stop detecting because a
 // broker was briefly unavailable.
-func emitNotification(mgr *kafka.Manager, key string, issueType IssueType, notification map[string]interface{}) {
+//
+// It is a variable so a test can see what would be sent without a broker.
+var emitNotification = func(mgr *kafka.Manager, key string, issueType IssueType, notification map[string]interface{}) {
+	if mgr == nil {
+		return
+	}
 	code, _ := notification["_code"].(string)
 	delete(notification, "_code")
 
@@ -358,12 +479,24 @@ func buildSentinelNotification(
 	return notification, true
 }
 
+// dataPathImpact is what an INFRASTRUCTURE_DOWN alert says about a service on every
+// pipeline's data path. It used to end "nothing will resume on its own once it is back",
+// which was false: a streaming pipeline continues from its last position and a schedule
+// runs at its next time. What can need a person is narrower, and this names it.
+//
+// The api-gateway's Kafka watch says the same thing in the same words
+// (api-gateway/internal/handlers/core_service_watch.go dataPathImpact). The two are in
+// different modules, so neither can import the other: change both or neither.
+const dataPathImpact = "Pipelines cannot move data while it is down. Once it is back, streaming pipelines " +
+	"continue from where they left off and schedules run at their next time, but a run that failed, " +
+	"a pipeline that was stopped, or a scheduled time that passed during the outage may need you to start it again."
+
 // coreServiceImpact is what an INFRASTRUCTURE_DOWN alert names a service and says stops
 // while it is down, keyed by componentLabel. These are the services service_probes.go
-// checks. A label missing here — postgres, kafka, kafka-connect — gets the data-path
-// sentence, which is right for those three and wrong for these: an LLM service outage
-// does not stop a single pipeline, and telling every admin their data has stopped moving
-// would be a false page they learn to ignore.
+// checks, and Kafka Connect, which only CDC capture uses. A label missing here —
+// postgresql, kafka — gets dataPathImpact, which is right for those two and wrong for
+// these: an LLM service outage does not stop a single pipeline, and telling every admin
+// their data has stopped moving would be a false page they learn to ignore.
 var coreServiceImpact = map[string]struct{ name, impact string }{
 	"redis": {"Redis",
 		"New pipeline runs cannot start or move forward while it is down: workers receive their planning, validation and execution steps through it."},
@@ -372,15 +505,21 @@ var coreServiceImpact = map[string]struct{ name, impact string }{
 	"temporal-adapter": {"Temporal adapter",
 		"Pipeline runs cannot start or progress while it is down."},
 	"connector-deployer": {"connector deployer",
-		"Connectors cannot be started or restarted while it is down, so a connector that stops will not come back on its own."},
+		"Connectors cannot be started or restarted while it is down."},
 	"tool-generator": {"tool generator",
-		"Connectors cannot be started or restarted while it is down, so a connector that stops will not come back on its own."},
+		"Connectors cannot be started or restarted while it is down."},
 	"llm-service": {"AI",
 		"AI features are unavailable while it is down. Running pipelines keep moving data."},
+	// Only CDC capture runs in Kafka Connect (infra_preflight.go probes it for CDC runs
+	// alone), so a batch run is not affected and the alert must not say it is.
+	"kafka-connect": {"Kafka Connect",
+		"Streaming pipelines cannot capture new changes from their sources while it is down; scheduled and " +
+			"manual runs are not affected. Once it is back, streaming pipelines continue from where they left off, " +
+			"but one that was stopped during the outage may need you to start it again."},
 }
 
 // componentLabel turns a component id into something worth putting in a sentence.
-// Component ids are "<type>:<name>" — "infrastructure:postgres",
+// Component ids are "<type>:<name>" — "infrastructure:postgresql",
 // "kafka_consumer:rsync.cdc-orders" — and the type is already carried by the copy
 // that quotes the label.
 func componentLabel(componentID string) string {
@@ -405,6 +544,27 @@ func metaString(m map[string]interface{}, key string) string {
 // in Go and never round-trips through JSON before it gets here, so the widths
 // are whatever the caller happened to use; float64 is covered anyway in case a
 // future caller does decode one.
+// metaStrings reads a list of names, whether the detector put a []string in the map or it
+// came back from JSON as []interface{}.
+func metaStrings(m map[string]interface{}, key string) []string {
+	if m == nil {
+		return nil
+	}
+	switch v := m[key].(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, x := range v {
+			if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 func metaInt(m map[string]interface{}, key string) int64 {
 	if m == nil {
 		return 0

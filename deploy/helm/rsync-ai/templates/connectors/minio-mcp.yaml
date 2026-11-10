@@ -74,6 +74,8 @@ spec:
             # looks like a crash-looping pod that is in fact perfectly healthy.
             - name: MCP_HTTP_MODE
               value: "true"
+            - name: RSYNC_CLAIM_CHECK_GZIP
+              value: {{ .Values.connectors.minio.claimCheckGzip | quote }}
           readinessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 10

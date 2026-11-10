@@ -40,7 +40,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
 # name|context|dockerfile|extra-build-args
 #
 # The connector images carry a 4th field: their Dockerfile pulls
-# warehouse_adapters.py and canonical_types.py through a BuildKit NAMED CONTEXT
+# warehouse_adapters.py, canonical_types.py and sql_paging.py through a BuildKit NAMED CONTEXT
 # called `shared` (see docker-compose.mcp.yml build.additional_contexts). Build
 # one without it and it fails at COPY --from=shared, so the field is not
 # optional decoration.
@@ -115,8 +115,11 @@ for name in "${WANT[@]}"; do
   extra="${extra//@ROOT@/$ROOT}"
   ref="$REGISTRY/$name:$TAG"
   echo "=== build $ref  (context=$ctx dockerfile=$dockerfile${extra:+ $extra})"
+  # `legal` (the repo root) carries THIRD_PARTY_NOTICES.md to the images whose context is
+  # a subdirectory (`COPY --from=legal`); an image that does not use it ignores it, so it
+  # is passed uniformly, as docker-publish.yml does.
   # shellcheck disable=SC2086  # $extra is a deliberate multi-word arg list
-  docker build -q $extra -t "$ref" -f "$ROOT/$dockerfile" "$ROOT/$ctx" >/dev/null
+  docker build -q --build-context legal="$ROOT" $extra -t "$ref" -f "$ROOT/$dockerfile" "$ROOT/$ctx" >/dev/null
   echo "=== load  $ref -> kind/$CLUSTER"
   kind load docker-image "$ref" --name "$CLUSTER"
   built=$((built + 1))

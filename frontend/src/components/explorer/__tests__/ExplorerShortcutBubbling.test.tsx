@@ -32,9 +32,7 @@ describe("preventDefault from a nested control, seen at the page root", () => {
         onKeyDown={(e) => {
           rootSawEvent(e.defaultPrevented)
           handleExplorerRunShortcut(e, {
-            hasNlInput: false,
             hasSql: true,
-            generateSQL: vi.fn(),
             attemptRunQuery: rootRanQuery,
           })
         }}
@@ -68,9 +66,7 @@ describe("preventDefault from a nested control, seen at the page root", () => {
       <div
         onKeyDown={(e) =>
           handleExplorerRunShortcut(e, {
-            hasNlInput: false,
             hasSql: true,
-            generateSQL: vi.fn(),
             attemptRunQuery: rootRanQuery,
           })
         }

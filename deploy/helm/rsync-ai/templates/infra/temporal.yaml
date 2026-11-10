@@ -13,7 +13,7 @@ is in Postgres.
 {{/*
 The dynamic-config file DYNAMIC_CONFIG_FILE_PATH names. The auto-setup image
 does NOT ship it -- Temporal's own docker-compose supplies it as a bind mount,
-and this platform's compose does the same (docker-compose.yml:242 mounts
+and this platform's compose does the same (docker-compose.yml:243 mounts
 deploy/temporal onto /etc/temporal/config/dynamicconfig). Setting the env var
 without also supplying the file is fatal, not a fallback: Temporal exits with
 "unable to validate dynamic config ... no such file or directory" before it

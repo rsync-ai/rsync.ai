@@ -179,6 +179,8 @@ func (e *RepairOwnershipRowExecutor) Run(ctx context.Context, sig diagnose.Signa
 type ZombieExecutionSweeper struct {
 	DB        *sql.DB
 	ZombieAge time.Duration // defaults to ZombieTimeout when zero
+	// Notifications receives a PIPELINE_RUN_FAILED notice per reaped run; nil sends none.
+	Notifications NotificationProducer
 }
 
 func (e *ZombieExecutionSweeper) Action() diagnose.Action { return ActionSweepZombie }
@@ -204,5 +206,5 @@ func (e *ZombieExecutionSweeper) Sweep(ctx context.Context) error {
 	if e.DB == nil {
 		return fmt.Errorf("ZombieExecutionSweeper: DB is required")
 	}
-	return runZombieSweep(ctx, e.DB, e.ZombieAge)
+	return runZombieSweep(ctx, e.DB, e.ZombieAge, e.Notifications)
 }

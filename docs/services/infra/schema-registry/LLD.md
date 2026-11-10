@@ -7,7 +7,7 @@ Source: `docker-compose.yml` service `schema-registry`
 - host mapped to `${RSYNC_HP_SCHEMA_REGISTRY:-8085}` to avoid conflicts
 - **not** `8081` — that was the Confluent-era port, corrected everywhere else in 2026 and
   missed here because that pass grepped code, not `docs/`. In this stack `8081` is the
-  orchestrator's host port ([docker-compose.yml:961](../../../../docker-compose.yml)), so the
+  orchestrator's host port ([docker-compose.yml:967](../../../../docker-compose.yml)), so the
   stale number pointed at a live and entirely unrelated service.
 
 ### Health

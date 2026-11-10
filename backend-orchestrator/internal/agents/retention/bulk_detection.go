@@ -92,7 +92,7 @@ func (d *BulkLoadDetector) DetectBulkLoad(
 	// Get consumer groups
 	consumers, err := d.offsetTracker.GetConsumerGroupsForTopic(ctx, topic)
 	if err != nil {
-		consumers = []string{}
+		return nil, fmt.Errorf("failed to get consumer groups: %w", err)
 	}
 
 	// Assume bulk load starts from offset 0 or last known position
@@ -144,8 +144,12 @@ func (d *BulkLoadDetector) UpdateBulkLoadProgress(
 		return nil, fmt.Errorf("bulk load not found: %s", bulkLoadID)
 	}
 
-	// Get progress from offset tracker
-	progress, progressMap := d.offsetTracker.GetBulkLoadProgress(ctx, bl)
+	// Get progress from offset tracker. A consumer whose progress could not be read
+	// leaves the bulk load as it was: marking the others caught up could finish it.
+	progress, progressMap, err := d.offsetTracker.GetBulkLoadProgress(ctx, bl)
+	if err != nil {
+		return nil, fmt.Errorf("bulk load %s progress: %w", bulkLoadID, err)
+	}
 
 	bl.mu.Lock()
 	bl.Progress = progress

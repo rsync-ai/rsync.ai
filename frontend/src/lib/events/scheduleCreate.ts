@@ -29,11 +29,11 @@ export function onPipelineScheduleCreate(handler: (pipelineId: string) => void) 
 //
 // Distinct from PIPELINE_SCHEDULE_CREATE_EVENT above, which is a *request to open the
 // create dialog*, not a notification that anything changed. Schedules are mutated from
-// two places — the header action (PipelineScheduleCreateDialogLauncher) and the panel's
-// own controls — and the panel used to refetch only after its own mutations. So creating
-// from the header left the panel reading "No schedules configured" until a hard reload,
-// while deleting from the panel refreshed immediately: the same state, two answers,
-// depending on which button you happened to use. Every mutation emits this now.
+// two places — the page's create dialog (PipelineScheduleCreateDialogLauncher) and the
+// panel's own controls — and the panel used to refetch only after its own mutations. So
+// creating left the panel reading "No schedule" until a hard reload, while deleting from
+// the panel refreshed immediately: the same state, two answers, depending on which
+// button you happened to use. Every mutation emits this now.
 export const PIPELINE_SCHEDULES_CHANGED_EVENT = "rsync:pipeline_schedules_changed"
 
 export function emitPipelineSchedulesChanged(pipelineId: string) {

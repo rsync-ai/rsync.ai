@@ -6,16 +6,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -134,8 +137,17 @@ func sendSlackWebhook(ctx context.Context, client *http.Client, ch SlackChannel,
 }
 
 type emailMessage struct {
-	Subject string
-	Body    string
+	Subject     string
+	Body        string
+	Attachments []Attachment
+}
+
+// Attachment is a file an email carries after its text: a workflow's chart as
+// a PNG.
+type Attachment struct {
+	Filename    string
+	ContentType string
+	Content     []byte
 }
 
 // sendSMTP delivers one plain-text message over a single SMTP session, with
@@ -238,7 +250,8 @@ func sendSMTP(ctx context.Context, ch EmailChannel, to string, m emailMessage) e
 	return nil
 }
 
-// buildEmail renders RFC 5322 headers and a quoted-printable UTF-8 body.
+// buildEmail renders RFC 5322 headers and a quoted-printable UTF-8 body; with
+// attachments, a multipart/mixed body of the text and then each file in base64.
 func buildEmail(from, to *mail.Address, m emailMessage, now time.Time) ([]byte, error) {
 	var b bytes.Buffer
 	header := func(k, v string) {
@@ -249,19 +262,71 @@ func buildEmail(from, to *mail.Address, m emailMessage, now time.Time) ([]byte, 
 	header("Subject", mime.QEncoding.Encode("utf-8", singleLine(m.Subject)))
 	header("Date", now.Format(time.RFC1123Z))
 	header("MIME-Version", "1.0")
-	header("Content-Type", "text/plain; charset=utf-8")
-	header("Content-Transfer-Encoding", "quoted-printable")
-	b.WriteString("\r\n")
+	if len(m.Attachments) == 0 {
+		header("Content-Type", "text/plain; charset=utf-8")
+		header("Content-Transfer-Encoding", "quoted-printable")
+		b.WriteString("\r\n")
+		if err := writeQuotedPrintable(&b, m.Body); err != nil {
+			return nil, err
+		}
+		return b.Bytes(), nil
+	}
 
-	qp := quotedprintable.NewWriter(&b)
-	body := strings.ReplaceAll(strings.ReplaceAll(m.Body, "\r\n", "\n"), "\n", "\r\n")
-	if _, err := qp.Write([]byte(body)); err != nil {
+	mw := multipart.NewWriter(&b)
+	header("Content-Type", mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": mw.Boundary()}))
+	b.WriteString("\r\n")
+	text, err := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Type":              {"text/plain; charset=utf-8"},
+		"Content-Transfer-Encoding": {"quoted-printable"},
+	})
+	if err != nil {
 		return nil, fmt.Errorf("encode email body: %w", err)
 	}
-	if err := qp.Close(); err != nil {
+	if err := writeQuotedPrintable(text, m.Body); err != nil {
+		return nil, err
+	}
+	for _, a := range m.Attachments {
+		name := singleLine(a.Filename)
+		ct := a.ContentType
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		part, err := mw.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {mime.FormatMediaType(ct, map[string]string{"name": name})},
+			"Content-Disposition":       {mime.FormatMediaType("attachment", map[string]string{"filename": name})},
+			"Content-Transfer-Encoding": {"base64"},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode attachment: %w", err)
+		}
+		enc := base64.StdEncoding.EncodeToString(a.Content)
+		for len(enc) > 76 {
+			if _, err := io.WriteString(part, enc[:76]+"\r\n"); err != nil {
+				return nil, fmt.Errorf("encode attachment: %w", err)
+			}
+			enc = enc[76:]
+		}
+		if _, err := io.WriteString(part, enc+"\r\n"); err != nil {
+			return nil, fmt.Errorf("encode attachment: %w", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
 		return nil, fmt.Errorf("encode email body: %w", err)
 	}
 	return b.Bytes(), nil
+}
+
+// writeQuotedPrintable writes body with CRLF line ends, quoted-printable.
+func writeQuotedPrintable(w io.Writer, body string) error {
+	qp := quotedprintable.NewWriter(w)
+	body = strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\n", "\r\n")
+	if _, err := qp.Write([]byte(body)); err != nil {
+		return fmt.Errorf("encode email body: %w", err)
+	}
+	if err := qp.Close(); err != nil {
+		return fmt.Errorf("encode email body: %w", err)
+	}
+	return nil
 }
 
 // singleLine collapses every run of whitespace, CR and LF included, to one

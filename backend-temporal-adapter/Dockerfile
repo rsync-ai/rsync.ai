@@ -14,6 +14,7 @@ WORKDIR /build
 COPY shared/go/kafkaclient /build/shared/go/kafkaclient
 COPY shared/go/pgdriver /build/shared/go/pgdriver
 COPY shared/go/memlimit /build/shared/go/memlimit
+COPY shared/go/workflowdef /build/shared/go/workflowdef
 
 COPY backend-temporal-adapter/go.mod backend-temporal-adapter/go.sum* /build/backend-temporal-adapter/
 WORKDIR /build/backend-temporal-adapter
@@ -49,6 +50,9 @@ COPY --from=builder --chown=appuser:appgroup /build/backend-temporal-adapter/tem
 # The binary this stage received is the one the builder built, byte for byte.
 COPY --from=builder /build/backend-temporal-adapter/temporal-adapter.sha256 /tmp/
 RUN sha256sum -c /tmp/temporal-adapter.sha256 && rm /tmp/temporal-adapter.sha256
+
+# The licence attributions for what this image ships.
+COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 USER appuser
 

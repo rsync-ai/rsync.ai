@@ -22,6 +22,7 @@ import re
 import json
 import logging
 import asyncio
+import contextvars
 import httpx
 import time
 import requests
@@ -133,14 +134,13 @@ async def _infer_domain_with_llm(connector_name: str, description: str = "") -> 
     Uses async call wrapper around sync OpenAI client.
     """
     try:
-        import openai
-        
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return None
         
         # Run sync OpenAI call in thread pool via shared factory (honours OPENAI_BASE_URL / Azure)
         def run_inference():
+            from src.egress import guarded_call
             from src.utils.openai_client import (
                 make_sync_client, resolve_provider, get_default_model, with_reasoning_headroom,
             )
@@ -155,13 +155,15 @@ If you don't recognize the service, respond with "unknown".
 Do not include "www." or "https://".
 Also, search your knowledge for "official brand assets" or "press kit" to confirm."""
 
-            response = client.chat.completions.create(
+            response = guarded_call(
+                client,
+                component="logo_downloader",
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
                 max_tokens=with_reasoning_headroom(50),
             )
-            return response.choices[0].message.content.strip().lower()
+            return response.text.strip().lower()
 
         domain = await asyncio.to_thread(run_inference)
         
@@ -634,30 +636,6 @@ async def _try_sources_async(
 # MAIN FUNCTIONS
 # =============================================================================
 
-def _extract_company_variations(connector_name: str, domain: str) -> List[str]:
-    """Extract company/brand variations from domain intelligently."""
-    variations = set()
-    name_lower = _normalize_name(connector_name)
-    
-    if domain:
-        domain_parts = domain.replace('www.', '').split('.')
-        base_domain = domain_parts[0] if domain_parts else ""
-        if base_domain:
-            variations.add(base_domain)
-            for part in domain_parts:
-                if part not in ['api', 'www', 'docs', 'app', 'admin', 'com', 'io', 'net', 'org']:
-                    variations.add(part)
-    
-    if '-' in name_lower:
-        variations.update(name_lower.split('-'))
-        
-    # Cloud patterns
-    for cloud in ['aws', 'gcp', 'azure', 'google', 'amazon']:
-        if name_lower.startswith(cloud):
-            remainder = name_lower[len(cloud):].lstrip('-_')
-            if remainder: variations.add(remainder)
-            
-    return list(variations)
 
 # Brands whose real mark lives on a wired source under a DIFFERENT slug than the
 # connector id / Simple-Icons slug — chiefly AWS/Microsoft product icons that
@@ -751,14 +729,6 @@ def get_connector_info(connector_name: str, base_url: Optional[str] = None, desc
     
     return {"domain": f"{name_lower}.com", "icon": name_lower, "category": ConnectorCategory.UNKNOWN}
 
-def register_connector(name: str, domain: str, icon: str = None, category: ConnectorCategory = ConnectorCategory.UNKNOWN):
-    """Runtime registration"""
-    name_lower = _normalize_name(name)
-    CONNECTOR_REGISTRY[name_lower] = {
-        "domain": domain,
-        "icon": icon or name_lower,
-        "category": category,
-    }
 
 # Max bytes to accept for a vendor-declared (x-logo) logo fetch, and the redirect
 # budget. A tiny OpenAPI spec can point info.x-logo.url at an arbitrarily large
@@ -1070,7 +1040,10 @@ def download_logo(
         # Create a new thread to run the async function
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:
+            # A new thread starts with an empty context; run it in a copy of
+            # this one so the guarded call still names the request's workspace.
             future = executor.submit(
+                contextvars.copy_context().run,
                 asyncio.run,
                 download_logo_async(
                     connector_name, connector_path, domain, base_url, prefer_svg,
@@ -1096,7 +1069,3 @@ def generate_placeholder_svg(connector_name: str, connector_path: str, color: st
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="{color}"/><text x="50" y="50" fill="white" font-size="50" text-anchor="middle" dy=".3em">{initial}</text></svg>'
     _save_file(connector_path, "logo.svg", svg.encode('utf-8'))
     return True
-
-def ensure_logo_for_connector(connector_name: str, connector_path: str) -> bool:
-    """Entry point"""
-    return download_logo(connector_name, connector_path)[0]

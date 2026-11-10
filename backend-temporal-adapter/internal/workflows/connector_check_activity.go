@@ -574,6 +574,11 @@ func GenerateConnectorActivityV2(ctx context.Context, req GenerateConnectorReque
 		return nil, fmt.Errorf("failed to build generator request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// The tool-generator names this workspace in the egress log line of each
+	// model call it makes; without it they read workspace=-.
+	if ws := strings.TrimSpace(req.WorkspaceID); ws != "" {
+		httpReq.Header.Set("X-Workspace-ID", ws)
+	}
 	// tool-generator guards /v1/generate with X-Internal-Secret whenever
 	// INTERNAL_SERVICE_SECRET is set (llm-service deployment/routes.py
 	// require_internal_secret, checked before the LLM gate). Without it every
@@ -674,6 +679,9 @@ type MissingConnector struct {
 type GenerateConnectorRequest struct {
 	CorrelationID string `json:"correlation_id"`
 	ConnectorType string `json:"connector_type"`
+	// WorkspaceID is the pipeline's workspace. The tool-generator names it in
+	// the egress log line of each model call it makes (X-Workspace-ID).
+	WorkspaceID string `json:"workspace_id,omitempty"`
 }
 
 type GenerateConnectorResult struct {

@@ -183,6 +183,9 @@ def test_resolve_model_exists_and_is_the_only_reader_of_the_yaml_key():
     )
 
 
+_GUARDED_CALLS = frozenset({"guarded_call", "guarded_acall", "_guarded_explorer_call"})
+
+
 def test_every_chat_completion_call_resolves_its_model():
     """The positive denominator.
 
@@ -192,11 +195,16 @@ def test_every_chat_completion_call_resolves_its_model():
     """
     tree = ast.parse(GATEWAY_MAIN.read_text())
 
+    # Every model call goes through the egress guard (src/egress/guard.py), so
+    # the sites are guard calls; a raw `.create` is still counted if one returns.
     create_calls = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "create"):
+        func = node.func
+        is_create = isinstance(func, ast.Attribute) and func.attr == "create"
+        is_guarded = isinstance(func, ast.Name) and func.id in _GUARDED_CALLS
+        if not (is_create or is_guarded):
             continue
         for kw in node.keywords:
             if kw.arg == "model":

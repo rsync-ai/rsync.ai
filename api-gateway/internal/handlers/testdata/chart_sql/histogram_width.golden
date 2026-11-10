@@ -1,0 +1,75 @@
+# settings: {"version":2,"type":"histogram","roles":{"x":[{"column":"amount","width":25}]}}
+
+-- postgres
+SELECT FLOOR(src."amount" / 25.0) * 25.0 AS "amount", 25.0 AS "rsync_bin_width", COUNT(*) AS "count"
+FROM "gold"."orders" src
+WHERE src."amount" IS NOT NULL AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY FLOOR(src."amount" / 25.0) * 25.0
+ORDER BY FLOOR(src."amount" / 25.0) * 25.0 ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT FLOOR(src.`amount` / 25.0) * 25.0 AS `amount`, 25.0 AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY FLOOR(src.`amount` / 25.0) * 25.0
+ORDER BY FLOOR(src.`amount` / 25.0) * 25.0 ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) FLOOR(src.[amount] / 25.0) * 25.0 AS [amount], 25.0 AS [rsync_bin_width], COUNT_BIG(*) AS [count]
+FROM [gold].[orders] src
+WHERE src.[amount] IS NOT NULL AND src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY FLOOR(src.[amount] / 25.0) * 25.0
+ORDER BY FLOOR(src.[amount] / 25.0) * 25.0 ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT FLOOR(src.`amount` / 25.0) * 25.0 AS `amount`, 25.0 AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+GROUP BY FLOOR(src.`amount` / 25.0) * 25.0
+ORDER BY FLOOR(src.`amount` / 25.0) * 25.0 ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT FLOOR(src."AMOUNT" / 25.0) * 25.0 AS "AMOUNT", 25.0 AS "RSYNC_BIN_WIDTH", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+GROUP BY FLOOR(src."AMOUNT" / 25.0) * 25.0
+ORDER BY FLOOR(src."AMOUNT" / 25.0) * 25.0 ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT FLOOR(src.`amount` / 25.0) * 25.0 AS `amount`, 25.0 AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY FLOOR(src.`amount` / 25.0) * 25.0
+ORDER BY FLOOR(src.`amount` / 25.0) * 25.0 ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT FLOOR(src.`amount` / 25.0) * 25.0 AS `amount`, 25.0 AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+GROUP BY FLOOR(src.`amount` / 25.0) * 25.0
+ORDER BY FLOOR(src.`amount` / 25.0) * 25.0 ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT FLOOR(src."AMOUNT" / 25.0) * 25.0 AS "AMOUNT", 25.0 AS "RSYNC_BIN_WIDTH", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+GROUP BY FLOOR(src."AMOUNT" / 25.0) * 25.0
+ORDER BY FLOOR(src."AMOUNT" / 25.0) * 25.0 ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

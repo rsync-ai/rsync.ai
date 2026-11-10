@@ -63,17 +63,27 @@ var upgrader = websocket.Upgrader{
 
 // DomainEventManager manages domain event subscriptions
 type DomainEventManager struct {
-	subscribers   map[string]map[*websocket.Conn]bool // pipeline_id -> connections
-	mu            sync.RWMutex
-	kafkaConsumer sarama.ConsumerGroup
-	cancel        context.CancelFunc
-	done          chan struct{}
+	subscribers map[string]map[*websocket.Conn]bool // pipeline_id -> connections
+	mu          sync.RWMutex
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
 var eventManager *DomainEventManager
 
+// newDomainEventConsumerGroup is sarama.NewConsumerGroup; a test swaps it to
+// play a broker that is still starting.
+var newDomainEventConsumerGroup = sarama.NewConsumerGroup
+
+var domainEventDialBackoff = rsynckafka.DefaultConsumerGroupDialBackoff
+
 // InitDomainEventManager initializes the domain event manager.
 // The provided ctx (typically appCtx) controls the consumer loop lifetime.
+//
+// It returns an error only for a Kafka security configuration this consumer
+// cannot use. Kafka not answering yet is not an error: the consumer goroutine
+// dials until it does (rsynckafka.ConnectConsumerGroup), so a gateway that
+// starts before Kafka still delivers HITL checkpoints once Kafka is up.
 func InitDomainEventManager(ctx context.Context, kafkaBrokers []string) error {
 	config := sarama.NewConfig()
 	config.Version = sarama.V3_4_0_0
@@ -94,25 +104,24 @@ func InitDomainEventManager(ctx context.Context, kafkaBrokers []string) error {
 	// both with one PREFIXED grant. An unqualified group id under a PREFIXED
 	// grant does not crash: the broker rejects the JoinGroup and this consumer
 	// simply never delivers a HITL checkpoint to the browser.
-	consumer, err := sarama.NewConsumerGroup(kafkaBrokers, kafkaclient.Group("api-gateway-domain-events"), config)
-	if err != nil {
-		return err
-	}
+	groupID := kafkaclient.Group("api-gateway-domain-events")
 
 	consumerCtx, cancel := context.WithCancel(ctx)
 	eventManager = &DomainEventManager{
-		subscribers:   make(map[string]map[*websocket.Conn]bool),
-		kafkaConsumer: consumer,
-		cancel:        cancel,
-		done:          make(chan struct{}),
+		subscribers: make(map[string]map[*websocket.Conn]bool),
+		cancel:      cancel,
+		done:        make(chan struct{}),
 	}
 
-	go eventManager.consumeDomainEvents(consumerCtx)
+	go eventManager.consumeDomainEvents(consumerCtx, func() (sarama.ConsumerGroup, error) {
+		return newDomainEventConsumerGroup(kafkaBrokers, groupID, config)
+	})
 	return nil
 }
 
-// ShutdownDomainEventManager stops the consumer loop and closes the Kafka consumer.
-// Call this during graceful shutdown before the process exits.
+// ShutdownDomainEventManager stops the consumer loop, which closes the Kafka
+// consumer on its way out. Call this during graceful shutdown before the
+// process exits.
 func ShutdownDomainEventManager() {
 	if eventManager == nil {
 		return
@@ -122,9 +131,6 @@ func ShutdownDomainEventManager() {
 	case <-eventManager.done:
 	case <-time.After(5 * time.Second):
 		log.Warn("Timed out waiting for domain event consumer to stop")
-	}
-	if err := eventManager.kafkaConsumer.Close(); err != nil {
-		log.WithError(err).Warn("Error closing domain event Kafka consumer")
 	}
 }
 
@@ -209,10 +215,20 @@ func (m *DomainEventManager) unsubscribe(pipelineID string, conn *websocket.Conn
 	}
 }
 
-// consumeDomainEvents consumes domain events from Kafka and broadcasts to subscribers.
-// Exits cleanly when ctx is cancelled (e.g. on SIGTERM via appCancel).
-func (m *DomainEventManager) consumeDomainEvents(ctx context.Context) {
+// consumeDomainEvents dials Kafka until it answers, then consumes domain events
+// and broadcasts them to subscribers. Exits cleanly when ctx is cancelled (e.g.
+// on SIGTERM via appCancel), closing the consumer if it had connected.
+func (m *DomainEventManager) consumeDomainEvents(ctx context.Context, dial func() (sarama.ConsumerGroup, error)) {
 	defer close(m.done)
+	consumer, err := rsynckafka.ConnectConsumerGroup(ctx, "domain event consumer", domainEventDialBackoff, dial)
+	if err != nil {
+		return // ctx ended before Kafka answered
+	}
+	defer func() {
+		if err := consumer.Close(); err != nil {
+			log.WithError(err).Warn("Error closing domain event Kafka consumer")
+		}
+	}()
 	handler := &domainEventHandler{manager: m}
 
 	for {
@@ -220,7 +236,7 @@ func (m *DomainEventManager) consumeDomainEvents(ctx context.Context) {
 			log.Info("Domain event consumer stopping (context cancelled)")
 			return
 		}
-		err := m.kafkaConsumer.Consume(ctx, kafkaclient.Topics("pipeline.domain.events"), handler)
+		err := consumer.Consume(ctx, kafkaclient.Topics("pipeline.domain.events"), handler)
 		if err != nil {
 			if ctx.Err() != nil {
 				return // clean shutdown

@@ -39,6 +39,9 @@ export interface Pipeline {
   cdc_mode?: "initial" | "streaming_only"
   dataset?: string
   default_run_mode?: "resume" | "reload"
+  // false when the destination is an app's API (reverse ETL): a run updates the
+  // records it wrote before and the gateway refuses a Reload. Absent = it has one.
+  reload_supported?: boolean
   selected_tables?: string[]
   destination_namespace?: string
   destination_config?: DestinationConfig
@@ -53,15 +56,6 @@ export interface Pipeline {
   user_id?: string
   created_at: string
   updated_at: string
-}
-
-export interface CreatePipelineRequest {
-  name: string
-  description: string
-  config: {
-    nodes: PipelineNode[]
-  }
-  status?: "draft" | "active"
 }
 
 /**
@@ -112,23 +106,6 @@ export async function updatePipelineTables(pipelineId: string, tables: string[])
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: "Failed to update tables" }))
     throw new Error(extractErrorMessage(error) || "Failed to update tables")
-  }
-
-  return response.json()
-}
-
-/**
- * Update a pipeline
- */
-export async function updatePipeline(id: string, data: Partial<CreatePipelineRequest>): Promise<Pipeline> {
-  const response = await authFetch(API_ENDPOINTS.PIPELINES.UPDATE(id), {
-    method: "PUT",
-    body: JSON.stringify(data),
-  })
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: "Failed to update pipeline" }))
-    throw new Error(extractErrorMessage(error) || "Failed to update pipeline")
   }
 
   return response.json()
@@ -287,6 +264,74 @@ export class AssessmentRequiredError extends Error {
   }
 }
 
+/** The 409 codes a HITL resume returns when the pause can't take this answer. */
+export type HITLRefusalCode =
+  | "run_finished"
+  | "pause_already_answered"
+  | "pause_busy"
+  | "hitl_answer_in_flight"
+  | "table_selection_in_flight"
+
+const HITL_REFUSAL_CODES: ReadonlySet<string> = new Set<HITLRefusalCode>([
+  "run_finished",
+  "pause_already_answered",
+  "pause_busy",
+  "hitl_answer_in_flight",
+  "table_selection_in_flight",
+])
+
+/**
+ * Thrown by the HITL resume calls when the gateway refuses the answer because
+ * the pause is gone or taken: the run finished, the step was answered in
+ * another tab, or another answer is on its way. The gateway asks the run before
+ * it signals (api-gateway pipeline_hitl_gate.go), so a dialog that outlived its
+ * pause gets this instead of re-signalling the run.
+ *
+ * `retryable` is true only for `pause_busy`: the run is still checking the last
+ * answer to this step, so the same dialog can try again in a moment.
+ */
+export class HITLAnswerRefusedError extends Error {
+  readonly code: HITLRefusalCode
+  readonly retryable: boolean
+  readonly howEnded?: string
+  readonly executionId?: string
+  constructor(code: HITLRefusalCode, message: string, opts?: { howEnded?: string; executionId?: string }) {
+    super(message)
+    this.name = "HITLAnswerRefusedError"
+    this.code = code
+    this.retryable = code === "pause_busy"
+    this.howEnded = opts?.howEnded
+    this.executionId = opts?.executionId
+  }
+}
+
+/** The refusal in a HITL resume's error response, or null when it is some other error. */
+export function hitlAnswerRefusalFrom(status: number, bodyText: string): HITLAnswerRefusedError | null {
+  if (status !== 409 || !bodyText) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyText)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const p = parsed as { error?: unknown; message?: unknown; how_ended?: unknown; execution_id?: unknown }
+  if (typeof p.error !== "string" || !HITL_REFUSAL_CODES.has(p.error)) return null
+  const message = typeof p.message === "string" && p.message ? p.message : "This step can no longer take this answer."
+  return new HITLAnswerRefusedError(p.error as HITLRefusalCode, message, {
+    howEnded: typeof p.how_ended === "string" ? p.how_ended : undefined,
+    executionId: typeof p.execution_id === "string" ? p.execution_id : undefined,
+  })
+}
+
+/**
+ * True when the dialog that sent this answer has outlived its pause: close it
+ * and say why, instead of offering a retry that cannot succeed.
+ */
+export function isStaleHITLAnswer(err: unknown): err is HITLAnswerRefusedError {
+  return err instanceof HITLAnswerRefusedError && !err.retryable
+}
+
 /**
  * Fetch the pre-migration assessment for a pipeline without starting
  * a run. Used to render the modal on demand from a "Review" button.
@@ -423,7 +468,7 @@ export async function resumePipelineConnections(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "")
-    throw new Error(extractErrorMessage(errorText) || "Failed to resume pipeline connections")
+    throw hitlAnswerRefusalFrom(response.status, errorText) ?? new Error(extractErrorMessage(errorText) || "Failed to resume pipeline connections")
   }
 
   return response.json()
@@ -443,7 +488,7 @@ export async function resumePipelineConnectors(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "")
-    throw new Error(extractErrorMessage(errorText) || "Failed to resume pipeline connectors")
+    throw hitlAnswerRefusalFrom(response.status, errorText) ?? new Error(extractErrorMessage(errorText) || "Failed to resume pipeline connectors")
   }
 
   return response.json()
@@ -474,6 +519,8 @@ export async function resumePipelineTables(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "")
+    const refusal = hitlAnswerRefusalFrom(response.status, errorText)
+    if (refusal) throw refusal
     let msg = extractErrorMessage(errorText) || "Failed to resume pipeline tables"
     // If backend returned structured invalid_tables details, surface them to the user.
     try {
@@ -532,7 +579,7 @@ export async function resumePipelineNodeInput(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "")
-    throw new Error(extractErrorMessage(errorText) || "Failed to resume pipeline node input")
+    throw hitlAnswerRefusalFrom(response.status, errorText) ?? new Error(extractErrorMessage(errorText) || "Failed to resume pipeline node input")
   }
 
   return response.json()

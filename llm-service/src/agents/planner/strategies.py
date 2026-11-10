@@ -24,7 +24,9 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 import requests
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
+from src.egress.scope import workspace_headers
 from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
 from src.utils.masking import connections_for_llm, scrub_error_for_llm
 from src.utils.kafka_topics import topic
@@ -152,11 +154,7 @@ class CDCProviderRegistry:
             normalized = "postgresql"
         
         return supported_dbs.get(normalized)
-    
-    def is_cdc_capable(self, source_type: str) -> bool:
-        """Check if a source type supports CDC"""
-        return self.get_cdc_provider(source_type) is not None
-    
+
     def get_all_cdc_sources(self) -> List[str]:
         """Get all source types that support CDC"""
         return list(self._provider_cache.keys())
@@ -429,56 +427,7 @@ class DataPathDecider:
             sink="kafka-mcp-sink",
             reason="Default path: direct Kafka transport"
         )
-    
-    def estimate_data_size(
-        self, 
-        table_name: str, 
-        row_count: Optional[int] = None,
-        schema_info: Optional[Dict] = None
-    ) -> Optional[float]:
-        """
-        Estimate data size in MB based on table metadata.
-        
-        This is a heuristic estimation. More accurate estimation
-        would require querying the source database.
-        """
-        if row_count is None:
-            return None
-        
-        # Average bytes per row (rough estimate)
-        # Can be refined based on schema_info
-        avg_bytes_per_row = 500  # Conservative estimate
-        
-        if schema_info:
-            # More accurate estimate based on column types
-            column_sizes = {
-                "integer": 8,
-                "bigint": 8,
-                "string": 100,  # Average
-                "text": 500,    # Variable
-                "json": 1000,   # Variable
-                "timestamp": 8,
-                "boolean": 1,
-                "float": 8,
-                "double": 8,
-            }
-            
-            columns = schema_info.get("columns", [])
-            if columns:
-                total_bytes = sum(
-                    column_sizes.get(col.get("type", "string"), 100)
-                    for col in columns
-                )
-                avg_bytes_per_row = total_bytes * 1.2  # 20% overhead for formatting
-        
-        estimated_bytes = row_count * avg_bytes_per_row
-        estimated_mb = estimated_bytes / (1024 * 1024)
-        
-        logger.info(f"Estimated data size for {table_name}: {estimated_mb:.2f} MB "
-                   f"({row_count} rows × ~{avg_bytes_per_row} bytes/row)")
-        
-        return estimated_mb
-    
+
     def get_pipeline_config(self, decision: DataPathDecision) -> Dict[str, Any]:
         """
         Generate pipeline configuration based on data path decision.
@@ -873,6 +822,42 @@ class PlanningContext:
     error_context: Optional[Dict[str, Any]] = None
 
 
+def _connector_type_of(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        value = value.get("connector_type") or value.get("type")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().lower().replace("_", "-")
+
+
+def connector_role_types(context: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    """The (source, destination) connector types a /plan request names, if any.
+
+    Callers name roles in several shapes: ``source_type`` (orchestrator planner
+    worker), ``source_connector`` as a string or a ``{type|connector_type}`` map,
+    a ``source_connection`` map, or the capability resolver's
+    ``connectors.resolved_connectors.source``. MongoDB, PostgreSQL and MySQL can
+    each be either role, so without these the heuristic planner guesses — and a
+    PostgreSQL -> MongoDB CDC plan streamed from MongoDB (prod a6ca2103).
+    """
+    if not isinstance(context, dict):
+        return None, None
+    connectors = context.get("connectors")
+    resolved = connectors.get("resolved_connectors") if isinstance(connectors, dict) else None
+    if not isinstance(resolved, dict):
+        resolved = {}
+
+    def _side(side: str) -> Optional[str]:
+        for value in (context.get(f"{side}_type"), context.get(f"{side}_connector"),
+                      context.get(f"{side}_connection"), resolved.get(side)):
+            found = _connector_type_of(value)
+            if found:
+                return found
+        return None
+
+    return _side("source"), _side("destination")
+
+
 def build_replan_user_request(
     natural_language: str, error_context: Optional[Dict[str, Any]]
 ) -> str:
@@ -894,8 +879,10 @@ def build_replan_user_request(
     stage = error_context.get("stage", "execution")
     # Upstream promises a sanitized reason, but the privacy contract (row values
     # never reach the LLM) must not depend on every producer honoring that —
-    # scrub at the last hop before the prompt.
+    # scrub at the last hop before the prompt. The stage comes from the same
+    # producer, so it gets the same treatment.
     reason = scrub_error_for_llm(str(reason), max_len=500)
+    stage = scrub_error_for_llm(str(stage), max_len=80)
     return (
         f"{natural_language}\n\n"
         f"IMPORTANT — the previous execution plan FAILED during {stage}: {reason}. "
@@ -978,13 +965,19 @@ class HeuristicPlanningStrategy(PlanningStrategy):
         # prefer those roles even for connectors that can be both source and destination
         # (e.g., postgresql/mysql). This prevents the heuristic plan from treating the
         # destination connector as an additional source for CDC.
-        if context.source_connection and context.destination_connection:
-            src_tool = (context.source_connection.get("connector_type") or "").strip().lower().replace("_", "-")
-            dst_tool = (context.destination_connection.get("connector_type") or "").strip().lower().replace("_", "-")
-            if src_tool:
-                sources = [src_tool]
-            if dst_tool:
-                destinations = [dst_tool]
+        # Each side is pinned on its own: a known source alone still keeps the
+        # destination engine from being planned as a second CDC source.
+        src_tool = _connector_type_of(context.source_connection)
+        dst_tool = _connector_type_of(context.destination_connection)
+        if src_tool:
+            sources = [src_tool]
+            if not dst_tool:
+                destinations = [d for d in destinations if d != src_tool] or destinations
+        if dst_tool:
+            destinations = [dst_tool]
+            if not src_tool:
+                sources = [s for s in sources if s != dst_tool] or sources
+        others = [t for t in others if t not in (src_tool, dst_tool)]
         
         # Order: sources first, then destinations, then others
         # NOTE: duplicates are allowed (e.g., postgresql->postgresql) to represent source+destination steps.
@@ -1750,9 +1743,12 @@ class AsyncConnectorChecker:
         
         # Generate missing connectors in parallel
         if to_generate:
+            # run_in_executor does not carry contextvars; copy them so the
+            # request's workspace reaches _generate_connector's header.
             gen_futures = [
                 loop.run_in_executor(
                     self._executor, 
+                    contextvars.copy_context().run,
                     self._generate_connector, 
                     tool, 
                     context
@@ -1820,6 +1816,7 @@ class AsyncConnectorChecker:
                 # Tool-generator v1 API: POST /v1/generate (legacy /generate was removed)
                 f"{self.tool_generator_url}/v1/generate",
                 json=gen_request,
+                headers=workspace_headers(),
                 timeout=120
             )
             
@@ -1951,78 +1948,6 @@ class SmartPipelineDecider:
     def __init__(self):
         logger.info("SmartPipelineDecider initialized")
 
-    def estimate_data_size_from_discovery(self, tables: List[Dict[str, Any]]) -> DataStatistics:
-        """
-        Build `DataStatistics` from a connection discovery-style payload.
-
-        Expected input shape (subset):
-        - [{"name": "...", "row_count": 123, "columns": [{"name": "...", "type": "..."}]}]
-        """
-        stats = DataStatistics()
-        tables = tables or []
-
-        # Rough per-column byte estimates (heuristics)
-        type_sizes = {
-            "int": 8,
-            "integer": 8,
-            "bigint": 8,
-            "smallint": 4,
-            "serial": 8,
-            "bigserial": 8,
-            "float": 8,
-            "double": 8,
-            "real": 8,
-            "numeric": 16,
-            "decimal": 16,
-            "bool": 1,
-            "boolean": 1,
-            "date": 8,
-            "time": 8,
-            "timestamp": 8,
-            "timestamptz": 8,
-            "uuid": 16,
-            "json": 1000,
-            "jsonb": 1000,
-            "text": 500,
-            "varchar": 100,
-            "character varying": 100,
-            "string": 100,
-        }
-
-        for t in tables:
-            name = str(t.get("name") or t.get("table") or "").strip() or "unknown"
-            try:
-                row_count = int(t.get("row_count") or 0)
-            except Exception:
-                row_count = 0
-
-            cols = t.get("columns") or []
-            col_count = len(cols) if isinstance(cols, list) else 0
-
-            if isinstance(cols, list) and cols:
-                bytes_per_row = 0.0
-                for c in cols:
-                    ct = str((c or {}).get("type") or "string").lower()
-                    # normalize common type prefixes (e.g., varchar(255))
-                    ct = ct.split("(", 1)[0].strip()
-                    bytes_per_row += type_sizes.get(ct, 100)
-                bytes_per_row *= 1.2  # overhead
-            else:
-                bytes_per_row = 500.0
-
-            estimated_mb = (row_count * bytes_per_row) / (1024 * 1024)
-
-            stats.add_table(
-                TableStats(
-                    name=name,
-                    row_count=row_count,
-                    estimated_size_mb=float(estimated_mb),
-                    column_count=col_count,
-                )
-            )
-
-        return stats
-    
     def decide_strategy(
         self,
         sync_mode: str,

@@ -163,3 +163,34 @@ func TestSweep_QueryFailureDoesNotPanic(t *testing.T) {
 	w := &HealWorker{DB: db}
 	w.sweep(context.Background()) // must not panic
 }
+
+// TestSweep_ExecutionQueryFailureStillRunsTheOtherPasses — the failed-execution query is
+// one candidate source of five, and its failure used to return from sweep() before the
+// other four: the zombie sweep, the stale-park reconcile, the orphaned-issue reaper and
+// the issue sweep. None of them reads its rows, so one bad query silenced all of them for
+// as long as it kept failing.
+func TestSweep_ExecutionQueryFailureStillRunsTheOtherPasses(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.MatchExpectationsInOrder(false)
+
+	mock.ExpectQuery("pipeline_run_table_stats").WillReturnError(context.DeadlineExceeded)
+	// Each pass only has to be reached; a failure of its own is logged and passed over.
+	for _, pass := range []string{
+		"WITH swept AS",                   // sweepZombies
+		"WITH stale AS",                   // reconcileStaleParks
+		"UPDATE sentinel_active_issues",   // reapOrphanedIssues
+		"WITH candidates AS MATERIALIZED", // sweepIssues
+	} {
+		mock.ExpectQuery(pass).WillReturnError(context.DeadlineExceeded)
+	}
+
+	(&HealWorker{DB: db}).sweep(context.Background())
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a failed execution query skipped a pass that does not depend on it: %v", err)
+	}
+}

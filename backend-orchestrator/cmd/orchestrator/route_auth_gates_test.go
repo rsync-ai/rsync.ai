@@ -56,7 +56,7 @@ func TestUngatedGroupsRequireAPrincipal(t *testing.T) {
 
 	// Non-nil registry/agent so the two conditionally-mounted groups are
 	// actually registered; anonymous requests are refused before either is used.
-	router := setupRouter(nil, nil, nil, &consumer.Registry{}, &retention.Agent{}, db, nil, nil)
+	router := setupRouter(nil, nil, nil, &consumer.Registry{}, &retention.Agent{}, db, nil, nil, nil)
 
 	const pipelineID = "abd8a64d-0000-0000-0000-000000000000"
 	cases := []struct {

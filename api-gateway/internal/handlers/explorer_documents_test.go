@@ -213,6 +213,104 @@ func TestFindExplorerDocuments_UpstreamStatusMapping(t *testing.T) {
 	}
 }
 
+func serveDocAggregate(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := wsScopeRouter(http.MethodPost, "/api/v1/explorer/documents/aggregate", AggregateExplorerDocuments)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/v1/explorer/documents/aggregate", strings.NewReader(body)))
+	return rr
+}
+
+// A pipeline preview forwards the pipeline as written (key order, 64-bit integers) and
+// redacts the documents it returns, like find.
+func TestAggregateExplorerDocuments_ForwardsPipelineAndRedacts(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+	docFindConnection(t, mock, "mongodb")
+	calls, sent := docFindOrchestrator(t, "/api/v1/agent/explorer-aggregate", http.StatusOK, `{
+		"success": true, "collection": "orders", "returned": 1, "has_more": false, "columns": ["_id","email","total"],
+		"documents": [{"_id":"paid","email":"alice@example.com","total":9007199254740993}]}`)
+
+	rr := serveDocAggregate(t, `{"connection_id":"`+docFindConnID+`","collection":"orders","limit":20,
+		"pipeline":[{"$match":{"n":{"$gte":9007199254740993}}},{"$group":{"_id":"$status","total":{"$sum":"$amount"}}},{"$sort":{"z":1,"a":-1}}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("orchestrator calls = %d, want 1", calls.Load())
+	}
+	req := sent.Load().(string)
+	for _, want := range []string{`"connector_type":"mongodb"`, `"collection":"orders"`, `"limit":20`,
+		`{"$sort":{"z":1,"a":-1}}`, `9007199254740993`, `"connection_string"`} {
+		if !strings.Contains(req, want) {
+			t.Errorf("orchestrator request missing %s: %s", want, req)
+		}
+	}
+	out := rr.Body.String()
+	if strings.Contains(out, "alice@example.com") || strings.Contains(out, `"success"`) {
+		t.Errorf("response leaks a redacted value or the internal flag: %s", out)
+	}
+	if !strings.Contains(out, `9007199254740993`) {
+		t.Errorf("response lost a 64-bit integer: %s", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// A pipeline that writes or runs code never reaches the database or the orchestrator.
+func TestAggregateExplorerDocuments_RefusesBeforeLoading(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+	calls, _ := docFindOrchestrator(t, "/api/v1/agent/explorer-aggregate", http.StatusOK, `{}`)
+
+	for _, tc := range []struct{ pipeline, code, path string }{
+		{`[{"$facet":{"a":[{"$out":"x"}]}}]`, "operator_not_allowed", "pipeline[0].$facet.a[0].$out"},
+		{`[{"$currentOp":{}}]`, "stage_not_allowed", "pipeline[0].$currentOp"},
+		{`{"$match":{}}`, "invalid_pipeline", "pipeline"},
+	} {
+		rr := serveDocAggregate(t, `{"connection_id":"`+docFindConnID+`","collection":"c","pipeline":`+tc.pipeline+`}`)
+		var body map[string]string
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != http.StatusBadRequest || body["error_code"] != tc.code || body["path"] != tc.path {
+			t.Errorf("%s: got %d %+v, want 400 %s at %s", tc.pipeline, rr.Code, body, tc.code, tc.path)
+		}
+	}
+	if rr := serveDocAggregate(t, `{"collection":"c","pipeline":[]}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("missing connection_id: want 400, got %d", rr.Code)
+	}
+	if calls.Load() != 0 {
+		t.Errorf("orchestrator called %d times", calls.Load())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+func TestAggregateExplorerDocuments_GatesAndUpstreamErrors(t *testing.T) {
+	t.Run("sql connection", func(t *testing.T) {
+		mock, cleanup := wsScopeMockDB(t)
+		defer cleanup()
+		docFindConnection(t, mock, "postgresql")
+		calls, _ := docFindOrchestrator(t, "/api/v1/agent/explorer-aggregate", http.StatusOK, `{}`)
+		rr := serveDocAggregate(t, `{"connection_id":"`+docFindConnID+`","collection":"c","pipeline":[]}`)
+		if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "not_document_connection") || calls.Load() != 0 {
+			t.Fatalf("want 400 not_document_connection and no orchestrator call, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+	t.Run("timeout keeps 504", func(t *testing.T) {
+		mock, cleanup := wsScopeMockDB(t)
+		defer cleanup()
+		docFindConnection(t, mock, "mongodb")
+		docFindOrchestrator(t, "/api/v1/agent/explorer-aggregate", http.StatusGatewayTimeout,
+			`{"error":"explorer_aggregate failed","error_code":"query_timeout","details":"the pipeline exceeded 15000 ms"}`)
+		rr := serveDocAggregate(t, `{"connection_id":"`+docFindConnID+`","collection":"c","pipeline":[]}`)
+		if rr.Code != http.StatusGatewayTimeout || !strings.Contains(rr.Body.String(), "query_timeout") {
+			t.Fatalf("got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
 // A document connection must never reach the SQL executors (D8).
 func TestExecuteExplorerQuery_RejectsDocumentConnection(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
@@ -243,7 +341,7 @@ func TestBuildDocumentSchemaIndex_MapsCollections(t *testing.T) {
 		 "columns":[{"name":"_id","type":"objectId","nullable":false},{"name":"total","type":"double","nullable":true}]},
 		{"name":"customers","schema":"shop","columns":[]}]}`)
 
-	idx, err := buildSchemaIndex(t.Context(), docFindConnID, "mongodb", enc, false)
+	idx, err := buildSchemaIndex(t.Context(), docFindConnID, "", "mongodb", enc, false)
 	if err != nil {
 		t.Fatalf("buildSchemaIndex: %v", err)
 	}
@@ -387,7 +485,7 @@ func TestBuildDocumentSchemaIndex_OverallStatus(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			calls, _ := docFindOrchestrator(t, "/api/v1/agent/discover-schema", http.StatusOK, tc.body)
-			idx, err := buildSchemaIndex(t.Context(), docFindConnID, "mongodb", enc, false)
+			idx, err := buildSchemaIndex(t.Context(), docFindConnID, "", "mongodb", enc, false)
 			if calls.Load() != 1 {
 				t.Fatalf("orchestrator calls = %d, want 1", calls.Load())
 			}
@@ -487,7 +585,7 @@ func TestBuildDocumentSchemaIndex_UpstreamErrorBodyIsScrubbed(t *testing.T) {
 			}
 			calls, _ := docFindOrchestrator(t, "/api/v1/agent/discover-schema", tc.status, tc.body)
 
-			_, err = buildSchemaIndex(t.Context(), docFindConnID, "mongodb", enc, false)
+			_, err = buildSchemaIndex(t.Context(), docFindConnID, "", "mongodb", enc, false)
 			if n := calls.Load(); n != 1 {
 				t.Fatalf("orchestrator calls = %d, want 1", n)
 			}
@@ -537,7 +635,7 @@ func TestBuildDocumentSchemaIndex_LongReasonIsBoundedAndScrubbed(t *testing.T) {
 			calls, _ := docFindOrchestrator(t, "/api/v1/agent/discover-schema", http.StatusOK,
 				`{"overall_status":"failed","tables":[],"warnings_messages":`+string(w)+`}`)
 
-			_, err = buildSchemaIndex(t.Context(), docFindConnID, "mongodb", enc, false)
+			_, err = buildSchemaIndex(t.Context(), docFindConnID, "", "mongodb", enc, false)
 			if n := calls.Load(); n != 1 {
 				t.Fatalf("orchestrator calls = %d, want 1", n)
 			}

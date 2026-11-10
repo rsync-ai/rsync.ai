@@ -121,6 +121,28 @@ func TestScrub_MasksRowValues(t *testing.T) {
 			mustHide:   []string{"topsecret"},
 			mustRemain: []string{"value was", "in the row"},
 		},
+		{
+			// Userinfo with an empty user name: the URL rule required one.
+			name:       "url password with no user name",
+			in:         "redis connect failed: redis://:hunter2@cache:6379/0",
+			mustHide:   []string{"hunter2"},
+			mustRemain: []string{"redis://", "@cache:6379/0"},
+		},
+		{
+			// Credential-named query parameters shorter than the 40-char blob
+			// rule, and the access key id inside a presigned URL.
+			name:       "credential query parameters",
+			in:         "GET https://b.s3.amazonaws.com/o.csv?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524&key=AIzaSyA1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvW&code=4/0AY0e-g7abcDEF&page=2",
+			mustHide:   []string{"AKIAIOSFODNN7EXAMPLE", "AIzaSy", "0AY0e-g7abcDEF"},
+			mustRemain: []string{"https://b.s3.amazonaws.com/o.csv?X-Amz-Credential=", "&key=", "&code=", "&page=2"},
+		},
+		{
+			// A token-shaped path segment, while the rest of the path stays.
+			name:       "token in a url path",
+			in:         "POST https://hooks.example.com/services/T0ABCDE12/B0ABCDE34/aB3dE5fG7hI9jK1lM3nO5pQ7 failed",
+			mustHide:   []string{"aB3dE5fG7hI9jK1lM3nO5pQ7"},
+			mustRemain: []string{"https://hooks.example.com/services/T0ABCDE12/B0ABCDE34/", " failed"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -151,6 +173,10 @@ func TestScrub_PreservesHarmlessDiagnostics(t *testing.T) {
 		"executor stage batch_transfer stalled at 80%",
 		"port 5432 unreachable",
 		"last event at 2026-07-02 14:10:33 (3600 seconds ago)",
+		// A URL is not a secret blob: the 40-char rule used to read this
+		// path as a token and return `…HubSpot-public-api-spec-[redacted].json`.
+		"spec fetch failed: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/main/PublicApiSpecs/CRM/Contacts/Rollouts/424/v3/contacts.json returned 404",
+		"GET https://api.example.com/v1/items?page=2&sort=name returned 500",
 	}
 	for _, s := range unchanged {
 		if got := Scrub(s); got != s {

@@ -85,30 +85,13 @@ func TestResumePipelineTables_MemberAllowed(t *testing.T) {
 // running execution in the active workspace and gets 200. Brackets
 // TestCancelExecution_ViewerDenied (viewer → 403) on the WSMember boundary.
 func TestCancelExecution_MemberAllowed(t *testing.T) {
-	mock, cleanup := wsScopeMockDB(t)
+	// A batch cancel also stops the run's sink worker
+	// (cancel_execution_stop_test.go): answer it here.
+	mock, _, cleanup := cancelHarness(t, false, http.StatusOK)
 	defer cleanup()
-	mock.MatchExpectationsInOrder(false)
+	expectCancelWrites(mock)
 
-	// Workspace-scoped status lookup yields the pipeline the role gate authorizes.
-	mock.ExpectQuery(`SELECT e\.status, e\.pipeline_id`).
-		WithArgs(wsScopeExecution, wsScopeWS).
-		WillReturnRows(sqlmock.NewRows([]string{"status", "pipeline_id"}).AddRow("running", wsScopePipeline))
-	expectMemberRoleGate(mock)
-	mock.ExpectExec(`UPDATE executions SET status = 'cancelled'`).
-		WithArgs(wsScopeExecution).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Best-effort projections (errors are swallowed by the handler).
-	mock.ExpectExec(`UPDATE pipeline_progress`).
-		WithArgs(wsScopePipeline, wsScopeExecution).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE pipelines SET status = 'stopped'`).
-		WithArgs(wsScopePipeline).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	r := wsScopeRouterAsRole(http.MethodPost, "/executions/:id/cancel", CancelExecution, "member")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/executions/"+wsScopeExecution+"/cancel", nil))
-
+	w := serveCancel(t)
 	if w.Code != http.StatusOK {
 		t.Fatalf("a member must be allowed to cancel a teammate's run; got %d: %s", w.Code, w.Body.String())
 	}

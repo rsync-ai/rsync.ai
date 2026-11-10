@@ -7,17 +7,20 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/handlers"
+	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 )
 
-// startSinkWorkerReaper starts the orphan sink-worker reaper
-// (KI-CDC-SINK-WORKER-NO-REAPER). It retries the stop_sink that a pipeline
-// Stop/Delete could not make, only for workers whose pipeline row is gone or
-// 'stopped' past a grace period. Dormant unless SINK_WORKER_REAPER_MODE is
-// dry_run or enforce. It lives in its own file so main.go line numbers cited
-// across the docs do not shift. The goroutine runs for the life of the process.
-func startSinkWorkerReaper(db *sql.DB, mcpManager *mcp.ServerManager) {
-	reaper := handlers.NewSinkWorkerReaperFromEnv(db, mcpManager)
+// startSinkWorkerReaper starts the sink-worker reaper (KI-CDC-SINK-WORKER-NO-REAPER).
+// It stops the workers of deleted pipelines, of pipelines 'stopped' past a grace
+// period, and of finished batch runs, and re-runs a deleted pipeline's topic cleanup
+// once its last worker is gone (KI-CDC-ORPHAN-TOPICS-RECREATED). On unless
+// SINK_WORKER_REAPER_MODE is off; dry_run only logs. It lives in its own file so
+// main.go line numbers cited across the docs do not shift. The goroutine runs for the
+// life of the process.
+func startSinkWorkerReaper(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.TopologyManager) {
+	reaper := handlers.NewSinkWorkerReaperFromEnv(db, mcpManager).
+		WithKafkaCleanup(handlers.PipelineKafkaCleanup(db, tm))
 	if reaper == nil {
 		return
 	}

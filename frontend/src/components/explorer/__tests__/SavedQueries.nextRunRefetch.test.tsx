@@ -3,6 +3,10 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: "admin",
@@ -16,7 +20,7 @@ vi.mock("@/contexts/WorkspaceContext", () => ({
 
 import { authFetch } from "@/lib/api/auth-fetch"
 import { SavedQueries, type SavedQuery } from "@/components/explorer/SavedQueries"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // The Explorer panel's "Next run" badge had the schedules page's bug: fetched once, it
 // read "due now" from the moment the run fired until something else reloaded the list.

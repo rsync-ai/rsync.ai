@@ -21,6 +21,8 @@ services:
     container_name: ${STACK_PREFIX:-rsync-ai}-mongodb-v1-0-0-mcp
   mysql-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-mysql-v1-0-0-mcp
+  nse-india-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-nse-india-v1-0-0-mcp
   oracle-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-oracle-v1-0-0-mcp
   postgresql-v1-0-0-mcp:
@@ -37,6 +39,8 @@ services:
     container_name: ${STACK_PREFIX:-rsync-ai}-sqlserver-v1-0-0-mcp
   stripe-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-stripe-v1-0-0-mcp
+  upstox-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-upstox-v1-0-0-mcp
   widgets-graphql-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-widgets-graphql-v1-0-0-mcp
 networks:

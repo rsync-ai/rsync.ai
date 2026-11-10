@@ -100,7 +100,7 @@ Names below are shown with the default prefix. `<pid8>` / `<eid8>` are the first
 
 | Component | Group id that actually joins | Source |
 |---|---|---|
-| Orchestrator, per-topic consumers — today only the schema-drift healer's, so only when `RSYNC_SCHEMA_DRIFT_ENABLED=true` | `rsync.<KAFKA_GROUP_ID>-<qualified topic>` | qualified once at [config.go:172](../../backend-orchestrator/internal/config/config.go) → [kafka_identity.go:56](../../backend-orchestrator/internal/config/kafka_identity.go); named by `consumerGroupID` at [manager.go:1038-1039](../../backend-orchestrator/internal/kafka/manager.go); joined from [healer.go:180](../../backend-orchestrator/internal/agents/healer/healer.go) |
+| Orchestrator, per-topic consumers — today only the schema-drift healer's, so only when `RSYNC_SCHEMA_DRIFT_ENABLED=true` | `rsync.<KAFKA_GROUP_ID>-<qualified topic>` | qualified once at [config.go:172](../../backend-orchestrator/internal/config/config.go) → [kafka_identity.go:56](../../backend-orchestrator/internal/config/kafka_identity.go); named by `consumerGroupID` at [manager.go:1024-1025](../../backend-orchestrator/internal/kafka/manager.go); joined from [healer.go:180](../../backend-orchestrator/internal/agents/healer/healer.go) |
 | Consumer-scaling agent | `rsync.<CONSUMER_GROUP_PREFIX>-<topic>` (default `rsync.rsync-pipeline-<topic>`) | [consumer/kafka_identity.go:62-63](../../backend-orchestrator/internal/agents/consumer/kafka_identity.go); default at [consumer/config.go:142](../../backend-orchestrator/internal/agents/consumer/config.go) |
 | CDC table-stats agent | `rsync.cdc-table-stats-<pipeline uuid>` | [cdcstats/kafka_identity.go:33](../../backend-orchestrator/internal/agents/cdcstats/kafka_identity.go) |
 | CDC schema-change agent | `rsync.cdc-schema-changes-<pipeline uuid>` | [cdcstats/kafka_identity.go:37](../../backend-orchestrator/internal/agents/cdcstats/kafka_identity.go) |
@@ -108,7 +108,7 @@ Names below are shown with the default prefix. `<pid8>` / `<eid8>` are the first
 | CDC sink, streaming-only | `rsync.sink-<pid8>-stream` | [sink_consumer_group.go:73](../../backend-orchestrator/internal/agents/executor/sink_consumer_group.go) |
 | CDC sink, default | `rsync.sink-<pid8>` | [sink_consumer_group.go:75](../../backend-orchestrator/internal/agents/executor/sink_consumer_group.go) |
 | CDC sink, per-execution (**opt-in only**) | `rsync.sink-<pid8>-<eid8>` | [sink_consumer_group.go:71](../../backend-orchestrator/internal/agents/executor/sink_consumer_group.go), behind `CDC_STREAMING_SINK_GROUP_PER_EXECUTION` (default off, [:17](../../backend-orchestrator/internal/agents/executor/sink_consumer_group.go)) |
-| api-gateway, main consumer | `rsync.api-gateway-consumer-group` | [consumer.go:92](../../api-gateway/internal/kafka/consumer.go); logical name passed at [main.go:540](../../api-gateway/cmd/server/main.go) |
+| api-gateway, main consumer | `rsync.api-gateway-consumer-group` | [consumer.go:92](../../api-gateway/internal/kafka/consumer.go); logical name passed at [main.go:552](../../api-gateway/cmd/server/main.go) |
 | api-gateway, projector | `rsync.api-gateway-projector` | [event_projector.go:130](../../api-gateway/internal/projector/event_projector.go) |
 | api-gateway, notifier inbox | `rsync.api-gateway-notifier` | [notifier.go:169](../../api-gateway/internal/notifier/notifier.go) |
 | api-gateway, domain events | `rsync.api-gateway-domain-events` | [domain_events.go:97](../../api-gateway/internal/handlers/domain_events.go) |
@@ -151,12 +151,12 @@ not a per-service rollout. The old groups linger on the broker until
 
 | Operation | Resource | Needed by | Source |
 |---|---|---|---|
-| `Describe` | `Cluster` | every client's metadata refresh; `ListGroups` behind the topology API's group listing | [manager.go:1653](../../backend-orchestrator/internal/kafka/manager.go) (`ListTopics`), [topology.go:528](../../backend-orchestrator/internal/kafka/topology.go) (`ListConsumerGroups`) |
+| `Describe` | `Cluster` | every client's metadata refresh; `ListGroups` behind the topology API's group listing | [manager.go:1664](../../backend-orchestrator/internal/kafka/manager.go) (`ListTopics`), [topology.go:528](../../backend-orchestrator/internal/kafka/topology.go) (`ListConsumerGroups`) |
 | `Create` | `Cluster` or `Topic` | topic provisioning — see §5 | [topology.go:319](../../backend-orchestrator/internal/kafka/topology.go) (`ensureTopicLocked`, the **only** creator in the service) |
 | `Alter` | `Topic` | partition expansion on an existing topic | [topology.go:297](../../backend-orchestrator/internal/kafka/topology.go), [:618](../../backend-orchestrator/internal/kafka/topology.go) (`CreatePartitions`) |
 | `Delete` | `Topic` | pipeline teardown and `DELETE /api/v1/topology/topics/:name` | [topology.go:583](../../backend-orchestrator/internal/kafka/topology.go), called from [cdc_kafka_teardown.go:518](../../backend-orchestrator/internal/handlers/cdc_kafka_teardown.go) |
 | `Describe` | `Topic` | `ListTopics` metadata calls | [topology.go:284](../../backend-orchestrator/internal/kafka/topology.go), [:467](../../backend-orchestrator/internal/kafka/topology.go) |
-| `Describe` | `Group` | consumer-lag reporting (`OffsetFetch`) | [manager.go:1324](../../backend-orchestrator/internal/kafka/manager.go) |
+| `Describe` | `Group` | consumer-lag reporting (`OffsetFetch`) | [manager.go:1310](../../backend-orchestrator/internal/kafka/manager.go) |
 | `Delete` | `Group` | pipeline teardown deletes the pipeline's own `sink-*` groups | [topology.go:551](../../backend-orchestrator/internal/kafka/topology.go), called from [cdc_kafka_teardown.go:499](../../backend-orchestrator/internal/handlers/cdc_kafka_teardown.go) |
 
 rsync.ai does **not** call `DescribeConfigs` or `AlterConfigs` — you do not need to
@@ -248,7 +248,7 @@ On a single-broker cluster leave `KAFKA_REPLICATION_FACTOR` unset or at `1`.
 **Narrowed, not closed.** The batch data topic and the CDC topic are now
 pre-created explicitly through the orchestrator's `TopologyManager`
 ([executor.go](../../backend-orchestrator/internal/agents/executor/executor.go)
-via `Manager.EnsureTopicExists` → [manager.go:1671](../../backend-orchestrator/internal/kafka/manager.go)),
+via `Manager.EnsureTopicExists` → [manager.go:1682](../../backend-orchestrator/internal/kafka/manager.go)),
 and a source-scanning guard test fails the build if a new produce target appears
 in the orchestrator without a matching creator
 ([topology_produce_targets_test.go](../../backend-orchestrator/internal/kafka/topology_produce_targets_test.go)).
@@ -258,8 +258,9 @@ The steady-state platform topics — `pipeline.domain.events`,
 `rsync.healer.*` topics when `RSYNC_SCHEMA_DRIFT_ENABLED=true` — are created by
 the orchestrator at startup, before any consumer joins
 ([`PlatformTopicNames` / `EnsurePlatformTopics`, topology.go](../../backend-orchestrator/internal/kafka/topology.go)).
-What is still left to broker auto-create is tracked, with its current inventory,
-as `KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY`.
+The per-pipeline data-plane topics are pre-created when a pipeline runs
+([kafka-topics.md §2d](../architecture/kafka-topics.md)), and every broker this
+repo bundles runs with auto-create off, so nothing is left to the broker.
 
 So on a cluster with auto-create off you must still grant `Create`.
 
@@ -271,7 +272,7 @@ carries your rows.
 
 **Every pipeline's data topic is named at runtime**, from the pipeline's own id —
 `rsync.pipeline.<pipeline-id-8>.data` — in
-[executor.go:2410](../../backend-orchestrator/internal/agents/executor/executor.go)
+[executor.go:2355](../../backend-orchestrator/internal/agents/executor/executor.go)
 and [hybrid_cdc.go:381](../../backend-orchestrator/internal/agents/executor/hybrid_cdc.go).
 The name does not exist until an operator creates the pipeline, so there is
 nothing to pre-create and no static job that can cover it: the chart's

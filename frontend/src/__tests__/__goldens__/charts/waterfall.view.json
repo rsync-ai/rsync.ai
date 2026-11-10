@@ -1,0 +1,57 @@
+{
+  "kind": "echart",
+  "settings": {
+    "description": "Cash by Step",
+    "x": {
+      "field": "x",
+      "label": "Step",
+      "categories": [
+        "1 Opening",
+        "2 Sales",
+        "3 Refunds",
+        "4 Payroll",
+        "5 Interest"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "decimal",
+      "title": "Cash"
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Cash",
+          "color": "series-1"
+        }
+      ]
+    },
+    "type": "waterfall",
+    "total": true
+  },
+  "rows": [
+    {
+      "x": "1 Opening",
+      "v": 1000
+    },
+    {
+      "x": "2 Sales",
+      "v": 650
+    },
+    {
+      "x": "3 Refunds",
+      "v": -180
+    },
+    {
+      "x": "4 Payroll",
+      "v": -720
+    },
+    {
+      "x": "5 Interest",
+      "v": 45
+    }
+  ],
+  "series": [],
+  "notes": []
+}

@@ -65,24 +65,6 @@ func TestConcurrencyForShippedDeployments(t *testing.T) {
 	}
 }
 
-// The wrapper must stay a pure projection of the decision, or the logged reason
-// and the pool the code actually uses could drift apart -- which would be worse
-// than not logging a reason at all.
-func TestComputeTableConcurrencyAgreesWithDecide(t *testing.T) {
-	const mib = int64(1024 * 1024)
-	for _, cpu := range []int{0, 1, 2, 4, 8, 64} {
-		for _, mem := range []int64{0, 256 * mib, 512 * mib, 2048 * mib, 16384 * mib} {
-			for _, override := range []int{0, 3} {
-				want, _ := decideTableConcurrency(cpu, mem, override)
-				if got := computeTableConcurrency(cpu, mem, override); got != want {
-					t.Fatalf("cpu=%d mem=%d override=%d: compute=%d decide=%d",
-						cpu, mem, override, got, want)
-				}
-			}
-		}
-	}
-}
-
 // The log line is the whole deliverable here, so assert the literal string an
 // operator will read rather than trusting that it formats sensibly.
 func TestDescribeConcurrencyRendersTheOperatorFacingString(t *testing.T) {

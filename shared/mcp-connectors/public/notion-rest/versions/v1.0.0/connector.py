@@ -39,6 +39,17 @@ logger = logging.getLogger(__name__)
 # Pagination safety caps (overrideable per-call)
 DEFAULT_MAX_PAGES = 10
 DEFAULT_MAX_RECORDS = 10000
+# One API export call reads at most this many pages, and starts no new page
+# after this many seconds; then it returns has_more + next_cursor and the
+# executor calls again from there. The time budget keeps one call inside the
+# orchestrator's 30 s MCP call limit.
+API_MAX_PAGES_PER_CALL = 100
+API_TIME_BUDGET_S = 20
+
+# A {placeholder} in a resource endpoint (/v2/list/{list_id}/task). One pattern
+# for both readers: _make_request_v2 fills it in, and discover_schema leaves out
+# a table whose placeholder the connection does not set.
+PATH_PARAM_PATTERN = r"\{([^/{}]+)\}"
 
 
 class NotionRestConnector(BaseMCPConnector):
@@ -289,6 +300,32 @@ class NotionRestConnector(BaseMCPConnector):
             "Accept": "application/json",
         }
     
+    @staticmethod
+    def _trailing_item_placeholder(endpoint: str, config: Dict = None):
+        """(collection, name) when ``endpoint`` ends in an item placeholder
+        (``/pet/{petId}``), else None. A trailing placeholder the connection
+        config fills is a selector the route needs (``/me/top/{type}``), not
+        the item id."""
+        import re as _re_ip
+        m = _re_ip.fullmatch(r"(.*)/\{([^/{}]+)\}/?", endpoint or "")
+        if not m or (config or {}).get(m.group(2)) not in (None, ""):
+            return None
+        return (m.group(1) or "/"), m.group(2)
+
+    def _item_path(self, endpoint: str, record_id: Any, config: Dict = None) -> str:
+        """The route of one record. The id fills a trailing item placeholder:
+        appended after it instead, the placeholder reaches _sub_path_param,
+        which has nothing to fill it with and raises."""
+        trailing = self._trailing_item_placeholder(endpoint, config)
+        if trailing:
+            return f"{trailing[0].rstrip('/')}/{record_id}"
+        return f"{endpoint}/{record_id}"
+
+    def _collection_path(self, endpoint: str, config: Dict = None) -> str:
+        """Where a create POSTs: the endpoint without its item placeholder."""
+        trailing = self._trailing_item_placeholder(endpoint, config)
+        return trailing[0] if trailing else endpoint
+
     def _make_request(self, method: str, endpoint: str, config: Dict, 
                       params: Dict = None, data: Dict = None) -> Dict[str, Any]:
         """Legacy request wrapper (dict). Uses BaseMCPConnector._make_request_v2 under the hood."""
@@ -350,7 +387,7 @@ class NotionRestConnector(BaseMCPConnector):
                             f"Missing required path parameter '{_key}' for endpoint '{endpoint}'"
                         )
                     return str(_val)
-                endpoint = _re_pp.sub(r"\{([^/{}]+)\}", _sub_path_param, endpoint)
+                endpoint = _re_pp.sub(PATH_PARAM_PATTERN, _sub_path_param, endpoint)
                 if _consumed and isinstance(params, dict):
                     params = {k: v for k, v in params.items() if k not in _consumed}
             url = f"{str(base).rstrip('/')}/{endpoint.lstrip('/')}"
@@ -802,6 +839,75 @@ class NotionRestConnector(BaseMCPConnector):
                 keys.add(str(spec["query_param"]).lower())
         return {k: v for k, v in (config or {}).items() if k.lower() not in keys}
 
+    def _auth_material(self, headers: Dict) -> Dict:
+        """The auth-bearing headers in `headers`, keyed by lowercase name.
+
+        A credential-free header is not auth material: an empty token renders
+        as a bare scheme name ("Bearer"), which a server treats exactly like
+        sending nothing at all.
+        """
+        out = {}
+        for k, v in (headers or {}).items():
+            if k.lower() not in self._AUTH_HEADER_NAMES:
+                continue
+            parts = str(v or "").split()
+            if not parts:
+                continue
+            if len(parts) == 1 and parts[0].lower() in ("bearer", "token", "basic"):
+                continue
+            out[k.lower()] = v
+        return out
+
+    def _unused_credential_keys(self, config: Dict) -> List[str]:
+        """The credential keys in `config`, when NOT ONE of them reaches a request.
+
+        _credentials_present() is generous on purpose -- it ends in a generic
+        key list, so a credential under an unexpected name is still put to the
+        anonymous control -- while _get_headers() emits only the auth scheme
+        this connector reads. A key on the first list but not the second (a
+        `personal_access_token` handed to a connector that reads `token`) sends
+        every probe out anonymously, and the control then has nothing to strip.
+        So ask the headers directly: with the env fallback switched off, if
+        stripping every credential key changes no header and leaves no auth
+        material behind, nothing the caller supplied was ever sent.
+
+        Returns [] whenever any credential does reach the request -- that one is
+        then the credential under test -- including a declared query-string
+        credential, which the headers cannot show.
+        """
+        cfg = config or {}
+        keys = {
+            "access_token", "token", "api_key", "apikey", "bearer_token",
+            "personal_access_token", "private_token", "auth_token",
+        }
+        if cfg.get("username") and cfg.get("password"):
+            keys.update(("username", "password"))
+        for spec in (getattr(self, "SUPPORTED_AUTH_METHODS", None) or {}).values():
+            if spec.get("query_param") and cfg.get(spec["query_param"]):
+                return []
+            keys.update(spec.get("config_keys") or [])
+        present = sorted(k for k in keys if cfg.get(k))
+        if not present:
+            return []
+        saved_env = {k: os.environ.get(k) for k in ("ALLOW_ENV_CREDENTIALS", "MCP_API_KEY")}
+        try:
+            os.environ["ALLOW_ENV_CREDENTIALS"] = "false"
+            os.environ.pop("MCP_API_KEY", None)
+            try:
+                authed = self._get_headers(cfg) or {}
+                anon = self._get_headers(self._anonymous_config(cfg)) or {}
+            except Exception:
+                return []
+        finally:
+            for _k, _v in saved_env.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+        if authed != anon or self._auth_material(authed):
+            return []
+        return present
+
     def _probe_endpoint_is_public(self, endpoint: str, config: Dict,
                                   params: Dict = None) -> Optional[bool]:
         """Re-issue a successful probe WITHOUT credentials, as a control.
@@ -837,28 +943,12 @@ class NotionRestConnector(BaseMCPConnector):
             except Exception:
                 return None
 
-            def _auth_material(headers):
-                out = {}
-                for k, v in headers.items():
-                    if k.lower() not in self._AUTH_HEADER_NAMES:
-                        continue
-                    # A credential-free header is not auth material: an empty
-                    # token renders as a bare scheme name ("Bearer"), which a
-                    # server treats exactly like sending nothing at all.
-                    parts = str(v or "").split()
-                    if not parts:
-                        continue
-                    if len(parts) == 1 and parts[0].lower() in ("bearer", "token", "basic"):
-                        continue
-                    out[k.lower()] = v
-                return out
-
             # Nothing to strip, or the strip changed nothing (query-string auth,
             # an unknown config key, a cached token we cannot see). Either way an
             # anonymous 2xx would be indistinguishable from an authenticated one.
-            if not _auth_material(authed_headers):
+            if not self._auth_material(authed_headers):
                 return None
-            if _auth_material(anon_headers) == _auth_material(authed_headers):
+            if self._auth_material(anon_headers) == self._auth_material(authed_headers):
                 return None
             try:
                 result = self._make_request('GET', endpoint, anon, params=params)
@@ -876,7 +966,13 @@ class NotionRestConnector(BaseMCPConnector):
 
         if result.get("success"):
             return True
-        if int(result.get("status_code") or 0) in (401, 403):
+        # Refused: the IDENTICAL request minus only the credential came back
+        # 4xx, so the credential is what earned the 2xx. Any 4xx, not just
+        # 401/403 -- ClickUp answers a missing token 400 "Authorization header
+        # required" (OAUTH_017), and an API may hide a gated resource behind a
+        # 404. 408/429 are about timing, not the credential: no verdict.
+        code = int(result.get("status_code") or 0)
+        if 400 <= code < 500 and code not in (408, 429):
             return False
         return None
 
@@ -944,11 +1040,15 @@ class NotionRestConnector(BaseMCPConnector):
             # whenever _credentials_present() says yes — it ends in a generic
             # key list — but _get_headers() never turns that key into a
             # header: a config carrying `personal_access_token` against a
-            # connector that does not declare that key does exactly this. So
-            # `credentials_validated: True` can still rest on an uncorroborated
-            # whoami 2xx. The fallback is deliberate — an inconclusive control
-            # must not fail an otherwise good connection — but the hole it
-            # leaves is open, and is NOT closed here.
+            # connector that does not declare that key does exactly this.
+            # _unused_credential_keys() catches that case before the fallback
+            # below trusts a whoami 2xx, and reports it unvalidated with the
+            # key named. What it leaves is a control that ran but could not be
+            # read: the credential reached the request and the anonymous
+            # re-issue came back neither 2xx nor 401/403 (a 500, say). A whoami
+            # 2xx is still trusted there, uncorroborated — on purpose, since an
+            # inconclusive control must not fail or downgrade a working
+            # connection.
             resource_candidates = [
                 "/databases",
                 "/users",
@@ -970,6 +1070,7 @@ class NotionRestConnector(BaseMCPConnector):
             last_err = None
             saw_auth_failure = False
             saw_public_endpoint = False
+            unvalidated_reach = None
             # Probe THIS connector's own listable, path-param-free resource
             # endpoints FIRST (with a minimal page) via the real auth path — for
             # the vast majority of vendors these are the only endpoints that
@@ -1020,16 +1121,37 @@ class NotionRestConnector(BaseMCPConnector):
                         saw_public_endpoint = True
                         last_err = "reachable, but the endpoints that answered are public and cannot validate credentials"
                         continue
-                    # Inconclusive (no control possible) -- fall back to the
-                    # historical rule: trust a whoami 2xx, keep looking after a
-                    # resource 2xx.
+                    # Inconclusive: the control could not run, or its answer
+                    # could not be read. First rule out that nothing the caller
+                    # supplied ever reached a request -- a key this connector
+                    # does not turn into auth. Then the 2xx was earned
+                    # anonymously and proves nothing about the credential: say
+                    # so, and name the key, so the user knows which to change.
                     if not is_resource:
+                        unused = self._unused_credential_keys(config)
+                        if unused:
+                            return {
+                                "success": True,
+                                "message": "Connection successful",
+                                "credentials_validated": False,
+                                "warning": (
+                                    "Reachable, but the credentials were not validated: no "
+                                    "request this connector sends carries the config key(s) "
+                                    + ", ".join(unused)
+                                    + ". Check the key name against the ones it documents."
+                                ),
+                            }
+                        # The credential DID reach the request; only the control
+                        # was unreadable (an anonymous 500, say). Fall back to
+                        # the historical rule: trust a whoami 2xx, keep looking
+                        # after a resource 2xx.
                         return {
                             "success": True,
                             "message": "Connection successful",
                             "credentials_validated": True,
                         }
                     last_err = "reachable but credentials were not validated on an auth-protected endpoint"
+                    unvalidated_reach = last_err
                     continue
                 code = int(result.get("status_code") or 0)
                 if code in (401, 403):
@@ -1102,9 +1224,12 @@ class NotionRestConnector(BaseMCPConnector):
                         "auth-protected paths on this API may still fail."
                     ),
                 }
+            # A probe that REACHED the API says more than the 404s of the whoami
+            # paths tried after it: "Last error: HTTP 404" sent a user whose
+            # token worked looking for a wrong URL.
             return {
                 "success": False,
-                "error": f"No probe endpoint confirmed the connection. Last error: {last_err or 'all candidates 404/timed out'}.",
+                "error": f"No probe endpoint confirmed the connection. Last error: {unvalidated_reach or last_err or 'all candidates 404/timed out'}.",
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1277,6 +1402,28 @@ class NotionRestConnector(BaseMCPConnector):
                 },
             ]
 
+            # A table whose endpoint needs a path ID the connection does not set
+            # ({list_id} in /v2/list/{list_id}/task) cannot be read: every request
+            # for it fails "Missing required path parameter" in _make_request_v2
+            # (same rule: None or "" is unset). Leave it out until the ID is
+            # saved on the connection, rather than offer a table no sync can read.
+            # Each table left out is reported with the settings it needs, so a
+            # pipeline that already syncs it asks for the setting instead of
+            # reading the table as dropped from the source.
+            import re as _re_pp
+            tables_needing_settings = []
+            listed = []
+            for r in resources:
+                unset = [
+                    _k for _k in _re_pp.findall(PATH_PARAM_PATTERN, r.get("endpoint") or "")
+                    if (config or {}).get(_k) in (None, "")
+                ]
+                if unset:
+                    tables_needing_settings.append({"name": r["name"], "missing_settings": unset})
+                else:
+                    listed.append(r)
+            resources = listed
+
             # One probe per resource: read the first record (for column
             # schema) and the total (for row count). Per-resource
             # failures stay local — one bad endpoint must not take down
@@ -1350,7 +1497,8 @@ class NotionRestConnector(BaseMCPConnector):
             return {
                 "success": True,
                 "tables": resources,  # Using 'tables' for compatibility
-                "total_tables": len(resources)
+                "total_tables": len(resources),
+                "tables_needing_settings": tables_needing_settings,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1406,14 +1554,16 @@ class NotionRestConnector(BaseMCPConnector):
         if not endpoint:
             return {"success": False, "error": f"Unknown resource: {resource}"}
         
-        # Extract pagination parameters
-        max_pages = int(params.get("max_pages") or DEFAULT_MAX_PAGES)
-        max_records = int(params.get("max_records") or DEFAULT_MAX_RECORDS)
+        # Extract pagination parameters. The executor's `limit` is its batch
+        # size: one call returns at most that many rows, then has_more.
+        max_pages = int(params.get("max_pages") or API_MAX_PAGES_PER_CALL)
+        max_records = int(params.get("max_records") or params.get("limit") or DEFAULT_MAX_RECORDS)
+        time_budget_s = float(params.get("time_budget_s") or API_TIME_BUDGET_S)
         
         # Extract incremental sync parameters
         since = params.get('since') or params.get('updated_since') or params.get('modified_after')
+        # Where an earlier call stopped (its next_cursor); the read resumes there.
         cursor = params.get('cursor') or params.get('next_cursor')
-        incremental_field = params.get('incremental_field', 'updated_at')
         
         # Only pass *query params* to the API (exclude config/object/max_pages, etc.)
         query_params = {}
@@ -1424,6 +1574,11 @@ class NotionRestConnector(BaseMCPConnector):
         
         # Build resource config with incremental metadata
         resource_config = self._get_resource_config(resource)
+        incremental_field = (
+            params.get('incremental_field')
+            or resource_config.get('incremental_field')
+            or 'updated_at'
+        )
         
         # Always forward 'since' to the API when provided — even if the resource
         # doesn't advertise supports_incremental, sending the param is harmless
@@ -1433,11 +1588,6 @@ class NotionRestConnector(BaseMCPConnector):
             incremental_param = resource_config.get('incremental_param', 'updated_since')
             query_params[incremental_param] = since
         
-        # Apply cursor for pagination resumption
-        if cursor:
-            pagination_param = resource_config.get('pagination_param', 'cursor')
-            query_params[pagination_param] = cursor
-
         # On an incremental re-run the caller passes its last checkpoint as
         # `since`. Forward it as prior_watermark so a 0-row result echoes the
         # checkpoint back instead of resetting it (and re-scanning from zero).
@@ -1460,10 +1610,12 @@ class NotionRestConnector(BaseMCPConnector):
                 incremental_field=incremental_field if resource_config.get('supports_incremental') else None,
                 resource_config=resource_config,
                 prior_watermark=prior_watermark,
+                resume_cursor=cursor,
+                time_budget_s=time_budget_s,
             )
 
             # Convert ExportResult to dict (carries records, next_cursor,
-            # has_more, and stats.watermark/max_watermark).
+            # has_more, warnings, and stats.watermark/max_watermark).
             return result.to_dict()
 
         except Exception as e:
@@ -1811,11 +1963,11 @@ class NotionRestConnector(BaseMCPConnector):
             return {"success": False, "error": "Missing 'id' parameter"}
         
         # Keep the endpoint template ('/databases') as a PLAIN
-        # string literal so any '{placeholder}' path params stay literal and are
-        # bound later by _make_request -> _sub_path_param from config/params.
-        # Do NOT f-string the endpoint here or a bare '{param}' becomes an
-        # undefined name -> NameError at runtime.
-        endpoint = "/databases" + f"/{record_id}"
+        # string literal: _item_path puts the id in a trailing item placeholder,
+        # and any other '{placeholder}' stays literal for _make_request ->
+        # _sub_path_param to bind from config/params. Do NOT f-string the
+        # endpoint here or a bare '{param}' becomes an undefined name.
+        endpoint = self._item_path("/databases", record_id, config)
         return self._make_request('GET', endpoint, config)
     
     def list_users(self, params: Dict = None) -> Dict[str, Any]:
@@ -1833,11 +1985,11 @@ class NotionRestConnector(BaseMCPConnector):
             return {"success": False, "error": "Missing 'id' parameter"}
         
         # Keep the endpoint template ('/users') as a PLAIN
-        # string literal so any '{placeholder}' path params stay literal and are
-        # bound later by _make_request -> _sub_path_param from config/params.
-        # Do NOT f-string the endpoint here or a bare '{param}' becomes an
-        # undefined name -> NameError at runtime.
-        endpoint = "/users" + f"/{record_id}"
+        # string literal: _item_path puts the id in a trailing item placeholder,
+        # and any other '{placeholder}' stays literal for _make_request ->
+        # _sub_path_param to bind from config/params. Do NOT f-string the
+        # endpoint here or a bare '{param}' becomes an undefined name.
+        endpoint = self._item_path("/users", record_id, config)
         return self._make_request('GET', endpoint, config)
     
     def list_pages(self, params: Dict = None) -> Dict[str, Any]:
@@ -1855,11 +2007,11 @@ class NotionRestConnector(BaseMCPConnector):
             return {"success": False, "error": "Missing 'id' parameter"}
         
         # Keep the endpoint template ('/search') as a PLAIN
-        # string literal so any '{placeholder}' path params stay literal and are
-        # bound later by _make_request -> _sub_path_param from config/params.
-        # Do NOT f-string the endpoint here or a bare '{param}' becomes an
-        # undefined name -> NameError at runtime.
-        endpoint = "/search" + f"/{record_id}"
+        # string literal: _item_path puts the id in a trailing item placeholder,
+        # and any other '{placeholder}' stays literal for _make_request ->
+        # _sub_path_param to bind from config/params. Do NOT f-string the
+        # endpoint here or a bare '{param}' becomes an undefined name.
+        endpoint = self._item_path("/search", record_id, config)
         return self._make_request('GET', endpoint, config)
     
     def list_blocks(self, params: Dict = None) -> Dict[str, Any]:
@@ -1877,11 +2029,11 @@ class NotionRestConnector(BaseMCPConnector):
             return {"success": False, "error": "Missing 'id' parameter"}
         
         # Keep the endpoint template ('/blocks') as a PLAIN
-        # string literal so any '{placeholder}' path params stay literal and are
-        # bound later by _make_request -> _sub_path_param from config/params.
-        # Do NOT f-string the endpoint here or a bare '{param}' becomes an
-        # undefined name -> NameError at runtime.
-        endpoint = "/blocks" + f"/{record_id}"
+        # string literal: _item_path puts the id in a trailing item placeholder,
+        # and any other '{placeholder}' stays literal for _make_request ->
+        # _sub_path_param to bind from config/params. Do NOT f-string the
+        # endpoint here or a bare '{param}' becomes an undefined name.
+        endpoint = self._item_path("/blocks", record_id, config)
         return self._make_request('GET', endpoint, config)
 
     # DO NOT implement handle_request, _handle_tool_call, run, or list_tools

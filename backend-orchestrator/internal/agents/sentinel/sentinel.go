@@ -32,7 +32,6 @@ type Agent struct {
 	issueDetector *IssueDetector
 	healer        *Healer
 	logger        *AuditLogger
-	predictor     *AnomalyPredictor
 
 	// State
 	activeIssues map[string]*Issue
@@ -87,7 +86,6 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig, a
 	agent.healthMonitor.serviceProbes = serviceProbesFromEnv(os.Getenv)
 	agent.issueDetector = NewIssueDetector(config, agent.logger)
 	agent.healer = NewHealer(kafkaManager, db, config, agent.logger, agentManager)
-	agent.predictor = NewAnomalyPredictor(config, agent.logger)
 
 	return agent
 }
@@ -113,12 +111,6 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("failed to start healer: %w", err)
 	}
 	log.Info("✅ Auto-Healer started")
-
-	// Start predictor
-	if err := a.predictor.Start(a.ctx); err != nil {
-		return fmt.Errorf("failed to start anomaly predictor: %w", err)
-	}
-	log.Info("✅ Anomaly Predictor started")
 
 	// Start logger
 	if err := a.logger.Start(a.ctx); err != nil {
@@ -151,9 +143,6 @@ func (a *Agent) Stop() {
 	}
 	if a.healer != nil {
 		a.healer.Stop()
-	}
-	if a.predictor != nil {
-		a.predictor.Stop()
 	}
 	if a.logger != nil {
 		a.logger.Stop()
@@ -368,6 +357,7 @@ func (a *Agent) resolveRecoveredIssues(ctx context.Context, components []*Compon
 			"issue_type":   issue.Type,
 			"component_id": issue.ComponentID,
 		}).Info("✅ Issue resolved — component is healthy again")
+		publishInstanceResolved(a.kafkaManager, issue)
 	}
 
 	a.deleteIssueRows(ctx, ids)
@@ -434,18 +424,6 @@ func (a *Agent) triggerHealing(issue *Issue) {
 			"trace_id":     traceID,
 			"span_id":      spanID,
 		}).Warn("⏭️  Healing action skipped — issue left open")
-	} else if result.Success && action == HealingActionAlert {
-		// Delivered, not repaired. An alert fixes nothing, so the issue stays open until
-		// resolveRecoveredIssues sees the component healthy again. Resolving it here
-		// dropped it from activeIssues while the service was still down, and the next
-		// detection after the cooldown filed it as new and alerted again every five
-		// minutes for the length of the outage.
-		log.WithFields(log.Fields{
-			"issue_id":     issue.ID,
-			"component_id": issue.ComponentID,
-			"trace_id":     traceID,
-			"span_id":      spanID,
-		}).Info("📣 Alert delivered — issue left open until the component recovers")
 	} else if result.Success {
 		log.WithFields(log.Fields{
 			"issue_id":     issue.ID,

@@ -101,3 +101,17 @@ const (
 	// DAG-specific policy codes
 	PolicyCodeNodeInputRequired = "NODE_INPUT_REQUIRED" // Node needs user input via NL
 )
+
+// policyCodeIsAWait reports whether a policy code is a wait the workflow parks
+// or re-dispatches on (user input, the next chunk) rather than a failure.
+func policyCodeIsAWait(code string) bool {
+	switch code {
+	case PolicyCodeTableSelectionRequired,
+		PolicyCodeNeedsContinuation,
+		PolicyCodeNodeInputRequired,
+		PolicyCodeMissingConnectors,
+		PolicyCodeMissingConnections:
+		return true
+	}
+	return false
+}

@@ -177,7 +177,8 @@ func (vr *VersionResolver) ResolveConnectorVersion(connectionID string) (*Connec
 	}
 
 	// Default to "latest" if not specified
-	if connectorVersion == "" {
+	floating := IsFloatingVersion(connectorVersion)
+	if floating {
 		connectorVersion = "latest"
 	}
 
@@ -196,14 +197,29 @@ func (vr *VersionResolver) ResolveConnectorVersion(connectionID string) (*Connec
 		return nil, fmt.Errorf("failed to resolve version: %w", err)
 	}
 
-	// Build version path.
-	var versionPath string
-	versionPath = filepath.Join(vr.connectorsBasePath, resolvedDir, "versions", concreteVersion)
+	versionPath, err := vr.versionPath(resolvedDir, connectorType, concreteVersion)
+	if err != nil {
+		return nil, err
+	}
 
-	// Validate version exists
-	if _, err := os.Stat(versionPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("version path does not exist: %s (connector=%s, version=%s)",
-			versionPath, connectorType, concreteVersion)
+	// A connection still at "latest" is pinned to the version it runs on now,
+	// so a connector version published later cannot move it.
+	if floating {
+		pinned, perr := pinConnectorVersion(database, connectionID, concreteVersion)
+		switch {
+		case perr != nil || IsFloatingVersion(pinned):
+			log.Warnf("⚠️  Connection %s: failed to pin %s to %s (%v); this run uses %s",
+				connectionID, connectorType, concreteVersion, perr, concreteVersion)
+		case pinned == concreteVersion:
+			log.Infof("📌 Pinned connection %s to %s %s (was latest)", connectionID, connectorType, pinned)
+		default:
+			// Another resolve pinned the row first; run on its pin.
+			log.Infof("📌 Connection %s already pinned to %s %s (latest is %s)", connectionID, connectorType, pinned, concreteVersion)
+			concreteVersion = pinned
+			if versionPath, err = vr.versionPath(resolvedDir, connectorType, concreteVersion); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// Compute directory hash for integrity
@@ -227,6 +243,56 @@ func (vr *VersionResolver) ResolveConnectorVersion(connectionID string) (*Connec
 
 	log.Infof("✅ Resolved connector snapshot: %s@%s (hash=%s)", canonicalType, concreteVersion, hash[:8])
 	return snapshot, nil
+}
+
+// versionPath returns <base>/<connectorDir>/versions/<version>, or an error
+// when that directory does not exist.
+func (vr *VersionResolver) versionPath(connectorDir, connectorType, version string) (string, error) {
+	p := filepath.Join(vr.connectorsBasePath, connectorDir, "versions", version)
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		return "", fmt.Errorf("version path does not exist: %s (connector=%s, version=%s)",
+			p, connectorType, version)
+	}
+	return p, nil
+}
+
+// CurrentVersion returns the version "latest" means for a connector today,
+// from its latest.json. Connection create stores it, so a new connection is
+// pinned from the start.
+func (vr *VersionResolver) CurrentVersion(connectorType string) (string, error) {
+	resolvedDir, _, err := vr.resolveConnectorDir(connectorType)
+	if err != nil {
+		return "", err
+	}
+	return vr.resolveVersion(resolvedDir, "latest")
+}
+
+// IsFloatingVersion reports whether a stored connector_version follows
+// latest.json instead of naming a version. The column is NOT NULL DEFAULT
+// 'latest', so floating is "latest" or empty.
+func IsFloatingVersion(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "" || v == "latest"
+}
+
+// pinConnectorVersion stores concrete on a connection whose version still
+// floats and returns the version the connection is pinned to. The WHERE
+// clause makes the first pin win: when another resolve pinned the row first
+// (the orchestrator pins with the same statement), nothing is written and
+// that pin is returned, so a pin is never moved.
+func pinConnectorVersion(database *sql.DB, connectionID, concrete string) (string, error) {
+	var pinned string
+	err := database.QueryRow(
+		`UPDATE connections SET connector_version = $2 WHERE id = $1 AND lower(btrim(connector_version)) IN ('', 'latest') RETURNING connector_version`,
+		connectionID, concrete,
+	).Scan(&pinned)
+	if err == sql.ErrNoRows {
+		err = database.QueryRow(`SELECT connector_version FROM connections WHERE id = $1`, connectionID).Scan(&pinned)
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(pinned), nil
 }
 
 // resolveVersion resolves "latest" to a concrete version or validates a specific version

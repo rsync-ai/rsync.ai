@@ -97,6 +97,16 @@ def _ollama_base_url() -> str:
     return url
 
 
+def _openai_base_url() -> str:
+    """Return the OpenAI base URL, OpenAI's own API when OPENAI_BASE_URL is empty.
+
+    Every OpenAI client gets this explicitly. Compose passes OPENAI_BASE_URL
+    through as "" when it is unset, and a client built without ``base_url``
+    reads the variable itself and takes the "" as the address: no host.
+    """
+    return (os.getenv("OPENAI_BASE_URL") or "").strip() or "https://api.openai.com/v1"
+
+
 # Example values this repo's env templates and docs have shipped in credential
 # slots. An operator who copied one of those files has not set up an LLM, so these
 # count as unset. Compared lower-cased.
@@ -663,15 +673,12 @@ def make_sync_client(provider: str = "", timeout: float = 45.0, max_retries: int
             max_retries=max_retries,
         )
     # openai
-    kwargs: dict = {
-        "api_key": openai_api_key(),
-        "timeout": timeout,
-        "max_retries": max_retries,
-    }
-    _base = (os.getenv("OPENAI_BASE_URL") or "").strip()
-    if _base:
-        kwargs["base_url"] = _base
-    return OpenAI(**kwargs)
+    return OpenAI(
+        api_key=openai_api_key(),
+        base_url=_openai_base_url(),
+        timeout=timeout,
+        max_retries=max_retries,
+    )
 
 
 def make_async_client(provider: str = "", timeout: float = 120.0) -> AsyncOpenAI:
@@ -710,11 +717,11 @@ def make_async_client(provider: str = "", timeout: float = 120.0) -> AsyncOpenAI
             timeout=timeout,
         )
     # openai
-    kwargs: dict = {"api_key": openai_api_key(async_client=True), "timeout": timeout}
-    _base = (os.getenv("OPENAI_BASE_URL") or "").strip()
-    if _base:
-        kwargs["base_url"] = _base
-    return AsyncOpenAI(**kwargs)
+    return AsyncOpenAI(
+        api_key=openai_api_key(async_client=True),
+        base_url=_openai_base_url(),
+        timeout=timeout,
+    )
 
 
 def client_egress_host(client) -> str:

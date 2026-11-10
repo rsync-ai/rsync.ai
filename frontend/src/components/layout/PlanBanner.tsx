@@ -52,9 +52,10 @@ export function bannerFromPlan(data: PlanSummary): BannerState | null {
   if ((data.plan === "free" || data.plan === "starter") && data.pipelines_limit != null) {
     const used = data.pipelines_used ?? 0
     const limit = data.pipelines_limit
-    // Free: always nudge. Starter (paid): only nudge once at/over the cap,
-    // so a paying customer with headroom isn't nagged every page load.
-    if (data.plan === "free" || used >= limit) {
+    // The Usage page owns the "x/y pipelines" meter; the banner repeats it only
+    // near the cap. Free: one pipeline left or fewer. Starter (paid): only at/over
+    // the cap, so a paying customer with headroom isn't nagged every page load.
+    if ((data.plan === "free" && limit - used <= 1) || used >= limit) {
       return { variant: "plan_limit", plan: data.plan, used, limit }
     }
   }
@@ -89,10 +90,19 @@ export function PlanBanner() {
   }, [pathname, refresh])
 
   useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void refresh()
+    // Coming back to a tab fires both "visibilitychange" and "focus"; they are
+    // one return, so the second within a second reads nothing new.
+    let lastReturn = 0
+    const onReturn = () => {
+      const now = Date.now()
+      if (now - lastReturn < 1_000) return
+      lastReturn = now
+      void refresh()
     }
-    const onFocus = () => void refresh()
+    const onVisible = () => {
+      if (document.visibilityState === "visible") onReturn()
+    }
+    const onFocus = onReturn
     window.addEventListener("focus", onFocus)
     document.addEventListener("visibilitychange", onVisible)
     const offWorkspace = onActiveWorkspaceChange(() => void refresh())
@@ -115,7 +125,7 @@ export function PlanBanner() {
 
   return (
     <>
-      <div className="sticky top-16 z-20 -mx-4 sm:-mx-6 -mt-4 sm:-mt-6 mb-4 flex items-center justify-between gap-4 border-b border-primary/20 bg-primary/5 px-4 py-2.5 text-sm text-primary dark:border-primary/30 dark:bg-primary/10">
+      <div className="sticky top-16 z-20 flex shrink-0 items-center justify-between gap-4 border-b border-primary/20 bg-primary/5 px-4 py-2.5 text-sm text-primary dark:border-primary/30 dark:bg-primary/10">
         <div className="flex min-w-0 items-center gap-2">
           <Sparkles className="h-4 w-4 shrink-0 text-primary" />
           <span>

@@ -167,9 +167,9 @@ services:
       # OLLAMA_BASE_URL as well, not OLLAMA_URL alone. _ollama_base_url in
       # llm-service/src/utils/openai_client.py:70 reads BASE_URL first and only
       # falls back to URL when BASE_URL is unset or empty -- and
-      # docker-compose.yml:1585 hard-codes
+      # docker-compose.yml:1586 hard-codes
       # OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 on tool-generator,
-      # a line docker-compose.prod.yml:789 repeats. With only OLLAMA_URL set
+      # a line docker-compose.prod.yml:781 repeats. With only OLLAMA_URL set
       # here, that service kept dialling the host on both of those bases while
       # this overlay's whole promise is that it does not have to. Rendered
       # `docker compose -f docker-compose.yml -f docker-compose.ollama.yml config`
@@ -213,7 +213,7 @@ services:
       # A fifth model name, and the only one that is a LIST. When the Explorer's
       # NL->SQL step returns something that is not a SELECT, it retries against
       # each name in EXPLORER_SQL_FALLBACK_MODELS in turn
-      # (llm-service/src/gateway/main.py:2756-2782), and its built-in default is
+      # (llm-service/src/gateway/main.py:2759-2782), and its built-in default is
       # the literal `qwen2.5:7b,llama3:latest,codellama:7b-instruct` -- names
       # from the era when this file pulled three models. ollama-pull downloads
       # one, so on a default install two of those three are guaranteed 404s

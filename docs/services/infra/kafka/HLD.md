@@ -2,7 +2,6 @@
 
 ### Purpose
 Kafka is the **message bus** for rsync-ai:
-- agent command + result topics,
 - pipeline domain events and CDC topics,
 - (optionally) schema-registry backed Avro payloads.
 

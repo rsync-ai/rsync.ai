@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A Debezium SOURCE must bound its retries, and MongoDB and PostgreSQL sources must heartbeat.
+"""A Debezium SOURCE must bound its retries, and MongoDB, PostgreSQL and MySQL sources must heartbeat.
 
 KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL. Two independent defaults combined into a
 pipeline that reported "healthy" for three days while moving zero rows:
@@ -27,6 +27,11 @@ pipeline that reported "healthy" for three days while moving zero rows:
    Debezium itself logged that the events "were all filtered out" and to enable
    heartbeats. A heartbeat commits the last LSN received, filtered or not.
 
+4. A MySQL/MariaDB connector writes nothing on an idle source, so without a
+   heartbeat the Sentinel cannot tell a quiet binlog from a dead stream. A
+   heartbeat is a record on the heartbeat topic every interval, which the freshness
+   watchdog (cdc_source_freshness.go) reads as proof of life.
+
 This file is the live path. `cdc_config_generator.py` also emits a MongoDB config
 but is explicitly advisory; the config that actually starts a connector is the one
 `_build_config` returns here.
@@ -53,6 +58,7 @@ _OWNED_ENV = (
     "CDC_CONNECTOR_RETRY_WAIT_MS",
     "CDC_MONGO_HEARTBEAT_INTERVAL_MS",
     "CDC_PG_HEARTBEAT_INTERVAL_MS",
+    "CDC_MYSQL_HEARTBEAT_INTERVAL_MS",
 )
 
 
@@ -94,7 +100,7 @@ def _relational_cfg(db_type, **overrides):
 
 
 # --------------------------------------------------------------------------
-# Heartbeats (MongoDB and PostgreSQL)
+# Heartbeats (MongoDB, PostgreSQL and MySQL/MariaDB)
 # --------------------------------------------------------------------------
 
 
@@ -147,9 +153,10 @@ def test_the_key_debezium_names_the_topic_from_is_set():
 
 
 def test_heartbeat_interval_is_a_positive_integer_of_minutes_not_hours():
-    # The freshness watchdog (cdc_source_freshness.go) alarms after 20 minutes of a
-    # frozen stream position. An interval at or above that window would make a
-    # HEALTHY idle pipeline alarm, so the two numbers are not independent.
+    # The freshness watchdog (cdc_source_freshness.go sourceFreshnessStallBound)
+    # alarms after max(20 minutes, 4 heartbeats) of no progress, so a long interval
+    # no longer makes a healthy idle pipeline alarm — it makes the alarm slow. Kept
+    # inside the 20m floor so a real stall is still reported in about 20 minutes.
     ms = int(cfg_interval := _cfg()["heartbeat.interval.ms"])
     assert ms > 0, cfg_interval
     assert ms <= 10 * 60 * 1000, (
@@ -158,16 +165,39 @@ def test_heartbeat_interval_is_a_positive_integer_of_minutes_not_hours():
     )
 
 
-@pytest.mark.parametrize("db_type", ["mysql", "sqlserver"])
-def test_mysql_and_sqlserver_get_no_heartbeat(db_type):
-    # MySQL's time-based binlog expiry is the same class of risk as the oplog and is
-    # tracked in BACKLOG.md rather than changed blind here. Enabling heartbeats for
-    # a source the orchestrator does not pre-create a heartbeat topic for
-    # (executor.go) would publish to a topic nothing created.
-    cfg = _relational_cfg(db_type)
+def test_sqlserver_gets_no_heartbeat():
+    # Enabling heartbeats for a source the orchestrator does not pre-create a
+    # heartbeat topic for (executor.go) would publish to a topic nothing created.
+    cfg = _relational_cfg("sqlserver")
     assert "heartbeat.interval.ms" not in cfg
     assert "topic.heartbeat.prefix" not in cfg
     assert "heartbeat.topics.prefix" not in cfg
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "mariadb"])
+def test_mysql_source_heartbeats_by_default(db_type):
+    # An idle MySQL/MariaDB source commits no new binlog position, so without a
+    # heartbeat the freshness watchdog cannot tell "quiet" from "dead" and a
+    # stalled stream is never reported. MariaDB runs the MySQL connector.
+    cfg = _relational_cfg(db_type)
+    assert cfg["heartbeat.interval.ms"] == "300000"
+    # Both keys, one value: the naming key decides the topic (see the two-key test).
+    assert cfg["topic.heartbeat.prefix"] == "rsync.heartbeat"
+    assert cfg["heartbeat.topics.prefix"] == "rsync.heartbeat"
+
+
+def test_mysql_heartbeat_never_writes_to_the_source():
+    # heartbeat.action.query runs a write on the customer's database. rsync.ai
+    # reads the source and nothing else.
+    cfg = _relational_cfg("mysql")
+    assert "heartbeat.action.query" not in cfg
+
+
+def test_mysql_heartbeat_uses_its_own_interval_variable(monkeypatch):
+    monkeypatch.setenv("CDC_MYSQL_HEARTBEAT_INTERVAL_MS", "90000")
+    monkeypatch.setenv("CDC_PG_HEARTBEAT_INTERVAL_MS", "60000")
+    assert _relational_cfg("mysql")["heartbeat.interval.ms"] == "90000"
+    assert _relational_cfg("postgresql")["heartbeat.interval.ms"] == "60000"
 
 
 @pytest.mark.parametrize("db_type", ["postgresql", "postgres"])

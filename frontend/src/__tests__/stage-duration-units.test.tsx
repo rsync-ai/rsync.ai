@@ -9,7 +9,8 @@
  *
  *   ms  — StageDetailPanel:260, DAGVisualization:694, DAGVisualizationV2:244
  *         (all via `formatDuration(ms)`), PipelineInsightsBar:41 and
- *         NodeInspector:89 (both `Math.round(x / 1000)` + "s")
+ *         NodeInspector:89 (both `Math.round(x / 1000)` + "s"; NodeInspector
+ *         has since been deleted, as nothing rendered it)
  *   sec — PipelineAccordionView:1066 (`formatDurationSeconds`)
  *
  * So a stage that really took 42 s renders "42ms" in the DAG, "0s" in the
@@ -32,7 +33,7 @@ vi.mock("next/navigation", () => ({
 }))
 
 import { stageDurationMs } from "@/components/pipeline/dagHelpers"
-import { formatDuration } from "@/components/pipeline/dagHelpers"
+import { formatDuration } from "@/lib/duration"
 import type { ExecutionPlanStage } from "@/components/pipeline/dagTypes"
 import { StageDetailPanel } from "@/components/pipeline/StageDetailPanel"
 

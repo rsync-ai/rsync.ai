@@ -241,15 +241,3 @@ export class AgentWebSocket {
     }
   }
 }
-
-// Singleton instance
-let wsInstance: AgentWebSocket | null = null
-
-export function getAgentWebSocket(): AgentWebSocket {
-  if (!wsInstance) {
-    wsInstance = new AgentWebSocket()
-    wsInstance.connect()
-  }
-  return wsInstance
-}
-

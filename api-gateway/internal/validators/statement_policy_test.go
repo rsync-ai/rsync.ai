@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"api-gateway/internal/security"
+
+	"github.com/rsync-ai/shared/sqlexec/stmt"
 )
 
 func TestClassifyStatement(t *testing.T) {
@@ -34,8 +36,8 @@ func TestClassifyStatement(t *testing.T) {
 		"":         ClassUnknown,
 	}
 	for stmtType, want := range cases {
-		if got := ClassifyStatement(stmtType); got != want {
-			t.Errorf("ClassifyStatement(%q) = %q, want %q", stmtType, got, want)
+		if got := stmt.ClassifyStatement(stmtType); got != want {
+			t.Errorf("stmt.ClassifyStatement(%q) = %q, want %q", stmtType, got, want)
 		}
 	}
 }
@@ -427,5 +429,76 @@ func TestValidateExplorerStatement_CTEWriteNeedsAdmin(t *testing.T) {
 	// An admin may run it, exactly as they may run a bare MERGE.
 	if res := ValidateExplorerStatement(exploit, security.WSAdmin); !res.Valid {
 		t.Errorf("admin was refused a CTE-prefixed MERGE: %q", res.ErrorMessage)
+	}
+}
+
+// IsSingleStatement is the run check's single-statement rule, asked ahead of time. Each
+// case is also put to ValidateExplorerStatement as the owner, who may run any write, so
+// the two cannot drift apart: where it says one statement, the run check does not refuse
+// the SQL as several statements or as empty.
+func TestIsSingleStatement(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"INSERT INTO a.t SELECT 1", true},
+		{"INSERT INTO a.t SELECT 1;", true},
+		{"  INSERT INTO a.t SELECT 1 ;\n", true},
+		{"INSERT INTO a.t SELECT 'a;b'", true},
+		{`INSERT INTO "a;b" SELECT 1`, true},
+		{"INSERT INTO a.t SELECT 1 -- nightly; keep", true},
+		{"/* step 1; step 2 */ INSERT INTO a.t SELECT 1", true},
+		{"INSERT INTO a.t SELECT 1; -- done", true},
+
+		{"INSERT INTO a.t SELECT 1; INSERT INTO a.u SELECT 1", false},
+		{"INSERT INTO a.t SELECT 1;;", false},
+		{"INSERT INTO a.t SELECT 1; -- done\nUPDATE a.u SET x = 1", false},
+		// The run check knows nothing of dollar quotes or backslash escapes, so it
+		// refuses both, and a model built on either never runs.
+		{"INSERT INTO a.t SELECT $$a;b$$", false},
+		{`INSERT INTO a.t SELECT 'it\'s; fine'`, false},
+		{"", false},
+		{"   ", false},
+		{"-- only a comment", false},
+		{"/* nothing */", false},
+	}
+	var single, several int
+	for _, tc := range cases {
+		got := IsSingleStatement(tc.sql)
+		if got != tc.want {
+			t.Errorf("IsSingleStatement(%q) = %v, want %v", tc.sql, got, tc.want)
+		}
+		v := ValidateExplorerStatement(tc.sql, security.WSOwner)
+		refused := v != nil && !v.Valid &&
+			(v.ErrorCode == ErrCodeMultipleStatements || v.ErrorCode == ErrCodeEmptyQuery)
+		if got == refused {
+			t.Errorf("IsSingleStatement(%q) = %v, but the run check refused it as several or none: %v", tc.sql, got, refused)
+		}
+		if tc.want {
+			single++
+		} else {
+			several++
+		}
+	}
+	if single == 0 || several == 0 {
+		t.Fatalf("cases must cover both answers: %d single, %d not", single, several)
+	}
+}
+
+// The engine refuses a write above the class the gateway allows it
+// (stmt.Permits(MaxClassForRole(role), class)); the gateway refuses one the role
+// table does not allow (MinRoleForClass). The two must agree for every role and
+// class, or a statement the gateway lets through is refused, or worse, the reverse.
+func TestMaxClassForRoleAgreesWithTheRoleTable(t *testing.T) {
+	roles := []security.WorkspaceRole{security.WSViewer, security.WSMember, security.WSAdmin, security.WSOwner}
+	classes := []StatementClass{ClassRead, ClassDMLWrite, ClassDDL, ClassDestructive, ClassBlocked, ClassUnknown}
+	for _, role := range roles {
+		for _, class := range classes {
+			min, blocked := MinRoleForClass(class)
+			want := !blocked && role.Meets(min)
+			if got := stmt.Permits(MaxClassForRole(role), class); got != want {
+				t.Errorf("role %s, class %s: engine permits=%v, role table allows=%v", role, class, got, want)
+			}
+		}
 	}
 }

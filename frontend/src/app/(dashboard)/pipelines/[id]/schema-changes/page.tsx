@@ -59,7 +59,7 @@ export default async function SchemaChangesPage({ params }: Props) {
   if (!pipeline) notFound()
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <Link href={`/pipelines/${id}`}>
         <Button variant="ghost" size="sm">
           <ArrowLeft className="h-4 w-4 mr-2" />
@@ -70,11 +70,11 @@ export default async function SchemaChangesPage({ params }: Props) {
         heading="Schema changes"
         description={
           pipeline.isCDC
-            ? `Schema-drift changes detected for “${pipeline.name}”. This is a CDC pipeline — new columns are applied as they stream in, so they appear here as history.`
-            : `Review and approve schema-drift changes detected for “${pipeline.name}”.`
+            ? `Schema-drift changes detected for “${pipeline.name}”. This is a CDC pipeline — column changes are handled as they stream in and appear here as history; a dropped source table waits here for your decision.`
+            : `Schema-drift changes detected for “${pipeline.name}”. Column changes are handled automatically and appear here as history; a dropped source table waits here for your decision.`
         }
       />
-      {/* What gets filed for review, above the list of what was filed. */}
+      {/* What gets filed, above the list of what was filed. */}
       <SchemaDriftPolicyCard pipelineId={id} isCDC={pipeline.isCDC} />
       <SchemaDriftApprovalList
         pipelineId={id}

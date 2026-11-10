@@ -149,15 +149,20 @@ func SnapshotPlaintext(in []Row, canonical []CanonicalTransform) (*PlaintextSnap
 		return snap, nil
 	}
 	for _, row := range in {
-		m := map[string]interface{}(row)
-		if len(snap.leaves) > 0 {
-			snap.collectMap(m)
-		}
-		for _, segs := range snap.paths {
-			snap.collectAtPath(m, segs)
-		}
+		snap.collectRow(row)
 	}
 	return snap, nil
+}
+
+// collectRow records the values every target covers in one row.
+func (s *PlaintextSnapshot) collectRow(row Row) {
+	m := map[string]interface{}(row)
+	if len(s.leaves) > 0 {
+		s.collectMap(m)
+	}
+	for _, segs := range s.paths {
+		s.collectAtPath(m, segs)
+	}
 }
 
 // collectAtPath records the scalars at segs beneath v, matching each segment

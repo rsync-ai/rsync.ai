@@ -4,6 +4,10 @@ import userEvent from "@testing-library/user-event"
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: "admin",
@@ -161,7 +165,7 @@ describe("SavedQueries row badges", () => {
     row.focus()
     await user.keyboard("{Enter}")
 
-    expect(onLoad).toHaveBeenCalledWith("SELECT 1", undefined)
+    expect(onLoad).toHaveBeenCalledWith("SELECT 1", undefined, query().id)
   })
 
   it("still reports a failed last run after its target table is cleared", async () => {
@@ -188,5 +192,38 @@ describe("SavedQueries row badges", () => {
     expect(screen.queryByText("does nothing")).not.toBeInTheDocument()
     expect(screen.queryByText("runs as written")).not.toBeInTheDocument()
     expect(screen.queryByText(/last run failed/i)).not.toBeInTheDocument()
+  })
+})
+
+// On a MongoDB connection the list holds saved pipelines and sits under the Document
+// Browser, where there is no SQL to write. Its words point at the Pipeline tab.
+describe("SavedQueries on a document connection", () => {
+  it("speaks of pipelines and the tab they are written in", async () => {
+    mockFetch.mockResolvedValue(res(200, { saved_queries: [], count: 0 }))
+    render(<SavedQueries connectionId={CONNECTION_ID} currentSql="" queryLanguage="document" onLoad={vi.fn()} />)
+
+    expect(
+      await screen.findByText("No saved pipelines yet. Write one in the Pipeline tab, then Save current."),
+    ).toBeInTheDocument()
+    const save = screen.getByRole("button", { name: /save current/i })
+    expect(save).toBeDisabled()
+    expect(save).toHaveAttribute("title", "Write a valid pipeline in the Pipeline tab first")
+  })
+
+  it("offers to save a valid pipeline", async () => {
+    mockFetch.mockResolvedValue(res(200, { saved_queries: [], count: 0 }))
+    render(
+      <SavedQueries
+        connectionId={CONNECTION_ID}
+        currentSql={`{"collection":"orders","pipeline":[]}`}
+        queryLanguage="document"
+        onLoad={vi.fn()}
+      />,
+    )
+
+    await screen.findByText(/No saved pipelines yet/)
+    const save = screen.getByRole("button", { name: /save current/i })
+    expect(save).toBeEnabled()
+    expect(save).toHaveAttribute("title", "Save the current pipeline")
   })
 })

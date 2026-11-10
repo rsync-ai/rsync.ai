@@ -1,25 +1,24 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import Link from "next/link"
 import { useSearchParams } from "next/navigation"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { RefreshCw, Pause, Play, StopCircle, Activity, List, BarChart3 } from "lucide-react"
+import { RefreshCw, Activity, List } from "lucide-react"
 import { toast } from "sonner"
+import { cn } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
-import { authFetch, authFetchOrThrow } from "@/lib/api/auth-fetch"
-import { classifyError } from "@/lib/utils/error-handling"
+import { authFetch } from "@/lib/api/auth-fetch"
 import { ReasoningTimeline } from "@/components/pipeline/ReasoningTimeline"
-import { MonitoringOverviewTab } from "@/components/pipeline/MonitoringOverviewTab"
 import { TableStatisticsPanel } from "@/components/pipeline/TableStatisticsPanel"
-import { useFeatureFlags } from "@/config/features"
 import { PipelineTableSelector } from "@/components/pipeline/PipelineTableSelector"
 import { getConnectionMetadata, truncatedTableTotal, type ConnectionTableMetadata } from "@/lib/api/connections"
 import { getPipeline, resumePipelineTables, updatePipelineCDCTables, updatePipelineTables } from "@/lib/api/pipelines"
+import { SuggestionsReviewDialog } from "@/components/chat/SuggestionsReviewDialog"
+import { usePipelineTransformStep } from "@/lib/hooks/usePipelineTransformStep"
+import { transformsReviewTables } from "@/lib/pipeline/transformStep"
 import {
   isLayoutV2Destination,
   isObjectStorageDestination,
@@ -37,19 +36,13 @@ import {
 } from "@/lib/pipeline/cdcBackfill"
 import { makeTableMatcher, parseTableStatsRows } from "@/lib/pipeline/tableStatsRows"
 import { headerRowLine } from "@/lib/pipeline/dataPlaneRowMetrics"
-import {
-  isWaitingForFirstData,
-  normalizePipelineStatus,
-  reconcilePipelineStatus,
-  WAITING_FOR_FIRST_DATA_LABEL,
-} from "@/lib/pipeline/statusNormalization"
+import { normalizePipelineStatus, reconcilePipelineStatus } from "@/lib/pipeline/statusNormalization"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { emitPipelineRefresh, onPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { mergeNewestPage } from "@/lib/pipeline/mergeNewestEvents"
 import { PANEL_STATE_RETRY_MAX_MS, PANEL_STATE_RETRY_MS, panelStatePollMs } from "@/lib/pipeline/panelStatePoll"
 import { STATUS_EVENT_TYPES } from "@/lib/pipeline/eventNormalizer"
-import { stepInfoFromEvents } from "@/components/pipeline/PipelineLiveStatePanel"
-import type { PipelineStateResponse, BlockingReasonDetails } from "@/lib/api/types"
+import type { PipelineStateResponse } from "@/lib/api/types"
 
 type PipelineRunEvent = {
   pipeline_id: string
@@ -80,8 +73,8 @@ const EVENTS_PAGE_SIZE = 50
 // Stage transitions are a handful per run; the endpoint's cap is 500.
 const STATUS_EVENTS_LIMIT = 500
 
-// How often the Activity sub-tab re-reads the newest page while it is open —
-// the cadence the Live events card it replaced used.
+// How often Activity re-reads the newest page while it is on screen — the
+// cadence the Live events card it replaced used.
 const ACTIVITY_POLL_MS = 5000
 
 /** Short reason for a failed events read, shown inside "Could not load events (…)". */
@@ -98,23 +91,6 @@ function toRunEvents(raw: unknown): PipelineRunEvent[] {
     payload: e?.payload && typeof e.payload === "object" ? e.payload : {},
     received_at: String(e?.received_at || e?.occurred_at || new Date().toISOString()),
   }))
-}
-
-/**
- * The trace of the run the header names. The newest row is often a CDC stream
- * stat, stamped with the pipeline id as its execution and trace, which put the
- * pipeline id beside the run's execution id; the run's own rows come first.
- */
-export function runTraceId(
-  events: Array<Pick<PipelineRunEvent, "execution_id" | "trace_id">>,
-  state: Pick<PipelineStateResponse, "execution_id" | "trace_id"> | null,
-  pipelineId: string,
-): string | undefined {
-  const execId = (state?.execution_id || "").trim()
-  const own = execId ? events.find((e) => e.execution_id === execId && e.trace_id)?.trace_id : undefined
-  if (own) return own
-  if (state?.trace_id) return state.trace_id
-  return events.find((e) => e.trace_id && e.execution_id !== pipelineId && e.trace_id !== pipelineId)?.trace_id
 }
 
 async function connectionConfig(id: string): Promise<Record<string, unknown> | null> {
@@ -170,14 +146,25 @@ async function loadObjectLayoutInfo(
   }
 }
 
-export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "monitoring" | "table_stats" }) {
+/**
+ * Two cards that share the pipeline's /state and events reads: "activity" (the
+ * Data flow tab's event feed) and "table_stats" (the Table statistics tab).
+ * Neither repeats the run's status, its current-run link or Pause/Resume/Stop:
+ * the page header (PipelineHealthHeader + the header actions) owns those, and
+ * Live Execution on Overview links the current run.
+ */
+export function PipelineMonitoringPanel(props: {
+  pipelineId: string
+  variant?: "activity" | "table_stats"
+  /** The mode the server page resolved; stands in until the pipeline GET answers. */
+  pipelineType?: "etl" | "cdc"
+}) {
   const { pipelineId } = props
-  const variant = props.variant ?? "monitoring"
+  const variant = props.variant ?? "activity"
   const searchParams = useSearchParams()
   const lastEditTablesTokenRef = useRef<string>("")
 
   const [state, setState] = useState<PipelineStateResponse | null>(null)
-  const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [stateError, setStateError] = useState<string | null>(null)
   // The rows, the cursor for the page after them, and whether one exists, in
@@ -199,12 +186,6 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   // transitions also arrive through the feed; groupByStage folds both in.
   const [statusEvents, setStatusEvents] = useState<PipelineRunEvent[]>([])
 
-  const flags = useFeatureFlags()
-  // The Monitoring card's sub-tab, controlled: Activity polls only while it is
-  // the one on screen, and the Overview's "View in Activity" switches to it.
-  const [monitorSubTab, setMonitorSubTab] = useState<string>(() =>
-    variant === "table_stats" ? "table-stats" : flags.monitoringOverview ? "monitoring-overview" : "activity"
-  )
   const pollInflightRef = useRef(false)
 
   const [showEditTables, setShowEditTables] = useState(false)
@@ -221,6 +202,10 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   // fetch below would otherwise not see a table that just became "removed".
   const [tableStatsRefreshTick, setTableStatsRefreshTick] = useState(0)
   const [pipelineSyncMode, setPipelineSyncMode] = useState<"batch" | "cdc" | null>(null)
+  // Which pipeline the GET below has answered for, either way. Until it has, a
+  // missing source connection is "not known yet", not "no first run".
+  const [pipelineLoadedFor, setPipelineLoadedFor] = useState<string | null>(null)
+  const pipelineLoaded = pipelineLoadedFor === pipelineId
   const [pipelineSourceConnectionId, setPipelineSourceConnectionId] = useState<string | null>(null)
   const [pipelineSelectedTables, setPipelineSelectedTables] = useState<string[]>([])
   // Destination namespace (schema/database/dataset) the executor actually writes to.
@@ -370,8 +355,6 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
       })
     } catch {
       setStateError("Network error")
-    } finally {
-      setLoading(false)
     }
   }, [pipelineId])
 
@@ -457,7 +440,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     }
   }, [pipelineId, fetchStatusEvents])
 
-  // Silent re-read of the newest page for the Activity sub-tab: no loading
+  // Silent re-read of the newest page for the Activity card: no loading
   // state (the list must not blank every 5 s), merged into what is already
   // shown so pages pulled in with "Load more" survive. A failure keeps the
   // rows and says the list may be stale; it never swaps them for an error.
@@ -501,8 +484,8 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     fetchEvents()
   }, [fetchState, fetchEvents])
 
-  // Activity keeps itself current while it is open (and the page is visible).
-  const activityOpen = variant === "monitoring" && monitorSubTab === "activity"
+  // Activity keeps itself current while it is on screen (and the page is visible).
+  const activityOpen = variant === "activity"
   useEffect(() => {
     if (!activityOpen) return
     const t = window.setInterval(() => {
@@ -546,91 +529,19 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     return () => clearInterval(t)
   }, [hasState, state?.status, stateRetryable, fetchState])
 
-  const status = state?.status || (loading ? "loading" : "unknown")
-
-  // CDC-D2: this panel read /state and nothing else, so the Table statistics tab
-  // could report "running" for the very execution the Overview tab — one click
-  // away, same page load — was already showing as "idle". /state freezes at
-  // running when a stream dies; only /runtime can see that. Same reconciliation
-  // as the status pill, the CDC action cluster and the header menu, so all five
-  // surfaces now answer this question the same way.
-  //
-  // Only the ESCALATED verdict overrides the badge; in the ordinary case the raw
-  // status word is displayed exactly as before.
+  // CDC-D2: /state freezes at running when a stream dies; only /runtime can see
+  // that. The stats card counts its tables as Running or Paused from this, so it
+  // uses the same reconciliation as the header's status pill.
   const { runtime: pipelineRuntime } = usePipelineRuntime(pipelineId)
   const reconciledStatus = useMemo(
     () => reconcilePipelineStatus(normalizePipelineStatus(state?.status), pipelineRuntime?.phase),
     [state?.status, pipelineRuntime?.phase]
   )
-  const statusEscalated = reconciledStatus !== normalizePipelineStatus(state?.status)
-  // Issue #20: a CDC stream that set up but never delivered a row is still "running"
-  // (with "Streaming pipeline active") to /state. /runtime's waiting_for_data says so.
-  const waitingForFirstData = isWaitingForFirstData(reconciledStatus, pipelineRuntime?.phase)
 
   const pausedByUser = state?.status === "waiting_for_user" && state?.blocking_reason?.type === "paused_by_user"
   // #14: a paused pipeline keeps its last summary ("Streaming pipeline active"),
-  // and the stats card below counted its tables as Running. Both read paused now.
+  // and the stats card below counted its tables as Running. They read paused now.
   const pipelinePaused = reconciledStatus === "paused" || pausedByUser
-
-  const canStop = ["processing", "waiting_for_user", "pending"].includes(String(state?.status || ""))
-  const canPause = String(state?.status || "") === "processing"
-  const canResume = pausedByUser
-
-  // Stop / Pause / Resume. The header implements the same three actions and
-  // reports failure (PipelineActions.tsx) — these three used to `.catch(() =>
-  // null)`, so the SAME button was honest in one place and mute in the other.
-  // A 403 from the workspace-role gate looked exactly like a successful stop.
-  async function runControlAction(
-    action: "stop" | "pause" | "resume",
-    endpoint: string,
-    body?: string
-  ) {
-    try {
-      await authFetchOrThrow(endpoint, { method: "POST", body })
-      toast.success(
-        action === "stop" ? "Pipeline stopped" : action === "pause" ? "Pipeline paused" : "Pipeline resumed"
-      )
-    } catch (e) {
-      const err = classifyError(e, `pipeline.${action}` as Parameters<typeof classifyError>[1])
-      toast.error(err.title, { description: err.hint ?? err.message })
-    } finally {
-      // Refresh either way: on failure the server's actual state is exactly
-      // what the user needs to see. Through the refresh bus (#13), not only this
-      // panel's own fetches: the header badge, the status strip and the Table
-      // statistics card each poll on their own and otherwise kept the old status
-      // until a full reload. This panel's own listener below runs onRefresh.
-      emitPipelineRefresh(pipelineId)
-    }
-  }
-
-  async function stopPipeline() {
-    await runControlAction("stop", API_ENDPOINTS.PIPELINES.STOP(pipelineId))
-  }
-
-  async function pausePipeline() {
-    await runControlAction(
-      "pause",
-      API_ENDPOINTS.PIPELINES.PAUSE(pipelineId),
-      JSON.stringify({ execution_id: state?.execution_id })
-    )
-  }
-
-  async function resumePipeline() {
-    await runControlAction(
-      "resume",
-      API_ENDPOINTS.PIPELINES.RESUME(pipelineId),
-      JSON.stringify({ execution_id: state?.execution_id })
-    )
-  }
-
-  const latestTraceID = runTraceId(events, state, pipelineId)
-
-  // The same "Step n/m" as the Overview's timeline; the stage transitions are
-  // fetched apart from the paged feed, so a short page does not shorten it.
-  const stepInfo = useMemo(
-    () => stepInfoFromEvents([...statusEvents, ...events], state),
-    [statusEvents, events, state]
-  )
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true)
@@ -702,6 +613,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     getPipeline(pipelineId)
       .then((p) => {
         if (cancelled) return
+        setPipelineLoadedFor(pipelineId)
         const sm = p.sync_mode
         setPipelineSyncMode(sm === "cdc" || sm === "batch" ? sm : null)
         const src = typeof p.source_connection_id === "string" ? String(p.source_connection_id).trim() : ""
@@ -737,6 +649,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
       })
       .catch(() => {
         if (cancelled) return
+        setPipelineLoadedFor(pipelineId)
         setPipelineSyncMode(null)
         setPipelineSourceConnectionId(null)
         setPipelineSelectedTables([])
@@ -763,8 +676,11 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     const msg = String(state?.message || "").toLowerCase()
     const summary = String(state?.summary || "").toLowerCase()
     if (msg.includes("streaming") || summary.includes("streaming")) return "cdc"
+    // Before the pipeline GET answers, the page's own mode: a CDC pipeline
+    // otherwise drew the batch copy first. Batch stays null, as before.
+    if (props.pipelineType === "cdc") return "cdc"
     return null
-  }, [pipelineSyncMode, state?.message, state?.summary])
+  }, [pipelineSyncMode, state?.message, state?.summary, props.pipelineType])
   // This run's rows only, in both modes: the events span earlier runs, and the
   // Table statistics panel below reads this run (item 34).
   const latestRowMetrics = useMemo(() => headerRowLine(events, state?.execution_id), [events, state?.execution_id])
@@ -790,6 +706,22 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   // For table discovery (listing tables), prefer the pipeline's configured source connection ID.
   // Event inference is best-effort and may be unavailable early in the run.
   const effectiveSourceConnectionId = pipelineSourceConnectionId || inferredSourceConnectionId
+
+  // A table-selection pause goes picker → transform step → resume, as in chat;
+  // the step resumes the run itself.
+  const transformStep = usePipelineTransformStep({
+    pipelineId,
+    executionId: state?.execution_id,
+    sourceConnectionId: effectiveSourceConnectionId,
+    onResumed: () => {
+      fetchState()
+      fetchEvents()
+    },
+  })
+  // Tables already chosen, paused only for the transform step (review_transforms_only).
+  const reviewTables = isWaitingForTableSelection
+    ? transformsReviewTables(state?.blocking_reason?.details as Record<string, unknown> | undefined)
+    : null
 
   // Fetch per-table stats for the latest execution (best-effort) so "Edit tables"
   // can auto-select for older pipelines, show last-run counts, and mark tables no
@@ -830,14 +762,16 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     }
   }, [pipelineId, state?.execution_id, pipelineSelectedTables.length, tableStatsRefreshTick, effectiveSyncMode])
 
-  // UX decision:
-  // - On the dedicated "Table statistics" page, ALWAYS show the tables section so users can manage selection.
-  // - Inside the Monitoring tab, only show it when it is actionable (HITL table selection or post-run).
+  // The tables section renders only on the "Table statistics" card, where it always
+  // shows so users can manage the selection; the Activity card never renders it.
   const showTablesControls = variant === "table_stats" || isWaitingForTableSelection || hasCompletedOnce
   const canOpenTablesModal = isWaitingForTableSelection || !!effectiveSourceConnectionId
 
   async function openEditTables() {
     if (!showTablesControls) return
+
+    // A review-only pause opens the transform step on its tables, with no picker.
+    if (reviewTables && transformStep.start(reviewTables)) return
 
     // If we're currently in the HITL table_selection step, use the same table list the executor provided.
     // This avoids showing an "edit tables" modal that can't list tables early in the run.
@@ -900,137 +834,48 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     void openEditTables()
   }, [variant, searchParams, canOpenTablesModal])
 
+  // Table statistics is a tab of cards (its KPIs, charts and table list), so it
+  // has no frame of its own: a card round cards read as a box in a box.
+  const frameless = variant === "table_stats"
+
   return (
-    <Card className="border-zinc-200 dark:border-zinc-800">
-      <CardHeader className="space-y-1">
+    <Card
+      data-testid="pipeline-monitoring-panel"
+      className={frameless ? "border-0 bg-transparent shadow-none dark:bg-transparent" : "border-zinc-200 dark:border-zinc-800"}
+    >
+      {/* Title and Refresh only. The run's status, its current-run link and
+          Pause/Resume/Stop are the page header's (PipelineHealthHeader and the
+          header actions); this card used to repeat all three. */}
+      <CardHeader className={cn("space-y-1", frameless && "px-0 pt-0")}>
         <div className="flex items-start justify-between gap-3">
           <div>
             <CardTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
-              {variant === "table_stats" ? "Table statistics" : "Monitoring"}
-            </CardTitle>
-            <CardDescription>
-              {state?.execution_id ? (
-                <>
-                  Execution{" "}
-                  <Link className="underline" href={`/executions/${state.execution_id}`}>
-                    {state.execution_id.slice(0, 8)}
-                  </Link>
-                  {latestTraceID ? <span className="ml-2 font-mono text-xs">trace {String(latestTraceID).slice(0, 8)}</span> : null}
-                </>
+              {variant === "table_stats" ? (
+                <Activity className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
               ) : (
-                "No active execution yet"
+                <List className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
               )}
-            </CardDescription>
+              {variant === "table_stats" ? "Table statistics" : "Activity"}
+            </CardTitle>
+            {variant === "activity" ? (
+              <CardDescription>What the pipeline has been doing</CardDescription>
+            ) : null}
           </div>
-
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
-              <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
-              Refresh
-            </Button>
-            {canPause && (
-              <Button variant="outline" size="sm" onClick={pausePipeline}>
-                <Pause className="h-4 w-4 mr-2" />
-                Pause
-              </Button>
-            )}
-            {canResume && (
-              <Button variant="outline" size="sm" onClick={resumePipeline}>
-                <Play className="h-4 w-4 mr-2" />
-                Resume
-              </Button>
-            )}
-            {canStop && (
-              <Button variant="outline" size="sm" onClick={stopPipeline}>
-                <StopCircle className="h-4 w-4 mr-2" />
-                Stop
-              </Button>
-            )}
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {waitingForFirstData ? (
-            <Badge
-              variant="outline"
-              className="border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300"
-            >
-              {WAITING_FOR_FIRST_DATA_LABEL}
-            </Badge>
-          ) : (
-            <Badge variant={statusEscalated && reconciledStatus === "failed" ? "destructive" : "outline"}>
-              {statusEscalated ? reconciledStatus : status}
-            </Badge>
-          )}
-          {stepInfo ? (
-            <Badge variant="secondary">
-              Step {stepInfo.current_step}/{stepInfo.total_steps}
-            </Badge>
-          ) : typeof state?.progress?.current_step === "number" && typeof state?.progress?.total_steps === "number" ? (
-            <Badge variant="secondary">
-              Step {state.progress.current_step}/{state.progress.total_steps}
-            </Badge>
-          ) : null}
-          {state?.blocking_reason?.type ? (
-            <Badge variant="secondary">{state.blocking_reason.type}</Badge>
-          ) : null}
-          {pipelinePaused ? (
-            <span className="text-xs text-muted-foreground" data-testid="pipeline-paused-summary">
-              Paused — no changes stream until you resume the pipeline.
-            </span>
-          ) : waitingForFirstData && pipelineRuntime?.message ? (
-            <span className="text-xs text-muted-foreground">{pipelineRuntime.message}</span>
-          ) : state?.summary ? (
-            <span className="text-xs text-muted-foreground">{state.summary}</span>
-          ) : null}
+          <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
+            <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
+            Refresh
+          </Button>
         </div>
       </CardHeader>
 
-      <CardContent className="space-y-4">
+      <CardContent className={cn("space-y-4", frameless && "px-0 pb-0")}>
         {stateError ? (
           <div className="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
             {stateError}
           </div>
         ) : null}
-        <Tabs value={monitorSubTab} onValueChange={setMonitorSubTab}>
-          {variant === "monitoring" ? (
-            <TabsList className="w-full flex flex-wrap h-auto justify-start gap-1">
-              {flags.monitoringOverview && (
-                <TabsTrigger value="monitoring-overview">
-                  <BarChart3 className="h-4 w-4 mr-2" />
-                  Overview
-                </TabsTrigger>
-              )}
-              {/* Was "Trace": the same event stream, then shown as raw event
-                  codes. It now reads in words, with the codes behind each
-                  row's Details toggle. */}
-              <TabsTrigger value="activity">
-                <List className="h-4 w-4 mr-2" />
-                Activity
-              </TabsTrigger>
-            </TabsList>
-          ) : null}
-
-          {variant === "monitoring" && flags.monitoringOverview && (
-            <TabsContent value="monitoring-overview" className="space-y-4">
-              <MonitoringOverviewTab pipelineId={pipelineId} onOpenActivity={() => setMonitorSubTab("activity")} />
-            </TabsContent>
-          )}
-
-          {variant === "monitoring" ? (
-            <TabsContent value="activity" className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-medium flex items-center gap-2">
-                <List className="h-4 w-4" />
-                What the pipeline has been doing
-              </div>
-              <Button variant="outline" size="sm" onClick={() => fetchEvents()} disabled={eventsLoading}>
-                <RefreshCw className={`h-4 w-4 mr-2 ${eventsLoading ? "animate-spin" : ""}`} />
-                Reload
-              </Button>
-            </div>
-
+        {variant === "activity" ? (
+          <div className="space-y-3">
             {/* A failed read never borrows the empty state (F-284): with nothing
                 loaded it says the read failed; with rows already on screen it
                 keeps them and says they may be out of date. */}
@@ -1074,11 +919,11 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
               </ScrollArea>
               </>
             )}
-            </TabsContent>
-          ) : null}
+          </div>
+        ) : null}
 
-          {variant === "table_stats" ? (
-            <TabsContent value="table-stats" className="space-y-3">
+        {variant === "table_stats" ? (
+          <div className="space-y-3">
             {/*
               No fixed-height scroll box here. This used to be `h-[500px] overflow-y-auto`
               around the Tables card, the Summary AND the per-table grid, so past ~10
@@ -1111,7 +956,11 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
                             </Button>
                           ) : null}
                           <Button size="sm" variant="outline" onClick={openEditTables} disabled={!canOpenTablesModal}>
-                            {isWaitingForTableSelection ? "Select tables" : "Edit tables"}
+                            {reviewTables && effectiveSourceConnectionId
+                              ? "Review transforms"
+                              : isWaitingForTableSelection
+                                ? "Select tables"
+                                : "Edit tables"}
                           </Button>
                         </div>
                       </div>
@@ -1124,7 +973,9 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
                         {!canOpenTablesModal
                           ? isWaitingForTableSelection
                             ? " (Waiting for table list…)"
-                            : " (Available after the first successful run.)"
+                            : pipelineLoaded
+                              ? " (Available after the first successful run.)"
+                              : null
                           : null}
                       </CardDescription>
 
@@ -1224,9 +1075,8 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
                 mode={effectiveSyncMode ?? undefined}
               />
             </div>
-            </TabsContent>
-          ) : null}
-        </Tabs>
+          </div>
+        ) : null}
       </CardContent>
 
       <PipelineTableSelector
@@ -1239,8 +1089,13 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
           fetchEvents()
         }}
         onTablesSelected={async (tables) => {
-          // 1) If workflow is waiting for table selection, resume the active run.
+          // 1) If workflow is waiting for table selection, resume the active run:
+          // through the transform step when there is one to show.
           if (isWaitingForTableSelection) {
+            if (transformStep.start(tables)) {
+              setPipelineSelectedTables(tables)
+              return
+            }
             await resumePipelineTables(pipelineId, { execution_id: state?.execution_id, selected_tables: tables })
             // Keep UI selection in sync (useful if user reopens modal quickly).
             setPipelineSelectedTables(tables)
@@ -1338,6 +1193,10 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
               : "Edit tables for this pipeline"
         }
       />
+
+      {transformStep.dialogProps ? (
+        <SuggestionsReviewDialog {...transformStep.dialogProps} destinationType={pipelineDestType ?? undefined} />
+      ) : null}
     </Card>
   )
 }

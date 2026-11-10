@@ -33,6 +33,3 @@ export function Providers({ children }: ProvidersProps) {
     </ThemeProvider>
   )
 }
-
-// Re-export telemetry hooks for convenience
-export { useTelemetry, useTraceId, TelemetryProvider, TelemetryDevTools } from "./TelemetryProvider"

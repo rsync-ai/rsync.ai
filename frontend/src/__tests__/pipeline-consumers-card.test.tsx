@@ -144,7 +144,7 @@ describe("ConsumersCard", () => {
     render(<MonitorTab pipelineId="p1" />)
 
     await screen.findByText(/has not been measured/)
-    const card = screen.getByTestId("consumers-card")
+    screen.getByTestId("consumers-card")
   })
 
   it("distinguishes a measured pipeline with no consumers from an unmeasured one", async () => {
@@ -152,7 +152,7 @@ describe("ConsumersCard", () => {
     render(<MonitorTab pipelineId="p1" />)
 
     await screen.findByText(/No consumers running yet/)
-    const card = screen.getByTestId("consumers-card")
+    screen.getByTestId("consumers-card")
   })
 
   it("says a failed read failed instead of reporting no consumers", async () => {

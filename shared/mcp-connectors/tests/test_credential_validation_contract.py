@@ -27,6 +27,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 
 import pytest
@@ -134,6 +135,16 @@ def _drive(version_dir, world, config):
 
     Returns (success, credentials_validated, warned).
     """
+    result, _ = _drive_result(version_dir, world, config)
+    return (result.get("success"),
+            result.get("credentials_validated"),
+            bool(result.get("warning")))
+
+
+def _drive_result(version_dir, world, config):
+    """`_drive`, returning the whole response and whether ANY request the
+    connector sent carried auth material -- the fact the response is about."""
+    carried = []
     logging.disable(logging.CRITICAL)
     try:
         cls = _load_connector_class(version_dir)
@@ -155,6 +166,7 @@ def _drive(version_dir, world, config):
             authed = any(
                 k.lower() in AUTH_HEADERS and len(str(v or "").split()) >= 2
                 for k, v in headers.items())
+            carried.append(authed)
             ok = {"success": True, "status_code": 200, "data": {}}
             deny = lambda code: {"success": False, "status_code": code,
                                  "error": f"HTTP {code}"}
@@ -167,6 +179,24 @@ def _drive(version_dir, world, config):
                 return ok if authed else deny(401)
             if world == "whoami_public":
                 return ok if endpoint in WHOAMI else deny(404)
+            if world == "whoami_errors_anonymously":
+                # Auth-gated, but it answers an anonymous caller 500 rather
+                # than 401/403, so the control cannot read a verdict from it.
+                if endpoint not in WHOAMI:
+                    return deny(404)
+                return ok if authed else deny(500)
+            if world == "resource_refuses_anonymous_400":
+                # ClickUp: a request with no token is answered 400
+                # "Authorization header required" (OAUTH_017), not 401.
+                return deny(404) if endpoint in WHOAMI else (
+                    ok if authed else deny(400))
+            if world == "resource_hides_from_anonymous_404":
+                return deny(404) if endpoint in WHOAMI else (
+                    ok if authed else deny(404))
+            if world == "resource_rate_limits_anonymously":
+                # 429 is about timing, not the credential: no verdict.
+                return deny(404) if endpoint in WHOAMI else (
+                    ok if authed else deny(429))
             if world == "rejects_everything":
                 return deny(401)
             raise AssertionError(f"unknown world {world}")
@@ -175,9 +205,7 @@ def _drive(version_dir, world, config):
         result = inst.test_connection(dict(config))
     finally:
         logging.disable(logging.NOTSET)
-    return (result.get("success"),
-            result.get("credentials_validated"),
-            bool(result.get("warning")))
+    return result, any(carried)
 
 
 IDS = [name for name, _ in CORROBORATING]
@@ -229,10 +257,18 @@ def test_public_whoami_does_not_validate_a_credential(name, version_dir):
 
 
 @pytest.mark.parametrize("name,version_dir", CORROBORATING, ids=IDS)
-@pytest.mark.parametrize("world", ["resource_auth_gated", "whoami_auth_gated"])
+@pytest.mark.parametrize("world", ["resource_auth_gated", "whoami_auth_gated",
+                                   "resource_refuses_anonymous_400",
+                                   "resource_hides_from_anonymous_404"])
 def test_auth_gated_endpoint_does_validate(name, version_dir, world):
     """The control must not be so strict it rejects real credentials: when the
-    endpoint refuses anonymous callers, a 2xx DOES prove the credential."""
+    endpoint refuses anonymous callers, a 2xx DOES prove the credential.
+
+    "Refuses" is any 4xx to the identical request minus the credential, not
+    only 401/403. Bug class: a refusal read from one status code instead of
+    from the two answers differing. ClickUp answers a missing token 400, so a
+    valid token failed its connection test (2026-10-04).
+    """
     cls = _load_connector_class(version_dir)
     success, validated, _ = _drive(version_dir, world, _credential_for(cls))
     assert success is True and validated is True, (
@@ -252,6 +288,21 @@ def test_no_credentials_against_public_api_still_connects(name, version_dir):
 
 
 @pytest.mark.parametrize("name,version_dir", CORROBORATING, ids=IDS)
+def test_a_rate_limited_control_proves_nothing_and_says_why(name, version_dir):
+    """Two-sided with the 4xx rule above: a 429 to the anonymous re-ask is
+    about timing, so the credential stays unproven. And the error must name
+    that, not the 404 of a whoami path tried after it -- "Last error: HTTP 404"
+    sent a user with a working token looking for a wrong URL."""
+    cls = _load_connector_class(version_dir)
+    result, carried = _drive_result(version_dir, "resource_rate_limits_anonymously",
+                                    _credential_for(cls))
+    assert carried, f"{name}: the declared credential never reached a request"
+    assert result.get("success") is False, f"{name}: {result}"
+    error = str(result.get("error") or "")
+    assert "not validated" in error and "404" not in error, f"{name}: {error!r}"
+
+
+@pytest.mark.parametrize("name,version_dir", CORROBORATING, ids=IDS)
 def test_rejected_credentials_fail(name, version_dir):
     """A 401 everywhere is a failure, with or without a corroboration step."""
     cls = _load_connector_class(version_dir)
@@ -259,11 +310,88 @@ def test_rejected_credentials_fail(name, version_dir):
     assert success is False, f"{name}: reported success when the API refused every probe"
 
 
+# Every key `_credentials_present()` counts as "a credential was supplied", one
+# config per key. Its generic tail is the part no connector declares, which is
+# why driving only DECLARED keys (`_credential_variants`) never found
+# KI-CREDENTIAL-CONTROL-DISARMED-BY-UNDECLARED-KEY: a key the connector does not
+# turn into a header sends every probe out anonymously, the anonymous control
+# has nothing to strip and answers None, and a public whoami 2xx was then
+# reported `credentials_validated: True`.
+GENERIC_CREDENTIALS = [
+    {key: "test-credential-value"} for key in (
+        "access_token", "token", "api_key", "apikey", "bearer_token",
+        "personal_access_token", "private_token", "auth_token")
+] + [{"username": "test-user", "password": "test-credential-value"}]
+
+
+def _names(warning, key):
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])", warning)
+
+
+@pytest.mark.parametrize("name,version_dir", CORROBORATING, ids=IDS)
+def test_a_credential_no_request_carries_is_never_validated(name, version_dir):
+    """Every credential key, declared or not, against a public whoami.
+
+    Two-sided, per connector: a key the connector sends must go through the
+    anonymous control (and the warning must not blame it); a key it does not
+    send must come back unvalidated WITH a warning that names it, so the user
+    can see which key to change.
+    """
+    carried_keys, dropped_keys = [], []
+    for creds in GENERIC_CREDENTIALS:
+        result, carried = _drive_result(version_dir, "whoami_public", creds)
+        keys = sorted(creds)
+        warning = str(result.get("warning") or "")
+        assert result.get("credentials_validated") is not True, (
+            f"{name} {keys}: reported credentials_validated=True on a whoami that "
+            f"answers everybody (any request carried auth: {carried})."
+        )
+        assert result.get("success") is True and warning, (
+            f"{name} {keys}: expected (success=True, warning set), got {result}"
+        )
+        if carried:
+            carried_keys += keys
+            assert not any(_names(warning, k) for k in keys), (
+                f"{name} {keys}: the request DID carry this credential, but the "
+                f"warning names it as unused: {warning!r}"
+            )
+        else:
+            dropped_keys += keys
+            missing = [k for k in keys if not _names(warning, k)]
+            assert not missing, (
+                f"{name} {keys}: no request carried {missing}, and the warning does "
+                f"not say so, so the user cannot tell which key to change: {warning!r}"
+            )
+    # Anti-vacuity: both sides must actually have been exercised.
+    assert carried_keys, f"{name}: no credential key reached a request at all"
+    assert dropped_keys, f"{name}: every key reached a request; the dropped side is untested"
+
+
+@pytest.mark.parametrize("name,version_dir", CORROBORATING, ids=IDS)
+def test_an_unreadable_control_on_a_carried_credential_keeps_the_old_verdict(name, version_dir):
+    """The other None path, kept on purpose: the credential DID reach the
+    request, the whoami refused the anonymous control with a 500 rather than a
+    401/403, so the control has no verdict and the historical rule (trust the
+    whoami 2xx) decides. This pins that the fix above narrows that rule to
+    credentials no request carried, rather than dropping it for everyone -- an
+    inconclusive control must not fail or downgrade a working connection. If
+    this is deliberately tightened later, update the caveat recorded in
+    CAPABILITIES-ARCHIVE.md under KI-CREDENTIAL-CONTROL-DISARMED-BY-UNDECLARED-KEY.
+    """
+    cls = _load_connector_class(version_dir)
+    result, carried = _drive_result(version_dir, "whoami_errors_anonymously", _credential_for(cls))
+    assert carried, f"{name}: the declared credential never reached a request"
+    assert result.get("success") is True and result.get("credentials_validated") is True, (
+        f"{name}: {result}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Drift guards: the generator and its output must not diverge again.
 # ---------------------------------------------------------------------------
 
-HELPER_NAMES = ("_credentials_present", "_anonymous_config", "_probe_endpoint_is_public")
+HELPER_NAMES = ("_credentials_present", "_anonymous_config", "_auth_material",
+                "_unused_credential_keys", "_probe_endpoint_is_public")
 
 
 def _function_source(path, name):

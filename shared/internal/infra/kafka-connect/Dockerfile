@@ -180,6 +180,9 @@ RUN set -eu; \
 # both rely on it -- neither overrides the entrypoint. See the script's header.
 COPY --chmod=0755 connect-entrypoint.sh sync-log4j-loggers.sh /opt/rsync/
 COPY --chmod=0644 log4j-loggers.properties /opt/rsync/
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 ENTRYPOINT ["/opt/rsync/connect-entrypoint.sh"]
 CMD ["start"]
 

@@ -81,11 +81,9 @@ def _import_builder():
 def write_artifacts(generated: Any, spec: Dict[str, Any], out_dir: str) -> List[str]:
     """Persist the rendered connector.
 
-    Deliberately does NOT call ``GeneratedConnector.save_to_directory``: that
-    method also fetches a logo over the network, which would make the
-    scaffolder neither offline nor reproducible. The two refusal guards it
-    applies are reproduced here so an invalid or empty build still cannot be
-    written to disk.
+    Writes files only -- no logo fetch or other network call -- so the
+    scaffolder stays offline and reproducible. An invalid or empty build is
+    refused, so neither can be written to disk.
     """
     if not getattr(generated, "is_valid", False):
         raise OpenAPIConversionError(

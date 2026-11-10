@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"api-gateway/internal/security"
+	"api-gateway/internal/services"
 	"api-gateway/internal/validators"
 )
 
@@ -138,9 +139,7 @@ func TestModelDialect(t *testing.T) {
 		"mariadb":    "mysql",
 		"sqlserver":  "sqlserver",
 		"mssql":      "sqlserver",
-		"bigquery":   "",
-		"databricks": "",
-		"snowflake":  "",
+		// The warehouses: TestModelDialect_EveryWarehouse.
 		"salesforce": "",
 	}
 	for in, want := range cases {
@@ -262,6 +261,19 @@ func TestModelRunMinRoleMatchesDDLPolicy(t *testing.T) {
 	if modelRunMinRole != ddlMin {
 		t.Fatalf("modelRunMinRole = %q but ClassDDL requires %q — the model bar has drifted from the policy table",
 			modelRunMinRole, ddlMin)
+	}
+}
+
+// An agent and Ask rsync.ai reach the model routes through services.Authorize before
+// the handler's own gate. The two must name the same role: a lower one would let the
+// tool start work the handler then refuses, a higher one would refuse an agent what
+// the same user may do by hand.
+func TestModelPolicyMatchesTheModelRoutes(t *testing.T) {
+	if r, ok := services.MinRole(services.ActionModelWrite); !ok || r != modelRunMinRole {
+		t.Fatalf("services.ActionModelWrite needs %q, the model routes need %q", r, modelRunMinRole)
+	}
+	if r, ok := services.MinRole(services.ActionModelRead); !ok || r != security.WSViewer {
+		t.Fatalf("services.ActionModelRead needs %q, reading a model needs %q", r, security.WSViewer)
 	}
 }
 

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest"
-import { formatAbsoluteTime, formatNextRun } from "@/components/explorer/scheduleTime"
+import { formatNextRun } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // These strings are what a user reads to decide whether to wait for the next
 // scheduled rebuild or force one now. The failure mode is not a crash — it is a

@@ -9,8 +9,8 @@ tempfile.NamedTemporaryFile creates its file 0600 whatever the umask is, and the
 atomic rename kept that mode.
 
 The class is "a writer into the connector volume produces a file only its own
-uid can read", so the test walks everything a save, a promotion and a
-deprecation leave behind rather than checking latest.json alone.
+uid can read", so the test walks everything a save and two promotions leave
+behind rather than checking latest.json alone.
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def test_generated_connector_is_readable_by_other_uids(tmp_path: Path, container
         "metadata.json": json.dumps({"name": "XKCD", "connector_type": "xkcd"}),
         "requirements.txt": "requests\n",
         "Dockerfile": "FROM python:3.11-slim\n",
-        "oauth/token_manager.py": "# nested artifact\n",
+        "assets/README.md": "# nested artifact\n",
     }
 
     v1 = vm.calculate_next_version(name)
@@ -62,7 +62,6 @@ def test_generated_connector_is_readable_by_other_uids(tmp_path: Path, container
     v2 = vm.calculate_next_version(name)
     vm.save_to_versioned_path(name, v2, artifacts)
     assert vm.promote_to_latest(name, v2, changes=["Regenerated"], validation_passed=True)
-    assert vm.deprecate_version(name, v1, reason="superseded")
 
     connector_root = vm.get_connector_path(name)
     assert (connector_root / "latest.json").is_file()

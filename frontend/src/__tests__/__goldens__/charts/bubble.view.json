@@ -1,0 +1,111 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "bubble",
+    "description": "quantity against amount, sized by Discount, coloured by region",
+    "points": {
+      "x": {
+        "field": "x",
+        "label": "amount",
+        "format": "decimal"
+      },
+      "y": {
+        "field": "y",
+        "label": "quantity",
+        "format": "decimal"
+      },
+      "size": {
+        "field": "size",
+        "label": "Discount",
+        "format": "decimal"
+      },
+      "rows": {
+        "field": "n",
+        "label": "Rows",
+        "format": "integer"
+      }
+    },
+    "series": {
+      "field": "s",
+      "label": "region",
+      "values": [
+        {
+          "key": "s0",
+          "label": "APAC",
+          "color": "series-1"
+        },
+        {
+          "key": "s1",
+          "label": "EU",
+          "color": "series-3"
+        },
+        {
+          "key": "s2",
+          "label": "US",
+          "color": "series-2"
+        }
+      ]
+    }
+  },
+  "rows": [
+    {
+      "x": 150,
+      "y": 8,
+      "size": 20,
+      "n": 1,
+      "s": "s1"
+    },
+    {
+      "x": 90,
+      "y": 6,
+      "size": 12,
+      "n": 4,
+      "s": "s0"
+    },
+    {
+      "x": 110,
+      "y": 3,
+      "size": 8,
+      "n": 1,
+      "s": "s0"
+    },
+    {
+      "x": 60,
+      "y": 2,
+      "size": 5,
+      "n": 1,
+      "s": "s2"
+    },
+    {
+      "x": 210,
+      "y": 5,
+      "size": 3,
+      "n": 1,
+      "s": "s2"
+    },
+    {
+      "x": 20,
+      "y": 1,
+      "size": 2,
+      "n": 2,
+      "s": "s1"
+    }
+  ],
+  "series": [
+    {
+      "value": "APAC",
+      "color": "series-1"
+    },
+    {
+      "value": "EU",
+      "color": "series-3"
+    },
+    {
+      "value": "US",
+      "color": "series-2"
+    }
+  ],
+  "notes": [
+    "1 row has no size above zero, so it is not drawn."
+  ]
+}

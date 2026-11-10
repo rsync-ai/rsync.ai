@@ -181,7 +181,7 @@ EOF
 ### 7. Connection form fields (no frontend change)
 
 The connection form is **generic**: `frontend/src/components/connectors/GenericConnectorForm.tsx`
-renders its fields from `connector.configuration_schema.properties` (`GenericConnectorForm.tsx:266`, `:373`) and contains no hardcoded database list. The api-gateway
+renders its fields from `connector.configuration_schema.properties` (`GenericConnectorForm.tsx:431`, `:2133`) and contains no hardcoded database list. The api-gateway
 maps the connector's own `config_schema` onto that wire field (`api-gateway/internal/handlers/tools.go:1448`).
 
 So there is no frontend file to edit — add the fields to the connector instead:

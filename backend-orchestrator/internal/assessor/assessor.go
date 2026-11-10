@@ -360,14 +360,6 @@ func (r *Registry) Resolve(sourceType string) (SourceAssessor, bool) {
 	return nil, false
 }
 
-// HasDedicated reports whether a source-type-specific assessor (not the
-// fallback) is registered for sourceType. Lets handlers distinguish
-// "deep DB checks" from "generic connector checks" for messaging.
-func (r *Registry) HasDedicated(sourceType string) bool {
-	_, ok := r.byType[sourceType]
-	return ok
-}
-
 // SupportedTypes returns the list of source types with registered
 // assessors. Useful for /v1/health and admin endpoints.
 func (r *Registry) SupportedTypes() []string {

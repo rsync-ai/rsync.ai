@@ -1,7 +1,6 @@
-// utils.formatRelativeTime is past-only: it subtracts in one direction and floors,
-// so every future timestamp lands in its `return "Just now"` fallback. A next-run
-// time is always in the future, which is exactly the case it cannot express — hence
-// a forward-looking formatter rather than a call to that one.
+// utils.formatRelativeTime is past-only: it clamps a future timestamp to "just now".
+// A next-run time is always in the future, which is exactly the case it cannot
+// express — hence a forward-looking formatter rather than a call to that one.
 //
 // next_run_at is computed server-side (api-gateway nextScheduleRun) rather than in
 // the browser, so these helpers only format an instant they are handed. They never
@@ -29,15 +28,6 @@ export function formatNextRun(iso: string): string {
   return `in ${Math.floor(hours / 24)}d`
 }
 
-/**
- * The absolute local time, for the title attribute. A relative string is easier to
- * read at a glance but ambiguous when it matters — someone deciding whether to wait
- * for the next rebuild or force one needs the wall-clock time, in their own zone.
- *
- * Defined in @/lib/utils so pages outside the explorer share it; re-exported here
- * for the existing imports.
- */
-export { formatAbsoluteTime } from "@/lib/utils"
 
 // ---------------------------------------------------------------------------
 // Refetching when a next run comes due

@@ -211,6 +211,10 @@ spec:
               value: "all"
             - name: CONNECT_PRODUCER_RETRIES
               value: "10"
+            # Without it every CDC topic is stored uncompressed: no broker or topic
+            # default sets one, and Debezium's topic creation sets none.
+            - name: CONNECT_PRODUCER_COMPRESSION_TYPE
+              value: {{ .Values.connectors.cdc.kafkaConnect.compressionType | quote }}
             # The default 1 MiB rejects any row wider than it, and the rejection
             # surfaces as a stuck connector rather than a bad row. Same value as the
             # broker's KAFKA_MESSAGE_MAX_BYTES in templates/infra/kafka.yaml by
@@ -316,7 +320,7 @@ spec:
             default on Confluent Cloud and on plenty of managed clusters --
             rendered a worker config that cannot authenticate, and Connect
             reports that as a login-module error rather than as "you asked for
-            PLAIN". Mirrors llm-service/src/utils/kafka_security.py:220-224.
+            PLAIN". Mirrors llm-service/src/utils/kafka_security.py:218-224.
             An unsupported mechanism is rejected at render time by
             templates/validate.yaml rather than shipped as a broken JAAS string.
             */}}
@@ -579,6 +583,10 @@ spec:
               value: "8000"
             - name: MCP_HTTP_MODE
               value: "true"
+            # The worker dials a pinned destination as
+            # <STACK_PREFIX>-<id>-vX-Y-Z-mcp, the connector Service name.
+            - name: STACK_PREFIX
+              value: {{ .Values.global.stackPrefix | quote }}
             {{- if .Values.connectors.minio.enabled }}
             # Batches too large to ride inline are claim-checked to MinIO and
             # fetched through the minio connector. The worker's default is the
@@ -587,7 +595,8 @@ spec:
             - name: MINIO_MCP_URL
               value: {{ printf "http://%s:8000/mcp" (include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "minio" "version" "v1.0.0")) | quote }}
             {{- end }}
-            # The sink owns the durable ACK ledger (pipeline_batch_acks). With
+            # The sink owns the durable ACK ledger (pipeline_batch_acks for batch;
+            # cdc_counter_totals + cdc_offset_floors for CDC). With
             # no POSTGRES_URL the DB handle is nil, the ledger stays empty, and
             # the post-flight silent-drop invariant falls back to sink-emitted
             # stats events — a strictly weaker signal for "did this offset reach
@@ -624,6 +633,8 @@ spec:
             # Authentication required" — which reads as a Redis outage.
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@{{ include "rsync-ai.redis.address" . }}/0"
+            # CDC rows are masked here, batch rows in the orchestrator: one key.
+            {{- include "rsync-ai.piiHashKeyEnv" . | nindent 12 }}
           readinessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 10

@@ -380,7 +380,10 @@ describe("connection page — status and dates (#56)", () => {
       last_test_status: "success",
       last_tested_at: "2026-09-01T10:00:00Z",
     } as ReturnType<typeof connection>)
+    // The success's age is said with it (KI-CONNECTION-BADGE-OUTRANKS-EXPIRED-TOKEN):
+    // the Status card's line under the word.
     expect(statusCell()).toBe("Connected")
+    expect(screen.getByTestId("connection-last-test").textContent).toMatch(/^Last test: Succeeded · \d+d ago$/)
   })
 
   it("a stored failed test reads Test failed, not the raw status column", async () => {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 )
 
 // APIPollingWorker handles pipelines with sync_mode = "api_polling".
@@ -436,7 +437,7 @@ func flattenToStringMap(m map[string]interface{}) map[string]string {
 		case string:
 			out[k] = val
 		default:
-			out[k] = fmt.Sprintf("%v", val)
+			out[k] = utils.ConfigString(val)
 		}
 	}
 	return out

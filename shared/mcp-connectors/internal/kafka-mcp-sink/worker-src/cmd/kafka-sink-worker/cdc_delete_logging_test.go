@@ -153,7 +153,7 @@ func TestCDCDeleteEmitsLogLine(t *testing.T) {
 	var n int64
 	var err error
 	recs := captureLogLines(t, func() {
-		n, _, err = writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete")
+		n, _, err = writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete", msg.Offset)
 	})
 	if err != nil {
 		t.Fatalf("writeCDCToDestination(delete) returned error: %v", err)
@@ -200,7 +200,7 @@ func TestCDCDeleteLogNeverLeaksPKValue(t *testing.T) {
 	client := &http.Client{Transport: &scriptedDeleteRT{}}
 
 	raw := captureLogStderr(t, func() {
-		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete"); err != nil {
+		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete", msg.Offset); err != nil {
 			t.Errorf("writeCDCToDestination(delete) returned error: %v", err)
 		}
 	})
@@ -224,7 +224,7 @@ func TestCDCDeleteLogFieldsSurviveScrubber(t *testing.T) {
 	client := &http.Client{Transport: &scriptedDeleteRT{}}
 
 	recs := captureLogLines(t, func() {
-		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete"); err != nil {
+		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "delete", msg.Offset); err != nil {
 			t.Errorf("writeCDCToDestination(delete) returned error: %v", err)
 		}
 	})
@@ -261,7 +261,7 @@ func TestCDCDeleteLogFieldsSurviveScrubber(t *testing.T) {
 	// workers and restarts.
 	cfg2, msg2, sm2 := cdcDeleteFixture(map[string]interface{}{"id": 2}, []string{"id"})
 	recs2 := captureLogLines(t, func() {
-		if _, _, err := writeCDCToDestination(context.Background(), client, cfg2, nil, msg2, sm2, "delete"); err != nil {
+		if _, _, err := writeCDCToDestination(context.Background(), client, cfg2, nil, msg2, sm2, "delete", msg2.Offset); err != nil {
 			t.Errorf("writeCDCToDestination(delete) returned error: %v", err)
 		}
 	})
@@ -286,7 +286,7 @@ func TestCDCUpsertEmitsNoDeleteLine(t *testing.T) {
 	client := &http.Client{Transport: &scriptedDeleteRT{}}
 
 	recs := captureLogLines(t, func() {
-		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert"); err != nil {
+		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert", msg.Offset); err != nil {
 			t.Errorf("writeCDCToDestination(upsert) returned error: %v", err)
 		}
 	})

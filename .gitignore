@@ -129,3 +129,7 @@ security-audit-results/*.sarif
 security-audit-results/_log_*.txt
 security-audit-results/*.txt
 !security-audit-results/REPORT.md
+
+# Ask rsync.ai accuracy eval output (scripts/assistant_accuracy_eval.py): its
+# answers.jsonl holds Ask's answer text, which can quote workspace values.
+assistant-accuracy-*/

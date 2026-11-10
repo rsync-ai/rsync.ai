@@ -24,6 +24,31 @@ const (
 	SignalNodeInputProvided = "node_input_provided"
 )
 
+// nodeKindRuntimeChangeID gates the node-kind runtime: the graph preflight
+// (validateRunnableGraph) and the scheduler answering wait, merge and split
+// itself, a wait by sleeping.
+//
+// Versioned because both change the command stream. The preflight fails a run
+// before its first activity, and a wait adds a timer where an activity used to
+// be scheduled; replaying a history recorded before this change must keep
+// dispatching those three kinds and must not be refused, or it diverges from
+// its own history. Such a replay is still safe: the executor now refuses any
+// node task other than a destination's data_transfer, so the dispatched node
+// fails instead of re-running the transfer.
+//
+// Making a kind the preflight refuses runnable later changes the preflight
+// again, so it needs a new version of this change ID, not an edit in place.
+const nodeKindRuntimeChangeID = "dag-node-kind-runtime"
+
+// preRuntimeLocalNodeKinds are the kinds the scheduler answered itself before
+// nodeKindRuntimeChangeID. A history recorded then dispatched every other
+// kind, so this set is frozen: a kind made local later is still dispatched when
+// such a history replays.
+var preRuntimeLocalNodeKinds = map[string]bool{
+	workflowtypes.NodeKindSource:    true,
+	workflowtypes.NodeKindTransform: true,
+}
+
 // NodeInputPayload is the payload for the node_input_provided signal
 type NodeInputPayload struct {
 	PipelineID  string                 `json:"pipeline_id"`
@@ -47,6 +72,10 @@ type DAGScheduler struct {
 	nodeOutputs  map[string]map[string]interface{}
 	runningNodes map[string]bool
 	completedSet map[string]bool
+
+	// nodeKindRuntime is false while replaying a history recorded before
+	// nodeKindRuntimeChangeID; set once in Execute.
+	nodeKindRuntime bool
 }
 
 // NewDAGScheduler creates a new DAG scheduler
@@ -94,6 +123,15 @@ func (s *DAGScheduler) Execute() error {
 		return fmt.Errorf("invalid DAG: %w", err)
 	}
 
+	// Refuse a graph the runtime cannot run before any node starts, rather
+	// than failing (or, before the executor's guard, transferring) at the node.
+	s.nodeKindRuntime = workflow.GetVersion(s.ctx, nodeKindRuntimeChangeID, workflow.DefaultVersion, 1) != workflow.DefaultVersion
+	if s.nodeKindRuntime {
+		if err := validateRunnableGraph(s.graph); err != nil {
+			return fmt.Errorf("unrunnable DAG: %w", err)
+		}
+	}
+
 	// Setup node input signal channel
 	nodeInputCh := workflow.GetSignalChannel(s.ctx, SignalNodeInputProvided)
 
@@ -123,10 +161,13 @@ func (s *DAGScheduler) Execute() error {
 			waitingNodes := s.graph.GetWaitingNodes()
 			if len(waitingNodes) > 0 {
 				logger.Info("⏳ Waiting for node input", "waiting_nodes", waitingNodes)
-				// Wait for a signal or timeout
-				_ = workflow.Await(s.ctx, func() bool {
+				// Wait for a signal or timeout. The wait ends with an error only
+				// when the run is cancelled; looping on it would spin.
+				if err := workflow.Await(s.ctx, func() bool {
 					return len(s.graph.GetWaitingNodes()) == 0 || s.graph.HasFailed()
-				})
+				}); err != nil {
+					return err
+				}
 				continue
 			}
 
@@ -285,8 +326,24 @@ func (s *DAGScheduler) executeNode(ctx workflow.Context, nodeID string) (map[str
 	// Deterministic local nodes: these do not call external workers/agents.
 	// localNodeOutput (node_kind_routing.go) owns the decision: the bool it
 	// returns IS whether this kind is handled locally, so there is no gate here
-	// that could be narrowed while an unreachable case arm is left behind.
-	if out, handled := localNodeOutput(nodeID, node, inputs); handled {
+	// that could be narrowed while an unreachable case arm is left behind. The
+	// one exception is replay of a history recorded before the node-kind
+	// runtime, which dispatched every kind but the frozen legacy set.
+	out, handled := localNodeOutput(nodeID, node, inputs)
+	if handled && !s.nodeKindRuntime && !preRuntimeLocalNodeKinds[node.Kind] {
+		handled = false
+	}
+	if handled {
+		if node.Kind == workflowtypes.NodeKindWait {
+			d, err := waitDuration(node.Config)
+			if err != nil {
+				return nil, fmt.Errorf("wait node %s: %w", nodeID, err)
+			}
+			logger.Info("⏸️ Wait node sleeping", "node_id", nodeID, "duration", d)
+			if err := workflow.Sleep(ctx, d); err != nil {
+				return nil, err
+			}
+		}
 		return out, nil
 	}
 
@@ -373,8 +430,12 @@ func (s *DAGScheduler) handleNodeInput(ctx workflow.Context, payload NodeInputPa
 		return
 	}
 
-	// Apply config patch
+	// Apply config patch. A node the planner left without config decodes with a
+	// nil Config (the field is omitempty), so it needs a map before the write.
 	if payload.ConfigPatch != nil {
+		if node.Config == nil {
+			node.Config = make(map[string]interface{}, len(payload.ConfigPatch))
+		}
 		for k, v := range payload.ConfigPatch {
 			node.Config[k] = v
 		}

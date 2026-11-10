@@ -24,6 +24,7 @@ describe("alertClassLabel", () => {
     expect(alertClassLabel("cdc-lag-aa4c1a3c", "high_lag")).toBe("Source replication lag")
     expect(alertClassLabel("cdc-sink-lag-aa4c1a3c", "high_lag")).toBe("Not reaching the destination")
     expect(alertClassLabel("cdc-connector-down-aa4c1a3c", "connector_down")).toBe("Connector down")
+    expect(alertClassLabel("cdc-rows-parked-aa4c1a3c", "rows_parked")).toBe("Changes set aside (not delivered)")
   })
 
   it("does not confuse the two lag classes", () => {

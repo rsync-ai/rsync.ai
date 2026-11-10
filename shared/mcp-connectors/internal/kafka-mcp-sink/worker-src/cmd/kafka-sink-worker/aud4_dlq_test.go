@@ -47,9 +47,9 @@ func TestAUD4DLQRouting(t *testing.T) {
 	}
 	defer dlqWriter.Close()
 
-	// Placeholder reader: flushBatch calls CommitMessages on it. Without a GroupID this
-	// returns an ignored error (the code does `_ = b.reader.CommitMessages(...)`); we
-	// never Read from it, so no broker round-trip is needed here.
+	// Placeholder reader: the commit gate calls CommitMessages on it. Without a GroupID
+	// this returns an error the gate ignores (it retries on the next landing); we never
+	// Read from it, so no broker round-trip is needed here.
 	reader := kafka.NewReader(kafka.ReaderConfig{Brokers: []string{broker}, Topic: topic})
 	defer reader.Close()
 
@@ -63,8 +63,7 @@ func TestAUD4DLQRouting(t *testing.T) {
 		destType:   "postgresql",
 		destCfg:    map[string]interface{}{},
 		params:     cdcBatchingParams{enabled: true, maxRetries: 1, backoff: time.Millisecond},
-		reader:     reader,
-		hw:         newHighWaterTracker(),
+		gate:       newCommitGate(reader.CommitMessages, newHighWaterTracker()),
 		httpClient: &http.Client{Transport: failRT{}, Timeout: 2 * time.Second},
 		dlqWriter:  dlqWriter,
 		metrics:    metrics,

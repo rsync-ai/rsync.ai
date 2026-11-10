@@ -66,6 +66,10 @@ type ConversationContext struct {
 	ID        string `json:"id"` // conversation_id (same as session_id)
 	UserID    string `json:"user_id"`
 	SessionID string `json:"session_id"`
+	// WorkspaceID is the workspace the conversation belongs to. It is part of the
+	// cache key, so a pending confirmation started in one workspace is never
+	// resumed after the user switches to another.
+	WorkspaceID string `json:"workspace_id,omitempty"`
 
 	// State machine
 	State         ConversationState `json:"state"`
@@ -187,6 +191,7 @@ func (c *ConversationContext) Snapshot() *ConversationContext {
 		ID:            c.ID,
 		UserID:        c.UserID,
 		SessionID:     c.SessionID,
+		WorkspaceID:   c.WorkspaceID,
 		State:         c.State,
 		PendingIntent: clonePendingIntent(c.PendingIntent),
 		LastMessage:   c.LastMessage,
@@ -342,14 +347,16 @@ func NewConversationCache(client *redis.Client) *ConversationCache {
 	}
 }
 
-// buildKey constructs the Redis key for a conversation
-func (c *ConversationCache) buildKey(userID, conversationID string) string {
-	return fmt.Sprintf("%s%s:%s", ConversationKeyPrefix, userID, conversationID)
+// buildKey constructs the Redis key for a conversation. The workspace is part of
+// the key: a confirmation pending in one workspace must not be answered from
+// another (KI-CHAT-SKIPS-WORKSPACE-ROLE).
+func (c *ConversationCache) buildKey(userID, workspaceID, conversationID string) string {
+	return fmt.Sprintf("%s%s:%s:%s", ConversationKeyPrefix, userID, workspaceID, conversationID)
 }
 
-// Get retrieves a conversation context by user ID and conversation ID
-func (c *ConversationCache) Get(ctx context.Context, userID, conversationID string) (*ConversationContext, error) {
-	key := c.buildKey(userID, conversationID)
+// Get retrieves a conversation context by user, workspace and conversation ID
+func (c *ConversationCache) Get(ctx context.Context, userID, workspaceID, conversationID string) (*ConversationContext, error) {
+	key := c.buildKey(userID, workspaceID, conversationID)
 
 	val, err := c.client.Get(ctx, key).Bytes()
 	if err == redis.Nil {
@@ -384,7 +391,7 @@ func (c *ConversationCache) Set(ctx context.Context, conv *ConversationContext) 
 	now := time.Now()
 	conv.Touch(now)
 	snap := conv.Snapshot()
-	key := c.buildKey(snap.UserID, snap.ID)
+	key := c.buildKey(snap.UserID, snap.WorkspaceID, snap.ID)
 
 	data, err := json.Marshal(snap)
 	if err != nil {
@@ -411,8 +418,8 @@ func (c *ConversationCache) Set(ctx context.Context, conv *ConversationContext) 
 }
 
 // GetOrCreate retrieves an existing conversation or creates a new one
-func (c *ConversationCache) GetOrCreate(ctx context.Context, userID, conversationID string) (*ConversationContext, error) {
-	conv, err := c.Get(ctx, userID, conversationID)
+func (c *ConversationCache) GetOrCreate(ctx context.Context, userID, workspaceID, conversationID string) (*ConversationContext, error) {
+	conv, err := c.Get(ctx, userID, workspaceID, conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +427,7 @@ func (c *ConversationCache) GetOrCreate(ctx context.Context, userID, conversatio
 	if conv == nil {
 		// Create new conversation
 		conv = NewConversationContext(userID, conversationID)
+		conv.WorkspaceID = workspaceID
 		if err := c.Set(ctx, conv); err != nil {
 			log.WithError(err).Warn("Failed to cache new conversation")
 			// Continue even if caching fails - we have an in-memory copy

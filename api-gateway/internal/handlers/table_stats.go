@@ -32,6 +32,17 @@ const (
 	capturedSnapshotSQL = "(snapshot_rows + COALESCE(legacy_snapshot_reads, 0))"
 )
 
+// rewoundSQL is true for a stats row whose table its run rewound (migration 141):
+// the run lost batches and put the table's resume position back to where it
+// started, so a Resume re-reads its rows. The orchestrator records the checkpoint's
+// table name, which the stats row carries as qualified_name, or as table_name when
+// the sink qualified a bare name with the source database. Batch only: a CDC row's
+// execution_id is its pipeline id, which no rewind records.
+const rewoundSQL = `EXISTS (SELECT 1 FROM pipeline_run_rewinds rw
+		WHERE rw.pipeline_id = pipeline_run_table_stats.pipeline_id
+		  AND rw.execution_id = pipeline_run_table_stats.execution_id::text
+		  AND rw.source_table IN (pipeline_run_table_stats.qualified_name, pipeline_run_table_stats.table_name))`
+
 // TableStat represents a single table's statistics
 type TableStat struct {
 	// schema_name can be NULL in DB (e.g. if the source doesn't have schemas).
@@ -99,6 +110,11 @@ type TableStat struct {
 	// what did not.
 	DLQRows int64 `json:"dlq_rows"`
 
+	// Rewound: the run lost batches and put this table's resume position back to
+	// where it started (rewoundSQL), so a Resume re-reads its rows. A degraded table
+	// reads "Rewound" only then; otherwise its rows were simply not written.
+	Rewound bool `json:"rewound,omitempty"`
+
 	// Timestamps
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
@@ -113,6 +129,9 @@ type TableStatsSummary struct {
 	TablesFailed    int    `json:"tables_failed"`
 	TablesRunning   int    `json:"tables_running"`
 	TablesDegraded  int    `json:"tables_degraded"`
+	// TablesRewound counts the degraded tables whose run rewound them (rewoundSQL);
+	// they are in TablesDegraded too.
+	TablesRewound int `json:"tables_rewound"`
 	// TablesWaitingForData counts selected CDC tables with nothing captured or
 	// applied yet. They are not in TablesRunning.
 	TablesWaitingForData int `json:"tables_waiting_for_data"`
@@ -176,22 +195,7 @@ func GetPipelineTableStats(c *gin.Context) {
 	sortBy := strings.TrimSpace(c.DefaultQuery("sort", "qualified_name")) // qualified_name, inserted_rows, status, updated_at
 	exportFormat := strings.TrimSpace(c.Query("export"))
 
-	// CDC table stats are stored under a stable execution key (execution_id == pipeline_id)
-	// so UIs can always query the latest streaming counters, even when the current run has a
-	// separate Temporal execution/workflow ID.
-	if modeFilter == "cdc" {
-		executionID = pipelineID
-	}
-
-	// A caller that names a CDC run by its own id — the Execution Details page does
-	// — matched no row, because the run's stats live under the pipeline key above,
-	// and the page said "No table statistics" beside a pipeline showing 83,230 rows
-	// (UI #40). When the run has no rows of its own, read the stream key instead.
-	if modeFilter == "" && executionID != "" && executionID != pipelineID &&
-		cdcRunStatsAreUnderPipelineKey(database, pipelineID, executionID) {
-		modeFilter = "cdc"
-		executionID = pipelineID
-	}
+	executionID, modeFilter = tableStatsReadScope(database, pipelineID, executionID, modeFilter)
 
 	limit := 50
 	if s := c.Query("limit"); s != "" {
@@ -255,6 +259,7 @@ func GetPipelineTableStats(c *gin.Context) {
 			(COALESCE(applied_inserts, 0) + COALESCE(applied_updates, 0) + COALESCE(applied_deletes, 0)) AS applied_total_events,
 			last_applied_ts,
 			COALESCE(dlq_rows, 0) AS dlq_rows,
+			` + rewoundSQL + ` AS rewound,
 			destination_schema, destination_qualified_name, orchestration_execution_id,
 			started_at, completed_at, updated_at
 		FROM pipeline_run_table_stats
@@ -365,6 +370,7 @@ func GetPipelineTableStats(c *gin.Context) {
 		var appliedInserts, appliedUpdates, appliedDeletes, appliedTotalEvents sql.NullInt64
 		var lastEventTs, lastAppliedTs, startedAt, completedAt sql.NullTime
 		var dlqRows int64
+		var rewound bool
 		var destSchema, destQualifiedName, orchExecutionID sql.NullString
 		var updatedAt time.Time
 
@@ -373,7 +379,7 @@ func GetPipelineTableStats(c *gin.Context) {
 			&readRows, &insertedRows,
 			&inserts, &updates, &deletes, &totalEvents, &lastEventTs,
 			&appliedInserts, &appliedUpdates, &appliedDeletes, &appliedTotalEvents, &lastAppliedTs,
-			&dlqRows,
+			&dlqRows, &rewound,
 			&destSchema, &destQualifiedName, &orchExecutionID,
 			&startedAt, &completedAt, &updatedAt,
 		); err != nil {
@@ -410,6 +416,7 @@ func GetPipelineTableStats(c *gin.Context) {
 			stat.Status = status
 		}
 		stat.DLQRows = dlqRows
+		stat.Rewound = rewound
 		stat.UpdatedAt = updatedAt
 
 		if readRows.Valid {
@@ -537,6 +544,63 @@ func lastBatchRunThatMovedRows(database *sql.DB, pipelineID string) *LastDataRun
 		run.FinishedAt = &finished.Time
 	}
 	return &run
+}
+
+// tableStatsReadScope returns the execution id and mode a table-stats read is
+// scoped to, given the ones the caller sent.
+func tableStatsReadScope(database *sql.DB, pipelineID, executionID, modeFilter string) (string, string) {
+	// CDC table stats are stored under a stable execution key (execution_id == pipeline_id)
+	// so UIs can always query the latest streaming counters, even when the current run has a
+	// separate Temporal execution/workflow ID.
+	if modeFilter == "cdc" {
+		return pipelineID, modeFilter
+	}
+
+	// A caller that names a CDC run by its own id — the Execution Details page does
+	// — matched no row, because the run's stats live under the pipeline key above,
+	// and the page said "No table statistics" beside a pipeline showing 83,230 rows
+	// (UI #40). When the run has no rows of its own, read the stream key instead.
+	if modeFilter == "" && executionID != "" && executionID != pipelineID &&
+		cdcRunStatsAreUnderPipelineKey(database, pipelineID, executionID) {
+		return pipelineID, "cdc"
+	}
+
+	// A read that named no run listed and summed every run's rows, one per table
+	// per run: a 6-table pipeline run twice reported 12 tables (prod 9a094389).
+	// Read the latest batch run instead; with none, or on a failed lookup, read
+	// everything as before.
+	if executionID == "" {
+		var latest string
+		err := database.QueryRow(tableStatsLatestBatchRunSQL(modeFilter), pipelineID).Scan(&latest)
+		if err != nil && err != sql.ErrNoRows {
+			log.WithError(err).Warn("table stats: could not find the latest batch run; reading every run")
+		}
+		if err == nil {
+			return latest, modeFilter
+		}
+	}
+	return executionID, modeFilter
+}
+
+// tableStatsLatestBatchRunSQL finds a pipeline's newest batch run with stats. The
+// stream key (execution_id = pipeline_id) is never a run. Asked with no mode, a
+// CDC pipeline is skipped, so its stream rows stay in the read.
+func tableStatsLatestBatchRunSQL(modeFilter string) string {
+	cdcSkip := ""
+	if modeFilter == "" {
+		cdcSkip = `
+		   AND NOT EXISTS (SELECT 1 FROM pipelines p WHERE p.id = $1::uuid AND ` + pipelineRowIsCDCSQL + `)`
+	}
+	return `
+		SELECT s.execution_id::text
+		  FROM pipeline_run_table_stats s
+		 WHERE s.pipeline_id = $1::uuid
+		   AND s.mode = 'batch'
+		   AND s.execution_id IS NOT NULL
+		   AND s.execution_id <> $1::uuid` + cdcSkip + `
+		 GROUP BY s.execution_id
+		 ORDER BY MAX(s.created_at) DESC, s.execution_id DESC
+		 LIMIT 1`
 }
 
 // cdcRunStatsAreUnderPipelineKey reports whether executionID is a run of a CDC
@@ -1105,7 +1169,8 @@ func computeTableStatsSummary(database *sql.DB, pipelineID, executionID string) 
 			SUM(COALESCE(applied_deletes, 0)) as sum_applied_deletes,
 			SUM(COALESCE(applied_inserts, 0) + COALESCE(applied_updates, 0) + COALESCE(applied_deletes, 0)) as sum_applied_total_events,
 			SUM(COALESCE(dlq_rows, 0)) as sum_dlq_rows,
-			COUNT(*) FILTER (WHERE COALESCE(dlq_rows, 0) > 0) as cnt_tables_with_dlq
+			COUNT(*) FILTER (WHERE COALESCE(dlq_rows, 0) > 0) as cnt_tables_with_dlq,
+			COUNT(*) FILTER (WHERE `+rewoundSQL+`) as cnt_rewound
 		FROM pipeline_run_table_stats
 		%s
 		GROUP BY mode, 2
@@ -1131,12 +1196,12 @@ func computeTableStatsSummary(database *sql.DB, pipelineID, executionID string) 
 		var sumInserts, sumUpdates, sumDeletes, sumTotalEvents sql.NullInt64
 		var sumAppliedInserts, sumAppliedUpdates, sumAppliedDeletes, sumAppliedTotalEvents sql.NullInt64
 		var sumDLQRows sql.NullInt64
-		var cntTablesWithDLQ int
+		var cntTablesWithDLQ, cntRewound int
 
 		if err := rows.Scan(&mode, &status, &cnt, &sumReadRows, &sumInsertedRows,
 			&sumInserts, &sumUpdates, &sumDeletes, &sumTotalEvents,
 			&sumAppliedInserts, &sumAppliedUpdates, &sumAppliedDeletes, &sumAppliedTotalEvents,
-			&sumDLQRows, &cntTablesWithDLQ,
+			&sumDLQRows, &cntTablesWithDLQ, &cntRewound,
 		); err != nil {
 			continue
 		}
@@ -1153,6 +1218,9 @@ func computeTableStatsSummary(database *sql.DB, pipelineID, executionID string) 
 			summary.TablesRunning += cnt
 		case "degraded":
 			summary.TablesDegraded += cnt
+			// A rewind puts back every table of the run; only a degraded one is
+			// "Rewound" to the user — a complete table lost nothing.
+			summary.TablesRewound += cntRewound
 		}
 
 		if mode == "batch" {

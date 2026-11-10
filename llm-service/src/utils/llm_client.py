@@ -5,6 +5,8 @@ import requests
 import logging
 from typing import Dict, Any, Optional
 
+from src.egress.scope import workspace_headers
+
 logger = logging.getLogger(__name__)
 
 # Connect timeout 5s, read timeout configurable via env (default 120s for slow LLMs)
@@ -76,7 +78,9 @@ class LLMClient:
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 response = requests.post(
-                    url, json=payload, timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT)
+                    url, json=payload, timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                    # The gateway's egress record names the caller's workspace.
+                    headers=workspace_headers(),
                 )
                 if _is_llm_not_configured(response):
                     logger.warning("LLM Service has no LLM set up; not retrying %s", prompt_name)

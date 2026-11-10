@@ -25,12 +25,6 @@ ARG NEXT_PUBLIC_API_URL=http://localhost:5001
 ARG NEXT_PUBLIC_WS_URL=ws://localhost:5001/ws
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
-ARG NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL=http://localhost:8081
-ENV NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL=$NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL
-ARG NEXT_PUBLIC_WS_ORCHESTRATOR_URL=ws://localhost:8081/ws
-ENV NEXT_PUBLIC_WS_ORCHESTRATOR_URL=$NEXT_PUBLIC_WS_ORCHESTRATOR_URL
-ARG NEXT_PUBLIC_LLM_SERVICE_URL=http://localhost:5011
-ENV NEXT_PUBLIC_LLM_SERVICE_URL=$NEXT_PUBLIC_LLM_SERVICE_URL
 ARG NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW=false
 ENV NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW=$NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW
 ARG NEXT_PUBLIC_FEATURE_MONITORING_INFRA=false
@@ -61,6 +55,10 @@ RUN adduser --system --uid 1001 nextjs
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 USER nextjs
 

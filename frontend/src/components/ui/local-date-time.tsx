@@ -1,7 +1,7 @@
 "use client"
 
 import { useSyncExternalStore } from "react"
-import { formatAbsoluteTime } from "@/lib/utils"
+import { formatAbsoluteTime, viewerTimeZone } from "@/lib/utils"
 
 // A server component that formats a time formats it in the SERVER's zone — UTC on
 // every deployment we ship — and prints it with nothing saying so, so a viewer in
@@ -25,15 +25,19 @@ export function formatUtcDateTime(d: Date): string {
 
 /**
  * A point in time, in the viewer's own zone with the zone named. Before hydration
- * (and with JavaScript off) it shows the UTC time, labelled as UTC.
+ * (and with JavaScript off) it shows the UTC time, labelled as UTC. `zone={false}`
+ * leaves the zone off for a page that names it once with <ViewerTimeZone>; the
+ * UTC time before hydration keeps its label, since that is not the named zone.
  */
 export function LocalDateTime({
   value,
   fallback = "Unknown",
+  zone = true,
   className,
 }: {
   value: Date | string | null | undefined
   fallback?: string
+  zone?: boolean
   className?: string
 }) {
   const hydrated = useHydrated()
@@ -43,7 +47,17 @@ export function LocalDateTime({
   const iso = d.toISOString()
   return (
     <time dateTime={iso} title={iso} className={className}>
-      {hydrated ? formatAbsoluteTime(iso) : formatUtcDateTime(d)}
+      {hydrated ? formatAbsoluteTime(iso, { zone }) : formatUtcDateTime(d)}
     </time>
   )
+}
+
+/**
+ * "Times in Europe/Berlin." for a page whose times leave their zone off. Nothing
+ * before hydration: the times then show UTC and say so themselves.
+ */
+export function ViewerTimeZone() {
+  const hydrated = useHydrated()
+  if (!hydrated) return null
+  return <> Times in {viewerTimeZone()}.</>
 }

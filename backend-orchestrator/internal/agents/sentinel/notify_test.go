@@ -1,9 +1,14 @@
 package sentinel
 
 import (
+	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +46,40 @@ func codeOf(t *testing.T, n map[string]interface{}) string {
 	return se.Code
 }
 
+// structuredErrorOf reads the structured error off a built payload, failing the test
+// when there is none.
+func structuredErrorOf(t *testing.T, n map[string]interface{}) (se struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Audience string `json:"audience"`
+}) {
+	t.Helper()
+	raw, ok := n["error"]
+	if !ok {
+		t.Fatal("no structured error: the gateway has no code to find the headline under and no severity but info")
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal structured error: %v", err)
+	}
+	if err := json.Unmarshal(b, &se); err != nil {
+		t.Fatalf("unmarshal structured error: %v", err)
+	}
+	return se
+}
+
+// gatewayCatalog is the api-gateway's catalog.go, read from disk (see
+// TestEveryCuratedCodeHasCopyInTheGateway for why).
+func gatewayCatalog(t *testing.T) string {
+	t.Helper()
+	catalogPath := filepath.Join(repoRoot(t), "api-gateway", "internal", "notifier", "catalog.go")
+	b, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", catalogPath, err)
+	}
+	return string(b)
+}
+
 // Every failure class that means "the data stopped" must reach the bell, and
 // must carry the catalog code its copy hangs off. A missing code is not a
 // cosmetic problem: the api-gateway falls back to a humanized event type and
@@ -63,6 +102,19 @@ func TestEveryStoppedDataIssueReachesTheUser(t *testing.T) {
 		// never surface it, which is the whole reason the policy looks at the
 		// alert type first.
 		{"sink wedged escalation", IssueTypeHighLag, IssueSeverityWarning, "sink_wedged_escalation", "CDC_SINK_WEDGED"},
+		// The respawn rung's terminal verdict (cdc_sink_respawn.go sinkRespawnEscalate): the
+		// sink container holds no worker for the pipeline and restarts could not bring one
+		// back. Also a high_lag WARNING, so it too is pushed only by its alert type.
+		{"sink absent", IssueTypeHighLag, IssueSeverityWarning, "sink_absent", "CDC_SINK_ABSENT"},
+		// The sink-drain alarm once it has outlasted DefaultSinkDrainNotifyAfter: same
+		// high_lag type as the page-only warning, told apart by its alert type.
+		{"sink not draining", IssueTypeHighLag, IssueSeverityCritical, "sink_not_draining", "CDC_SINK_NOT_DRAINING"},
+		// Source-side lag once it has outlasted DefaultSourceLagNotifyAfter with the committed
+		// position frozen: same high_lag type as the page-only source_lag warning.
+		{"source lag sustained", IssueTypeHighLag, IssueSeverityCritical, "source_lag_sustained", "CDC_SOURCE_LAG_HIGH"},
+		// Changes the sink consumed and parked instead of writing: every lag signal is
+		// green for these, which is why they need an alert of their own.
+		{"rows parked", IssueTypeRowsParked, IssueSeverityCritical, "cdc_rows_parked", "CDC_ROWS_PARKED"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,6 +151,7 @@ func TestAnOrdinaryWarningIsNotPushed(t *testing.T) {
 		alertType string
 	}{
 		{"high lag", IssueTypeHighLag, "sink_lag"},
+		{"source lag", IssueTypeHighLag, "source_lag"},
 		{"no row movement", IssueTypeNoRowMovement, string(IssueTypeNoRowMovement)},
 		{"stalled run", IssueTypeStalledRun, string(IssueTypeStalledRun)},
 	} {
@@ -107,6 +160,114 @@ func TestAnOrdinaryWarningIsNotPushed(t *testing.T) {
 				t.Fatalf("%s was pushed to the bell; warnings belong on the overview", tc.name)
 			}
 		})
+	}
+}
+
+// The sink-drain alarm escalates under ONE issue id: a warning on the page first, pushed
+// only once the stall outlasts the notify bound. What the owner reads must not borrow the
+// engineer's description -- it names the consumer group, which nobody reading an email can
+// act on -- and must say how long and how much.
+func TestASinkThatStopsDrainingIsPushedOnceItOutlastsTheNotifyBound(t *testing.T) {
+	stall := DefaultSinkDrainStallAfter
+	notify := DefaultSinkDrainNotifyAfter
+	if sev, alertType := sinkDrainAlert(stall, notify); sev != IssueSeverityWarning || alertType != "sink_lag" {
+		t.Fatalf("at the stall bound got %s/%s, want a warning sink_lag", sev, alertType)
+	}
+	if _, ok := buildSentinelNotification(IssueTypeHighLag, IssueSeverityWarning, "sink_lag", "pipe-1", "d", nil); ok {
+		t.Fatal("a stall shorter than the notify bound was pushed")
+	}
+
+	sev, alertType := sinkDrainAlert(notify, notify)
+	if sev != IssueSeverityCritical || alertType != "sink_not_draining" {
+		t.Fatalf("at the notify bound got %s/%s, want a critical sink_not_draining", sev, alertType)
+	}
+	n, ok := buildSentinelNotification(IssueTypeHighLag, sev, alertType, "pipe-1",
+		"CDC sink is not draining Kafka ... (group: sink-1a2b3c4d)",
+		map[string]interface{}{"stalled_for_seconds": int64(1200), "total_lag": int64(4821), "consumer_group": "sink-1a2b3c4d"})
+	if !ok {
+		t.Fatal("a sink stalled past the notify bound was not pushed")
+	}
+	msg, _ := n["message"].(string)
+	for _, want := range []string{"20 minutes", "4821 waiting", "destination"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q does not say %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "sink-1a2b3c4d") {
+		t.Errorf("message names the consumer group: %q", msg)
+	}
+}
+
+// Sustained source lag is pushed under its own code, and what the owner reads says how long
+// nothing has been read and how much is waiting, without the engineer's description: that
+// names the replication slot, which nobody reading an email can act on.
+func TestASustainedSourceLagIsPushedWithItsOwnCode(t *testing.T) {
+	notify := DefaultSourceLagNotifyAfter
+	sev, alertType := sourceLagAlert(notify, notify, notify, notify, true)
+	n, ok := buildSentinelNotification(IssueTypeHighLag, sev, alertType, "pipe-1",
+		"Replication slot lag is 812.4 MB (slot: rsync_slot_1a2b3c4d) — source changes are not being consumed fast enough",
+		map[string]interface{}{"frozen_for_seconds": int64(7200), "lagging_for_seconds": int64(9000),
+			"lag_mb": 812.4, "slot_name": "rsync_slot_1a2b3c4d"})
+	if !ok {
+		t.Fatal("source lag sustained past the notify bound was not pushed")
+	}
+	if got := codeOf(t, n); got != "CDC_SOURCE_LAG_HIGH" {
+		t.Fatalf("code = %q, want CDC_SOURCE_LAG_HIGH", got)
+	}
+	msg, _ := n["message"].(string)
+	for _, want := range []string{"2 hours", "812 MB", "source database", "destination"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q does not say %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "rsync_slot_1a2b3c4d") {
+		t.Errorf("message names the replication slot: %q", msg)
+	}
+}
+
+// The notify bound never sits below the stall bound: a notification about a sink the alarm
+// does not yet call stalled is the false alarm the stall bound exists to prevent.
+func TestTheNotifyBoundIsHeldAtOrAboveTheStallBound(t *testing.T) {
+	t.Setenv("CDC_SINK_DRAIN_STALL_AFTER", "10m")
+	t.Setenv("CDC_SINK_DRAIN_NOTIFY_AFTER", "2m")
+	if got := sinkDrainNotifyAfter(); got != 10*time.Minute {
+		t.Fatalf("notify bound = %s with the stall bound at 10m, want 10m", got)
+	}
+	t.Setenv("CDC_SINK_DRAIN_NOTIFY_AFTER", "30m")
+	if got := sinkDrainNotifyAfter(); got != 30*time.Minute {
+		t.Fatalf("notify bound = %s, want the configured 30m", got)
+	}
+}
+
+// The parked-rows alert names where the changes went missing, in names and counts only,
+// and reads the same after the metadata has been through JSON (the table list comes back
+// as []interface{}).
+func TestTheParkedRowsAlertNamesTheTables(t *testing.T) {
+	_, meta := rowsParkedReport([]parkedTable{
+		{"public.orders", 40}, {"public.payments", 7}, {"public.users", 2}, {"public.audit", 1},
+	}, 50, 12)
+	b, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire map[string]interface{}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for name, m := range map[string]map[string]interface{}{"in process": meta, "after JSON": wire} {
+		n, ok := buildSentinelNotification(IssueTypeRowsParked, IssueSeverityCritical, "cdc_rows_parked", "pipe-1", "d", m)
+		if !ok {
+			t.Fatalf("%s: no alert built", name)
+		}
+		msg, _ := n["message"].(string)
+		for _, want := range []string{"12 change(s)", "public.orders", "public.payments", "public.users", "and 1 more", "will not arrive"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("%s: message %q does not say %q", name, msg, want)
+			}
+		}
+		if strings.Contains(msg, "public.audit") {
+			t.Errorf("%s: message names more than %d tables: %q", name, rowsParkedTablesShown, msg)
+		}
 	}
 }
 
@@ -221,12 +382,7 @@ func TestStallDurationReadsAsEnglish(t *testing.T) {
 // file. Both directions are NOT checked: a catalog entry without a producer here
 // is dead copy, not a broken alert, and other services publish codes too.
 func TestEveryCuratedCodeHasCopyInTheGateway(t *testing.T) {
-	catalogPath := filepath.Join(repoRoot(t), "api-gateway", "internal", "notifier", "catalog.go")
-	b, err := os.ReadFile(catalogPath)
-	if err != nil {
-		t.Fatalf("read %s: %v", catalogPath, err)
-	}
-	catalog := string(b)
+	catalog := gatewayCatalog(t)
 
 	codes := make([]string, 0, len(notifiableIssueTypes)+len(notifiableAlertTypes))
 	for _, a := range notifiableIssueTypes {
@@ -248,6 +404,114 @@ func TestEveryCuratedCodeHasCopyInTheGateway(t *testing.T) {
 		if !strings.Contains(catalog, `"`+code+`": {`) {
 			t.Errorf("code %q is published by the sentinel but has no entry in api-gateway catalog.go; "+
 				"the bell will show a humanized event type with no category", code)
+		}
+	}
+}
+
+// The class KI-CDC-WAL-PRESSURE-NOTICE-RENDERS-AS-INFO and
+// KI-CDC-POSITION-RETENTION-NOTICE-RENDERS-AS-INFO belong to: a notification built by
+// hand, outside buildSentinelNotification, with no catalog code. The api-gateway titles
+// one after its humanized event type and files it as info whatever it says about itself,
+// and TestEveryCuratedCodeHasCopyInTheGateway cannot see it, because its code (if any) is
+// in none of the curated tables. So this checks what each raise actually sends: a code,
+// the same code and a severity in the structured error, and copy for it in the gateway.
+func TestEverySentinelRaiseCarriesACodeTheGatewayCurates(t *testing.T) {
+	catalog := gatewayCatalog(t)
+	for _, tc := range episodeRaises {
+		t.Run(tc.name, func(t *testing.T) {
+			c, b, mock := episodeSentinels(t)
+			sent := captureAlerts(t)
+			mock.ExpectQuery(episodeUpsert).WillReturnRows(detectedAtRow())
+
+			tc.raise(context.Background(), c, b)
+
+			if len(*sent) != 1 {
+				t.Fatalf("sent %d notifications, want 1", len(*sent))
+			}
+			n := (*sent)[0].notification
+			code, _ := n["_code"].(string)
+			if tc.code == uncuratedCritical {
+				// The control: nobody curated it, so it goes out bare and gets the fallback.
+				if code != "" {
+					t.Errorf("_code = %q, want none for an uncurated issue type", code)
+				}
+				return
+			}
+			if code == "" {
+				t.Fatalf("sent with no code: the gateway titles it %q and files it as info", n["type"])
+			}
+			se := structuredErrorOf(t, n)
+			if se.Code != code || se.Audience != "user" || se.Severity == "" {
+				t.Errorf("structured error = %+v, want code %s for the user, with a severity", se, code)
+			}
+			if !strings.Contains(catalog, `"`+code+`": {`) {
+				t.Errorf("code %q has no entry in api-gateway catalog.go: the bell shows a humanized type", code)
+			}
+		})
+	}
+}
+
+// Every function that hands emitNotification a payload is one a test holds to carrying a
+// curated code. A new emitter fails here until somebody says how it is checked: the two
+// hand-built alerts above went out uncoded because nothing asked.
+func TestEveryNotificationEmitterIsChecked(t *testing.T) {
+	checkedBy := map[string]string{
+		"publishSentinelAlert": "buildSentinelNotification; TestEveryCuratedCodeHasCopyInTheGateway",
+		"publishInstanceAlert": "buildSentinelNotification; TestEveryCuratedCodeHasCopyInTheGateway",
+		"publishResolved":      "buildResolvedNotification; TestAResolvedNoticeIsAddressedLikeItsAlert",
+		"emitWALAlert":         "episodeRaises; TestEverySentinelRaiseCarriesACodeTheGatewayCurates",
+		"emitHorizonAlert":     "episodeRaises; TestEverySentinelRaiseCarriesACodeTheGatewayCurates",
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var emitters []string
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			// A method or function by its name; a function held in a var
+			// (publishResolved) by the var's.
+			var encl string
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				encl = d.Name.Name
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					if vs, ok := spec.(*ast.ValueSpec); ok && len(vs.Names) > 0 {
+						encl = vs.Names[0].Name
+					}
+				}
+			}
+			ast.Inspect(decl, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "emitNotification" {
+					emitters = append(emitters, encl)
+				}
+				return true
+			})
+		}
+	}
+	// None found means the scan, not the package, is broken.
+	if len(emitters) < len(checkedBy) {
+		t.Fatalf("found %d calls to emitNotification (%v), want at least %d", len(emitters), emitters, len(checkedBy))
+	}
+	sort.Strings(emitters)
+	for _, e := range emitters {
+		if _, ok := checkedBy[e]; !ok {
+			t.Errorf("%s calls emitNotification and no test checks the code it sends; "+
+				"add it to episodeRaises (or build it with buildSentinelNotification) and to checkedBy", e)
 		}
 	}
 }

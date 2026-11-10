@@ -179,7 +179,7 @@ describe("AgenticPipelineHome — demo quick pipeline", () => {
       { connector_type: "postgresql", type: "destination" },
     ])
     const onSubmit = vi.fn()
-    render(<AgenticPipelineHome onSubmit={onSubmit} />)
+    render(<AgenticPipelineHome onSubmit={onSubmit} onPrefill={() => {}} onCustom={() => {}} />)
 
     fireEvent.click(await screen.findByText("Sample data → Postgres"))
     expect(onSubmit).toHaveBeenCalledWith("sync sample-data to postgresql")
@@ -190,7 +190,7 @@ describe("AgenticPipelineHome — demo quick pipeline", () => {
       { connector_type: "mysql", type: "source" },
       { connector_type: "postgresql", type: "destination" },
     ])
-    render(<AgenticPipelineHome onSubmit={() => {}} />)
+    render(<AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />)
 
     // The matching chip proves the connections loaded before the absence check.
     await screen.findByText("MySQL → Postgres")
@@ -199,7 +199,7 @@ describe("AgenticPipelineHome — demo quick pipeline", () => {
 
   it("leaves it out of the generic examples shown to a user with no connections", async () => {
     serveConnections([])
-    render(<AgenticPipelineHome onSubmit={() => {}} />)
+    render(<AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />)
 
     await waitFor(() => expect(mockFetch).toHaveBeenCalled())
     await screen.findByText("MySQL → S3")

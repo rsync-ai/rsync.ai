@@ -291,12 +291,18 @@ def test_the_doc_and_the_link_scanner_both_work():
     # 577 lines, the two satellites 467 between them. The floor is on the three together --
     # the board, wherever it is kept -- because a floor on the index alone would now be
     # satisfied by a file that had lost every row it still holds.
+    # Re-measured 2026-10-01, after nine Known issues were resolved and their write-ups left
+    # the active tail: 2477 lines scanned. The floor drops to 2200, not to the measurement:
+    # it exists to catch a scanner that reads nothing, not a board that shrank honestly.
+    # Re-measured 2026-10-01 again (#1334): the board was 603 lines on `main`, and eight
+    # ✅ rows retired for space left 595. It stays that low only while 109 drop-ins wait
+    # for the fold, so the floor drops to 500, not to the measurement.
     board = len(DOC.read_text().split("\n")) + sum(
         len(p.read_text().split("\n")) for p in SATELLITES
     )
-    assert board > 600, f"the status board is {board} lines, far shorter than expected -- wrong file?"
+    assert board > 500, f"the status board is {board} lines, far shorter than expected -- wrong file?"
     lines = [line for _, _, line in _scanned()]
-    assert len(lines) > 2500, (
+    assert len(lines) > 2200, (
         f"only {len(lines)} lines scanned; the archive tail at {MOVED_FROM!r} has shrunk or moved"
     )
     all_links = [p for line in lines for p in _linked_source_paths(line)]

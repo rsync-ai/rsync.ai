@@ -1,0 +1,51 @@
+{
+  "kind": "echart",
+  "settings": {
+    "description": "Users by Stage",
+    "x": {
+      "field": "x",
+      "label": "Stage",
+      "categories": [
+        "Visited",
+        "Signed up",
+        "Activated",
+        "Paid"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "integer",
+      "title": "Users"
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Users",
+          "color": "series-1"
+        }
+      ]
+    },
+    "type": "funnel"
+  },
+  "rows": [
+    {
+      "x": "Visited",
+      "v": 1000
+    },
+    {
+      "x": "Signed up",
+      "v": 420
+    },
+    {
+      "x": "Activated",
+      "v": 180
+    },
+    {
+      "x": "Paid",
+      "v": 60
+    }
+  ],
+  "series": [],
+  "notes": []
+}

@@ -210,7 +210,7 @@ export function PipelineHeaderOverflowMenu(props: {
       toast.success("Pipeline renamed")
       setRenameOpen(false)
       router.refresh()
-    } catch (e) {
+    } catch {
       toast.error("Rename failed", { description: "Unexpected error renaming pipeline." })
     } finally {
       setRenaming(false)
@@ -237,7 +237,7 @@ export function PipelineHeaderOverflowMenu(props: {
       }
       setDeleteOpen(false)
       router.push("/pipelines")
-    } catch (e) {
+    } catch {
       toast.error("Delete failed", { description: "Unexpected error deleting pipeline." })
     } finally {
       setDeleting(false)
@@ -379,7 +379,7 @@ export function PipelineHeaderOverflowMenu(props: {
       </AlertDialog>
 
       {/* Rename dialog — simple text-input flow, fires PATCH /pipelines/:id { name } */}
-      <Dialog open={renameOpen} onOpenChange={(open) => (!renaming ? setRenameOpen(open) : null)}>
+      <Dialog open={renameOpen} onOpenChange={(open) => (!renaming ? setRenameOpen(open) : null)} closeOnOutsideClick={false}>
         <DialogContent className="sm:max-w-[460px]">
           <DialogHeader>
             <DialogTitle>Rename pipeline</DialogTitle>

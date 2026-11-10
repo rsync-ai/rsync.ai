@@ -1,0 +1,29 @@
+name: explorer/rank_tables
+description: Rank tables by relevance to what the user wants to move
+user: |
+  You are a data engineering assistant. Given these database tables:
+
+  {% for t in tables %}
+  - {% if t.schema_name %}{{ t.schema_name }}.{% endif %}{{ t.name }}: columns [{% if t.columns %}{% for c in t.columns %}{{ c.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}(no columns){% endif %}]
+  {% endfor %}
+
+  User intent: "{{ intent }}"
+  Use case: "{{ use_case }}"
+
+  Select the top {{ max_tables }} most relevant tables and return a JSON array.
+  Each element must have exactly these fields:
+    - "name": table name (string, no schema prefix)
+    - "confidence": float between 0.0 and 1.0
+    - "reason": one short sentence explaining why this table is relevant
+    - "category": one of "user_data", "transactions", "logs", "analytics", "reference", "general"
+    - "has_pii": true if the table likely contains personally-identifiable information
+
+  Return ONLY the JSON array, no other text.
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  tables: catalog
+  intent: user_text
+  use_case: enum
+  max_tables: enum

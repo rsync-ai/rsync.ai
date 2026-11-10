@@ -75,7 +75,6 @@ export interface RuntimeProgress {
 
 export interface RuntimeLiveness {
   last_event_at?: string
-  last_healthy_at?: string
   stale_seconds?: number
   // Captured-minus-applied across the pipeline's CDC tables: changes the source
   // recorded that the destination has not written yet. The gateway always sends

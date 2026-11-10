@@ -46,12 +46,11 @@ from src.utils.openai_client import (  # noqa: E402
     make_async_client as _create_async_client,
     rank_tables_default_model as _rank_tables_default_model,
     resolve_explorer_provider as _resolve_explorer_provider,
-    resolve_provider as _resolve_provider,
     _ollama_base_url,
-    llm_configured as _llm_configured,
     explorer_llm_configured as _explorer_llm_configured,
     with_reasoning_headroom,
 )
+from src.egress import EgressRefused, guarded_acall  # noqa: E402
 
 
 def _extract_json_array(raw: str) -> str:
@@ -81,8 +80,8 @@ RANK_TABLES_MODEL = _rank_tables_default_model(RANK_TABLES_PROVIDER)
 
 _client: Optional[AsyncOpenAI] = None if USE_MOCK else _create_async_client(RANK_TABLES_PROVIDER)
 
-# This endpoint sends table names, column names, types and row counts. Say where
-# they go — the previous silence is what let it point at OpenAI for months while
+# This endpoint sends table names, column names and types. Say where they
+# go — the previous silence is what let it point at OpenAI for months while
 # the operator believed EXPLORER_OFFLINE_ONLY covered the whole Explorer.
 logger.info(
     "rank-tables llm: provider=%s offline_only=%s model=%s ollama_base=%s",
@@ -147,59 +146,22 @@ async def rank_tables(request: RankTablesRequest) -> List[RankedTable]:
     if not request.tables:
         return []
 
-    # `provider` in the request body is a per-call override. Under offline mode
-    # it is a caller-controlled egress selector, so refuse it rather than honour
-    # it — a request body must not be able to route schema metadata off-box.
-    if request.provider and EXPLORER_OFFLINE_ONLY:
+    # `provider` in the request body used to pick another provider per call:
+    # a request body choosing where schema metadata goes. Only the deployment's
+    # configuration chooses that, so the field is refused, offline or not.
+    if request.provider:
         raise HTTPException(
             status_code=400,
             detail=(
-                "EXPLORER_OFFLINE_ONLY is enabled; a per-request provider override "
-                "is not permitted. Unset it to use the configured offline provider."
+                "A per-request provider is not accepted. rank-tables uses the "
+                "provider the deployment configures (RANK_TABLES_LLM_PROVIDER)."
             ),
         )
 
-    if request.provider:
-        provider = _resolve_provider(request.provider)
-        client = _create_async_client(provider)
-        # The model has to move with the provider. Keeping the globally-resolved
-        # RANK_TABLES_MODEL here would send e.g. "gpt-4o-mini" to Ollama.
-        model = _rank_tables_default_model(provider)
-        llm_ready = _llm_configured(request.provider)
-    else:
-        provider = RANK_TABLES_PROVIDER
-        client = _client
-        model = RANK_TABLES_MODEL
-        llm_ready = _explorer_llm_configured("RANK_TABLES_LLM_PROVIDER")
-
-    # Build a compact table summary for the prompt (no row data)
-    table_summaries = []
-    for t in request.tables:
-        cols = [c.name for c in (t.columns or [])][:10]  # cap at 10 columns
-        cols_str = ", ".join(cols) if cols else "(no columns)"
-        row_hint = f" ({t.row_count:,} rows)" if t.row_count else ""
-        schema_prefix = f"{t.schema_name}." if t.schema_name else ""
-        table_summaries.append(f"- {schema_prefix}{t.name}{row_hint}: columns [{cols_str}]")
-
-    tables_text = "\n".join(table_summaries)
+    client = _client
+    model = RANK_TABLES_MODEL
+    llm_ready = _explorer_llm_configured("RANK_TABLES_LLM_PROVIDER")
     max_tables = min(request.max_tables or 10, len(request.tables))
-
-    prompt = f"""You are a data engineering assistant. Given these database tables:
-
-{tables_text}
-
-User intent: "{request.intent}"
-Use case: "{request.use_case or 'replication'}"
-
-Select the top {max_tables} most relevant tables and return a JSON array.
-Each element must have exactly these fields:
-  - "name": table name (string, no schema prefix)
-  - "confidence": float between 0.0 and 1.0
-  - "reason": one short sentence explaining why this table is relevant
-  - "category": one of "user_data", "transactions", "logs", "analytics", "reference", "general"
-  - "has_pii": true if the table likely contains personally-identifiable information
-
-Return ONLY the JSON array, no other text."""
 
     if USE_MOCK or client is None or not llm_ready:
         # Offline fallback, also used when no LLM is set up: table selection
@@ -217,18 +179,41 @@ Return ONLY the JSON array, no other text."""
             for t in request.tables[:max_tables]
         ]
 
+    # Names and types only, ten columns a table. row_count stays out: it
+    # describes the customer's data, and the egress guard would drop it anyway.
+    tables = [
+        {
+            "name": t.name,
+            "schema_name": t.schema_name,
+            "columns": [{"name": c.name, "data_type": c.data_type} for c in (t.columns or [])][:10],
+        }
+        for t in request.tables
+    ]
+
     try:
-        response = await client.chat.completions.create(
+        response = await guarded_acall(
+            client,
+            component="explorer.rank_tables",
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            prompt="explorer/rank_tables",
+            variables={
+                "tables": tables,
+                "intent": request.intent,
+                "use_case": request.use_case or "replication",
+                "max_tables": max_tables,
+            },
             temperature=0.2,
             max_tokens=with_reasoning_headroom(1024),
         )
-        raw = response.choices[0].message.content or "[]"
-        ranked_raw: list = json.loads(_extract_json_array(raw))
+        ranked_raw: list = json.loads(_extract_json_array(response.text or "[]"))
+    except EgressRefused as exc:
+        logger.warning("LLM ranking refused by the egress guard: %s", exc.reason)
+        raise HTTPException(status_code=503, detail="LLM ranking unavailable: the request was refused")
     except Exception as exc:
+        # The exception text can quote the provider's reply: the log keeps it,
+        # the response does not.
         logger.warning("LLM ranking failed: %s", exc)
-        raise HTTPException(status_code=503, detail=f"LLM ranking unavailable: {exc}")
+        raise HTTPException(status_code=503, detail="LLM ranking unavailable")
 
     # Build a lookup for original table metadata
     table_meta = {t.name: t for t in request.tables}

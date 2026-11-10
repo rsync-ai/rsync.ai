@@ -191,7 +191,7 @@ export function SavedQueryEditDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange} closeOnOutsideClick={false}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>Edit query</DialogTitle>

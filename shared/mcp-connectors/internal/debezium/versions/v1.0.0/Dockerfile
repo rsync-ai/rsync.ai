@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app/
 
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
+
 ENV MCP_HTTP_MODE=true
 ENV DOCKER_CONTAINER=true
 ENV MCP_PORT=8000

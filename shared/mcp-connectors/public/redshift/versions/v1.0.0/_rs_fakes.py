@@ -16,13 +16,24 @@ from typing import Any, Dict, List, Optional
 
 
 class FakeCursor:
-    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None):
-        self._rows = rows if rows is not None else []
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, answers=None):
+        self._default = rows if rows is not None else []
+        self._rows = self._default
+        # (SQL substring, rows or an Exception to raise): a catalog or snapshot
+        # query gets its own answer, every other statement gets ``rows``.
+        self._answers = list(answers or [])
         # call log: list of {"sql": ..., "params": ...}
         self.executed: List[Dict[str, Any]] = []
 
     def execute(self, sql, params=None):
         self.executed.append({"sql": sql, "params": params})
+        self._rows = self._default
+        for needle, answer in self._answers:
+            if needle in sql:
+                if isinstance(answer, Exception):
+                    raise answer
+                self._rows = answer
+                break
         return None
 
     def fetchall(self):
@@ -44,15 +55,16 @@ class FakeCursor:
 class FakeConn:
     """Records cursors so a test can read back every statement executed."""
 
-    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None):
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, answers=None):
         self._rows = rows if rows is not None else []
+        self._answers = list(answers or [])
         self.cursors: List[FakeCursor] = []
         self.committed = 0
         self.rolled_back = 0
         self.closed = False
 
     def cursor(self, *args, **kwargs):
-        c = FakeCursor(rows=self._rows)
+        c = FakeCursor(rows=self._rows, answers=self._answers)
         self.cursors.append(c)
         return c
 
@@ -85,9 +97,9 @@ class FakeConn:
         return out
 
 
-def make_connector(connector_module, *, rows=None):
+def make_connector(connector_module, *, rows=None, answers=None):
     """Build a RedshiftMCPServer wired to a FakeConn (the _connect seam)."""
     server = connector_module.RedshiftMCPServer()
-    conn = FakeConn(rows=rows)
+    conn = FakeConn(rows=rows, answers=answers)
     server._connect = lambda config: conn  # type: ignore[assignment]
     return server, conn

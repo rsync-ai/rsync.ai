@@ -119,7 +119,7 @@ func destEntryPoints() []destEntryPoint {
 			msg := kafka.Message{Topic: "cdc.inventory.orders", Partition: 0, Offset: 7}
 			sm := &SinkMessage{PipelineID: "p-host-fallback", IsCDC: true, CDCOp: "c", Table: "inventory.orders",
 				After: map[string]interface{}{"id": 1}, PK: map[string]interface{}{"id": 1}, KeyFields: []string{"id"}}
-			_, _, err := writeCDCToDestination(context.Background(), c, pg, nil, msg, sm, "upsert")
+			_, _, err := writeCDCToDestination(context.Background(), c, pg, nil, msg, sm, "upsert", msg.Offset)
 			return err
 		}},
 		{"writeToDestination", "postgresql", func(c *http.Client) error {

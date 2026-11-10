@@ -36,13 +36,8 @@ func TestDerivedSinkConsumerGroupIsTheLegacyName(t *testing.T) {
 		{"", "sink-unknown"},                                      // SafeID8("") → "unknown"
 	}
 	for _, c := range cases {
-		if got := sinkConsumerGroup(c.pid); got != c.want {
-			t.Errorf("sinkConsumerGroup(%q) = %q, want %q", c.pid, got, c.want)
-		}
-		// The prefix is defined once, in handlers. Assert against that rather than
-		// against a second copy of the literal.
-		if got, derived := sinkConsumerGroup(c.pid), handlers.DerivedSinkConsumerGroup(c.pid); got != derived {
-			t.Errorf("sinkConsumerGroup(%q)=%q drifted from handlers.DerivedSinkConsumerGroup %q", c.pid, got, derived)
+		if got := handlers.DerivedSinkConsumerGroup(c.pid); got != c.want {
+			t.Errorf("handlers.DerivedSinkConsumerGroup(%q) = %q, want %q", c.pid, got, c.want)
 		}
 	}
 }

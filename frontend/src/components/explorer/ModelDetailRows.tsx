@@ -9,7 +9,8 @@ import { useEffect, useRef, useState } from "react"
 import { useCurrentUser } from "@/contexts/CurrentUserContext"
 import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
 import { getJson } from "@/components/explorer/getJson"
-import { SCHEDULE_LIST_LIMIT, buildModelLineage } from "@/components/explorer/modelLineage"
+import { SCHEDULE_LIST_LIMIT, buildModelLineage, type ModelLineage } from "@/components/explorer/modelLineage"
+import { LinkedModelsDialog } from "@/components/explorer/LinkedModelsDialog"
 import type { ScheduledQuery } from "@/components/explorer/scheduledModel"
 
 const LOOKUP_TIMEOUT_MS = 15_000
@@ -122,12 +123,13 @@ export function RunAsValue({ savedQueryId, scheduleId }: { savedQueryId: string;
 }
 
 type LineageResult =
-  | { key: string; status: "ok"; upstreams: number; downstreams: number; capped: boolean }
+  | { key: string; status: "ok"; lineage: ModelLineage; capped: boolean }
   | { key: string; status: "error"; message: string }
 
 /**
  * The Graph tab's own counts, from the same list and the same walk
- * (ModelLineageGraph), so the row and the graph's header cannot disagree.
+ * (ModelLineageGraph), so the row and the graph's header cannot disagree. The count opens
+ * a popup listing what it counted.
  */
 export function LineageCountValue({
   modelId,
@@ -151,6 +153,7 @@ export function LineageCountValue({
     : ""
   const key = `${modelId}|${reloadTick}|${rootKey}`
   const [result, setResult] = useState<LineageResult | null>(null)
+  const [open, setOpen] = useState(false)
   // Read when the list arrives rather than being a dependency: the page hands over a new
   // object on every schedule reload, and rootKey carries every part of it the walk uses.
   const rootRef = useRef(rootSchedule)
@@ -180,8 +183,7 @@ export function LineageCountValue({
         setResult({
           key,
           status: "ok",
-          upstreams: lineage.upstreamsFound,
-          downstreams: lineage.downstreamsFound,
+          lineage,
           capped: Math.max(count, schedules.length) >= SCHEDULE_LIST_LIMIT,
         })
       } catch {
@@ -197,21 +199,31 @@ export function LineageCountValue({
 
   if (!result || result.key !== key) return <span className="text-zinc-400">Counting…</span>
   if (result.status === "error") return <span className="text-zinc-500 dark:text-zinc-400">{result.message}</span>
+  const { lineage, capped } = result
   // A schedule left out of a capped list can only hide a link, never add one.
-  const atLeast = result.capped ? "at least " : ""
-  const text = `${atLeast}${result.upstreams} upstream · ${atLeast}${result.downstreams} downstream`
+  const atLeast = capped ? "at least " : ""
+  // The schedule's "Waits on all 2" names only the direct upstreams: a bare "3 upstream"
+  // read as a third it waits on.
+  const direct = (found: number, near: number) => (near < found ? ` (${near} direct)` : "")
+  const text =
+    `${atLeast}${lineage.upstreamsFound} upstream${direct(lineage.upstreamsFound, lineage.directUpstreams)} · ` +
+    `${atLeast}${lineage.downstreamsFound} downstream${direct(lineage.downstreamsFound, lineage.directDownstreams)}`
   return (
-    <button
-      type="button"
-      onClick={onOpenGraph}
-      className="text-left text-blue-600 hover:underline dark:text-blue-400"
-      title={
-        result.capped
-          ? `Counted from the first ${SCHEDULE_LIST_LIMIT} schedules in this workspace. Open the graph.`
-          : "Open the graph"
-      }
-    >
-      {text.charAt(0).toUpperCase() + text.slice(1)}
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        aria-haspopup="dialog"
+        className="text-left text-blue-600 hover:underline dark:text-blue-400"
+        title={
+          capped
+            ? `Counted from the first ${SCHEDULE_LIST_LIMIT} schedules in this workspace. Show what is linked.`
+            : "Show what is linked"
+        }
+      >
+        {text.charAt(0).toUpperCase() + text.slice(1)}
+      </button>
+      <LinkedModelsDialog open={open} onOpenChange={setOpen} lineage={lineage} capped={capped} onOpenGraph={onOpenGraph} />
+    </>
   )
 }

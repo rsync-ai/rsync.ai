@@ -78,3 +78,8 @@ parameters:
   max_tokens: 300
   response_format: { "type": "json_object" }
 
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  user_message: user_text

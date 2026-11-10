@@ -99,3 +99,9 @@ model: gpt-4o
 parameters:
   temperature: 0.2
   max_tokens: 600
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  pipeline_id: identifier
+  evidence_json: evidence

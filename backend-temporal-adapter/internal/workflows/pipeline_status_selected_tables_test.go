@@ -127,3 +127,34 @@ func TestDiffSelectedAgainstReportedEmptySelection(t *testing.T) {
 		t.Fatalf("empty selection: missing=%v matched=%d, want none/0", missing, matched)
 	}
 }
+
+// A selected table whose drop waits for a decision is left out of the run on
+// purpose (orchestrator withoutTablesAwaitingDrop), so it reports no stats row.
+// That is not a silent drop: failing the run for it hid the decision the user is
+// being asked for (prod t-clickup list_task, 2026-10-05). Matching follows the
+// executor's: exact, or bare when one side carries no schema, case-insensitive.
+func TestSelectionWithoutTablesAwaitingDrop(t *testing.T) {
+	selected := []string{"list_task", "team", "public.orders", "Legacy"}
+	remaining := selectionWithoutTablesAwaitingDrop(selected, []string{"LIST_TASK", "orders", "app.legacy"})
+	if strings.Join(remaining, ",") != "team" {
+		t.Fatalf("remaining = %v, want [team]", remaining)
+	}
+	missing, matched := diffSelectedAgainstReported(remaining, reportedSet("team"))
+	if len(missing) != 0 || matched != 1 {
+		t.Errorf("missing=%v matched=%d, want none/1", missing, matched)
+	}
+
+	// Control: without the pending decisions every left-out table reads as dropped.
+	missing, _ = diffSelectedAgainstReported(selected, reportedSet("team"))
+	if len(missing) != 3 {
+		t.Errorf("control: missing = %v, want the 3 left-out tables", missing)
+	}
+
+	// A different schema's table of the same name is not the one awaiting a decision.
+	if got := selectionWithoutTablesAwaitingDrop([]string{"sales.orders"}, []string{"public.orders"}); len(got) != 1 {
+		t.Errorf("sales.orders was excluded by public.orders's pending drop: %v", got)
+	}
+	if got := selectionWithoutTablesAwaitingDrop(selected, nil); len(got) != len(selected) {
+		t.Errorf("no pending drops: remaining = %v, want the whole selection", got)
+	}
+}

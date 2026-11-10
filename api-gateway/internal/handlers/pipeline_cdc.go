@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -129,6 +130,12 @@ func GetPipelineCDCStatus(c *gin.Context) {
 	forwardOrchestratorJSON(c, resp, "CDC status")
 }
 
+// cdcRestartProxyTimeout is how long the gateway waits for a CDC restart: past the
+// orchestrator's 55s cdcRestartBudget (connector restart, then sink-worker restart), so
+// the browser gets the orchestrator's answer and not a timeout, and short of
+// Cloudflare's 100s cut.
+const cdcRestartProxyTimeout = 60 * time.Second
+
 // RestartPipelineCDC restarts the underlying CDC connector for a pipeline (best-effort).
 // Proxies to backend-orchestrator. Ownership gate is local (the orchestrator
 // has no caller identity over this internal HTTP call).
@@ -142,7 +149,7 @@ func RestartPipelineCDC(c *gin.Context) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/restart", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return
@@ -152,7 +159,7 @@ func RestartPipelineCDC(c *gin.Context) {
 		req.Header.Set("X-Trace-ID", traceID)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: cdcRestartProxyTimeout}
 	setInternalServiceSecret(req)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -163,6 +170,11 @@ func RestartPipelineCDC(c *gin.Context) {
 
 	forwardOrchestratorJSON(c, resp, "Restart")
 }
+
+// cdcRecoverProxyTimeout is how long the gateway waits for a CDC recovery: past the
+// orchestrator's 90s cdcRecoverBudget, so the browser gets the orchestrator's answer
+// and not a timeout, and short of Cloudflare's 100s cut, so not a 524 either.
+const cdcRecoverProxyTimeout = 95 * time.Second
 
 // RecoverPipelineCDC triggers a guarded CDC recovery flow for a FAILED connector.
 // Proxies to backend-orchestrator.
@@ -184,7 +196,7 @@ func RecoverPipelineCDC(c *gin.Context) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/recover", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return
@@ -194,7 +206,7 @@ func RecoverPipelineCDC(c *gin.Context) {
 		req.Header.Set("X-Trace-ID", traceID)
 	}
 
-	client := &http.Client{Timeout: 45 * time.Second}
+	client := &http.Client{Timeout: cdcRecoverProxyTimeout}
 	setInternalServiceSecret(req)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -205,6 +217,12 @@ func RecoverPipelineCDC(c *gin.Context) {
 
 	forwardOrchestratorJSON(c, resp, "Recover")
 }
+
+// cdcBackfillProxyTimeout is how long the gateway waits for a CDC backfill request, from
+// the Backfill button and after a table change: past the orchestrator's 60s
+// cdcBackfillBudget, so the caller hears whether the backfill was queued, and short of
+// Cloudflare's 100s cut.
+const cdcBackfillProxyTimeout = 65 * time.Second
 
 // BackfillPipelineCDCTables triggers a Debezium ad-hoc snapshot (backfill) for specified tables.
 // Proxies to backend-orchestrator.
@@ -227,7 +245,7 @@ func BackfillPipelineCDCTables(c *gin.Context) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/backfill", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return
@@ -237,7 +255,7 @@ func BackfillPipelineCDCTables(c *gin.Context) {
 		req.Header.Set("X-Trace-ID", traceID)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: cdcBackfillProxyTimeout}
 	setInternalServiceSecret(req)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -314,7 +332,7 @@ func PausePipelineCDC(c *gin.Context) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/pause", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPut, url, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return
@@ -347,7 +365,7 @@ func ResumePipelineCDC(c *gin.Context) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/resume", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPut, url, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return

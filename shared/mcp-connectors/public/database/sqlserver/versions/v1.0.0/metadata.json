@@ -109,6 +109,24 @@
       "encrypt": {
         "type": "string",
         "description": "TLS mode override: 'yes'/'no'. Default is host-aware (Azure=yes+verify, boxed=yes+trust)."
+      },
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 2000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 24. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one batch, in whole seconds from 1 to 240. Leave blank for 5. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
       }
     },
     "required": [
@@ -142,6 +160,24 @@
         "type": "string",
         "description": "SQL Server password",
         "secret": true
+      },
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 2000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 24. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one batch, in whole seconds from 1 to 240. Leave blank for 5. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
       }
     },
     "required": [

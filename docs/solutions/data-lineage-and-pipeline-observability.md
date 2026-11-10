@@ -26,15 +26,16 @@ flowchart LR
 | Why did a run fail? | The error on the run, plus the [error reference](../errors/README.md), which explains each error code and what to do about it. |
 | What is downstream of this table or pipeline? | **Explorer → Lineage** draws one asset's upstream and downstream at a time. A model's own page has a **Graph** tab for the chain around that model. |
 | Which tables are stale? | A model's **freshness deadline** records a breach, with a cause, when the table falls further behind than you said it may. |
-| What is rebuilding right now? | The **Scheduled Queries** page and the model page show the live state of a rebuild, what is queued behind it and which upstream woke it. |
+| What is rebuilding right now? | The **Models** page and the model page show the live state of a rebuild, what is queued behind it and which upstream woke it. |
 
 ## How lineage is derived
 
-Nothing is scraped from a warehouse's query log. The graph is computed from three things
-rsync.ai already holds: the tables each pipeline run recorded, the SQL of each model, and the
-schedules you configured. It writes nothing and triggers nothing.
+Nothing is scraped from a warehouse's query log. The graph is computed from what rsync.ai
+already holds: the tables each pipeline run recorded, the SQL of each model, the schedules you
+configured, the saved charts and dashboards, and, for BigQuery, the external tables the
+warehouse reports. It changes nothing in your warehouse and triggers nothing.
 
-The four edge kinds do not carry equal weight, and each edge says which it is:
+The seven edge kinds do not carry equal weight, and each edge says which it is:
 
 | Edge | Direction | Evidence |
 |---|---|---|
@@ -42,10 +43,20 @@ The four edge kinds do not carry equal weight, and each edge says which it is:
 | `materializes` | model → table | **Declared** for a `table` model (its target table); **inferred** for a `statement` model (parsed from its SQL). |
 | `reads` | table → model | **Inferred** — parsed from the model's SQL. |
 | `triggers` | pipeline → model | **Declared** — someone configured this schedule. |
+| `external` | lake folder → external table | **Observed** — the warehouse reports an external table whose files are that folder. |
+| `draws` | model → chart | **Declared** — a saved chart reads this model. |
+| `shows` | chart → dashboard | **Declared** — a dashboard shows this chart. |
 
 An inferred edge is a suggestion, a declared edge is intent that may never have run, and only
 an observed edge is evidence that something happened. The graph keeps those apart instead of
 drawing one authoritative-looking "depends on" line.
+
+**Column lineage.** Each model's SQL is also read column by column (with sqlglot, no AI model
+call): which source columns each output column is copied, transformed or aggregated from, and
+which only filter, join, group, sort or window its rows. Choose a column on **Explorer →
+Lineage** to light where it comes from and what reads it, through every model on the way. The
+answer holds names only, never a row value, and is read again when the model's SQL changes or
+once a day.
 
 **Uncovered upstreams.** The most useful number in the graph is not the edge count: it is the
 set of producers a model reads from that do *not* cause it to refresh. Each is a model whose

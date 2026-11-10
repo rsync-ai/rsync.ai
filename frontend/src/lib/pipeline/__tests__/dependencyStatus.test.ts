@@ -11,6 +11,49 @@ describe("dependencyStatusLabel", () => {
     expect(dependencyStatusLabel({ status: "unknown", last_checked_at: "2026-09-16T10:00:00Z" })).toBe("unknown")
   })
 
+  // The prober skips a pipeline in these statuses (dependency_probe.go:102), so
+  // a row it never reached stays unchecked: "Checking…" there never ends.
+  it("reads 'Not checked' when the pipeline has finished, stopped or paused", () => {
+    for (const s of ["completed", "failed", "cancelled", "stopped", "paused", "archived", "COMPLETED"]) {
+      expect(dependencyStatusLabel({ status: "unknown" }, s)).toBe("Not checked")
+    }
+  })
+
+  it("control: keeps 'Checking…' while the pipeline runs, or when its status is not known", () => {
+    for (const s of ["running", "processing", "waiting_for_user", "idle", "", null, undefined]) {
+      expect(dependencyStatusLabel({ status: "unknown" }, s)).toBe("Checking…")
+    }
+  })
+
+  it("control: a finished pipeline does not relabel a row the prober did check", () => {
+    expect(dependencyStatusLabel({ status: "unknown", last_checked_at: "2026-09-16T10:00:00Z" }, "completed")).toBe(
+      "unknown",
+    )
+    expect(dependencyStatusLabel({ status: "healthy" }, "completed")).toBe("healthy")
+  })
+
+  // The gateway withdraws a paused or stopped pipeline's frozen "healthy" row
+  // (pipeline_runtime.go markUnprobedDeps): it was checked once, before the
+  // stop, and nothing has checked it since. It must not read like a probe that
+  // ran and could not decide.
+  it("reads 'Not checked' for a row the gateway marked as not checked while stopped or paused", () => {
+    for (const s of ["stopped", "paused"]) {
+      const dep = {
+        status: "unknown",
+        last_checked_at: "2026-10-22T10:00:00Z",
+        details: { not_checked_while: s, last_result: "healthy" },
+      }
+      expect(dependencyStatusLabel(dep, s)).toBe("Not checked")
+      expect(dependencyStatusLabel(dep)).toBe("Not checked")
+    }
+  })
+
+  it("control: details without the marker do not relabel a checked row", () => {
+    expect(
+      dependencyStatusLabel({ status: "unknown", last_checked_at: "2026-10-22T10:00:00Z", details: { error: "x" } }, "stopped"),
+    ).toBe("unknown")
+  })
+
   it("passes checked statuses through", () => {
     expect(dependencyStatusLabel({ status: "healthy" })).toBe("healthy")
     expect(dependencyStatusLabel({ status: "unhealthy", last_checked_at: "2026-09-16T10:00:00Z" })).toBe("unhealthy")

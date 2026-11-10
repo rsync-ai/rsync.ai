@@ -26,7 +26,7 @@ async function ensureLoggedIn(page: Page) {
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 15000 })
 
   // Confirm we got into the app shell (sidebar link exists)
-  await expect(page.locator('a:has-text("Agentic Data Pipeline")')).toBeVisible({ timeout: 30000 })
+  await expect(page.getByRole('navigation').getByRole('link', { name: 'Pipelines', exact: true })).toBeVisible({ timeout: 30000 })
 
   // Ensure user_id exists for client-side API calls (avoids relying on /auth/me).
   const existingUserId = await page.evaluate(() => localStorage.getItem('user_id') || '')
@@ -79,7 +79,7 @@ test.describe('rsync.ai - Execution Controls', () => {
     await ensureLoggedIn(page)
   })
 
-  test('Executions page: cancel works and status becomes cancelled', async ({ page }) => {
+  test('Run page: cancel works and status becomes cancelled', async ({ page }) => {
     const apiHeaders = await getApiAuthHeaders(page)
 
     // Create a unique pipeline so we can search by name reliably in the UI.
@@ -102,24 +102,11 @@ test.describe('rsync.ai - Execution Controls', () => {
     // Ensure the execution is queryable before relying on UI list rendering.
     await waitForExecutionExists(page, execId, 30000)
 
-    // Open executions list and search by pipeline name (stable UI anchor)
-    await page.goto('/executions')
-    const search = page.locator('input[placeholder*="Search by pipeline name or execution ID"]')
-    await expect(search).toBeVisible({ timeout: 30000 })
-
-    await search.fill(pipelineName)
-
-    // Wait for the execution card to appear and cancel it
-    const refreshBtn = page.getByRole('button', { name: /refresh executions/i })
-    // Some environments need an explicit refresh to pull latest executions.
-    for (let i = 0; i < 10; i++) {
-      await refreshBtn.click().catch(() => {})
-      if (await page.getByRole('link', { name: pipelineName }).first().isVisible().catch(() => false)) break
-      await new Promise((r) => setTimeout(r, 1000))
-    }
-    await expect(page.getByRole('link', { name: pipelineName }).first()).toBeVisible({ timeout: 30000 })
-
-    await page.locator('button:has-text("Cancel")').first().click()
+    // The run's own page has the Cancel button (the Runs list only links to it).
+    await page.goto(`/executions/${execId}`)
+    const cancelBtn = page.getByRole('button', { name: 'Cancel Execution' })
+    await expect(cancelBtn).toBeVisible({ timeout: 30000 })
+    await cancelBtn.click()
 
     // Verify via API (source of truth)
     const execJson = await waitForStatus(
@@ -133,7 +120,7 @@ test.describe('rsync.ai - Execution Controls', () => {
     )
     expect(execJson.status).toBe('cancelled')
 
-    // UI should now show Cancelled somewhere (best-effort; list refresh is async)
+    // The page refreshes after the cancel and shows the new status.
     await expect(page.locator('text=Cancelled').first()).toBeVisible({ timeout: 30000 })
   })
 

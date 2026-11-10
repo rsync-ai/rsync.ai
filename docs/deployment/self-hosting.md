@@ -183,14 +183,10 @@ nano frontend/.env
 Replace `YOUR_SERVER_IP` with your VM's public IP or domain. Example for IP-only (no domain):
 ```env
 NEXT_PUBLIC_API_URL=http://203.0.113.10
-NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL=http://203.0.113.10
-NEXT_PUBLIC_LLM_SERVICE_URL=http://203.0.113.10
 NEXT_PUBLIC_WS_URL=ws://203.0.113.10/ws
-NEXT_PUBLIC_WS_ORCHESTRATOR_URL=ws://203.0.113.10/ws
 NEXT_PUBLIC_APP_NAME=rsync.ai
 NEXT_PUBLIC_ENVIRONMENT=production
 API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
-ORCHESTRATOR_INTERNAL_URL=http://orchestrator:8080
 NEXTAUTH_URL=http://203.0.113.10
 NEXTAUTH_SECRET=$(openssl rand -base64 32)
 ```
@@ -344,7 +340,9 @@ rsync-ai uses an OpenAI-compatible API interface. You can use OpenAI directly, r
 
 **Without an LLM, these work as normal:** creating a pipeline from chat with the plain phrasing
 (`sync <source> to <destination>` — a rule-based parser reads it, no model), raw SQL in the Data
-Explorer, the shipped connectors, and running pipelines and CDC.
+Explorer, the shipped connectors, running pipelines and CDC, and workflows built by hand
+(**Workflows → Build it yourself**: a query, its conditions and a message for each, edited, tested
+and run like a drafted one).
 
 **These need an LLM** and answer `Set up an LLM first` (HTTP 503, `"error": "llm_not_configured"`)
 until one is set: free-form chat beyond pipeline commands, natural-language → SQL, LLM table and
@@ -419,6 +417,10 @@ LLM_MODEL=google/gemini-2.5-flash
   and llm-service logs why.
 - The renewal is covered by unit tests only; it has not yet been run against a live Vertex AI
   endpoint.
+- Ask rsync.ai offers this model as **Gemini (Vertex)**, with no key
+  ([details](../api/assistant.md#gemini-on-vertex-ai-with-no-key)), and sends it no sample rows.
+- `docker-compose.prod.yml` passes these settings to the tool generator as well, so it uses
+  `LLM_MODEL` too. Without `LLM_MODEL` the tool generator keeps its own default (`gpt-4o`).
 
 `install.sh` sets up all three. With a terminal it asks for what is missing; without one it stops
 and prints the settings it needs, instead of installing a different provider or none:
@@ -625,7 +627,7 @@ outright rather than warned about (`config.go:461-464`).
 
 > **IAM covers the Go services only.** The Python tier raises
 > `KafkaSecurityError` for `AWS_MSK_IAM`
-> (`llm-service/src/utils/kafka_security.py:123,422-427`) and the JVM Kafka
+> (`llm-service/src/utils/kafka_security.py:121,422-427`) and the JVM Kafka
 > Connect image ships no IAM login module, so an IAM-only cluster runs the Go
 > data plane and leaves the CDC profile unable to authenticate. **If you use
 > CDC, use SCRAM.**
@@ -896,12 +898,12 @@ Provider caveats, because the grant alone is not always sufficient:
 
 > **Why `db-init` treats that as fatal.** Left to the migrations, the same
 > failure is silent. The migration runner stops at the first failing file
-> (`api-gateway/internal/db/migrate.go:127-129`), and `001_init_schema.sql` is
+> (`api-gateway/internal/db/migrate.go:119-121`), and `001_init_schema.sql` is
 > the first file — so a privilege error there means **no** migration applies at
-> all. `main.go:311-313` then logs `❌ Database migration failed` and **starts
+> all. `main.go:403-405` then logs `❌ Database migration failed` and **starts
 > serving anyway** (there is no `return`), and the container healthcheck hits
 > `/health`, which is an unconditional `200` that never touches the database
-> (`main.go:614-621`). The result would be a stack that comes up "healthy"
+> (`main.go:784-791`). The result would be a stack that comes up "healthy"
 > against an empty schema, every request failing `relation "..." does not exist`.
 >
 > Verify explicitly after the first boot anyway — `/ready` is the endpoint that
@@ -1042,22 +1044,30 @@ How connectors map to containers:
 - `docker-compose.mcp.yml` is **auto-generated** by `scripts/mcp_generate_compose.py`, which reads each connector's `latest.json → current_version` to decide which version dir to build and names the service/container `rsync-ai-<id>-vX-Y-Z-mcp`. **Do not edit `docker-compose.mcp.yml` by hand** — regenerate it.
 - The orchestrator routes a connection's `connector_version` (or `"latest"`) to the matching container.
 
-Deploy a connector code change on the prod VM:
+Deploy a connector code change on the prod VM. **First, find out who owns the container:**
+`docker inspect -f '{{index .Config.Labels "rsync.ai/managed-by"}}' rsync-ai-<connector>-v<x-y-z>-mcp`.
+
+- **Empty → host compose.** Use the recipe below.
+- **`connector-deployer` → compose cannot replace it** (same pinned container name). Tag the
+  running image as a rollback (`rollback/mcp-<connector>:before-<sha>`), `docker rm -f` the
+  container (the deployer never rebuilds a running protected connector), then POST
+  tool-generator `/v1/deploy` with `force_rebuild: true`. That call carries the internal service
+  secret, so it is an operator step, not an agent one.
 
 ```bash
 cd ~/rsync-ai
 git pull origin main                                   # 1. get the updated connector code + latest.json
 python3 scripts/mcp_generate_compose.py                # 2. regenerate the MCP compose from latest.json
 # 3. rebuild + restart ONLY the changed connector (use the versioned service name):
-docker compose -f docker-compose.mcp.yml build <connector>-v<x-y-z>-mcp
-docker compose -f docker-compose.mcp.yml up -d --no-deps <connector>-v<x-y-z>-mcp
+docker compose -f docker-compose.mcp.yml --env-file .env.prod build <connector>-v<x-y-z>-mcp
+docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d --no-deps --force-recreate <connector>-v<x-y-z>-mcp
 ```
 
 Example — the Shopify connector (active version v1.0.0):
 
 ```bash
-docker compose -f docker-compose.mcp.yml build shopify-admin-graphql-v1-0-0-mcp
-docker compose -f docker-compose.mcp.yml up -d --no-deps shopify-admin-graphql-v1-0-0-mcp
+docker compose -f docker-compose.mcp.yml --env-file .env.prod build shopify-admin-graphql-v1-0-0-mcp
+docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d --no-deps --force-recreate shopify-admin-graphql-v1-0-0-mcp
 # verify the new code is in the image:
 docker exec rsync-ai-shopify-admin-graphql-v1-0-0-mcp grep -n config_keys /app/connector.py
 ```
@@ -1065,7 +1075,7 @@ docker exec rsync-ai-shopify-admin-graphql-v1-0-0-mcp grep -n config_keys /app/c
 Notes:
 - A connector code change is **not** picked up until you `build` — Docker reuses the cached image otherwise. Always `build` then `up -d`.
 - **In-place fix (no version bump):** the service name is unchanged; just rebuild the existing `v1-0-0` image (the active version per `latest.json`). Every bug fix ships this way.
-- **New version (a major change by hand, or a tool-generator regeneration, which always writes one):** step 2 regenerates the compose with the new service name (from the bumped `latest.json.current_version`); build + `up -d` that new service. See the [connector developer guide](../connectors/developer-guide.md) for when to bump vs patch in place.
+- **New version (a major change by hand, or a tool-generator regeneration, which writes one by default — only the user's explicit overwrite rewrites the current version in place and removes its container):** step 2 regenerates the compose with the new service name (from the bumped `latest.json.current_version`); build + `up -d` that new service. See the [connector developer guide](../connectors/developer-guide.md) for when to bump vs patch in place.
 
 ---
 
@@ -1236,6 +1246,9 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml \
 #    base_connector.py, or the BuildKit build context affects EVERY connector, so
 #    rebuild the whole set — not just the one connector you think changed. Skipping
 #    this leaves stale connector code running against new core services.
+#    It does NOT reach a connector that connector-deployer created (label
+#    rsync.ai/managed-by=connector-deployer) — redeploy those as in
+#    "Updating connector code" above.
 python3 scripts/mcp_generate_compose.py        # regenerate compose from latest.json (idempotent)
 docker compose -f docker-compose.mcp.yml --env-file .env.prod build
 
@@ -1243,6 +1256,14 @@ docker compose -f docker-compose.mcp.yml --env-file .env.prod build
 #    runs them on boot (see callout). There is no separate migrate command to run.
 docker compose -f docker-compose.yml -f docker-compose.prod.yml \
   --env-file .env.prod up -d
+#    `up -d` alone does NOT recreate planner and tool-generator after a rebuild: they take
+#    no build-info args, so their config hash never changes and compose leaves them on the
+#    old image. Force-recreate the app services you rebuilt — never the data services:
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod \
+  up -d --no-deps --force-recreate api-gateway orchestrator temporal-adapter llm-service \
+  planner tool-generator frontend connector-deployer kafka-mcp-sink-mcp
+#    Check each: docker inspect -f '{{.Image}}' <its container> must equal
+#    docker image inspect -f '{{.Id}}' <its image>
 docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d
 ```
 
@@ -1258,7 +1279,7 @@ docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d
 > is `v1.0.0`, and a bug fix patches `versions/<current_version>/` and keeps that version,
 > so step 3's `mcp_generate_compose.py` regenerates the same service names and a plain
 > rebuild picks up the new code. A new version (a major change, or a tool-generator
-> regeneration) changes the service name —
+> regeneration by default) changes the service name —
 > step 3 still handles it (it reads `latest.json`), but the old-version container
 > keeps running until you `down` it.
 
@@ -1296,6 +1317,10 @@ export GIT_COMMIT="$(git rev-parse HEAD)" BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:
 # rebuild + restart BOTH stacks (core first, then connectors)
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod build
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod up -d
+# force-recreate the rebuilt app services (see step 4 above) — never the data services:
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod \
+  up -d --no-deps --force-recreate api-gateway orchestrator temporal-adapter llm-service \
+  planner tool-generator frontend connector-deployer kafka-mcp-sink-mcp
 python3 scripts/mcp_generate_compose.py
 docker compose -f docker-compose.mcp.yml --env-file .env.prod build
 docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d
@@ -1333,7 +1358,7 @@ Services communicate over the Docker network. Ensure:
 ### Kafka consumer rebalancing / timeouts
 
 If you see frequent rebalancing in orchestrator logs:
-- Ensure only 1 replica of the orchestrator is running (see the scaling warning in `docker-compose.yml`)
+- Ensure only 1 replica of the orchestrator is running (more than one is untested: [orchestrator HLD](../services/orchestrator/HLD.md))
 - Check Kafka health: `docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list`
 
 ### TLS certificate not provisioning

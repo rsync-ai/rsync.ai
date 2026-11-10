@@ -232,5 +232,7 @@ or a documented run. In particular:
   verified than it says.
 - Do not call the project "open source". It is source-available under the
   [rsync.ai Source-Available License](../../LICENSE).
-- Do not describe reverse ETL, column-level lineage or hosted/cloud availability as
-  features: the first two are not shipped, and there is no hosted offering.
+- Do not describe reverse ETL or hosted/cloud availability as features: reverse ETL is not
+  shipped, and there is no hosted offering. Column-level lineage is shipped
+  ([#1550](https://github.com/rsync-ai/rsync-ai/pull/1550)) and may be named once the release
+  that carries it is tagged.

@@ -82,7 +82,20 @@ func checkConnectionLifecycleDraft(c *gin.Context, database *sql.DB, sourceConnI
 	if c.Query("allow_draft") == "true" {
 		return false
 	}
-	workspaceID := activeWorkspaceID(c)
+	if body := lifecycleDraftRefusal(database, activeWorkspaceID(c), sourceConnID, destConnID); body != nil {
+		c.JSON(http.StatusUnprocessableEntity, body)
+		return true
+	}
+	return false
+}
+
+// draftOverrideHint ends a draft refusal's message for a caller that can pass
+// ?allow_draft=true; a scheduled run cannot, so checkScheduledRun drops it.
+const draftOverrideHint = ", or pass ?allow_draft=true to override"
+
+// lifecycleDraftRefusal is checkConnectionLifecycleDraft without the request:
+// the 422 body it answers with, nil when the gate passes.
+func lifecycleDraftRefusal(database *sql.DB, workspaceID, sourceConnID, destConnID string) gin.H {
 	for _, cid := range []struct{ kind, id string }{
 		{"source", sourceConnID},
 		{"destination", destConnID},
@@ -99,19 +112,18 @@ func checkConnectionLifecycleDraft(c *gin.Context, database *sql.DB, sourceConnI
 			continue
 		}
 		if lifecycle := computeLifecycle(connectorType, connectorVersion); lifecycle == "draft" {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{
+			return gin.H{
 				"error":   "draft_connector_blocked",
-				"message": fmt.Sprintf("%s connector '%s@%s' is in lifecycle stage 'draft' (never run against the real vendor API). Test the connection first, or pass ?allow_draft=true to override.", cid.kind, connectorType, connectorVersion),
+				"message": fmt.Sprintf("%s connector '%s@%s' is in lifecycle stage 'draft' (never run against the real vendor API). Test the connection first%s.", cid.kind, connectorType, connectorVersion, draftOverrideHint),
 				"connector": gin.H{
 					"type":      connectorType,
 					"version":   connectorVersion,
 					"lifecycle": lifecycle,
 				},
-			})
-			return true
+			}
 		}
 	}
-	return false
+	return nil
 }
 
 // connectionLifecycleDraftError returns a non-empty user-facing error
@@ -286,9 +298,38 @@ func invalidateLifecycleCache(connectorType string) {
 // metadata puts these at the root and newer generated connectors put them inside
 // the capabilities block (the generator emits both — see spec.py to_metadata).
 func connectorMetadataBool(connectorType, key string) bool {
+	raw := connectorMetadataMap(connectorType)
+	if raw == nil {
+		return false
+	}
+	// Found the connector. Prefer the top-level key, then the capabilities block.
+	if v, ok := raw[key].(bool); ok {
+		return v
+	}
+	if caps, ok := raw["capabilities"].(map[string]interface{}); ok {
+		if v, ok := caps[key].(bool); ok {
+			return v
+		}
+	}
+	// Connector found but no explicit flag — default false.
+	return false
+}
+
+// connectorMetadataString reads a top-level string field (e.g. "category") from the
+// connector's metadata.json, the same lookup as connectorMetadataBool. "" when the
+// connector or the field is not found.
+func connectorMetadataString(connectorType, key string) string {
+	v, _ := connectorMetadataMap(connectorType)[key].(string)
+	return strings.TrimSpace(v)
+}
+
+// connectorMetadataMap finds a public connector's metadata.json in the connector index,
+// matched by id, connector_type or alias (all normalized to kebab-case). nil when none
+// matches.
+func connectorMetadataMap(connectorType string) map[string]interface{} {
 	target := canonicalizeConnectorID(connectorType)
 	if target == "" {
-		return false
+		return nil
 	}
 	idx := getConnectorIndex(GetMCPPublicConnectorsPath())
 	for _, sc := range idx.scanned {
@@ -299,40 +340,20 @@ func connectorMetadataBool(connectorType, key string) bool {
 		if json.Unmarshal(sc.Metadata, &raw) != nil {
 			continue
 		}
-		// Match by id, connector_type, or aliases (all normalized to kebab-case).
-		matched := false
 		for _, field := range []string{"id", "connector_type"} {
 			if v, ok := raw[field].(string); ok && canonicalizeConnectorID(v) == target {
-				matched = true
-				break
+				return raw
 			}
 		}
-		if !matched {
-			if aliases, ok := raw["aliases"].([]interface{}); ok {
-				for _, a := range aliases {
-					if s, ok := a.(string); ok && canonicalizeConnectorID(s) == target {
-						matched = true
-						break
-					}
+		if aliases, ok := raw["aliases"].([]interface{}); ok {
+			for _, a := range aliases {
+				if s, ok := a.(string); ok && canonicalizeConnectorID(s) == target {
+					return raw
 				}
 			}
 		}
-		if !matched {
-			continue
-		}
-		// Found the connector. Prefer the top-level key, then the capabilities block.
-		if v, ok := raw[key].(bool); ok {
-			return v
-		}
-		if caps, ok := raw["capabilities"].(map[string]interface{}); ok {
-			if v, ok := caps[key].(bool); ok {
-				return v
-			}
-		}
-		// Connector found but no explicit flag — default false.
-		return false
 	}
-	return false
+	return nil
 }
 
 // connectorSupportsDDL reports whether a connector can issue real DDL (CREATE
@@ -779,6 +800,11 @@ type MCPConnector struct {
 	DockerContainer string `json:"docker_container,omitempty"` // Container name
 	HasDockerfile   bool   `json:"has_dockerfile"`             // Whether connector has Dockerfile
 	LogoURL         string `json:"logo_url,omitempty"`         // Logo URL path: /api/v1/connectors/{name}/logo
+	// GeneratedBy is set when an AI agent or Ask rsync.ai generated the
+	// connector, so the connection form can say so before anyone gives it
+	// credentials (connector_generations.go connectorProvenance). Only the
+	// single-connector read fills it.
+	GeneratedBy *ConnectorProvenance `json:"generated_by,omitempty"`
 }
 
 func qaCounts(qa map[string]interface{}) (testsPassed int, testsFailed int) {
@@ -1424,6 +1450,7 @@ type connectorMetadataDTO struct {
 	Description          string                   `json:"description"`
 	Category             string                   `json:"category"`
 	Source               string                   `json:"source"`
+	GeneratedAt          interface{}              `json:"generated_at"` // any JSON type: a string field would fail the whole unmarshal on a non-string value
 	Status               string                   `json:"status"`
 	QualityTier          string                   `json:"quality_tier"`
 	QualityScore         float64                  `json:"quality_score"`
@@ -1486,6 +1513,31 @@ func mapToMCPConnector(meta connectorMetadataDTO, canonicalID, version string) M
 		OAuthAuthorizeParams:   meta.OAuthAuthorizeParams,
 		SupportedAuthMethods:   meta.SupportedAuthMethods,
 	}
+}
+
+// resolveConnectorSource returns a connector's immutable origin: its declared
+// `source`, else `generated` when there is positive evidence of tool-generator
+// origin, else the conservative `built_in`.
+//
+// The evidence is a `generated_at` timestamp. The tool generator's template
+// (metadata.json.j2) writes it at the TOP level; reading only
+// `qa_metadata.generated_at` listed every connector it generated as built_in
+// (and hid its confidence chip). Both locations count. Internal connectors are
+// excluded from the top-level signal: kafka-mcp-sink carries a top-level
+// `generated_at` and no `source`, and is orchestrator plumbing, not generated.
+// declaredInternal is the metadata's own flag, not the dev-only listing
+// override.
+func resolveConnectorSource(meta connectorMetadataDTO, declaredInternal bool) string {
+	if meta.Source != "" {
+		return meta.Source
+	}
+	if _, ok := meta.QAMetadata["generated_at"]; ok {
+		return "generated"
+	}
+	if meta.GeneratedAt != nil && !declaredInternal {
+		return "generated"
+	}
+	return "built_in"
 }
 
 // ListMCPConnectors lists all MCP connectors with full metadata
@@ -1564,6 +1616,10 @@ func ListMCPConnectors(c *gin.Context) {
 			canonicalID = canonicalizeConnectorID(dirName)
 		}
 
+		// The metadata's own `internal` flag, before the dev-only override below
+		// marks test connectors internal for listing purposes only.
+		declaredInternal := tempMetadata.Internal
+
 		// Hide dev-only/testing connectors from normal users.
 		// We treat them as internal for listing purposes.
 		if isDevOnlyConnector(canonicalID) {
@@ -1589,17 +1645,7 @@ func ListMCPConnectors(c *gin.Context) {
 		connector := mapToMCPConnector(tempMetadata, canonicalID, effectiveVersion)
 		// Resolve the immutable origin signal once (same rule the lifecycle
 		// block below used to), so confidence gating and connector.Source agree.
-		// Conservative default is `built_in` unless there's positive evidence of
-		// generator origin (a `generated_at` timestamp, which the tool generator
-		// always writes; hand-curated connectors don't).
-		resolvedSource := tempMetadata.Source
-		if resolvedSource == "" {
-			if _, hasGenAt := tempMetadata.QAMetadata["generated_at"]; hasGenAt {
-				resolvedSource = "generated"
-			} else {
-				resolvedSource = "built_in"
-			}
-		}
+		resolvedSource := resolveConnectorSource(tempMetadata, declaredInternal)
 		connector.Source = resolvedSource
 		connector.ConfidenceLevel = inferConfidenceLevel(resolvedSource, originalCategory, tempMetadata.Status, tempMetadata.QualityTier, tempMetadata.QAMetadata)
 
@@ -1936,6 +1982,8 @@ func GetMCPConnector(c *gin.Context) {
 			break
 		}
 	}
+
+	connector.GeneratedBy = connectorProvenance(c.Request.Context(), connector.Name, activeWorkspaceID(c))
 
 	c.JSON(http.StatusOK, connector)
 }

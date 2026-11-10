@@ -820,7 +820,7 @@ export class EventNormalizer {
       }
     }
 
-    for (const [_, call] of callMap.entries()) {
+    for (const call of callMap.values()) {
       if (call.id) {
         const duration = call.startedAt && call.completedAt
           ? new Date(call.completedAt).getTime() - new Date(call.startedAt).getTime()
@@ -888,30 +888,6 @@ export class EventNormalizer {
             reversibility: e.payload?.reversibility,
           }))
       )
-  }
-
-  /**
-   * Infer failures/retries from event sequences (best-effort)
-   */
-  static inferRetries(events: PipelineRunEvent[]): Array<{ stage: string; retries: number; lastError?: string }> {
-    const retryMap = new Map<string, { count: number; lastError?: string }>()
-
-    for (const event of events) {
-      if (event.severity === "error" || event.payload?.error || event.payload?.retry) {
-        const key = event.stage_id || "unknown"
-        const existing = retryMap.get(key) || { count: 0 }
-        retryMap.set(key, {
-          count: existing.count + 1,
-          lastError: event.payload?.error || event.payload?.message || existing.lastError,
-        })
-      }
-    }
-
-    return Array.from(retryMap.entries()).map(([stage, data]) => ({
-      stage,
-      retries: data.count,
-      lastError: data.lastError,
-    }))
   }
 
   // Helper functions

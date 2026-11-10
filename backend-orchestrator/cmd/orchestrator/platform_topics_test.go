@@ -3,12 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/IBM/sarama"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 // TestEnsurePlatformTopicsWithRetryRetriesThenSucceeds: a broker that refuses the
@@ -73,6 +78,63 @@ func TestEnsurePlatformTopicsWithRetryStopsOnCancel(t *testing.T) {
 	}, 5, time.Second, func(time.Duration) { t.Fatal("slept after the context was cancelled") })
 	if err == nil || calls != 1 {
 		t.Fatalf("calls = %d, err = %v; want one call and an error", calls, err)
+	}
+}
+
+// TestEnsurePlatformTopicsWithRetryStopsOnARefusal: a broker that refuses the create
+// by ACL refuses it on every attempt, so retrying only delays startup by 15 s. The
+// refusal is joined with other topics' errors by EnsurePlatformTopics; it must still
+// be seen, end the loop after one call, and reach the caller unwrapped. The control is
+// the same joined error without the refusal, which retries.
+func TestEnsurePlatformTopicsWithRetryStopsOnARefusal(t *testing.T) {
+	refusal := fmt.Errorf("failed to create topic 'rsync.notifications': %w",
+		&sarama.TopicError{Err: sarama.ErrClusterAuthorizationFailed})
+	joined := errors.Join(errors.New("rsync.pipeline.domain.events: request timed out"), refusal)
+
+	calls := 0
+	err := ensurePlatformTopicsWithRetry(context.Background(), func(context.Context) error {
+		calls++
+		return joined
+	}, 5, time.Second, func(time.Duration) { t.Fatal("slept after an ACL refusal; no retry can succeed") })
+	if calls != 1 {
+		t.Fatalf("ensure called %d times after an ACL refusal, want 1", calls)
+	}
+	if !errors.Is(err, sarama.ErrClusterAuthorizationFailed) {
+		t.Fatalf("err = %v, want it to carry the broker refusal", err)
+	}
+
+	ccalls := 0
+	_ = ensurePlatformTopicsWithRetry(context.Background(), func(context.Context) error {
+		ccalls++
+		return errors.New("request timed out")
+	}, 3, time.Millisecond, func(time.Duration) {})
+	if ccalls != 3 {
+		t.Fatalf("control: a timeout was tried %d times, want 3", ccalls)
+	}
+}
+
+// TestPlatformTopicsRefusalIsLoggedAsAnErrorNamingTheGrant: startup still carries on
+// (the services that use a missing topic report their own error), but a refusal is a
+// deployment mistake the operator must fix, so it is an Error naming the grant, not a
+// Warn. Any other failure stays a Warn.
+func TestPlatformTopicsRefusalIsLoggedAsAnErrorNamingTheGrant(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	logPlatformTopicsFailure(fmt.Errorf("ensure platform topics: %w",
+		fmt.Errorf("failed to create topic 'rsync.notifications': %w", &sarama.TopicError{Err: sarama.ErrTopicAuthorizationFailed})))
+	e := hook.LastEntry()
+	if e == nil || e.Level != log.ErrorLevel {
+		t.Fatalf("a refusal was logged as %v, want an Error entry", e)
+	}
+	if !strings.Contains(e.Message, "Create") || !strings.Contains(e.Message, "kafka-acls.md") {
+		t.Errorf("the refusal log does not name the grant: %q", e.Message)
+	}
+
+	hook.Reset()
+	logPlatformTopicsFailure(errors.New("request timed out"))
+	if e := hook.LastEntry(); e == nil || e.Level != log.WarnLevel {
+		t.Fatalf("control: a timeout was logged as %v, want a Warn entry", e)
 	}
 }
 

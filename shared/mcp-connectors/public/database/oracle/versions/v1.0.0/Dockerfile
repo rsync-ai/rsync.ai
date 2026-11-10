@@ -35,22 +35,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/shared/mcp-connectors
 
 # Copy entire build context (safe: per-connector version directory is small).
-# This makes optional directories (like oauth/) work without Dockerfile conditionals.
+# This makes optional files work without Dockerfile conditionals.
 COPY . /app/
 
 # Canonical type authority (single source of truth), shipped from the `shared`
 # build context (shared/mcp-connectors/public) exactly like warehouse_adapters.py.
 # Discovery imports it as `canonical_types` from /app (on PYTHONPATH).
 COPY --from=shared canonical_types.py /app/canonical_types.py
+COPY --from=shared sql_paging.py /app/sql_paging.py
 
 # Copy base_connector to shared location if present
 RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \
     # Ensure runtime imports always resolve to the shared base_connector, not a per-connector copy. \
     rm -f /app/base_connector.py; \
-    fi && \
-    if [ -d /app/oauth ]; then \
-      mkdir -p /app/shared/mcp-connectors/oauth && cp -r /app/oauth/* /app/shared/mcp-connectors/oauth/; \
     fi
 
 # Add shared connectors to Python path

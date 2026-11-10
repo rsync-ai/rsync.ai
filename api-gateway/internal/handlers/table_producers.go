@@ -105,11 +105,16 @@ func producedTableKey(connectionID string, p producedTable) string {
 //     from an earlier 'table' life is not a claim about what the statement writes, so
 //     it is ignored.
 //   - 'none', and any value this build does not recognize, writes nowhere.
+//   - a document model (documentProducedTables) writes only in table mode, and its bare
+//     target lands in its pipeline's database.
 //
 // This only says what a model's SQL would write. Whether the caller may see the model at
 // all is the caller's filter, and it must be the same filter for every materialization:
 // a private model's SQL is as private as its target_table.
-func modelProducedTables(id, name, materialization, targetTable, sqlText string) []producedTable {
+func modelProducedTables(connectorType, id, name, materialization, targetTable, sqlText string) []producedTable {
+	if isDocumentConnector(connectorType) {
+		return documentProducedTables(id, name, materialization, targetTable, sqlText)
+	}
 	switch materialization {
 	case matTable:
 		if table, ok := modelProducedTable(id, name, materialization, targetTable); ok {
@@ -119,6 +124,60 @@ func modelProducedTables(id, name, materialization, targetTable, sqlText string)
 		return statementProducedTables(id, name, sqlText)
 	}
 	return nil
+}
+
+// documentProducedTables is the collection a MongoDB model writes. Only table mode
+// exists for one (authorizeDocumentModel refuses statement mode), so any other
+// materialization writes nowhere — its sql_text is a pipeline, and reading SQL write
+// targets out of JSON would answer nothing at best.
+//
+// A target_table of `collection` is written into the pipeline's own database, as the
+// connector's _materialize_target routes it, so it is qualified with the stored query's
+// database — the same name a pipeline that delivers there records, and the one another
+// model's pipeline reads it by. With no database in the query the connection's pinned
+// one applies, which nothing here can see, and the name stays bare rather than guessed.
+// `database.collection` already says where it goes.
+func documentProducedTables(id, name, materialization, targetTable, sqlText string) []producedTable {
+	table, ok := modelProducedTable(id, name, materialization, targetTable)
+	if !ok {
+		return nil
+	}
+	if table.DestQualified == "" {
+		if spec, ferr := parseDocumentModelQuery(sqlText); ferr == nil && spec.Database != "" {
+			table.DestQualified = spec.Database + "." + table.TableName
+		}
+	}
+	return []producedTable{table}
+}
+
+// modelReadReferences is every table a model reads — the consumer half of the rule
+// modelProducedTables is the producer half of, shared by the asset graph and the
+// upstream suggestion for the same reason.
+//
+// A SQL model's inputs are parsed out of its SQL. A document model's sql_text is not SQL
+// but a stored pipeline, which the SQL extractor finds no table in, so its inputs come
+// from the pipeline instead (validators.DocumentAggregateSources): the collection it
+// runs on and every collection a $lookup, $graphLookup or $unionWith names. Those are
+// all in the pipeline's own database, which qualifies them when the query names one;
+// when it does not, they stay bare and match by name alone, as an unqualified SQL
+// reference does. A pipeline rsync.ai would refuse to run reads nothing.
+func modelReadReferences(connectorType, sqlText string) []validators.TableRef {
+	if !isDocumentConnector(connectorType) {
+		return validators.ExtractTableReferences(sqlText)
+	}
+	spec, ferr := parseDocumentModelQuery(sqlText)
+	if ferr != nil {
+		return nil
+	}
+	var refs []validators.TableRef
+	for _, collection := range validators.DocumentAggregateSources(spec) {
+		parts := []string{collection}
+		if spec.Database != "" {
+			parts = []string{spec.Database, collection}
+		}
+		refs = append(refs, validators.TableRef{Parts: parts})
+	}
+	return refs
 }
 
 // statementProducedTables reads the tables a statement model writes out of its SQL.

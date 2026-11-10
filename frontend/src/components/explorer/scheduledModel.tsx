@@ -1,5 +1,6 @@
-import { AlertTriangle } from "lucide-react"
-import { Badge } from "@/components/ui/badge"
+import { Fragment } from "react"
+import { ACTIVITY_STATUS_TONES, StatusPill } from "@/components/kit/StatusPill"
+import { ACTIVITY_STATUS_LABELS, isActivityStatus } from "@/lib/api/activity"
 import { describeUpstreamSet, type RunProvenanceFields } from "@/components/explorer/runProvenance"
 import { describeCron } from "@/components/explorer/cronSentence"
 import { type ScheduleUpstream } from "@/components/explorer/liveState"
@@ -26,6 +27,8 @@ export interface ScheduledQuery {
   status: string
   materialization: string
   target_table?: string
+  /** The name of the workspace layer the model is in, or absent when it is in none (migration 135). */
+  layer?: string
   statement_class?: string
   /** Resolved from connector_type server-side by the Explorer capability table. */
   supports_materialization?: boolean
@@ -117,49 +120,55 @@ export function runsDoSomething(s: ScheduledQuery): boolean {
 }
 
 /**
- * "48ms", "12.3s", "4m 5s", "1h 2m": precise where a run is short, readable where
- * it is not. A dash, not "0ms", for a run with no duration yet — this renders into
- * the schedule table and the duration chart's axis, where a zero would read as a
- * measurement. Both behaviours now come from `@/lib/duration`; the sub-second
- * branch is the one this copy existed for (16 ms and 48 ms must not both read
- * "0s", or the chart draws two very different runs the same).
+ * A schema-qualified name that wraps after a dot before anywhere else. The Details column
+ * is narrow, and break-all cut public.swipes_total into "public.swipes_tota" and "l".
  */
-export { formatDurationOrDash as formatDuration } from "@/lib/duration"
+export function QualifiedName({ name }: { name: string }) {
+  return (
+    <span className="font-mono break-words">
+      {name.split(".").map((part, i) => (
+        <Fragment key={i}>
+          {i > 0 && (
+            <>
+              .<wbr />
+            </>
+          )}
+          {part}
+        </Fragment>
+      ))}
+    </span>
+  )
+}
+
+/** What each run of the model writes: the model page's Does row, and the Graph tab's run panel. */
+export function describeWhatItDoes(s: Pick<ScheduledQuery, "materialization" | "target_table">) {
+  if (s.materialization === "statement") return <span>Runs its SQL as written</span>
+  if (s.materialization === "table" && s.target_table) {
+    return (
+      <span>
+        Rebuilds <QualifiedName name={s.target_table} />
+      </span>
+    )
+  }
+  return <span className="text-amber-600 dark:text-amber-400">Nothing: no target table is set</span>
+}
 
 export function statusBadge(s: ScheduledQuery) {
   // A schedule whose runs do nothing is `active` and firing, and every fire refuses.
   // The status alone would report that as healthy, so it is called out separately.
   if (s.status === "active" && !runsDoSomething(s)) {
-    return (
-      <Badge variant="outline" className="border-amber-500 text-amber-600">
-        <AlertTriangle className="h-3 w-3 mr-1" />
-        does nothing
-      </Badge>
-    )
+    return <StatusPill tone="wait">Does nothing</StatusPill>
   }
-  if (s.status === "active") {
-    return (
-      <Badge variant="outline" className="border-emerald-500 text-emerald-600">
-        active
-      </Badge>
-    )
-  }
-  return (
-    <Badge variant="outline" className="text-zinc-500 dark:text-zinc-400">
-      {s.status}
-    </Badge>
-  )
+  if (s.status === "active") return <StatusPill tone="ok">Active</StatusPill>
+  return <StatusPill tone="skip">{capitalize(s.status)}</StatusPill>
 }
 
 export function runStatusBadge(status: string) {
-  if (status === "succeeded") {
-    return <Badge variant="outline" className="border-emerald-500 text-emerald-600">succeeded</Badge>
+  // A run's status in the words and colours every run list in the app uses.
+  if (isActivityStatus(status)) {
+    return <StatusPill tone={ACTIVITY_STATUS_TONES[status]}>{ACTIVITY_STATUS_LABELS[status]}</StatusPill>
   }
-  if (status === "failed") {
-    return <Badge variant="outline" className="border-red-500 text-red-600">failed</Badge>
-  }
-  if (status === "skipped") {
-    return <Badge variant="outline" className="border-amber-500 text-amber-600">skipped</Badge>
-  }
-  return <Badge variant="outline" className="text-zinc-500 dark:text-zinc-400">{status}</Badge>
+  return <StatusPill tone="cancel">{capitalize(status)}</StatusPill>
 }
+
+const capitalize = (word: string) => word.charAt(0).toUpperCase() + word.slice(1)

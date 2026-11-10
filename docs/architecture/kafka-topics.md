@@ -40,9 +40,6 @@ All three implementations must agree byte-for-byte. They share four behaviours:
   **bare `-`** — `:-` substitutes on empty as well as unset and would silently overwrite
   the operator's deliberate choice.
 
-`in_namespace()` (Python) recognizes both the prefixed and bare forms, because a
-deployment mid-migration has some of each.
-
 ### Reclaiming pre-namespace topics — `KAFKA_ALLOW_LEGACY_UNPREFIXED_TOPICS`
 
 | Var | Default | Set it when |
@@ -74,8 +71,8 @@ Narrowing the allowlist cannot strand a teardown: the platform's own reclamation
 (`POST /cdc/kafka-teardown` → `cleanupPipelineKafkaResources`,
 [cdc_kafka_teardown.go](../../backend-orchestrator/internal/handlers/cdc_kafka_teardown.go))
 reaches the TopologyManager directly and never consults it. That sweep matches each
-resource in **both** its bare and its qualified spelling for the same reason
-`in_namespace()` does.
+resource in **both** its bare and its qualified spelling, because a deployment
+mid-migration has some of each.
 
 `KAFKA_OWNED_TOPIC_PREFIXES` (comma-separated) extends the allowlist for a deployment
 that names topics differently. It adds to the built-ins and never replaces them.
@@ -108,8 +105,9 @@ is created, listed, subscribable and permanently unwritable.
 called at orchestrator startup through `ensurePlatformTopicsWithRetry`
 ([cmd/orchestrator/platform_topics.go](../../backend-orchestrator/cmd/orchestrator/platform_topics.go),
 [main.go:513-520](../../backend-orchestrator/cmd/orchestrator/main.go)) **before any
-consumer starts** — a consumer-group subscription auto-creates the topic it joins at the
-broker's defaults, and this function never re-sizes an existing topic. It creates the
+consumer starts** — on a broker with auto-creation on, a consumer-group subscription
+creates the topic it joins at the broker's defaults, and this function never re-sizes an
+existing topic. It creates the
 names `PlatformTopicNames()` returns (topology.go:375), through `EnsureTopic` →
 `kafkaclient.Topic()`, so they are correctly prefixed:
 
@@ -173,7 +171,7 @@ same config.
 
 The topics above are known at startup. The data-plane topics are not: their names carry a
 pipeline id or a connector name, so they can only be created when a pipeline runs.
-[`Manager.EnsureTopicExists`](../../backend-orchestrator/internal/kafka/manager.go) (:1671)
+[`Manager.EnsureTopicExists`](../../backend-orchestrator/internal/kafka/manager.go) (:1682)
 and its config-carrying sibling `EnsureTopicExistsWithConfig` (:1675) are that path, with
 two wrappers that fix the config: `EnsureSignalTopic` (:1733) and `EnsureDDLTopic` (:1770).
 They create the name the caller chose verbatim — these names are owned by Debezium and by
@@ -182,22 +180,27 @@ while the replication clamping still applies.
 
 | Call site | Topic | Partitions | Config |
 |---|---|---|---|
-| [executor.go:4054](../../backend-orchestrator/internal/agents/executor/executor.go) | `pipeline.<id8>.data` (batch) | 1 | — |
-| [executor.go:6437](../../backend-orchestrator/internal/agents/executor/executor.go) | `cdc-<id8>.<db>.<table>`, or one unified topic for dimension tables | resolved per pipeline, fallback 1 (executor.go:6278) | — |
-| [executor.go:3351](../../backend-orchestrator/internal/agents/executor/executor.go) | `schemahistory.<connector>` — historized engines only (MySQL/MariaDB, SQL Server, Oracle, Db2) | 1 | `cleanup.policy=delete`, `retention.ms=-1` |
-| [executor.go:3371](../../backend-orchestrator/internal/agents/executor/executor.go) | the connector's DDL topic, its bare `topic.prefix` `cdc-<id8>` — historized engines only | 1 | `EnsureDDLTopic`: delete, 7 days |
-| [executor.go:3403](../../backend-orchestrator/internal/agents/executor/executor.go) | `heartbeat.<topic.prefix>` (so `rsync.heartbeat.rsync.cdc-<id8>` under the default prefix) — PostgreSQL and MongoDB only | 1 | `cleanup.policy=delete` |
-| [executor.go:2968](../../backend-orchestrator/internal/agents/executor/executor.go), [cdc_incremental.go:357](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go) | `signals.<id8>` — PostgreSQL family and MongoDB only | 1 | `EnsureSignalTopic`: delete, 1 day, hourly segments |
-| [manager.go:1016](../../backend-orchestrator/internal/kafka/manager.go) | `<consumed topic>.dlq` for each orchestrator consumer | 1 | `DLQTopicConfig`: delete, 7 days |
+| [executor.go:3999](../../backend-orchestrator/internal/agents/executor/executor.go) | `pipeline.<id8>.data` (batch) | 1 | — |
+| [executor.go:6641](../../backend-orchestrator/internal/agents/executor/executor.go) | `cdc-<id8>.<db>.<table>`, or one unified topic for dimension tables | resolved per pipeline, fallback 1 (executor.go:6452) | — |
+| [executor.go:3215](../../backend-orchestrator/internal/agents/executor/executor.go) | `schemahistory.<connector>` — historized engines only (MySQL/MariaDB, SQL Server, Oracle, Db2) | 1 | `cleanup.policy=delete`, `retention.ms=-1` |
+| [executor.go:3235](../../backend-orchestrator/internal/agents/executor/executor.go) | the connector's DDL topic, its bare `topic.prefix` `cdc-<id8>` — historized engines only | 1 | `EnsureDDLTopic`: delete, 7 days |
+| [executor.go:3267](../../backend-orchestrator/internal/agents/executor/executor.go) | `heartbeat.<topic.prefix>` (so `rsync.heartbeat.rsync.cdc-<id8>` under the default prefix) — PostgreSQL and MongoDB only | 1 | `cleanup.policy=delete` |
+| [executor.go:2832](../../backend-orchestrator/internal/agents/executor/executor.go), [cdc_incremental.go:357](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go) | `signals.<id8>` — PostgreSQL family and MongoDB only | 1 | `EnsureSignalTopic`: delete, 1 day, hourly segments |
+| [manager.go:1002](../../backend-orchestrator/internal/kafka/manager.go) | `<consumed topic>.dlq` for each orchestrator consumer | 1 | `DLQTopicConfig`: delete, 7 days |
 
 The sink worker creates its own `<source_topic>.dlq` before the first write, 1 partition
 and 7 days' retention
 ([kafka-sink-worker main.go `ensureDLQTopic`](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)).
 
 Every pre-create above is **best-effort**: a failure is logged at Warn and the run
-continues, so a broker that does auto-create behaves exactly as it did before. That is
-deliberate — the pre-creation removes a dependency, it does not add a new way to fail a
-pipeline.
+continues. Every broker this repo bundles runs with auto-creation off (§4), so a failed
+pre-create then shows up where the topic is first written — a producer's
+`UNKNOWN_TOPIC_OR_PARTITION`, or a Connect task that cannot write — instead of being
+covered by the broker. A sink worker whose subscribed topic does not exist yet waits for
+it and does not join its consumer group until it does
+([kafka-sink-worker main.go `waitForTopicPartitions`](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)):
+joining early made kafka-go rejoin in a loop with no backoff, and the dials it made
+exhausted the sink container's ephemeral ports.
 
 The schema-history entry is the one with a geometry that is a correctness requirement
 rather than a preference. Debezium replays that topic in order to rebuild the source DDL,
@@ -221,7 +224,7 @@ side and by `test_topic_naming.py` on the connector side.
 | `pipeline.domain.events` | orchestrator ([progress_events.go:268](../../backend-orchestrator/internal/workers/progress_events.go), [main.go:333](../../backend-orchestrator/cmd/orchestrator/main.go)); temporal-adapter ([activities.go:144](../../backend-temporal-adapter/internal/workflows/activities.go)); sink worker ([main.go:3933](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)) | api-gateway WebSocket bridge, event projector, domain-events consumer | §2a, §2b |
 | `rsync.notifications` | orchestrator schema-drift healer ([healer.go:1274](../../backend-orchestrator/internal/agents/healer/healer.go)); temporal-adapter ([pipeline_failure_notification.go:61](../../backend-temporal-adapter/internal/workflows/pipeline_failure_notification.go)) | api-gateway notifier ([notifier.go:61](../../api-gateway/internal/notifier/notifier.go)) | §2a |
 | `pii.scan.request` | api-gateway ([handlers/pii.go:302](../../api-gateway/internal/handlers/pii.go)) | llm-service ([pii_scanner/kafka_consumer.py:21](../../llm-service/src/agents/pii_scanner/kafka_consumer.py)) | §2a, §2b |
-| `pii.scan.response` | llm-service PII scanner | api-gateway ([cmd/server/main.go:539](../../api-gateway/cmd/server/main.go)) | §2a, §2b |
+| `pii.scan.response` | llm-service PII scanner | api-gateway ([cmd/server/main.go:549](../../api-gateway/cmd/server/main.go)) | §2a, §2b |
 
 ### Schema-drift topics (only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`)
 
@@ -255,7 +258,7 @@ by [`kafka_bridge_group_test.go`](../../api-gateway/internal/websocket/kafka_bri
 
 | Topic | Shape | Producer | Consumer | Created by |
 |---|---|---|---|---|
-| `pipeline.<id8>.data` | batch row chunks / MinIO claim-check URLs | executor ([executor.go:2410](../../backend-orchestrator/internal/agents/executor/executor.go) names it) | `kafka-mcp-sink` | §2d |
+| `pipeline.<id8>.data` | batch row chunks / MinIO claim-check URLs | executor ([executor.go:2355](../../backend-orchestrator/internal/agents/executor/executor.go) names it) | `kafka-mcp-sink` | §2d |
 | `cdc-<id8>.<db>.<table>` | Debezium per-table stream | Debezium via Kafka Connect | `kafka-mcp-sink` | §2d |
 | `schemahistory.<connector>` | Debezium source-DDL history | Kafka Connect | Kafka Connect (on connector restart) | §2d |
 | `cdc-<id8>` | Debezium DDL events (historized engines) | Kafka Connect | orchestrator cdcstats ([schema_changes.go](../../backend-orchestrator/internal/agents/cdcstats/schema_changes.go)) | §2d |
@@ -264,14 +267,20 @@ by [`kafka_bridge_group_test.go`](../../api-gateway/internal/websocket/kafka_bri
 | `<topic>.dlq` | dead-lettered messages of one consumed topic | sink worker, orchestrator consumers | operator | §2d |
 
 `<id8>` is the first 8 characters of the pipeline UUID. The batch topic name is built at
-[executor.go:2410](../../backend-orchestrator/internal/agents/executor/executor.go)
+[executor.go:2355](../../backend-orchestrator/internal/agents/executor/executor.go)
 unless the pipeline carries a pre-provisioned one; there is no `cdc.<id8>` topic. The
 fixed `pipeline.failed.dlq` and `agent.failed.dlq` were removed in
 [#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
 
 ## 4. What this means for `auto.create.topics.enable=false`
 
-**Status: the code no longer depends on auto-creation; the setting has not been flipped.**
+**Status: flipped and proven ([#1314](https://github.com/rsync-ai/rsync-ai/pull/1314), 2026-10-01).** Every broker this repo bundles runs with
+auto-creation off: `KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'` in
+[docker-compose.yml](../../docker-compose.yml) and
+[docker-compose.quickstart.yml](../../docker-compose.quickstart.yml), and `"false"` in the
+Helm chart's broker ([kafka.yaml](../../deploy/helm/rsync-ai/templates/infra/kafka.yaml)).
+[test_bundled_kafka_never_auto_creates_topics.py](../../llm-service/tests/test_bundled_kafka_never_auto_creates_topics.py)
+fails if any of them turns it back on.
 
 This section used to read: the entire data plane and most of the response plane exist only
 because the broker creates topics on first produce or first fetch, so turning
@@ -279,29 +288,36 @@ because the broker creates topics on first produce or first fetch, so turning
 with a pipeline that transfers zero rows as the only visible symptom. That was accurate,
 and it mattered because the setting is one this platform does **not own** on a
 customer-managed cluster — several managed offerings ship it off, and a customer may
-simply have turned it off.
+simply have turned it off. Running the bundled brokers the same way means a missing
+creator fails here first, not on a customer's cluster.
 
-Every topic in §3 now has a named creator: §2a provisions the platform topics (event,
+Every topic in §3 has a named creator: §2a provisions the platform topics (event,
 notification, PII and, when enabled, healer) at startup, and §2d pre-creates the
-per-pipeline data topics when a pipeline runs. The producer-less bridge subscriptions that
-were creating topics by fetching from them are gone. The remaining hole is a documented one:
-`schemahistory.<connector>` is pre-created by §2d, but Kafka Connect is what writes to it,
-and if the pre-create fails Connect still expects the broker to have it.
+per-pipeline data topics when a pipeline runs. `schemahistory.<connector>` is the one Kafka
+Connect writes; §2d pre-creates it, and Debezium's schema-history storage also creates it
+when the connector starts — the e2e harness registers MySQL connectors with Connect
+directly, with no orchestrator in the path, and their history topics exist with
+auto-creation off.
 
-Two things are still true, and both are why the compose default has **not** been changed:
+How it was proven, on the local compose stack with the broker flipped:
 
-1. **Nothing here has been proven against a real broker with the setting off.** The guards
-   in this repo are static and unit-level — they assert that the code creates what it
-   produces to, not that a live CDC pipeline survives with auto-creation disabled. That
-   needs a `kind` cluster running an end-to-end CDC pipeline against a broker configured
-   with `auto.create.topics.enable=false`.
-2. **`docker-compose.yml` and `docker-compose.quickstart.yml` do not set
-   `KAFKA_AUTO_CREATE_TOPICS_ENABLE` at all**, so both inherit the broker image's default
-   of `true`. Flipping it is the last step, not the first: with auto-creation on, a missing
-   pre-create is invisible, so the flip is also the only real test of the work above.
+1. **The broker really refuses.** A console producer to a topic nobody created got
+   `UNKNOWN_TOPIC_OR_PARTITION`, then `not present in metadata after 6000 ms`.
+2. **Only the test harness broke.** The first data-pipeline gate logged 408
+   `UNKNOWN_TOPIC_OR_PARTITION` warnings and failed all three CDC tests it ran: those tests
+   register Debezium connectors with Connect themselves and passed no
+   `topic.creation.default.*`, which the orchestrator always sets. Every e2e Debezium config
+   now passes `topic.creation.default.replication.factor` and `topic.creation.default.partitions`
+   as `"-1"`, and the same test above fails on one that does not.
+3. **The pipelines run.** Batch, MySQL CDC to PostgreSQL, hybrid topics and the gate (3/3)
+   pass, and a PostgreSQL CDC pipeline created through the gateway — so its topics came
+   from the orchestrator's own creators — snapshotted, then carried an INSERT, an UPDATE and
+   a DELETE. Kafka Connect logged no `UNKNOWN_TOPIC_OR_PARTITION` in those runs.
+4. **It found one real bug.** A sink worker started on a topic that did not exist joined its
+   group anyway and rejoin-looped; see the best-effort paragraph in §2d.
 
-Do not describe the platform as safe on a broker with auto-creation off until that run has
-happened.
+An existing stack takes the setting when its broker container is recreated; topics already
+on the volume are unaffected. A customer-managed cluster's setting is still the customer's.
 
 ## 5. Consumer groups
 
@@ -345,6 +361,7 @@ set in the Connect compose and is not namespaced. It needs its own `LITERAL` gra
    an operator grants covers both or neither. Deriving the id from an already-qualified
    topic list is fine — the qualifier is idempotent — but do not hand-concatenate the
    prefix, or the two can drift.
-4. Create it explicitly. A produced topic with no creator is a topic that works only
-   while auto-create is on.
+4. Create it explicitly. Every bundled broker runs with auto-creation off (§4), so a
+   produced topic with no creator fails on its first write. A test that registers a
+   Debezium connector with Kafka Connect directly passes `topic.creation.default.*` too.
 5. Add a row to §3 with the producer, the consumer and the creator, each cited.

@@ -165,7 +165,7 @@ Client Request
 |--------|----------|-------------|
 | GET | `/api/v1/executions` | List executions |
 | GET | `/api/v1/executions/:id` | Get execution |
-| POST | `/api/v1/executions/:id/cancel` | Cancel execution |
+| POST | `/api/v1/executions/:id/cancel` | Cancel execution and stop the pipeline, as Stop does (CDC: connector and sink first, 502 if they refuse; `warnings` lists a sink that would not stop) |
 | GET | `/api/v1/executions/:id/logs` | Get logs |
 | GET | `/api/v1/executions/:id/stages` | Get stage details |
 

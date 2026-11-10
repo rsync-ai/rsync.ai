@@ -437,11 +437,27 @@ func (h *TransformHandler) GetPipelineTransforms(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"pipeline_id":         pipelineID,
 		"producer_transforms": producerTransforms,
 		"consumer_transforms": consumerTransforms,
-	})
+	}
+
+	// On a MongoDB CDC pipeline a consumer rule can only be one of the types that
+	// run inside the packed document; the save refuses the rest. Saying so here
+	// lets a UI offer only those, not a rule the save then refuses (the create
+	// dialog offered array_expand on such a pipeline). Absent: any type runs.
+	mongoCDC, err := h.pipelineIsMongoCDC(c.Request.Context(), pipelineID)
+	if err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Error("Failed to read the pipeline's source for its consumer rule types")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+	if mongoCDC {
+		resp["consumer_rule_types"] = transforms.PackedDocumentRuleTypes()
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // validateExecutableTransform rejects a transform that no engine can run.
@@ -463,10 +479,13 @@ func (h *TransformHandler) GetPipelineTransforms(c *gin.Context) {
 //   - Validated as ENABLED whatever the row's own flag says. A disabled rule is
 //     inert today, but PUT /transforms/:id flips `enabled` without re-checking
 //     the config, so accepting a broken rule while disabled just defers the DLQ.
-//   - The config is copied first. normalizeOne mutates the map it is handed
-//     (it deletes `operation`, `table`, `requires_full_dataset` after mapping
-//     them), and this map is about to be marshalled into transform_config.
-func validateExecutableTransform(cfg map[string]interface{}, order int) error {
+//   - The config is copied first, because this map is about to be marshalled
+//     into transform_config. normalizeOne now copies it too (it deletes
+//     `operation`, `table`, `requires_full_dataset` after mapping them, and used
+//     to do that to the map it was handed); this copy keeps that a local fact.
+//
+// It returns the rule as the engine will run it.
+func validateExecutableTransform(cfg map[string]interface{}, order int) (transforms.CanonicalTransform, error) {
 	cfgCopy := make(map[string]interface{}, len(cfg))
 	for k, v := range cfg {
 		cfgCopy[k] = v
@@ -482,10 +501,46 @@ func validateExecutableTransform(cfg map[string]interface{}, order int) error {
 	// Execution mode additionally refuses a table-scoped rule when the current
 	// table is unknown, which is the right call mid-pipeline and the wrong one
 	// here - at save time a rule scoped to "users" is exactly what was asked for.
-	_, _, err := transforms.NormalizeAndValidate(
+	canonical, _, err := transforms.NormalizeAndValidate(
 		[]map[string]any{item}, "", transforms.NormalizeModeSaveCheck,
 	)
-	return err
+	if err != nil || len(canonical) == 0 {
+		return transforms.CanonicalTransform{}, err
+	}
+	return canonical[0], nil
+}
+
+// A consumer rule on a MongoDB CDC pipeline
+//
+// The CDC sink hands each MongoDB change to the consumer chain packed as
+// {_id, document}, and only mask_pii and type_convert run inside the document
+// (transforms.RunsOnPackedDocument). Any other consumer rule names a column the
+// packed row does not have; the sink refuses such a chain and every change of
+// the table goes to the DLQ. The save refuses it first, where the operator is.
+// Like validateExecutableTransform, a rule is judged as if enabled. Producer
+// rules are not checked: the sink runs only transform_type = 'consumer'.
+
+// packedMongoRuleMessage explains one refused rule; names only.
+func packedMongoRuleMessage(ruleType string) string {
+	return fmt.Sprintf("%s cannot run on a MongoDB CDC change, which reaches the consumer rules as "+
+		"{_id, document}; only mask_pii and type_convert run inside the document", ruleType)
+}
+
+// pipelineIsMongoCDC reports whether the pipeline reads a MongoDB-family source
+// as CDC, the one shape whose consumer rows are packed. The CDC test is the
+// pipeline list's (pipelineListIsCDCSQL).
+func (h *TransformHandler) pipelineIsMongoCDC(ctx context.Context, pipelineID string) (bool, error) {
+	var connectorType string
+	var isCDC bool
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COALESCE(sc.connector_type, ''), `+pipelineListIsCDCSQL+`
+		FROM pipelines p
+		LEFT JOIN connections sc ON p.source_connection_id = sc.id
+		WHERE p.id = $1`, pipelineID).Scan(&connectorType, &isCDC)
+	if err != nil {
+		return false, err
+	}
+	return isCDC && transforms.IsMongoSourceType(connectorType), nil
 }
 
 // SavePipelineTransforms saves transforms for a pipeline
@@ -517,9 +572,17 @@ func (h *TransformHandler) SavePipelineTransforms(c *gin.Context) {
 	// DELETE then re-INSERT — so a partial accept would leave the pipeline with
 	// fewer transforms than the operator thinks they saved.
 	rejected := make([]string, 0)
+	packedRefused := make([]string, 0)
 	for i, t := range req.Transforms {
-		if err := validateExecutableTransform(t.TransformConfig, i); err != nil {
+		ct, err := validateExecutableTransform(t.TransformConfig, i)
+		if err != nil {
 			rejected = append(rejected, fmt.Sprintf("transform[%d]: %v", i, err))
+			continue
+		}
+		if t.TransformType == "consumer" {
+			for _, bad := range transforms.RulesUnsupportedOnPackedDocument([]transforms.CanonicalTransform{ct}) {
+				packedRefused = append(packedRefused, fmt.Sprintf("transform[%d]: %s", i, packedMongoRuleMessage(bad)))
+			}
 		}
 	}
 	if len(rejected) > 0 {
@@ -528,6 +591,21 @@ func (h *TransformHandler) SavePipelineTransforms(c *gin.Context) {
 			"details": rejected,
 		})
 		return
+	}
+	if len(packedRefused) > 0 {
+		mongoCDC, err := h.pipelineIsMongoCDC(c.Request.Context(), pipelineID)
+		if err != nil {
+			log.WithError(err).WithField("pipeline_id", pipelineID).Error("Failed to read the pipeline's source for the transform check")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+			return
+		}
+		if mongoCDC {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "One or more consumer rules cannot run on this MongoDB CDC pipeline; nothing was saved.",
+				"details": packedRefused,
+			})
+			return
+		}
 	}
 
 	// Start transaction
@@ -688,13 +766,17 @@ func (h *TransformHandler) UpdateTransform(c *gin.Context) {
 	// transform the engine cannot run: a new config, or flipping `enabled` on a
 	// row that was stored broken. Enabling validates the STORED config, since
 	// the request carries none.
+	// armed is the rule this request puts in force, when it can be read.
+	var armed *transforms.CanonicalTransform
 	if req.TransformConfig != nil {
-		if err := validateExecutableTransform(req.TransformConfig, 0); err != nil {
+		ct, err := validateExecutableTransform(req.TransformConfig, 0)
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": fmt.Sprintf("This transform cannot be executed by any engine: %v", err),
 			})
 			return
 		}
+		armed = &ct
 	} else if req.Enabled != nil && *req.Enabled {
 		var storedJSON []byte
 		if err := h.db.QueryRow(
@@ -702,12 +784,37 @@ func (h *TransformHandler) UpdateTransform(c *gin.Context) {
 		).Scan(&storedJSON); err == nil {
 			var stored map[string]interface{}
 			if json.Unmarshal(storedJSON, &stored) == nil {
-				if err := validateExecutableTransform(stored, 0); err != nil {
+				ct, err := validateExecutableTransform(stored, 0)
+				if err != nil {
 					c.JSON(http.StatusBadRequest, gin.H{
 						"error": fmt.Sprintf("This transform cannot be enabled — no engine can execute it: %v", err),
 					})
 					return
 				}
+				armed = &ct
+			}
+		}
+	}
+
+	// The same packed-MongoDB check as the save, for a consumer row.
+	if armed != nil {
+		if bad := transforms.RulesUnsupportedOnPackedDocument([]transforms.CanonicalTransform{*armed}); len(bad) > 0 {
+			var side, pipelineID string
+			err := h.db.QueryRowContext(c.Request.Context(),
+				`SELECT transform_type, pipeline_id::text FROM transform_definitions WHERE id = $1`, transformID,
+			).Scan(&side, &pipelineID)
+			mongoCDC := false
+			if err == nil && side == "consumer" {
+				mongoCDC, err = h.pipelineIsMongoCDC(c.Request.Context(), pipelineID)
+			}
+			if err != nil {
+				log.WithError(err).WithField("transform_id", transformID).Error("Failed to read the transform's pipeline source for the transform check")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+				return
+			}
+			if mongoCDC {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "This consumer rule cannot run on this MongoDB CDC pipeline: " + packedMongoRuleMessage(bad[0])})
+				return
 			}
 		}
 	}

@@ -192,3 +192,70 @@ func TestPGLegacySplitNeverDropsBelowStoredMinusSnapshot(t *testing.T) {
 		t.Errorf("applied_inserts = %d, want 110 kept (nothing was re-reported as snapshot rows)", got.appliedInserts)
 	}
 }
+
+// batchFlush is a batch-lane sink event; a flush has read == written. stampCompletedAt
+// reproduces a pre-fix sink, which put completed_at on every flush.
+func batchFlush(status string, rows float64, stampCompletedAt bool) map[string]interface{} {
+	meta := map[string]interface{}{
+		"source":     "kafka_mcp_sink",
+		"mode":       "batch",
+		"status":     status,
+		"started_at": "2026-10-01T05:00:00Z",
+		"table": map[string]interface{}{
+			"schema": "pipeline_test", "name": "demo_products", "qualified_name": pgOrchTable,
+		},
+		"counts": map[string]interface{}{"read_rows": rows, "inserted_rows": rows},
+	}
+	if stampCompletedAt {
+		meta["completed_at"] = "2026-10-01T05:00:05Z"
+	}
+	return map[string]interface{}{
+		"event_type":   "TABLE_STATS",
+		"pipeline_id":  pgOrchPipeID,
+		"execution_id": pgOrchExecID,
+		"metadata":     meta,
+	}
+}
+
+func pgBatchStatus(t *testing.T, db *sql.DB) (string, sql.NullString) {
+	t.Helper()
+	var status string
+	var completedAt sql.NullString
+	if err := db.QueryRow(
+		`SELECT status, completed_at::text FROM pipeline_run_table_stats
+		 WHERE pipeline_id = $1::uuid AND execution_id = $2::uuid AND qualified_name = $3`,
+		pgOrchPipeID, pgOrchExecID, pgOrchTable).Scan(&status, &completedAt); err != nil {
+		t.Fatalf("read batch stats row: %v", err)
+	}
+	return status, completedAt
+}
+
+// A batch table is "completed" only once the end-of-table event lands: per-flush running
+// events (read == written each time, completed_at stamped by a pre-fix sink) keep it
+// running, and a late flush after the end does not reopen it.
+func TestPGBatchRunningFlushNeverCompletesTheTable(t *testing.T) {
+	db := pgProjectorDB(t)
+	p := pgSeedOrchPipeline(t, db)
+
+	for _, n := range []float64{500, 1000} {
+		if err := p.upsertTableStats(batchFlush("running", n, true)); err != nil {
+			t.Fatalf("flush %v: %v", n, err)
+		}
+		if status, completedAt := pgBatchStatus(t, db); status != "running" || completedAt.Valid {
+			t.Fatalf("after flush %v: status/completed_at = %s/%v, want running/NULL — the table "+
+				"reads completed mid-copy", n, status, completedAt)
+		}
+	}
+	if err := p.upsertTableStats(batchFlush("completed", 1500, true)); err != nil {
+		t.Fatalf("end of table: %v", err)
+	}
+	if status, completedAt := pgBatchStatus(t, db); status != "completed" || !completedAt.Valid {
+		t.Fatalf("after the end-of-table event: status/completed_at = %s/%v, want completed/set", status, completedAt)
+	}
+	if err := p.upsertTableStats(batchFlush("running", 1000, false)); err != nil {
+		t.Fatalf("late flush: %v", err)
+	}
+	if status, _ := pgBatchStatus(t, db); status != "completed" {
+		t.Errorf("a late flush after the end moved status to %s, want completed kept", status)
+	}
+}

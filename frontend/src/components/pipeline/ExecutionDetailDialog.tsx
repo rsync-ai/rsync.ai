@@ -27,7 +27,8 @@ import {
 import { formatDateTime, formatRelativeTime } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { formatDuration } from "./dagHelpers"
+import { ACTIVITY_STATUS_LABELS, activityTriggerLabel } from "@/lib/api/activity"
+import { formatDuration } from "@/lib/duration"
 import {
   buildRunTimeline,
   computeRunDelta,
@@ -86,13 +87,14 @@ const FAILURE_STATUSES = new Set([
   "waiting_for_user",
 ])
 
+/** The words come from ACTIVITY_STATUS_LABELS; "success" and "completed" are one outcome. */
 export function statusPresentation(status: string) {
   const configs: Record<string, { icon: React.ElementType; color: string; label: string }> = {
-    running: { icon: Loader2, color: "text-blue-600", label: "Running" },
-    success: { icon: CheckCircle2, color: "text-green-600", label: "Success" },
-    completed: { icon: CheckCircle2, color: "text-green-600", label: "Completed" },
-    failed: { icon: XCircle, color: "text-red-600", label: "Failed" },
-    cancelled: { icon: XCircle, color: "text-zinc-400", label: "Cancelled" },
+    running: { icon: Loader2, color: "text-blue-600", label: ACTIVITY_STATUS_LABELS.running },
+    success: { icon: CheckCircle2, color: "text-green-600", label: ACTIVITY_STATUS_LABELS.succeeded },
+    completed: { icon: CheckCircle2, color: "text-green-600", label: ACTIVITY_STATUS_LABELS.succeeded },
+    failed: { icon: XCircle, color: "text-red-600", label: ACTIVITY_STATUS_LABELS.failed },
+    cancelled: { icon: XCircle, color: "text-zinc-400", label: ACTIVITY_STATUS_LABELS.cancelled },
     pending: { icon: Clock, color: "text-zinc-500 dark:text-zinc-400", label: "Pending" },
   }
   return configs[status] || configs.pending
@@ -360,7 +362,8 @@ export function ExecutionDetailDialog({
               {run.pipeline_name ? ` of ${run.pipeline_name}` : ""}
             </span>
             <Badge variant="outline" className="font-normal">
-              {run.trigger_source === "scheduled" ? "Scheduled" : "Manual"}
+              {/* The server stores a run with no trigger as manual (pipelines.go COALESCE). */}
+              {activityTriggerLabel(run.trigger_source || "manual")}
             </Badge>
           </DialogTitle>
         </DialogHeader>

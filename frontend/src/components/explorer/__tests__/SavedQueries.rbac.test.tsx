@@ -14,6 +14,10 @@ let mockUserId: string | undefined = "99999999-9999-9999-9999-999999999999"
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: mockRole,

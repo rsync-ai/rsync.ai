@@ -19,7 +19,10 @@ package main
 // scrubLog to shared/scrubber_golden.json, the same fixture the orchestrator and
 // llm-service scrubbers are pinned to. Patching two of the three now fails CI.
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 const scrubRedacted = "[redacted]"
 
@@ -27,7 +30,7 @@ var (
 	reScrubFailingRow  = regexp.MustCompile(`(?is)\bFailing row contains\b.*`)
 	reScrubValues      = regexp.MustCompile(`(?is)\bVALUES\b\s*\(.*`)
 	reScrubKeyDetail   = regexp.MustCompile(`(?i)(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)`)
-	reScrubURLCred     = regexp.MustCompile(`(\w+://)[^/\s:@]+:[^/\s@]*@`)
+	reScrubURLCred     = regexp.MustCompile(`(\w+://)[^/\s:@]*:[^/\s@]*@`)
 	reScrubBearer      = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+`)
 	reScrubKVSensitive = regexp.MustCompile(`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|authorization|bearer|access[_-]?key|private[_-]?key|client[_-]?secret)\b\s*[=:]\s*\S+`)
 	// Credential words fused into a longer key name — KAFKA_SASL_PASSWORD,
@@ -52,15 +55,25 @@ var (
 	//     'topsecret' in the row` lost its diagnostic tail.
 	//
 	// Replacements are not rescanned, so one pass cannot do either to itself.
-	reScrubQuotedLiteral = regexp.MustCompile(`(?s)(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|$)`)
+	// `\\?$` takes a literal cut right after a backslash ('john\\) too.
+	reScrubQuotedLiteral = regexp.MustCompile(`(?s)(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\\?$)`)
 	reScrubEmail         = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
 	// IPv4 — personal data under GDPR and not needed for diagnosis. Absent from
 	// this copy entirely until the golden parity test went looking for it.
-	reScrubIPv4       = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b`)
-	reScrubBase64     = regexp.MustCompile(`\b[A-Za-z0-9+/]{40,}={0,2}\b`)
-	reScrubSSN        = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
-	reScrubPhone      = regexp.MustCompile(`\b\d{3}[-.]\d{3}[-.]\d{4}\b`)
-	reScrubLongDigits = regexp.MustCompile(`\d{7,}`)
+	reScrubIPv4 = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b`)
+	// A dotted host name after lookup / dial tcp / host "…" / server at "…".
+	// See llmscrub.reHostInErrorText.
+	reScrubHostInErrorText = regexp.MustCompile(`(?i)(\blookup\s+|\bdial\s+(?:tcp|udp)[46]?\s+|\bhost(?:\s+name)?\s+"|\bserver\s+at\s+")[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+`)
+	reScrubBase64          = regexp.MustCompile(`\b[A-Za-z0-9+/]{40,}={0,2}\b`)
+	// URLs get their own rule (scrubLogURL), so a long spec URL stays readable
+	// and a key in a short query value is taken. See llmscrub.reURLOrBase64.
+	reScrubURLOrBase64  = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s'"<>]+)|\b[A-Za-z0-9+/]{40,}={0,2}\b`)
+	reScrubURLPathBlob  = regexp.MustCompile(`[A-Za-z0-9+]{40,}={0,2}`)
+	reScrubURLToken     = regexp.MustCompile(`[A-Za-z0-9_\-]{20,}`)
+	reScrubURLQueryCred = regexp.MustCompile(`(?i)([?&;#][A-Za-z0-9_.\-]*(?:key|sig|signature|secret|token|password|passwd|pwd|auth|credential|code)=)[^&#\s'"<>]*`)
+	reScrubSSN          = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+	reScrubPhone        = regexp.MustCompile(`\b\d{3}[-.]\d{3}[-.]\d{4}\b`)
+	reScrubLongDigits   = regexp.MustCompile(`\d{7,}`)
 )
 
 // scrubLog masks likely customer data (row values, credentials, PII) in sink
@@ -82,9 +95,51 @@ func scrubLog(s string) string {
 	s = reScrubQuotedLiteral.ReplaceAllString(s, "${1}'"+scrubRedacted+"'")
 	s = reScrubEmail.ReplaceAllString(s, "[email-redacted]")
 	s = reScrubIPv4.ReplaceAllString(s, "[ip-redacted]")
-	s = reScrubBase64.ReplaceAllString(s, scrubRedacted)
+	s = reScrubHostInErrorText.ReplaceAllString(s, "${1}[host-redacted]")
+	s = reScrubURLOrBase64.ReplaceAllStringFunc(s, scrubLogURLOrBlob)
 	s = reScrubSSN.ReplaceAllString(s, "[num-redacted]")
 	s = reScrubPhone.ReplaceAllString(s, "[num-redacted]")
 	s = reScrubLongDigits.ReplaceAllString(s, "[num-redacted]")
 	return s
+}
+
+// scrubLogURLOrBlob mirrors llmscrub.scrubURLOrBlob.
+func scrubLogURLOrBlob(m string) string {
+	if !strings.Contains(m, "://") {
+		return scrubRedacted
+	}
+	return scrubLogURL(m)
+}
+
+// scrubLogURL mirrors llmscrub.scrubURL: the URL stays readable; a blob in
+// scheme://authority, token-shaped path segments, and credential query
+// parameters are taken.
+func scrubLogURL(u string) string {
+	start := strings.Index(u, "://") + 3
+	end := len(u)
+	if i := strings.IndexAny(u[start:], "/?#"); i >= 0 {
+		end = start + i
+	}
+	head, path, query := u[:end], u[end:], ""
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path, query = path[:i], path[i:]
+	}
+	head = reScrubBase64.ReplaceAllString(head, scrubRedacted)
+	path = reScrubURLPathBlob.ReplaceAllString(path, scrubRedacted)
+	path = reScrubURLToken.ReplaceAllStringFunc(path, scrubLogMixedToken)
+	query = reScrubURLQueryCred.ReplaceAllString(query, "${1}"+scrubRedacted)
+	query = reScrubBase64.ReplaceAllString(query, scrubRedacted)
+	query = reScrubURLToken.ReplaceAllStringFunc(query, scrubLogMixedToken)
+	return head + path + query
+}
+
+// scrubLogMixedToken mirrors llmscrub.redactMixedToken: a run holding a
+// letter and a digit is a token; a word run is not.
+func scrubLogMixedToken(t string) string {
+	if strings.ContainsAny(t, "0123456789") && strings.IndexFunc(t, func(r rune) bool {
+		return ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z')
+	}) >= 0 {
+		return scrubRedacted
+	}
+	return t
 }

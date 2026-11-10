@@ -95,8 +95,9 @@ with open(_SHARED_CASES, encoding="utf-8") as _f:
 
 
 def test_shared_cases_match_the_connector_bounds():
-    assert (SHARED["min_seconds"], SHARED["max_seconds"]) == (
+    assert (SHARED["min_seconds"], SHARED["max_seconds"], SHARED["default_seconds"]) == (
         sink.MIN_FLUSH_INTERVAL_SECONDS, sink.MAX_FLUSH_INTERVAL_SECONDS,
+        sink.DEFAULT_FLUSH_INTERVAL_SECONDS,
     ), "update the shared cases, the worker's main.go and connector.py together"
     kinds = {"accepted": 0, "unset": 0, "refused": 0}
     for case in SHARED["cases"]:
@@ -170,7 +171,8 @@ def test_invalid_interval_is_refused_before_any_worker_starts(connector, value):
     error = res.get("error") or ""
     assert "max_file_interval_seconds" in error
     assert "whole number of seconds from 1 to 240" in error
-    assert "30-second default" in error
+    # The worker's own refusal names the same default (cdc_flush_interval_test.go).
+    assert f"{SHARED['default_seconds']}-second default" in error
     assert connector.spawned == [], "a worker was spawned with a refused interval"
     assert connector.workers == {}
     # The metrics port reserved for the refused start is handed back.
@@ -246,7 +248,10 @@ def test_the_form_field_has_no_default():
 
 def test_the_form_describes_the_bounds_the_connector_enforces():
     bounds = f"{sink.MIN_FLUSH_INTERVAL_SECONDS} to {sink.MAX_FLUSH_INTERVAL_SECONDS}"
+    # The form said "Leave blank for 30" after the worker's default moved to 240.
+    blank = f"Leave blank for {sink.DEFAULT_FLUSH_INTERVAL_SECONDS}."
     for where, field in _declared_flush_interval_fields():
-        assert bounds in field["description"], (
-            f"{where} description does not say {bounds!r}: {field['description']!r}"
-        )
+        for want in (bounds, blank):
+            assert want in field["description"], (
+                f"{where} description does not say {want!r}: {field['description']!r}"
+            )

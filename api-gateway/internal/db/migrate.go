@@ -15,8 +15,9 @@ import (
 
 // migrationLockKey is the pg_advisory_lock key every replica's migration runner
 // serializes on. The value is arbitrary; what matters is that all replicas use
-// the same one. Nothing else in this codebase takes an advisory lock, so there
-// is no collision to reason about.
+// the same one. Other features take advisory locks too (grep pg_advisory); one
+// whose key happened to equal this would only make one wait for the other,
+// never break either.
 const migrationLockKey int64 = 8410372615409821
 
 // migrationLockTimeout bounds how long a replica waits for the winner to finish.
@@ -114,16 +115,8 @@ func Migrate(migrationsDir string) error {
 		return fmt.Errorf("failed to read migrations directory '%s': %w", migrationsDir, err)
 	}
 
-	var migrationFiles []string
-	for _, f := range files {
-		if !f.IsDir() && strings.HasSuffix(f.Name(), ".sql") {
-			migrationFiles = append(migrationFiles, f.Name())
-		}
-	}
-	sort.Strings(migrationFiles)
-
 	// 3. Apply migrations
-	for _, file := range migrationFiles {
+	for _, file := range migrationFileNames(files) {
 		if err := applyMigration(db, migrationsDir, file); err != nil {
 			return err
 		}
@@ -132,6 +125,20 @@ func Migrate(migrationsDir string) error {
 	// Only now is the database actually usable. /ready reads this.
 	markSchemaReady()
 	return nil
+}
+
+// migrationFileNames returns the migrations to apply, in the order to apply them.
+// Dotfiles are skipped: a directory copied off a Mac carries an AppleDouble sidecar
+// ("._001_init.sql", binary data) per file, which sorts before every real migration.
+func migrationFileNames(entries []os.DirEntry) []string {
+	var names []string
+	for _, f := range entries {
+		if !f.IsDir() && strings.HasSuffix(f.Name(), ".sql") && !strings.HasPrefix(f.Name(), ".") {
+			names = append(names, f.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func applyMigration(db *sql.DB, dir, filename string) error {
@@ -208,4 +215,3 @@ func applyMigration(db *sql.DB, dir, filename string) error {
 	log.Printf("✅ Migration %s applied successfully.", filename)
 	return nil
 }
-

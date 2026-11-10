@@ -15,6 +15,7 @@ Generated: 2026-07-05T15:47:52.925352
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -126,10 +127,10 @@ GRAPHQL_OPERATIONS: Dict[str, Dict[str, Any]] = {
 # This generic template implements the contract conservatively so EVERY
 # generated GraphQL connector advances a checkpoint without per-API tuning:
 #
-#   * Filtering is OPT-IN by query shape — we inject the ``since`` value as a
-#     GraphQL variable ONLY when the operation's query template actually
-#     declares one of the recognized "updated after" variable names. If it
-#     declares none, we fall back to a full fetch (still correct; just no
+#   * Filtering is OPT-IN by query shape — we send the ``since`` value ONLY
+#     through something the operation's query template declares: an "updated
+#     after" variable, or a ``$where`` input the schema lets us bound. If it
+#     declares neither, we fall back to a full fetch (still correct; just no
 #     API-call savings until the spec exposes such a variable).
 #   * Watermark emission is automatic — we scan returned rows for a
 #     recognized "updated at" field and emit the max. Harmless no-op when no
@@ -138,9 +139,8 @@ GRAPHQL_OPERATIONS: Dict[str, Dict[str, Any]] = {
 # ISO-8601 keys the executor may use to replay the watermark as a filter.
 _SINCE_PARAM_KEYS = ("since", "updated_since", "modified_since", "modified_after")
 
-# GraphQL variable names commonly used to express "updated after <ts>". We
-# only inject a since-filter when the operation's query template declares one
-# of these (detected by ``$<name>`` in the query string).
+# GraphQL variable names commonly used to express "updated after <ts>",
+# matched first and exactly.
 _SINCE_VARIABLE_NAMES = (
     "since",
     "updatedSince",
@@ -151,8 +151,32 @@ _SINCE_VARIABLE_NAMES = (
     "modifiedAfter",
 )
 
+# Any other declared variable whose name — lowercased, punctuation dropped —
+# is an updated/modified/changed time compared from below (``updatedAt_gt``,
+# ``updated_at_gte``, ``lastModifiedAfter``). The shape REST discovery matches
+# (``openapi_discovery._INCREMENTAL_PARAM_RE``); never a created time or an
+# upper bound.
+_SINCE_VARIABLE_RE = re.compile(
+    r"[a-z]*(?:updated|modified|changed)(?:at|on|date|time)?(?:gte|gt|after|since|from|min)"
+)
+
+# ``$name: Type`` in an operation's variable definitions (``[T]`` reads as T).
+_DECLARED_VARIABLE_RE = re.compile(
+    r"\$([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\[?\s*([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# Scalars an ISO-8601 string cannot be sent as. A since-named variable of one
+# of these (an epoch, say) is left alone and the read stays a full fetch.
+_NON_TIMESTAMP_SCALARS = ("Int", "Float", "Boolean")
+
 # Row fields scanned for the max-updated watermark, in priority order.
 _WATERMARK_ROW_FIELDS = ("updatedAt", "updated_at", "modifiedAt", "modified_at")
+
+# Lower bounds on an updated-at field inside a ``$where`` input, in order of
+# preference: ``gte`` first, because the replayed watermark is cut to whole
+# seconds and a row written in that second must be read again, not skipped.
+# Hasura spells them ``_gte``; Prisma-generated schemas ``gte``.
+_WHERE_LOWER_BOUNDS = ("_gte", "gte", "_gt", "gt")
 
 
 def _normalize_iso_timestamp(raw: Any) -> Optional[str]:
@@ -197,21 +221,80 @@ def _read_since(params: Any) -> Optional[str]:
     return None
 
 
+def _declared_variables(query_template: str) -> Dict[str, str]:
+    """``{variable: base type name}`` from an operation's variable definitions."""
+    return {
+        m.group(1): m.group(2)
+        for m in _DECLARED_VARIABLE_RE.finditer(query_template or "")
+    }
+
+
 def _apply_since_filter(
     query_template: str,
     variables: Dict[str, Any],
     since_iso: str,
+    input_fields: Optional[Any] = None,
 ) -> Optional[str]:
-    """Inject ``since_iso`` as a GraphQL variable when the query declares one.
+    """Send ``since_iso`` through the first input the query declares that can carry it.
 
-    Returns the variable name used, or ``None`` when the query template
-    declares no recognized "updated after" variable (== full fetch).
+    In order: a variable named in ``_SINCE_VARIABLE_NAMES``; another variable
+    whose name reads as "updated after" (``_SINCE_VARIABLE_RE``); a ``$where``
+    input, bounded by ``_since_where_clause`` when ``input_fields`` can read
+    the schema. A variable typed as a number or a boolean is never filled.
+
+    Returns what was used, for the log (``updatedAt_gt``,
+    ``where.updated_at._gte``), or ``None`` when nothing can carry it (== full
+    fetch).
     """
-    for name in _SINCE_VARIABLE_NAMES:
-        if "$" + name in (query_template or ""):
-            # Respect a caller-supplied value if already present.
-            variables.setdefault(name, since_iso)
-            return name
+    declared = _declared_variables(query_template)
+    fillable = [n for n, t in declared.items() if t not in _NON_TIMESTAMP_SCALARS]
+    named = [n for n in _SINCE_VARIABLE_NAMES if n in fillable]
+    shaped = [
+        n for n in fillable
+        if _SINCE_VARIABLE_RE.fullmatch(re.sub(r"[^a-z0-9]", "", n.lower()))
+    ]
+    if named or shaped:
+        name = (named + shaped)[0]
+        # Respect a caller-supplied value if already present.
+        variables.setdefault(name, since_iso)
+        return name
+    where_type = declared.get("where")
+    if where_type and input_fields is not None and variables.get("where") is None:
+        clause = _since_where_clause(query_template, where_type, since_iso, input_fields)
+        if clause is not None:
+            variables["where"], used = clause
+            return used
+    return None
+
+
+def _since_where_clause(
+    query_template: str,
+    where_type: str,
+    since_iso: str,
+    input_fields: Any,
+) -> Optional[Tuple[Dict[str, Any], str]]:
+    """``(where, label)`` keeping rows updated at or after ``since_iso``, or ``None``.
+
+    The shape comes from the schema, not from the type's name: Hasura nests a
+    comparison (``{updated_at: {_gte: ts}}``), Prisma-generated schemas too
+    (``{updatedAt: {gte: ts}}``), Prisma 1 flattens it (``{updatedAt_gte: ts}``).
+    ``input_fields(type_name)`` returns ``{field: type name}`` for an input
+    type, or ``None`` when the schema cannot be read. Only an updated-at field
+    the query reads is bounded, so the watermark comes back from the same field
+    the filter compared.
+    """
+    fields = input_fields(where_type) or {}
+    for field in _WATERMARK_ROW_FIELDS:
+        if not re.search(r"(?<![\w$])" + field + r"(?!\w)", query_template):
+            continue
+        for bound in ("_gte", "_gt"):
+            if field + bound in fields:
+                return {field + bound: since_iso}, f"where.{field}{bound}"
+        if field in fields:
+            bounds = input_fields(fields[field]) or {}
+            for bound in _WHERE_LOWER_BOUNDS:
+                if bound in bounds:
+                    return {field: {bound: since_iso}}, f"where.{field}.{bound}"
     return None
 
 
@@ -707,6 +790,37 @@ class WidgetsGraphqlConnector(BaseMCPConnector):
             out.append((f.get("name", ""), self._flatten_graphql_type(f.get("type"))))
         return out
 
+    def _input_fields(self, type_name: str, config: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """``{field: leaf type name}`` of a GraphQL input type, or ``None``.
+
+        ``None`` when the type has no input fields (a scalar) or introspection
+        is unavailable — the incremental filter then falls back to a full fetch.
+        """
+        introspect = (
+            "query IntrospectInput($name: String!) {"
+            "  __type(name: $name) {"
+            "    inputFields { name type { name kind ofType { name kind ofType { name kind } } } }"
+            "  }"
+            "}"
+        )
+        try:
+            data = self._execute_graphql(introspect, {"name": type_name}, config)
+        except Exception as exc:
+            logger.warning(
+                "[Incremental] cannot read input type %s (%s); reading in full",
+                type_name, exc,
+            )
+            return None
+        type_info = data.get("__type") if isinstance(data, dict) else None
+        fields = type_info.get("inputFields") if isinstance(type_info, dict) else None
+        if not isinstance(fields, list):
+            return None
+        return {
+            f["name"]: self._flatten_graphql_type(f.get("type"))
+            for f in fields
+            if isinstance(f, dict) and f.get("name")
+        }
+
     def _introspect_columns(self, target_type: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Canonical-typed column list. Kept for callers that don't need PK info."""
         return [
@@ -869,16 +983,20 @@ class WidgetsGraphqlConnector(BaseMCPConnector):
 
         # -----------------------------------------------------------------
         # Incremental sync — replay the prior watermark as a since-filter when
-        # the operation's query declares a recognized "updated after" variable,
-        # and track max(updatedAt) so we can return the new watermark. When the
-        # query declares no such variable we full-fetch (still correct). See
-        # the module-level helpers + shared/mcp-connectors/INCREMENTAL.md.
+        # the operation's query declares an "updated after" variable or a
+        # `$where` input the schema lets us bound, and track max(updatedAt) so
+        # we can return the new watermark. When it declares neither we
+        # full-fetch (still correct). See the module-level helpers +
+        # shared/mcp-connectors/INCREMENTAL.md.
         # -----------------------------------------------------------------
         normalized_since = _read_since(params)
         incremental_applied = False
         if normalized_since:
             variables = dict(variables or {})
-            used_var = _apply_since_filter(query_template, variables, normalized_since)
+            used_var = _apply_since_filter(
+                query_template, variables, normalized_since,
+                input_fields=lambda type_name: self._input_fields(type_name, cfg),
+            )
             if used_var:
                 incremental_applied = True
                 logger.info(

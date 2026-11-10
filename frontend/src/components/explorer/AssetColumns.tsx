@@ -120,6 +120,9 @@ export function columnsPanelHeight(node: AssetNode, tables: WarehouseTables | un
  * The columns of the warehouse table a table asset names, searchable and ten at a time.
  * On the canvas it is inside a card the page hides from screen readers and a pointer can
  * drag, so its controls stay out of the tab order and keep the pointer to themselves.
+ *
+ * Given onPickColumn, each name is a button that chooses the column, so the page can
+ * light its lineage; the chosen one is pressed and the others on its path are marked.
  */
 export function ColumnsPanel({
   node,
@@ -127,12 +130,18 @@ export function ColumnsPanel({
   onRetry,
   inCanvas = false,
   className,
+  onPickColumn,
+  isChosen,
+  isOnPath,
 }: {
   node: AssetNode
   tables: WarehouseTables | undefined
   onRetry: () => void
   inCanvas?: boolean
   className?: string
+  onPickColumn?: (column: string) => void
+  isChosen?: (column: string) => boolean
+  isOnPath?: (column: string) => boolean
 }) {
   const [query, setQuery] = useState("")
   const [page, setPage] = useState(0)
@@ -189,9 +198,20 @@ export function ColumnsPanel({
           <ul aria-label={`Columns of ${node.name}`} className="min-h-0 flex-1 overflow-hidden text-xs">
             {shown.map((c) => (
               <li key={c.name} className="flex h-5 items-center gap-2">
-                <span className="truncate font-mono text-zinc-900 dark:text-white" title={c.name}>
-                  {c.name}
-                </span>
+                {onPickColumn ? (
+                  <ColumnButton
+                    name={c.name}
+                    chosen={isChosen?.(c.name) ?? false}
+                    onPath={isOnPath?.(c.name) ?? false}
+                    onPick={onPickColumn}
+                    className={controlClass}
+                    {...control}
+                  />
+                ) : (
+                  <span className="truncate font-mono text-zinc-900 dark:text-white" title={c.name}>
+                    {c.name}
+                  </span>
+                )}
                 {c.is_primary_key && (
                   <span className="shrink-0 rounded bg-zinc-100 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
                     key
@@ -238,6 +258,44 @@ export function ColumnsPanel({
   }
 
   return <div className={cn("flex flex-col", className)}>{body}</div>
+}
+
+/** A column name that chooses the column: pressed when chosen, marked when on the chosen one's path. */
+export function ColumnButton({
+  name,
+  chosen,
+  onPath,
+  onPick,
+  className,
+  tabIndex,
+}: {
+  name: string
+  chosen: boolean
+  onPath: boolean
+  onPick: (column: string) => void
+  className?: string
+  tabIndex?: number
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={chosen}
+      title={chosen ? `Stop tracing ${name}` : `Trace where ${name} comes from and what reads it`}
+      className={cn(
+        "min-w-0 truncate rounded px-1 text-left font-mono underline-offset-2 hover:underline",
+        chosen
+          ? "bg-violet-600 text-white dark:bg-violet-500"
+          : onPath
+            ? "bg-violet-50 text-violet-800 dark:bg-violet-950 dark:text-violet-200"
+            : "text-zinc-900 dark:text-white",
+        className,
+      )}
+      tabIndex={tabIndex}
+      onClick={() => onPick(name)}
+    >
+      {name}
+    </button>
+  )
 }
 
 function Note({ children }: { children: ReactNode }) {

@@ -24,7 +24,7 @@ verbatim, so "does the script name this target?" is a real question with a real
 answer, and it is the question that was silently answered "no" for three links.
 
 WHAT IT CATCHES. The fourth link. Someone documents the generation pipeline next
-month, points at `llm-service/src/agents/tool_generator/prompts/`, and every
+month, points at `llm-service/src/agents/tool_generator/agents/`, and every
 private check stays green -- `check-doc-links.sh` passes because the moat is right
 there in this repo. It is only on flip day, mid-cut, that it fails. This test
 fails the moment the link lands.

@@ -17,7 +17,7 @@ export type { GraphLayout, Rect }
 /** The most nodes one graph draws, the model itself included. */
 export const MAX_LINEAGE_NODES = 50
 
-/** GET /explorer/schedules returns at most this many rows and does not say when it stopped. */
+/** GET /api/v1/explorer/schedules returns at most this many rows and does not say when it stopped. */
 export const SCHEDULE_LIST_LIMIT = 500
 
 /**
@@ -75,6 +75,12 @@ export interface ModelLineage {
   /** Ancestors and descendants found, before the node cap. */
   upstreamsFound: number
   downstreamsFound: number
+  /**
+   * Of those, the ones one hop away: what the model's own schedule waits on, and the
+   * models that wait on it.
+   */
+  directUpstreams: number
+  directDownstreams: number
   /** How many of those were left out by the cap. */
   omitted: number
 }
@@ -240,6 +246,8 @@ export function buildModelLineage(
     edges,
     upstreamsFound: up.length,
     downstreamsFound: down.length,
+    directUpstreams: up.filter((f) => f.distance === 1).length,
+    directDownstreams: down.filter((f) => f.distance === 1).length,
     omitted: ranked.length - kept.length,
   }
 }
@@ -255,6 +263,8 @@ export interface LineageRun {
   started_at?: string
   finished_at?: string
   duration_ms?: number
+  /** The table a table model's run rebuilt, or would have; absent on a skip and for a statement model. */
+  target_table?: string
   rows_affected?: number | null
   skip_reason?: string
   error?: string
@@ -338,6 +348,18 @@ export function needsOlderRuns(runs: LineageRun[]): boolean {
   return runs.length > 0 && runs.every((r) => !isOutcome(r))
 }
 
+/** Runs `work` on every item, at most `limit` at once: one lookup per node, not fifty at once. */
+export async function runPool<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++]
+      await work(item)
+    }
+  })
+  await Promise.all(workers)
+}
+
 // ---------------------------------------------------------------------------------------
 // What one node says.
 
@@ -372,6 +394,8 @@ const SKIP_LABEL: Record<string, string> = {
   upstream_failed: "Skipped: upstream failed",
   upstream_skipped: "Skipped: upstream skipped",
   chain_depth_exceeded: "Skipped: hop limit",
+  trigger_lost: "Skipped: trigger lost",
+  upstream_check_failed: "Skipped: upstream check failed",
 }
 
 const WAITING_SKIP = "waiting_on_upstreams"
@@ -505,7 +529,7 @@ const PIPELINE_STATE_LABEL: Record<string, string> = {
 }
 
 export function modelHref(id: string): string {
-  return `/explorer/schedules/${encodeURIComponent(id)}?tab=graph`
+  return `/models/${encodeURIComponent(id)}?tab=graph`
 }
 
 /**

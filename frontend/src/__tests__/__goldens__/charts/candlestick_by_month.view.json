@@ -1,0 +1,52 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "candlestick",
+    "description": "open, high, low and close by day",
+    "x": {
+      "label": "day",
+      "categories": [
+        "2026-07",
+        "2026-08",
+        "2026-09",
+        "2026-10"
+      ]
+    },
+    "y": {
+      "label": "",
+      "format": "decimal"
+    }
+  },
+  "rows": [
+    {
+      "x": "2026-07",
+      "open": 100,
+      "high": 130,
+      "low": 95,
+      "close": 120
+    },
+    {
+      "x": "2026-08",
+      "open": 120,
+      "high": 125,
+      "low": 80,
+      "close": 90
+    },
+    {
+      "x": "2026-09",
+      "open": 90,
+      "high": 110,
+      "low": 85,
+      "close": 90
+    },
+    {
+      "x": "2026-10",
+      "open": 90,
+      "high": 140,
+      "low": 88,
+      "close": 135
+    }
+  ],
+  "series": [],
+  "notes": []
+}

@@ -16,59 +16,75 @@ import {
   ChevronRight,
   History,
   Cable,
-  Clock,
+  Boxes,
   Network,
   Search,
   Zap,
-  MessageSquareText,
-  Sparkles,
   Shield,
-  Wand2,
   Building2,
   Gauge,
+  LayoutDashboard,
+  ChartColumn,
   X,
 } from "lucide-react"
 import { RsyncLogo } from "@/components/icons/RsyncLogo"
+import { WorkflowNodes } from "@/components/icons/WorkflowNodes"
 import { useUsagePanelState } from "@/config/features"
 
-// Four groups, three of them headed. It was eight one- or two-item groups, each
+// Five groups, four of them headed. It was eight one- or two-item groups, each
 // with its own heading, which put Settings and Admin below the fold on an
-// ordinary laptop screen (#56).
+// ordinary laptop screen (#56). "Build" holds the three things that run — a
+// pipeline, a scheduled query, a workflow — and Runs lists all of their runs.
+// "Analyze" is where data is read (dashboards-design.md § 7.4): Dashboards,
+// Charts and the Explorer.
 const navigation: Array<{
   title?: string
   items: Array<{
     name: string
     href: string
     icon: typeof Home
-    highlight?: boolean
     exact?: boolean
+    /** Other path prefixes that light this row, e.g. the pipeline builder at /chat. */
+    alsoActive?: string[]
     adminOnly?: boolean
   }>
 }> = [
   {
     items: [
       { name: "Home", href: "/", icon: Home },
-      { name: "Data Pipeline", href: "/chat", icon: Sparkles, highlight: true },
+      // A pipeline run still opens at /executions/:id, and belongs to this list.
+      { name: "Runs", href: "/runs", icon: History, alsoActive: ["/executions"] },
     ],
   },
   {
-    title: "Pipelines",
+    title: "Build",
     items: [
-      { name: "All Pipelines", href: "/pipelines", icon: GitBranch },
-      { name: "Executions", href: "/executions", icon: History },
-      // /transforms had no link anywhere in the app — the page existed and was
-      // reachable only by typing the URL. It belongs here rather than under
-      // "Data": a transform plan is saved to one pipeline.
-      { name: "Transform Builder", href: "/transforms", icon: Wand2 },
+      // The pipeline builder (/chat) has no row of its own: it is where "New
+      // pipeline" and Home's box (without an LLM) lead, so it lights Pipelines.
+      // No "Transform Builder": a pipeline's transforms are added and edited in
+      // its Transforms tab, and /transforms only redirects there.
+      { name: "Pipelines", href: "/pipelines", icon: GitBranch, alsoActive: ["/chat"] },
+      // A saved query that builds a table or runs a statement, scheduled or not. The
+      // page was /explorer/schedules; next.config.ts redirects the old links.
+      { name: "Models", href: "/models", icon: Boxes },
+      // Reports and data alerts on data rsync.ai already loaded; drafted in Ask rsync.ai.
+      { name: "Workflows", href: "/workflows", icon: WorkflowNodes },
+    ],
+  },
+  {
+    title: "Analyze",
+    items: [
+      // A dashboard Ask rsync.ai drafted opens at /dashboard-proposals/:id until it is saved.
+      { name: "Dashboards", href: "/dashboards", icon: LayoutDashboard, alsoActive: ["/dashboard-proposals"] },
+      { name: "Charts", href: "/charts", icon: ChartColumn },
+      // `exact` because /explorer/lineage, in Data, is a CHILD in the URL: without
+      // it the prefix match lights up two rows at once.
+      { name: "Explorer", href: "/explorer", icon: Search, exact: true },
     ],
   },
   {
     title: "Data",
     items: [
-      // `exact` because /explorer/schedules is a sibling in the nav but a CHILD in
-      // the URL: without it the prefix match lights up both rows at once.
-      { name: "Explorer", href: "/explorer", icon: Search, exact: true },
-      { name: "Scheduled Queries", href: "/explorer/schedules", icon: Clock },
       { name: "Lineage", href: "/explorer/lineage", icon: Network },
       // Not `adminOnly`: /pii carries no role gate of its own, so hiding the row
       // would only hide a page every user can still reach by typing the URL.
@@ -100,10 +116,12 @@ export function Sidebar({ role }: SidebarProps) {
   const toggleSidebarCollapsed = useUIStore((state) => state.toggleSidebarCollapsed)
   const usagePanel = useUsagePanelState()
 
-  const isActiveLink = (href: string, exact = false) => {
+  const underPrefix = (prefix: string) => pathname === prefix || pathname.startsWith(prefix + "/")
+  const isActiveLink = (href: string, exact = false, alsoActive: string[] = []) => {
     if (href === "/") return pathname === "/" || pathname === "/dashboard"
+    if (alsoActive.some(underPrefix)) return true
     if (exact) return pathname === href
-    return pathname === href || pathname.startsWith(href + "/")
+    return underPrefix(href)
   }
 
   // NOTE: `role` here is the PLATFORM role from /auth/me (gates the operator-only
@@ -132,9 +150,8 @@ export function Sidebar({ role }: SidebarProps) {
                 if (item.href === "/usage" && usagePanel !== "on") return null
                 if (item.adminOnly && !isAdmin) return null
 
-                const isActive = isActiveLink(item.href, item.exact)
+                const isActive = isActiveLink(item.href, item.exact, item.alsoActive)
                 const Icon = item.icon
-                const isHighlighted = item.highlight
 
                 const linkContent = (
                   <Link
@@ -149,15 +166,13 @@ export function Sidebar({ role }: SidebarProps) {
                     onClick={() => isMobile && setSidebarOpen(false)}
                     className={cn(
                       "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all",
-                      isHighlighted && !isActive
-                        ? "text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950/30"
-                        : isActive
-                          ? "bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-white"
-                          : "text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-white",
+                      isActive
+                        ? "bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-white"
+                        : "text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-white",
                       collapsed && !isMobile && "justify-center px-2"
                     )}
                   >
-                    <Icon className={cn("h-5 w-5 shrink-0", isActive && "text-violet-600", isHighlighted && "text-violet-600")} />
+                    <Icon className={cn("h-5 w-5 shrink-0", isActive && "text-violet-600")} />
                     {(!collapsed || isMobile) && <span>{item.name}</span>}
                   </Link>
                 )

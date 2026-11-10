@@ -25,6 +25,10 @@ func TestRewindCheckpointsBehindNegativeAcksRewindsEachLostExecution(t *testing.
 		WillReturnRows(sqlmock.NewRows([]string{"execution_id"}).AddRow("lost-a").AddRow("lost-b"))
 	for _, id := range []string{"lost-a", "lost-b"} {
 		mock.ExpectBegin()
+		mock.ExpectExec("^SAVEPOINT record_rewound_tables$").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("INSERT INTO pipeline_run_rewinds").
+			WithArgs("pipe-1", id).WillReturnResult(sqlmock.NewResult(0, 3))
+		mock.ExpectExec("^RELEASE SAVEPOINT record_rewound_tables$").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectExec("UPDATE pipeline_checkpoints SET position = position->'run_start'").
 			WithArgs("pipe-1", id).WillReturnResult(sqlmock.NewResult(0, 2))
 		mock.ExpectExec("DELETE FROM pipeline_checkpoints").

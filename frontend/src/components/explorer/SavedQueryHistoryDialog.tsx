@@ -21,7 +21,7 @@ import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
 
 import { SqlDiffView } from "./SqlDiffView"
 import { updateSavedQuery } from "./savedQueryUpdate"
-import { formatAbsoluteTime } from "./scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // Every edit to a saved query has snapshotted the previous text since migration 084,
 // and until now nothing read those snapshots — GET /explorer/saved/:id/versions had no
@@ -247,7 +247,7 @@ export function SavedQueryHistoryDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange} closeOnOutsideClick={false}>
       <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">

@@ -26,15 +26,18 @@ The Orchestrator is the **execution brain** of rsync-ai. It:
 
 ### Dependencies
 - **Postgres**: pipeline metadata, connection configs, status tables
-- **Kafka**: agent command/results, domain events, CDC topics
-- **Redis**: correlation store (V2 request/reply)
+- **Kafka**: the data plane (CDC and batch topics) and pipeline domain events. Agent
+  requests do not travel over Kafka: the agent command/result topics were removed in #1227.
+- **Redis**: correlation store. Agent stages hand off their requests and replies through it.
 - **Shared volume**: `shared/mcp-connectors` (connector artifacts)
 - **Tool Generator**: self-healing deployment URL (`TOOL_GENERATOR_URL`)
 
 ### Scaling / HA Notes (Important)
-- Current docker-compose explicitly warns **do not scale** Orchestrator replicas > 1.
-  - Reason: static membership / topic-per-agent and consumer fencing risks.
-  - Scaling requires topic sharding and routing changes (see compose comments).
+- The orchestrator runs as **one replica**. Nothing in compose blocks a second one (the
+  per-agent Kafka topics behind the old "do not scale" warning were removed in #1227), but
+  more than one replica is **untested**.
+  - There is no leader election, so each replica would run its own schedulers, retention
+    and sentinel loops.
 
 ### Observability
 - OpenTelemetry tracing + JSON logs (fluent-bit ingestion).

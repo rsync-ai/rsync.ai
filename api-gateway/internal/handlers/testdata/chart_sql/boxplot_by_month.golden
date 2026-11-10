@@ -1,0 +1,66 @@
+# settings: {"version":2,"type":"boxplot","roles":{"x":[{"column":"day","grain":"month"}],"y":[{"column":"amount"}]},"sort":"x_desc"}
+
+-- postgres
+SELECT DATE_TRUNC('month', src."day") AS "day", MIN(src."amount") AS "rsync_min", PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY src."amount") AS "rsync_q1", PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY src."amount") AS "rsync_median", PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY src."amount") AS "rsync_q3", MAX(src."amount") AS "rsync_max"
+FROM "gold"."orders" src
+WHERE src."amount" IS NOT NULL AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY DATE_TRUNC('month', src."day")
+ORDER BY DATE_TRUNC('month', src."day") DESC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+-- refused: a box plot needs an exact percentile, which MySQL and MariaDB do not have (MariaDB has one only as a window function)
+
+-- sqlserver
+-- refused: a box plot needs an exact percentile, which SQL Server has only as a window function
+
+-- bigquery
+SELECT DATE_TRUNC(DATE(src.`day`), MONTH) AS `day`, MIN(src.`amount`) AS `rsync_min`, APPROX_QUANTILES(src.`amount`, 4)[OFFSET(1)] AS `rsync_q1`, APPROX_QUANTILES(src.`amount`, 4)[OFFSET(2)] AS `rsync_median`, APPROX_QUANTILES(src.`amount`, 4)[OFFSET(3)] AS `rsync_q3`, MAX(src.`amount`) AS `rsync_max`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+GROUP BY DATE_TRUNC(DATE(src.`day`), MONTH)
+ORDER BY DATE_TRUNC(DATE(src.`day`), MONTH) DESC
+LIMIT 10001
+-- unfiltered: day, region
+-- approximate
+
+-- snowflake
+SELECT DATE_TRUNC('MONTH', src."DAY") AS "DAY", MIN(src."AMOUNT") AS "RSYNC_MIN", PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_Q1", PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_MEDIAN", PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_Q3", MAX(src."AMOUNT") AS "RSYNC_MAX"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+GROUP BY DATE_TRUNC('MONTH', src."DAY")
+ORDER BY DATE_TRUNC('MONTH', src."DAY") DESC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT DATE_TRUNC('MONTH', src.`day`) AS `day`, MIN(src.`amount`) AS `rsync_min`, PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY src.`amount`) AS `rsync_q1`, PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY src.`amount`) AS `rsync_median`, PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY src.`amount`) AS `rsync_q3`, MAX(src.`amount`) AS `rsync_max`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY DATE_TRUNC('MONTH', src.`day`)
+ORDER BY DATE_TRUNC('MONTH', src.`day`) DESC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT toStartOfMonth(src.`day`) AS `day`, MIN(src.`amount`) AS `rsync_min`, quantile(0.25)(src.`amount`) AS `rsync_q1`, quantile(0.50)(src.`amount`) AS `rsync_median`, quantile(0.75)(src.`amount`) AS `rsync_q3`, MAX(src.`amount`) AS `rsync_max`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+GROUP BY toStartOfMonth(src.`day`)
+ORDER BY toStartOfMonth(src.`day`) DESC
+LIMIT 10001
+-- unfiltered: day, region
+-- approximate
+
+-- oracle
+SELECT TRUNC(src."DAY", 'MM') AS "DAY", MIN(src."AMOUNT") AS "RSYNC_MIN", PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_Q1", PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_MEDIAN", PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY src."AMOUNT") AS "RSYNC_Q3", MAX(src."AMOUNT") AS "RSYNC_MAX"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+GROUP BY TRUNC(src."DAY", 'MM')
+ORDER BY TRUNC(src."DAY", 'MM') DESC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

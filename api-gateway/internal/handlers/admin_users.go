@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"api-gateway/internal/config"
 	"api-gateway/internal/db"
 
 	"github.com/gin-gonic/gin"
@@ -484,6 +485,27 @@ func AdminDeleteUser(c *gin.Context) {
 	if _, err := tx.ExecContext(ctx, "SELECT id FROM workspaces WHERE owner_id = $1 FOR UPDATE", targetID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
+	}
+	// workspaces.owner_id is ON DELETE CASCADE: deleting the install
+	// workspace's owner would delete the install workspace and everything in it.
+	if config.SingleWorkspace() {
+		var ownsInstall bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM instance_settings s JOIN workspaces w ON w.id::text = s.value WHERE s.key = $1 AND w.owner_id = $2)`,
+			installWorkspaceSetting, targetID,
+		).Scan(&ownsInstall); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Could not check what this user still owns, so nothing was deleted. Try again.",
+			})
+			return
+		}
+		if ownsInstall {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "install_workspace_owner",
+				"message": "This user owns the install's workspace, so deleting them would delete it. Deactivate the user instead.",
+			})
+			return
+		}
 	}
 
 	var blockers userDeleteBlockers

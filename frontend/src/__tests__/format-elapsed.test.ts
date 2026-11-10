@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { formatElapsed } from "@/lib/utils"
+import { formatDurationOrDash as formatElapsed } from "@/lib/duration"
 
 // Durations truncate at every unit. The executions list used Math.round on the
 // leading unit, so 4m45s read "5m 45s", 1h45m read "2h 45m" and 2m59.6s read "2m 60s".

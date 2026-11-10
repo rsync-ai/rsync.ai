@@ -76,28 +76,72 @@ def test_validate_config_requires_host_path_token():
 
 # ============================ READ: pagination + rows =======================
 
-def test_export_keyset_returns_next_cursor_and_has_more():
-    s, conn = _db_fakes.make_connector(db, rows=[{"id": 1}, {"id": 2}, {"id": 3}])
-    out = s.export({**CFG, "table": "t", "cursor_column": "id", "limit": 3})
+# What a sweep reads before its first page. DESCRIBE TABLE lists the columns,
+# then a blank row and the partition section; Spark cannot order by a map.
+# DESCRIBE HISTORY's newest row carries the Delta version to pin pages to.
+DB_COLUMNS = ("DESCRIBE TABLE", [
+    {"col_name": "id", "data_type": "bigint", "comment": None},
+    {"col_name": "attrs", "data_type": "map<string,string>", "comment": None},
+    {"col_name": "name", "data_type": "string", "comment": None},
+    {"col_name": "", "data_type": "", "comment": ""},
+    {"col_name": "# Partition Information", "data_type": "", "comment": ""},
+    {"col_name": "name", "data_type": "string", "comment": None},
+])
+DB_HISTORY = ("DESCRIBE HISTORY", [{"version": 42, "timestamp": "2026-09-29 10:00:00"}])
+
+
+def test_export_sweep_orders_every_column_at_one_version():
+    """KI-WAREHOUSE-BATCH-PAGING-UNORDERED: the executor asks for stable paging
+    and never names a column. Delta does not enforce a declared key, so the
+    page orders by every orderable column and reads the Delta version the
+    first page took; the cursor carries that version and the next offset."""
+    s, conn = _db_fakes.make_connector(db, rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+                                       answers=[DB_COLUMNS, DB_HISTORY])
+    out = s.export({**CFG, "table": "t", "use_keyset_paging": True, "limit": 3})
     assert out["success"] is True, out
-    assert out["paging_mode"] == "keyset", out
-    assert out["next_cursor"] == 3 and out["has_more"] is True, out
+    assert out["paging_mode"] == "snapshot" and out["has_more"] is True, out
+    assert out["next_cursor"] == {"snapshot": 42, "offset": 3}, out
     # rows came back as Row objects but must be normalized to dicts
     assert out["data"] == [{"id": 1}, {"id": 2}, {"id": 3}], out["data"]
     sql = conn.all_sql()[-1]
-    assert "ORDER BY `id` ASC" in sql and "LIMIT 3" in sql, sql
-    assert "`main`.`default`.`t`" in sql, sql          # backtick 3-level qualify
+    # backtick 3-level qualify
+    assert sql == "SELECT * FROM `main`.`default`.`t` VERSION AS OF 42 ORDER BY `id`, `name` LIMIT 3 OFFSET 0", sql
+    assert "DESCRIBE HISTORY `main`.`default`.`t` LIMIT 1" in conn.all_sql(), conn.all_sql()
 
 
-def test_export_keyset_continuation_uses_bound_param():
-    s, conn = _db_fakes.make_connector(db, rows=[{"id": 9}])
+def test_export_sweep_continues_at_the_cursors_version():
+    s, conn = _db_fakes.make_connector(db, rows=[{"id": 4}], answers=[DB_COLUMNS, DB_HISTORY])
+    out = s.export({**CFG, "table": "t", "use_keyset_paging": True, "limit": 3, "offset": 0,
+                    "cursor": {"snapshot": 41, "offset": 3}})
+    assert out["success"] is True and out["has_more"] is False, out
+    assert out["paging_mode"] == "snapshot" and out["next_cursor"] is None, out
+    assert not any("DESCRIBE HISTORY" in q for q in conn.all_sql()), conn.all_sql()
+    assert conn.all_sql()[-1].endswith("VERSION AS OF 41 ORDER BY `id`, `name` LIMIT 3 OFFSET 3"), conn.all_sql()
+
+
+def test_export_sweep_on_a_view_steps_the_offset():
+    """A view has no Delta history: the first page reads unpinned and reports
+    plain offset paging, so the executor steps it."""
+    s, conn = _db_fakes.make_connector(
+        db, rows=[{"id": 1}, {"id": 2}],
+        answers=[DB_COLUMNS, ("DESCRIBE HISTORY", RuntimeError("DELTA_TABLE_NOT_FOUND"))])
+    out = s.export({**CFG, "table": "t", "cursor_column": "name", "limit": 2})
+    assert out["success"] is True, out
+    assert out["paging_mode"] == "offset" and out["next_cursor"] is None and out["has_more"] is True, out
+    assert conn.all_sql()[-1] == "SELECT * FROM `main`.`default`.`t` ORDER BY `name`, `id` LIMIT 2 OFFSET 0"
+
+
+def test_export_unreadable_catalog_pages_by_the_named_column():
+    s, conn = _db_fakes.make_connector(db, rows=[{"id": 9}],
+                                       answers=[("DESCRIBE", RuntimeError("PERMISSION_DENIED"))])
     out = s.export({**CFG, "table": "t", "cursor_column": "id",
                     "cursor_value": 8, "limit": 10})
     assert out["success"] is True, out
+    assert out["paging_mode"] == "keyset", out
     e = conn.all_execs()[-1]
     assert "WHERE `id` > ?" in e["sql"], e["sql"]       # Databricks native marker, not %s
     assert "%s" not in e["sql"], e["sql"]               # regression guard: %s is rejected by the driver
-    assert e["params"] == [8], e["params"]             # parameterized, not inlined
+    assert e["params"] == (8,), e["params"]            # parameterized, not inlined
 
 
 def test_export_two_level_prepends_catalog():

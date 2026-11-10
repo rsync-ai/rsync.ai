@@ -1,7 +1,7 @@
-elkjs 0.12.0 — the ELK graph layout engine, as used by rsync.ai's lineage graphs.
+elkjs 0.12.1 — the ELK graph layout engine, as used by rsync.ai's lineage graphs.
 
 Copyright (c) 2017, 2021 Kiel University and others.
-Source code: https://github.com/kieler/elkjs/tree/0.12.0
+Source code: https://github.com/kieler/elkjs/tree/0.12.1
 
 elkjs is offered under "EPL-2.0 OR GPL-3.0-or-later". rsync.ai uses it, unmodified,
 under the Eclipse Public License 2.0, whose full text follows.

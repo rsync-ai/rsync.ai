@@ -31,8 +31,9 @@ type ExecutionSummary struct {
 
 type PipelineTrends struct {
 	PipelineID string `json:"pipeline_id"`
-	// TotalRuns counts every run this pipeline ever had; the rest of the fields
-	// describe only the RecentExecutions window (?limit=, default 10).
+	// TotalRuns counts the runs with events still stored — run-history retention
+	// deletes a finished batch run's events after PIPELINE_RUN_RETENTION_DAYS; the rest
+	// of the fields describe only the RecentExecutions window (?limit=, default 10).
 	TotalRuns int `json:"total_runs"`
 	// SuccessRate is SucceededRuns / FinishedRuns over the window. A run still in
 	// flight has no outcome yet, so it counts toward neither side.

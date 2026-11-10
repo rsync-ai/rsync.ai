@@ -1,0 +1,71 @@
+# settings: {"version":2,"type":"sankey","roles":{"x":[{"column":"channel"}],"y":[{"column":"region"}],"measure":[{"aggregate":"count"}]}}
+
+-- postgres
+SELECT src."channel" AS "channel", src."region" AS "region", COUNT(*) AS "count"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY src."channel", src."region"
+ORDER BY COUNT(*) DESC, src."channel" ASC, src."region" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT src.`channel` AS `channel`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`channel`, src.`region`
+ORDER BY COUNT(*) DESC, src.`channel` ASC, src.`region` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) src.[channel] AS [channel], src.[region] AS [region], COUNT_BIG(*) AS [count]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY src.[channel], src.[region]
+ORDER BY COUNT_BIG(*) DESC, src.[channel] ASC, src.[region] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT src.`channel` AS `channel`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+GROUP BY src.`channel`, src.`region`
+ORDER BY COUNT(*) DESC, src.`channel` ASC, src.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT src."CHANNEL" AS "CHANNEL", src."REGION" AS "REGION", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."CHANNEL", src."REGION"
+ORDER BY COUNT(*) DESC, src."CHANNEL" ASC, src."REGION" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT src.`channel` AS `channel`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY src.`channel`, src.`region`
+ORDER BY COUNT(*) DESC, src.`channel` ASC, src.`region` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT src.`channel` AS `channel`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+GROUP BY src.`channel`, src.`region`
+ORDER BY COUNT(*) DESC, src.`channel` ASC, src.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT src."CHANNEL" AS "CHANNEL", src."REGION" AS "REGION", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."CHANNEL", src."REGION"
+ORDER BY COUNT(*) DESC, src."CHANNEL" ASC, src."REGION" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

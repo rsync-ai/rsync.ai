@@ -61,6 +61,9 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /ready` (DB ping)
 - `GET /ws` (WebSocket; token via `?token=` or `auth_token` cookie)
 - `GET /oauth/callback/:provider`
+- `POST /api/agent/v1/mcp`: the agent gateway, rsync.ai's MCP server. Agent token auth,
+  not a session; only registered when `RSYNC_AGENT_GATEWAY_ENABLED=true`. `GET` answers
+  405. See [agent-gateway.md](agent-gateway.md).
 
 ### Auth (public) — `/api/v1/auth`
 
@@ -77,10 +80,14 @@ session auth → email-verified gate → CSRF → rate limiting
 ### Feature flags
 
 - `GET /api/v1/features` (public within the group) — returns the runtime flag set:
-  `monitoring_overview`, `monitoring_infra`, `monitoring_traces`, `usage_panel`. The frontend fetches this on mount because
+  `monitoring_overview`, `monitoring_infra`, `monitoring_traces`, `usage_panel`,
+  `agent_gateway`, `assistant`. The frontend fetches this on mount because
   `NEXT_PUBLIC_*` is inlined at build time and every deployment runs the same image, so
   this endpoint is the only way a flag can differ per deployment. `usage_panel` gates the
   plan/quota UI and defaults to whatever `RSYNC_BILLING_ENFORCED` resolves to.
+  `agent_gateway` is `RSYNC_AGENT_GATEWAY_ENABLED` (default false) and gates Settings →
+  AI apps. `assistant` is `RSYNC_ASSISTANT_ENABLED` (default false) and gates
+  the header's Ask rsync.ai panel and Admin → Settings → AI models.
 
 ### Chat (agentic pipeline flow)
 
@@ -94,6 +101,7 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /pipelines/stats`
 - `POST /pipelines`
 - `GET /pipelines/:id`
+- `GET /pipelines/:id/health` (state, the one blocking cause with a fixed hint, last run, last success, schedule)
 - `PATCH /pipelines/:id`
 - `DELETE /pipelines/:id`
 - `POST /pipelines/:id/run` *(rate-limited)*
@@ -145,6 +153,17 @@ session auth → email-verified gate → CSRF → rate limiting
 - `POST /pipelines/:id/schema-changes/:changeId/approve`
 - `POST /pipelines/:id/schema-changes/:changeId/reject`
 
+Only a dropped source table waits for a decision; every other change is applied or recorded when it is detected, and is listed as history. Both decisions on a dropped table take it out of the pipeline. Approving also drops the destination table; rejecting keeps it.
+
+- A decision returns `200` with `status`, `drop_table` (the change is a dropped table) and `table_removed` (the table left the pipeline). Approve also returns `auto_applicable`, which says whether rsync.ai was asked to apply the change.
+- `404`: the change does not exist or was already decided.
+- `409 last_selected_table`: the table is the pipeline's only table, so it cannot be removed. Add another table, or delete the pipeline.
+- `409 table_removal_failed`: the table selection changed while the decision was being saved.
+- `502 table_removal_failed`: the CDC connector could not be given the new table list.
+- `500 table_removal_failed`: the table selection could not be read or saved.
+
+On every error the decision is not saved, and `message` says why.
+
 **Schedules (Temporal schedules)**
 
 - `POST /pipelines/:id/schedules`
@@ -167,7 +186,7 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /executions`
 - `GET /executions/:id`
 - `GET /executions/:id/transforms`
-- `POST /executions/:id/cancel`
+- `POST /executions/:id/cancel` — stops the pipeline as Stop does: a CDC pipeline's connector and sink first (502 and no change if they refuse), a batch pipeline's sink workers after; a sink that would not stop comes back in `warnings`
 - `GET /executions/:id/diagnose`
 
 ### Connectors (MCP registry) — `/api/v1/connectors`
@@ -187,6 +206,32 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /workspaces/:id`
 - `PATCH /workspaces/:id`
 - `GET /workspaces/:id/members`
+
+### Agent tokens — `/api/v1/agent-tokens` *(only registered when `RSYNC_AGENT_GATEWAY_ENABLED=true`)*
+
+Tokens for the agent gateway ([agent-gateway.md](agent-gateway.md)). A member lists and
+revokes their own; a workspace admin sees and revokes every member's.
+
+- `GET /agent-tokens`
+- `POST /agent-tokens` (`{"name", "expires_in_days", "scopes"?}`, 1-365, default 30; `scopes` may add `connectors:generate` or `models:write`, owners and admins only; the token is in this response only)
+- `DELETE /agent-tokens/:id`
+
+### Assistant — `/api/v1/assistant` *(only registered when `RSYNC_ASSISTANT_ENABLED=true`)*
+
+The in-app assistant, Ask rsync.ai ([assistant.md](assistant.md)). Session auth; it answers
+with the agent gateway's tools run as the caller, metadata only: the read tools, connector
+generation for an owner or admin who gives the API's URL, and, for an owner or admin, building,
+scheduling, running and pausing silver and gold models.
+
+- `GET /assistant/models` (the models that have a key, and the default one)
+- `POST /assistant/messages` (`{"question", "conversation_id"?, "page"?, "model"?}`; chat rate limit, LLM spend quota)
+
+Platform admin, under `/api/v1/admin`:
+
+- `GET /admin/assistant/models` (where each model's key comes from; never the key)
+- `PUT /admin/assistant/models/:entry` (`{"api_key"?, "model"}`; the key is encrypted, audited without it)
+- `DELETE /admin/assistant/models/:entry`
+- `POST /admin/assistant/models/:entry/test`
 
 ### Connections — `/api/v1/connections`
 
@@ -273,16 +318,15 @@ session auth → email-verified gate → CSRF → rate limiting
 - `POST /sql/generate`
 - `POST /explorer/query`
 - `POST /explorer/connections/:id/tables/recommend`
-- `POST /explorer/metabase/dashboard`
 - `GET /explorer/connections/:id/schema-index`
 - `POST /explorer/connections/:id/schema-index/refresh`
+- `POST /explorer/connections/:id/silver-sql` — the SQL of a silver model for one table: latest row per primary key, deletes dropped (built from names and types, no LLM)
 - `POST /explorer/tables/retrieve`
 - `POST /explorer/nl/resolve-tables`
 - `POST /explorer/nl/resolve-columns`
 - `POST /explorer/nl/next-steps`
 - `GET /explorer/export.csv` (legacy)
 - `POST /explorer/export`
-- `POST /explorer/share/slack`
 
 ### Admin — `/api/v1/admin` *(admin role required)*
 

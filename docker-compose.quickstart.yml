@@ -135,6 +135,32 @@ services:
 
   # ─── INFRASTRUCTURE ──────────────────────────────────────────────────────────
 
+  # Read-only Docker socket proxy, so api-gateway can show which connector
+  # containers are running. The gateway runs as non-root and mounts no socket, so
+  # without this every connector card read "Ready" and the Connectors page showed
+  # "Running (0)" with all of them up. POST is off: the proxy answers GETs only.
+  # It stays off the rsync-ai-mcp network on purpose -- connector containers run
+  # there, and the Docker API can read every container's environment.
+  # Same image as docker-compose.yml, with only the API section the gateway
+  # calls: GET /containers/json (getMCPDockerContainers in
+  # api-gateway/internal/handlers/tools.go).
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    container_name: rsync-ai-docker-socket-proxy
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
+
   postgres:
     image: postgres:16-alpine
     container_name: rsync-ai-postgres
@@ -302,13 +328,20 @@ services:
       # exceed it. docker-compose.yml has carried this since the bug was first hit; the
       # quickstart shipped the producer half alone.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
-      # Retention for topics rsync.ai does not create itself — Debezium auto-creates
-      # rsync.cdc-* and those inherit the BROKER default, not kafka/topology.go.
-      # 168h/delete matches Apache's own defaults, so nothing changes today; it
-      # pins the 7-day policy so a future image default cannot silently restore
-      # unbounded growth. See docker-compose.yml for the full note. Per-topic
-      # retention.ms=-1 on the Debezium schema-history topic wins over this,
-      # which is what that one exception relies on.
+      # No broker auto-creation: every topic rsync.ai uses has an explicit creator,
+      # and a missing one must fail here rather than on a customer cluster that
+      # ships with auto-creation off. Same setting as docker-compose.yml, which
+      # carries the full note.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      # Retention for topics created without a retention of their own — the
+      # rsync.cdc-* data topics, which Kafka Connect creates through
+      # topic.creation.default.* (partitions and replication only), inherit the
+      # BROKER default, not kafka/topology.go. 168h/delete matches Apache's own
+      # defaults, so nothing changes today; it pins the 7-day policy so a future
+      # image default cannot silently restore unbounded growth. See
+      # docker-compose.yml for the full note. Per-topic retention.ms=-1 on the
+      # Debezium schema-history topic wins over this, which is what that one
+      # exception relies on.
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_CLEANUP_POLICY: delete
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
@@ -627,6 +660,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+      # SSE-S3 for claim-check objects; install.sh generates it (and adds it on a
+      # re-run). Never change it once data is written -- see docker-compose.yml.
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY:?MINIO_KMS_SECRET_KEY is required}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -852,6 +888,9 @@ services:
       # top of this file; every key defaults to empty and empty means unset.
       <<: *kafka-security
       PORT: 5000
+      # The egress guard's own check that sample rows are off on this install,
+      # matching api-gateway's (src/egress/sample_rows.py).
+      RSYNC_LLM_SAMPLE_ROWS_ALLOWED: "false"
       # LLM cost logging (src/utils/llm_cost.py) writes llm_usage_events into the
       # database api-gateway migrates. Unset, every LLM call goes unmetered.
       DATABASE_URL: postgres://${POSTGRES_USER:-rsync}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${POSTGRES_SSLMODE:-disable}
@@ -868,7 +907,7 @@ services:
       # at one of them. There is no env_file on this service, so without this line
       # an operator who sets OPENAI_BASE_URL in .env watches it be silently
       # ignored and the stack keeps talking to api.openai.com — the one endpoint
-      # their key is not for. docker-compose.prod.yml:585 already passes it, which
+      # their key is not for. docker-compose.prod.yml:577 already passes it, which
       # is what makes the omission here an oversight rather than a policy.
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       # gcp-metadata = take the bearer from this VM's service account and refresh it
@@ -883,6 +922,13 @@ services:
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+      # The "Ask rsync.ai" assistant's Claude and Gemini entries, and each entry's
+      # model. A key an admin sets in Admin -> Settings -> AI models wins over these.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ASSISTANT_CLAUDE_MODEL: ${ASSISTANT_CLAUDE_MODEL:-}
+      ASSISTANT_OPENAI_MODEL: ${ASSISTANT_OPENAI_MODEL:-}
+      ASSISTANT_GEMINI_MODEL: ${ASSISTANT_GEMINI_MODEL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       # Empty, not gpt-4o. Empty lets each provider use its own default model
       # (openai_client.py get_default_model); gpt-4o is a name only OpenAI's catalog
@@ -1232,6 +1278,12 @@ services:
       KAFKA_USE_AVRO: "false"
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      # Key for mask rules that hash with hmac_sha256 (and the salt for sha256/md5).
+      # api-gateway, orchestrator and kafka-mcp-sink must all get the SAME value:
+      # batch masks in the orchestrator, CDC in the sink, preview in the gateway.
+      # Unset, hmac_sha256 rules refuse to save and to run. Never rotate it: every
+      # hash already in a destination stops matching new ones.
+      RSYNC_PII_HASH_SALT: ${RSYNC_PII_HASH_SALT:-}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -1404,6 +1456,8 @@ services:
         condition: service_healthy
       orchestrator:
         condition: service_started
+      docker-socket-proxy:
+        condition: service_started
     environment:
       # Kafka client security (BYO/managed broker). See x-kafka-security at the
       # top of this file; every key defaults to empty and empty means unset.
@@ -1446,14 +1500,39 @@ services:
       # /admin/health would otherwise report redis "down" on a healthy Redis.
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      # Key for mask rules that hash with hmac_sha256 (and the salt for sha256/md5).
+      # api-gateway, orchestrator and kafka-mcp-sink must all get the SAME value:
+      # batch masks in the orchestrator, CDC in the sink, preview in the gateway.
+      # Unset, hmac_sha256 rules refuse to save and to run. Never rotate it: every
+      # hash already in a destination stops matching new ones.
+      RSYNC_PII_HASH_SALT: ${RSYNC_PII_HASH_SALT:-}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
       RSYNC_CSRF_ENFORCE: "true"
       RSYNC_ALLOW_INTERNAL_CONNECTORS: "false"
+      # Live connector status (running/stopped, port) via the read-only proxy
+      # above. Unset, the gateway dials /var/run/docker.sock, which this image
+      # neither mounts nor could read as non-root.
+      MCP_DOCKER_API_URL: "http://docker-socket-proxy:2375"
       # Self-host has no Stripe / cloud plans: disable plan-quota enforcement so a
       # fresh install is never trial-gated (migration 060 would otherwise seed a
       # 14-day, 1-pipeline trial with no upgrade path). Cloud leaves this unset ⇒
       # enforced. See resolvePlanQuota / billingEnforced() in plan_quota.go.
       RSYNC_BILLING_ENFORCED: "false"
+      # AI agent access: the MCP server at /api/agent/v1/mcp and the agent token
+      # routes. On unless .env sets it false; the same default as cloud.
+      RSYNC_AGENT_GATEWAY_ENABLED: "${RSYNC_AGENT_GATEWAY_ENABLED:-true}"
+      # The "Ask rsync.ai" panel and its admin model keys. On unless .env sets it
+      # false; the same default as cloud. It answers once a model key is set.
+      RSYNC_ASSISTANT_ENABLED: "${RSYNC_ASSISTANT_ENABLED:-true}"
+      # Self-host sends no row value to a model: Ask rsync.ai's sample rows are off
+      # on this install, whatever an admin or workspace owner picks. Cloud leaves
+      # this unset (allowed). llm-service below reads the same value, so both
+      # checks hold. See LLMSampleRowsAllowed() in config/features.go.
+      RSYNC_LLM_SAMPLE_ROWS_ALLOWED: "false"
+      # One workspace per install: the first sign-up owns it, later users join it,
+      # and a second workspace is refused. Cloud leaves this unset (any number).
+      # See SingleWorkspace() in config/features.go and multi-tenancy.md.
+      RSYNC_SINGLE_WORKSPACE: "true"
       # Zero-credential try-it path. Unset ⇒ the demo endpoints report unavailable
       # and refuse to seed, which is the CLOUD behavior (app.rsync.ai must never
       # offer a bundled warehouse). Only this compose file sets it, so the split
@@ -1548,9 +1627,6 @@ services:
       - api-gateway
     environment:
       API_GATEWAY_INTERNAL_URL: http://api-gateway:8080
-      # The dashboard's server-side CDC fetch (app/(dashboard)/page.tsx) falls back
-      # to localhost:8081 without this, which inside this container is nothing.
-      ORCHESTRATOR_INTERNAL_URL: http://orchestrator:8080
       # The NEXT_PUBLIC_* pair below is inert on a published image -- the Next.js
       # compiler substituted those names at `docker build` time, so nothing set
       # here can reach the browser through them. They stay for a locally built
@@ -1594,6 +1670,11 @@ services:
   minio-mcp:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-minio:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-minio-v1-0-0-mcp
+    # The gateway lists connector containers by this label (or by the compose
+    # project rsync-ai-mcp, which this file is not). Without it the card reads
+    # "Ready" while the container runs.
+    labels:
+      - rsync-ai.mcp=true
     logging:
       driver: json-file
       options:
@@ -1608,12 +1689,16 @@ services:
       MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
       MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
       MINIO_BUCKET: pipeline-data
+      # Claim-check objects are gzipped; false writes plain JSON. Safe to flip:
+      # the reader autodetects either.
+      RSYNC_CLAIM_CHECK_GZIP: ${RSYNC_CLAIM_CHECK_GZIP:-true}
       ENVIRONMENT: production
 
   # The zero-credential demo source, and the reason it is worth a service block
-  # of its own: it is the ONLY connector in the tree whose auth_type is "none"
-  # (every other one of the 21 public connectors needs a credential before it
-  # will do anything). It carries its customers/orders/products rows inside its
+  # of its own: it is the ONLY connector in the tree that needs neither a
+  # credential nor an outside service (every other public connector needs a
+  # credential before it will do anything, except nse-india, which reads NSE's
+  # public archive over the network). It carries its customers/orders/products rows inside its
   # own image and imports nothing outside the Python standard library, so it is
   # the one source a fresh install can connect to before the operator has
   # produced a single secret.
@@ -1643,6 +1728,8 @@ services:
   sample-data-mcp:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-sample-data:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-sample-data-v1-0-0-mcp
+    labels:
+      - rsync-ai.mcp=true
     profiles: ["connectors"]
     logging:
       driver: json-file
@@ -1719,6 +1806,8 @@ services:
       CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_PRODUCER_ACKS: "all"
       CONNECT_PRODUCER_RETRIES: 10
+      # Compresses every CDC topic, which no broker or topic default does.
+      CONNECT_PRODUCER_COMPRESSION_TYPE: ${KAFKA_CONNECT_COMPRESSION_TYPE:-lz4}
       # Lockstep with the broker's message.max.bytes and the sink worker's
       # ReaderConfig.MaxBytes — a row with a large JSON/text/blob column fails the
       # task with RecordTooLargeException if these three disagree.
@@ -1821,6 +1910,8 @@ services:
   debezium-mcp:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-debezium:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-debezium-v1-0-0-mcp
+    labels:
+      - rsync-ai.mcp=true
     logging:
       driver: json-file
       options:
@@ -1861,6 +1952,8 @@ services:
   kafka-mcp-sink-mcp:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-kafka-sink:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-kafka-mcp-sink-v1-0-0-mcp
+    labels:
+      - rsync-ai.mcp=true
     logging:
       driver: json-file
       options:
@@ -1882,9 +1975,16 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
       MINIO_BUCKET: pipeline-data
       ENVIRONMENT: production
-      # The sink owns the durable ACK ledger (pipeline_batch_acks) and fails
-      # CLOSED without it: main.go:3153-3156 reads POSTGRES_URL then DATABASE_URL,
-      # and main.go:3186-3196 logs "FATAL: ACK ledger (POSTGRES_URL / DATABASE_URL)
+      # Key for mask rules that hash with hmac_sha256 (and the salt for sha256/md5).
+      # api-gateway, orchestrator and kafka-mcp-sink must all get the SAME value:
+      # batch masks in the orchestrator, CDC in the sink, preview in the gateway.
+      # Unset, hmac_sha256 rules refuse to save and to run. Never rotate it: every
+      # hash already in a destination stops matching new ones.
+      RSYNC_PII_HASH_SALT: ${RSYNC_PII_HASH_SALT:-}
+      # The sink owns the durable ACK ledger (pipeline_batch_acks for batch runs;
+      # cdc_counter_totals + cdc_offset_floors for CDC, migration 146) and fails
+      # CLOSED without it: main.go:4050 reads POSTGRES_URL then DATABASE_URL,
+      # and main.go:4085 logs "FATAL: ACK ledger (POSTGRES_URL / DATABASE_URL)
       # is unavailable" and os.Exit(1)s unless RSYNC_SINK_ALLOW_NO_LEDGER=true.
       # With neither name set the worker exits on every spawn and the Python
       # supervisor respawns it forever, so nothing drains the data topic and the

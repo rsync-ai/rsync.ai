@@ -39,7 +39,7 @@ export function getActiveWorkspaceIdFromCookies(cookies: ServerCookieReader): st
  * The active-workspace selection as a `name=value` cookie PAIR, or null when no
  * selection is present. This is the merge-friendly form for callers that already
  * build their own Cookie header (e.g. the explorer proxy routes forward
- * `Cookie: session_token=...` and must append the selection without clobbering
+ * `Cookie: auth_token=...` and must append the selection without clobbering
  * it). Workspace ids are UUIDs, so the value needs no escaping.
  */
 export function activeWorkspaceCookiePair(cookies: ServerCookieReader): string | null {

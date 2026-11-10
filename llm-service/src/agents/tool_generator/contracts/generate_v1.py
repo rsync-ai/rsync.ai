@@ -68,6 +68,18 @@ class GenerateRequestV1(BaseModel):
             "base_url without triggering a live introspection request."
         ),
     )
+    # Generator-trust P4a. False (default): a regeneration writes a NEW version,
+    # so a hand fix to the old one is never lost silently. True (the user's
+    # explicit choice): rewrite the version latest.json names in place and stop
+    # its running container, so connections pinned to it run the new code.
+    overwrite: bool = Field(
+        False,
+        description=(
+            "Rewrite the connector's current version in place instead of writing "
+            "a new version. Only the deterministic (spec / discovery-session) "
+            "paths can overwrite; any other path refuses."
+        ),
+    )
 
 
 class GenerateResponseV1(BaseModel):
@@ -88,6 +100,11 @@ class GenerateResponseV1(BaseModel):
     output_path: Optional[str] = None
     # Concrete version created during the save step (e.g., "v1.0.4")
     version: Optional[str] = None
+    # True when `version` was rewritten in place (request.overwrite), not added.
+    overwritten: bool = False
+    # Set when an overwrite was saved but the old version's running container
+    # could not be stopped: pipelines keep the old code until it restarts.
+    restart_error: Optional[str] = None
 
     iterations: int = 0
     total_time_ms: float = 0
@@ -110,3 +127,6 @@ class GenerateResponseV1(BaseModel):
     quality_tier: Optional[str] = None
     protocol: Optional[str] = None
     operation_count: Optional[int] = None
+    # [{code, severity, stage, message}] from agents/preflight.py: the errors
+    # that refused a connector, or the warnings a saved one carries.
+    preflight_issues: List[Dict[str, Any]] = Field(default_factory=list)

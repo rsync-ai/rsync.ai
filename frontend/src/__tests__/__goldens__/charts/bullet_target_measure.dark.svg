@@ -1,0 +1,35 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M6.5 10L6.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M96.5 10L96.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M187.5 10L187.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M278.5 10L278.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M368.5 10L368.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M459.5 10L459.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M550.5 10L550.5 286" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(6.025 293.95)" fill="#a1a1aa">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(96.6667 293.95)" fill="#a1a1aa">200</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(187.3083 293.95)" fill="#a1a1aa">400</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(277.95 293.95)" fill="#a1a1aa">600</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(368.5917 293.95)" fill="#a1a1aa">800</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(459.2333 293.95)" fill="#a1a1aa">1,000</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(549.875 293.95)" fill="#a1a1aa">1,200</text>
+<path d="M6 138L488 138A3 3 0 0 1 491 141L491 155A3 3 0 0 1 488 158L6 158L6 138Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M-1 -1l2 0l0 2l-2 0Z" transform="matrix(1.5,0,0,18,436.5729,147.975)" fill="#f2f2f2" fill-opacity="0.8" ecmeta_series_index="1" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-2"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+.zr-cls-2:hover {
+cursor:pointer;
+fill:rgba(255,255,255,1);
+}
+
+]]>
+
+</style>
+</svg>

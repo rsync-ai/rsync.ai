@@ -18,9 +18,7 @@ function makeEvent(over: Partial<ExplorerKeyboardEvent> = {}) {
 
 function makeDeps(over: Partial<Parameters<typeof handleExplorerRunShortcut>[1]> = {}) {
   return {
-    hasNlInput: false,
     hasSql: true,
-    generateSQL: vi.fn(),
     attemptRunQuery: vi.fn(),
     ...over,
   }
@@ -42,16 +40,7 @@ describe("handleExplorerRunShortcut", () => {
 
       expect(handleExplorerRunShortcut(e, deps)).toBe("already-handled")
       expect(deps.attemptRunQuery).not.toHaveBeenCalled()
-      expect(deps.generateSQL).not.toHaveBeenCalled()
       expect(e.preventDefault).not.toHaveBeenCalled()
-    })
-
-    it("bails before the NL branch too", () => {
-      const deps = makeDeps({ hasNlInput: true })
-      const e = makeEvent({ ctrlKey: true, defaultPrevented: true })
-
-      expect(handleExplorerRunShortcut(e, deps)).toBe("already-handled")
-      expect(deps.generateSQL).not.toHaveBeenCalled()
     })
   })
 
@@ -71,20 +60,11 @@ describe("handleExplorerRunShortcut", () => {
       expect(deps.attemptRunQuery).toHaveBeenCalledTimes(1)
     })
 
-    it("prefers NL generation when the prompt box has content", () => {
-      const deps = makeDeps({ hasNlInput: true, hasSql: true })
-
-      expect(handleExplorerRunShortcut(makeEvent({ metaKey: true }), deps)).toBe("generate")
-      expect(deps.generateSQL).toHaveBeenCalledTimes(1)
-      expect(deps.attemptRunQuery).not.toHaveBeenCalled()
-    })
-
-    it("does nothing when both inputs are empty", () => {
-      const deps = makeDeps({ hasNlInput: false, hasSql: false })
+    it("does nothing when the editor is empty", () => {
+      const deps = makeDeps({ hasSql: false })
 
       expect(handleExplorerRunShortcut(makeEvent({ metaKey: true }), deps)).toBe("ignored")
       expect(deps.attemptRunQuery).not.toHaveBeenCalled()
-      expect(deps.generateSQL).not.toHaveBeenCalled()
     })
   })
 

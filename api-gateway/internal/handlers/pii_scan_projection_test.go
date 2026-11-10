@@ -146,15 +146,6 @@ func TestPIITruncateIsRuneSafe(t *testing.T) {
 	}
 }
 
-func utf8Valid(s string) bool {
-	for _, r := range s {
-		if r == '�' {
-			return false
-		}
-	}
-	return true
-}
-
 // The delimiters must not be producible by a schema scan, or a crafted table
 // name could smuggle an extra key into the prune list.
 func TestPIIKeySeparatorsAreControlCharacters(t *testing.T) {

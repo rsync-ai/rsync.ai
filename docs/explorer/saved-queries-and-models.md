@@ -42,7 +42,7 @@ The two runnable modes want opposite things, and each is incoherent with the oth
 rather than merely unusual — wrapping a `DELETE` in `CREATE TABLE AS` is meaningless, and a
 scheduled `SELECT` burns warehouse time to deliver its rows nowhere. Both directions are
 refused with a message naming the other mode
-([saved_query_models.go:484](../../api-gateway/internal/handlers/saved_query_models.go:484)).
+([saved_query_models.go:529](../../api-gateway/internal/handlers/saved_query_models.go:529)).
 
 ---
 
@@ -81,7 +81,7 @@ Two constraints in 085/088 are worth knowing because they shape the API's error 
 ## 3. Authorization — the part to change carefully
 
 Every run, manual or scheduled, goes through
-[`authorizeModelRun`](../../api-gateway/internal/handlers/saved_query_models.go:436). It
+[`authorizeModelRun`](../../api-gateway/internal/handlers/saved_query_models.go:472). It
 re-derives everything from the **current** SQL and the run-as user's **current** role on
 every single run. Nothing is trusted from create time.
 
@@ -90,9 +90,9 @@ The order of its four checks is the security property:
 1. **Resolve the run-as user's role now.** A user removed from the workspace stops the
    schedule; a demoted user's schedule fails rather than keeps its old power.
 2. **Meet the minimum role** — `modelRunMinRole = WSAdmin`
-   ([:427](../../api-gateway/internal/handlers/saved_query_models.go:427)).
+   ([:463](../../api-gateway/internal/handlers/saved_query_models.go:463)).
 3. **`validators.ValidateExplorerStatement` — for every class, before any mode question**
-   ([:471](../../api-gateway/internal/handlers/saved_query_models.go:471)).
+   ([:514](../../api-gateway/internal/handlers/saved_query_models.go:514)).
 4. **Only then** does the mode get a say.
 
 > ### Why step 3 must stay where it is
@@ -132,15 +132,15 @@ through the same policy an interactive query gets
 Two classifier subtleties that exist because they were once bugs: an `ALTER` that drops an
 object escalates to `destructive`, and a `WITH`-led statement is classified on the write it
 performs rather than on `WITH`
-([:134](../../api-gateway/internal/validators/statement_policy.go:134),
-[:143](../../api-gateway/internal/validators/statement_policy.go:143)).
+([statement_class.go:110](../../shared/go/sqlexec/stmt/statement_class.go:110),
+[:118](../../shared/go/sqlexec/stmt/statement_class.go:118)).
 
 ### Authorizing an upstream set
 
 Naming a producer is a second authorization question, asked at write time on the create and
 update paths. Every entry in a proposed set is checked as a resource in its own right —
 viewer on the pipeline, or viewer on the model
-([`authorizeUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2418)).
+([`authorizeUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2533)).
 Without that, the field is a cross-tenant probe: the run history of a model the caller *does*
 own would report, run by run, when another tenant's pipeline finishes.
 
@@ -150,7 +150,7 @@ the operator asked for, and nothing distinguishes that from a producer that simp
 yet.
 
 A model upstream is also checked for a ring
-([`checkUpstreamCycle`](../../api-gateway/internal/handlers/saved_query_schedules.go:2522)),
+([`checkUpstreamCycle`](../../api-gateway/internal/handlers/saved_query_schedules.go:2637)),
 which walks *up* from each proposed model and asks whether the model being scheduled is
 already an ancestor. Only model edges can close a ring — a pipeline is never downstream of a
 model. Two details are load-bearing: the recursive term uses `UNION`, not `UNION ALL`, so a
@@ -165,13 +165,13 @@ write and a stored ring rebuilds on every upstream completion until the depth bo
 ### `cron` and `interval`
 
 Registered with Temporal
-([`createTemporalModelSchedule`](../../api-gateway/internal/handlers/saved_query_schedules.go:3068)).
+([`createTemporalModelSchedule`](../../api-gateway/internal/handlers/saved_query_schedules.go:3087)).
 `temporal_schedule_id` is mandatory for these and forbidden for event triggers — 095 splits
 085's blanket `NOT NULL` into one conditional constraint per direction, so a violation names
 which half is wrong.
 
 The "next run" shown in the UI is computed **locally**
-([`nextScheduleRun`](../../api-gateway/internal/handlers/saved_query_schedules.go:2916))
+([`nextScheduleRun`](../../api-gateway/internal/handlers/saved_query_schedules.go:2934))
 rather than by asking Temporal, because `Describe` is a network call per schedule and this
 runs once per row of a list. Two consequences:
 
@@ -222,14 +222,14 @@ and a model reading from three pipelines can name all three instead of being wir
 whichever one someone picked.
 
 **Fan-in is a per-schedule choice: `upstream_policy` `any` (the default) or `all`**
-(migration 104, [`normalizeUpstreamPolicy`](../../api-gateway/internal/handlers/saved_query_schedules.go:163)).
+(migration 104, [`normalizeUpstreamPolicy`](../../api-gateway/internal/handlers/saved_query_schedules.go:209)).
 Under `any` a completion fires every schedule that lists it, so a model naming three nightly
 pipelines rebuilds three times a night, and coalescing — one refresh workflow per model — is
 what keeps a burst to one rebuild. That is wrong for a real join: the model rebuilt the moment
 the first producer finished, reading the second one's previous output, and then again when the
 second finished. Under `all` a completion rebuilds the model only when every other upstream
 has also succeeded since this model's last successful rebuild **started**
-([`unsatisfiedUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2105));
+([`unsatisfiedUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2300));
 otherwise it writes a `skipped` run with `skip_reason = waiting_on_upstreams` saying how many
 are stale, and the last sibling to finish does the one rebuild. The message gives a count, not
 names: run history is readable by anyone who can see this model, and a stale upstream may be
@@ -237,45 +237,66 @@ another member's private model. Both sides of the comparison are on the database
 run's `started_at` is written as `NOW()` less its elapsed time — so a gateway whose clock is
 ahead cannot make a fresh sibling look stale. The firing upstream is excluded by id, so an
 adapter that sends an unrecognised `kind` loses the provenance (with a warning) but not the
-exclusion. A pipeline's completions are read from `pipeline_run_events`, which retention
-deletes after `PIPELINE_RUN_RETENTION_DAYS` (90 by default): a pipeline upstream that last
-completed before that reads as never completed and holds the model until it runs again. `all` is still not a barrier over a
+exclusion. A pipeline's completions are read from `pipeline_run_events`. Run-history
+retention deletes old runs' events after `PIPELINE_RUN_RETENTION_DAYS` (90 by default) but
+keeps the run holding each pipeline's newest `PIPELINE_COMPLETED`, so an upstream idle for
+longer still reads as completed then. A CDC pipeline never completes, so it counts as fresh on either of two stand-ins ([`upstreamIsFresh`](../../api-gateway/internal/handlers/saved_query_schedules.go:2379)): its newest watermark (`cdc_table_watermarks.source_time`, written by the sink) is past the baseline, or the sentinel measured its sink lag at 0 after the baseline — an idle source whose last change the model can read. The watermark is on the source's clock, the one exception to the database-clock rule above, and a lag of 0 reads a dead Debezium worker as idle too; that death raises its own `capture_stopped` issue. `all` is still not a barrier over a
 *night*: deciding when a batch is over is a freshness question, answered by a deadline (§12).
 Both schedule reads carry the policy — the one-model route and the workspace list
-([`ScheduledQuerySummary.UpstreamPolicy`](../../api-gateway/internal/handlers/saved_query_schedules.go:696)) —
+([`ScheduledQuerySummary.UpstreamPolicy`](../../api-gateway/internal/handlers/saved_query_schedules.go:861)) —
 because the list is where the cadence sentence is drawn, and a client that is not told
 falls back to "After any of…" for a model that waits on all of them. The policy also decides
 the Next run an active `after_upstream` schedule shows, on the list and on the model's own page
-([`describeUpstreamNextRun`](../../frontend/src/components/explorer/scheduledModel.tsx:102)): a
+([`describeUpstreamNextRun`](../../frontend/src/components/explorer/scheduledModel.tsx:105)): a
 fan-in on `all` reads "When all its upstreams have run", because the next landing alone does
 not rebuild it. With one upstream the policy changes nothing, so that model keeps "When an
 upstream runs".
 
-Two doors reach the same path:
+Three doors reach the same path:
 
 - A pipeline finishing — `PIPELINE_COMPLETED` →
-  [event_projector.go:213](../../api-gateway/internal/projector/event_projector.go:213) →
-  `OnPipelineCompleted` (wired at [main.go:498](../../api-gateway/cmd/server/main.go:498)) →
-  [`FireModelsAfterPipeline`](../../api-gateway/internal/handlers/saved_query_schedules.go:1837).
-- A model finishing —
-  [`fireDownstreamModelsAfterRun`](../../api-gateway/internal/handlers/saved_query_schedules.go:1859),
-  called from all three doors a model run comes through: the manual route, the internal
-  endpoint Temporal drives, and the in-process fallback below. A model is an upstream
-  whatever caused it to rebuild, and a chain that continued from only some of those would be
-  a rule nobody could hold in their head. Only a **succeeded** run propagates.
+  [event_projector.go:219](../../api-gateway/internal/projector/event_projector.go:219) →
+  `OnPipelineCompleted` (wired at [main.go:606](../../api-gateway/cmd/server/main.go:606)) →
+  [`FireModelsAfterPipeline`](../../api-gateway/internal/handlers/saved_query_schedules.go:2125).
+- A CDC pipeline's window closing. A CDC pipeline never emits `PIPELINE_COMPLETED`, so it
+  fires once per `CDC_AFTER_PIPELINE_INTERVAL_MINUTES` window (15 by default), at the first
+  boundary after rows landed: the trailing edge, so a burst then silence still builds its
+  tail. A singleton `CDCTrailingEdgeWorkflow` calls `/internal/cdc/trailing-edge/sweep` every
+  `CDC_TRAILING_EDGE_SWEEP_SECONDS` (60), and
+  [`fireAfterCDCWindow`](../../api-gateway/internal/handlers/cdc_trailing_edge.go:261) hands the models below to the same
+  fan-out under the window's occurrence. Reasoning:
+  workflows-design.md § 6.
+- A model finishing, through whichever door its run came in. A run Temporal drives — a
+  clock tick, or a rebuild by the refresh workflow — **takes its own hop**: the workflow
+  sends `next_hop: "caller"` with the run, the internal run endpoint answers with the run's
+  history row instead of firing anything
+  ([`answerInternalModelRun`](../../api-gateway/internal/handlers/model_next_hop.go:54)),
+  and the workflow asks
+  [`/downstream`](../../api-gateway/internal/handlers/model_next_hop.go:98) who is below
+  that row and starts their fan-out itself
+  ([`startModelNextHop`](../../backend-temporal-adapter/internal/workflows/model_next_hop.go:70)).
+  A manual Run now has no workflow, so the gateway takes its hop
+  ([`fireDownstreamModelsAfterRun`](../../api-gateway/internal/handlers/saved_query_schedules.go:2145)),
+  as it does for an internal run whose caller did not ask (an adapter that predates
+  `next_hop`). A model is an upstream whatever caused it to rebuild, and a chain that
+  continued from only some of those would be a rule nobody could hold in their head. Only a
+  **succeeded** run propagates, and both paths apply that rule to the run's history row.
 
-Both converge on
-[`fireDownstreamModels`](../../api-gateway/internal/handlers/saved_query_schedules.go:2092),
+The gateway's doors converge on
+[`fireDownstreamModels`](../../api-gateway/internal/handlers/saved_query_schedules.go:2431),
+and `/downstream` and the CDC sweep on the lookup inside it,
+[`lookupDownstreamModels`](../../api-gateway/internal/handlers/saved_query_schedules.go:2263),
 which reads the child table by upstream — the opposite direction from every other reader of
 it, and the reason `idx_sq_upstreams_by_pipeline` and `idx_sq_upstreams_by_model` exist.
 
 From there the whole set is handed over in **one** call. The gateway starts a single
 [`UpstreamFanOutWorkflow`](../../backend-temporal-adapter/internal/workflows/upstream_fanout_workflow.go:123) per completion
-([`temporalUpstreamFanOutDispatch`](../../api-gateway/internal/handlers/saved_query_schedules.go:1577)) carrying every waiting model as its argument,
+([`temporalUpstreamFanOutDispatch`](../../api-gateway/internal/handlers/saved_query_schedules.go:1839)), or the run's own workflow starts it as an
+`ABANDON` child, carrying every waiting model as its argument,
 and that workflow starts one [`ModelRefreshDispatchWorkflow`](../../backend-temporal-adapter/internal/workflows/upstream_fanout_workflow.go:215)
 child per model. Each child runs one activity,
 [`SignalModelRefreshActivity`](../../backend-temporal-adapter/internal/workflows/upstream_fanout_workflow.go:245), which signal-with-starts
-that model's [`ModelRefreshWorkflow`](../../backend-temporal-adapter/internal/workflows/model_refresh_workflow.go:112) on the id
+that model's [`ModelRefreshWorkflow`](../../backend-temporal-adapter/internal/workflows/model_refresh_workflow.go:115) on the id
 `model-refresh:<saved_query_id>` — and that workflow calls the same internal run endpoint the
 clock path calls, with `trigger=after_upstream`.
 
@@ -283,10 +304,25 @@ clock path calls, with `trigger=after_upstream`.
 durable. The gateway looked up the models and then signalled them one at a time from a
 detached goroutine, so a gateway that restarted after the third of nine signals left six
 models unrebuilt with nothing recording that they were owed anything — the goroutine died
-with the process, the in-process fallback died with it, and the next rebuild of those six was
-whenever their upstream happened to run again. Now the gateway makes one call and the fan-out
-is Temporal's problem the moment it returns; the gateway can die immediately afterwards and
-all nine models are still signalled.
+with the process, and the next rebuild of those six was whenever their upstream happened to
+run again. Now the gateway makes one call and the fan-out is Temporal's problem the moment it
+returns; the gateway can die immediately afterwards and all nine models are still signalled.
+
+**Why a model run's workflow takes its own hop.** That left the step *before* the fan-out:
+the run endpoint wrote the run's history row and then, on a goroutine of the request, looked
+up the models below and started their fan-out. A gateway restart between the row and the
+start lost the hop, and nothing said so. Now the run, the listing and the start of the
+fan-out child are each an event in the run's workflow history, so a worker or gateway restart
+between any two of them resumes from the last one recorded
+([model_next_hop_restart_integration_test.go](../../backend-temporal-adapter/internal/workflows/model_next_hop_restart_integration_test.go)
+stops the worker between a run and its hop, and the hop still happens once). The fan-out
+child gets the id the gateway would have used, `upstream-fanout:model:<id>:<run_id>`, so the
+two paths cannot fan out one run twice: whichever starts second is refused as a duplicate.
+There is no `GetVersion`: whether a workflow hops is its run activity's recorded result, so
+an execution from before this shape replays to the same commands
+([model_next_hop_replay_test.go](../../backend-temporal-adapter/internal/workflows/model_next_hop_replay_test.go)),
+and either deploy order hops exactly once — an old gateway ignores `next_hop` and fires as
+before, an old adapter never sends it.
 
 **Why the child is not `ModelRefreshWorkflow` itself.** That is the shape this looks like it
 should have and it does not work. A refresh loop has to be reached by *signal-with-start*, and
@@ -296,11 +332,16 @@ keyed on the model would collide across parents; and a child started without a s
 block on its signal channel forever, because the loop has no run timeout. Signal-with-start is
 a client-side primitive, so the only place a workflow can perform one is inside an activity.
 
-With no Temporal client — or when the fan-out fails to start — every model in the batch falls
-back to the in-process goroutine this path has always used. The fallback is now
-all-or-nothing rather than per-model, because there is one call to fail instead of N. Both
-routes end at the same endpoint, so a deployment without Temporal loses durability, not the
-trigger.
+There is no in-process route behind the fan-out any more
+(workflows-design.md § 4.2). With no Temporal client, or
+when the start fails, the gateway retries it for `fanOutRetryBudget` = 30 s
+([`startUpstreamFanOut`](../../api-gateway/internal/handlers/saved_query_schedules.go:1942))
+and then writes a `skipped` row with `skip_reason = trigger_lost` on every model below the
+completion
+([`deliverFanOut`](../../api-gateway/internal/handlers/saved_query_schedules.go:1996)), so a
+model whose trigger never arrived says so instead of reading "nothing happened". All or
+nothing, because there is one call to fail instead of N. A deployment without Temporal
+therefore rebuilds no triggered model; it records each one it could not wake.
 
 Thirteen properties of that path, each load-bearing:
 
@@ -313,7 +354,7 @@ Thirteen properties of that path, each load-bearing:
   was authorized. Without it, moving a pipeline into workspace B would keep rebuilding
   workspace A's model on B's data, and the history would show a normal successful rebuild.
   The Temporal route re-checks at run time
-  ([`modelRunScheduleLookup`](../../api-gateway/internal/handlers/saved_query_schedules.go:1468)),
+  ([`modelRunScheduleLookup`](../../api-gateway/internal/handlers/saved_query_schedules.go:1729)),
   because a workflow can rebuild long after the lookup that queued it. That second check is
   written as "**no** upstream is outside this model's workspace" rather than as a check on
   the one that fired, because the signal does not name which one that was and a fan-in
@@ -328,28 +369,20 @@ Thirteen properties of that path, each load-bearing:
   none. Only the last is beyond the reach of a row written by some future path.
 - **Completions arriving during a rebuild are kept, not dropped.** One workflow per model
   means a second completion — of the same producer or a different one in the set — is
-  delivered to the run already working and becomes one further rebuild. The fallback route
-  does the same in-process
-  ([`rebuildLocally`](../../api-gateway/internal/handlers/saved_query_schedules.go:2257)):
-  it used to lose the model's advisory run lock and drop that completion, which was found
-  live on a policy-`any` fan-in with Temporal down — woken by the root and by its sibling one
-  hop later, on two goroutines. Only a run held by *another* process (a second replica, or
-  the Temporal route) still refuses through the lock, and that holder wakes the same
-  consumers when it finishes. Coalescing is sound because a rebuild replaces the target wholesale rather than applying a
-  delta. A rerun is a new trigger, so under `all` it meets the policy again rather than
-  rebuilding against a sibling that has not finished. One call runs at most
-  `maxLocalRebuildRuns` = 5 times; past that the next rebuild is requeued for a fire slot
-  instead of holding one for as long as completions keep arriving, and a panic is recovered
-  and logged so the claim is released
-  ([`rebuildLocallyAbsorbing`](../../api-gateway/internal/handlers/saved_query_schedules.go:2261)).
+  delivered to the run already working and becomes one further rebuild. Only a run held by
+  another door (a manual Run now, or a clock tick) still refuses through the model's advisory
+  lock, and that holder wakes the same consumers when it finishes. Coalescing is sound
+  because a rebuild replaces the target wholesale rather than applying a delta. A rerun is a
+  new trigger, so under `all` it meets the policy again rather than rebuilding against a
+  sibling that has not finished.
 - **A redelivered completion does not fan out twice.** The fan-out is named after the
   completion that caused it and started under `ALLOW_DUPLICATE_FAILED_ONLY`, so Kafka
   redelivering `PIPELINE_COMPLETED` is refused by Temporal rather than rebuilding everything
   a second time. That refusal is read as success
-  ([`isFanOutAlreadyStarted`](../../api-gateway/internal/handlers/saved_query_schedules.go:1772)); falling back on it would run the whole batch on the
-  one route that has no coalescing. The name is the pipeline execution id, or a fresh uuid
-  for a model hop, which has no execution of its own
-  ([`fanOutOccurrence`](../../api-gateway/internal/handlers/saved_query_schedules.go:1638)). A hop must **not** reuse the execution id it carries —
+  ([`isFanOutAlreadyStarted`](../../api-gateway/internal/handlers/saved_query_schedules.go:2070)); recording it as `trigger_lost` would say "not
+  rebuilt" about models that are being rebuilt. The name is the pipeline execution id, or for
+  a model hop the hop's own run row (a fresh uuid when that row could not be written)
+  ([`fanOutOccurrence`](../../api-gateway/internal/handlers/saved_query_schedules.go:1907)). A hop must **not** reuse the execution id it carries —
   that id names the pipeline that started the chain, so every hop would collide with the
   first and the chain would stop after one, silently and as a duplicate.
 - **One model that cannot be signalled does not cost the others.** Every child is started
@@ -358,20 +391,22 @@ Thirteen properties of that path, each load-bearing:
   failed or was terminated — cancelling a fan-out cannot half-deliver it. A child retries for
   ten minutes (`modelRefreshDispatchHorizon`) and then stops: past that the honest answer is
   that this completion did not reach that model, and the parent's history names which ones.
-- **The fallback route is sequential within one completion, capped at 4 concurrent
-  fan-outs globally** (`eventFireSlots`,
-  [:1785](../../api-gateway/internal/handlers/saved_query_schedules.go:1785)). Models
-  downstream of one pipeline usually read the same tables; running them one at a time keeps
-  a thirty-table nightly load from opening thirty warehouse sessions at once. Rebuilds
-  Temporal accepted are bounded by the worker instead and never take a slot.
+- **A run's hop writes once, however often it is asked.** The listing is an activity, so a
+  response lost on the way back is asked for again. A succeeded run's answer writes nothing;
+  a failed run's skip rows are written only if none are linked to that run yet
+  ([`recordSkipsOnce`](../../api-gateway/internal/handlers/model_next_hop.go:193)), because
+  they carry no key of their own. Every database error answers 500, so the activity retries
+  it: an empty answer would read as "nothing below" and lose the hop with no error anywhere.
+  The run is matched on both the model and the run id, so one model's run cannot wake
+  another model's consumers.
 - **A chain is bounded at `maxTriggerChainDepth` = 8**
-  ([:186](../../api-gateway/internal/handlers/saved_query_schedules.go:186)). The depth
-  rides on the fan-out argument, then on each child, then on the signal payload, as well as
-  on the in-process call — so a chain that hops through Temporal is bounded by the same
-  number as one that does not. A hop that dropped it would report a chain eight deep as depth
+  ([:231](../../api-gateway/internal/handlers/saved_query_schedules.go:231)). The depth
+  rides on the fan-out argument, then on each child, then on the signal payload, then on the
+  run, and `/downstream` adds the hop to the depth the run carried — so a chain is bounded by
+  the same number whichever path takes each hop. A hop that dropped it would report a chain eight deep as depth
   zero, and the bound would never fire. It is a backstop, not the
   cycle check: a ring is refused at write time by `checkUpstreamCycle`
-  ([:2522](../../api-gateway/internal/handlers/saved_query_schedules.go:2522)), which is the
+  ([:2637](../../api-gateway/internal/handlers/saved_query_schedules.go:2637)), which is the
   only place a person can be told about it. It walks only schedules that are not `deleted`:
   a deleted schedule keeps its upstream rows, and counting them refused a legitimate edge
   forever. A chain that hits the bound writes a `skipped` run with
@@ -381,40 +416,45 @@ Thirteen properties of that path, each load-bearing:
 - **Retry belongs to the workflow.** It retries a rebuild three times with backoff, and
   spent retries do not fail the run — the completions buffered behind it would go down
   with it. A query the engine rejected on its merits is not retried at all, because the
-  endpoint answers 200 with status `failed`. The fallback route still has no retry: there,
-  the next completion of an upstream *is* the retry, and it carries fresher data than a
-  replay would.
+  endpoint answers 200 with status `failed`.
 - **Every triggered run says what woke it, and a model that was not rebuilt says why.**
   Migration 104 adds provenance to `saved_query_runs` — `upstream_kind`/`upstream_id`,
   `upstream_run_id` (the upstream model's own run row), `origin_execution_id` (the pipeline
   execution at the root, when there is one), `trigger_depth` (hops from the root) and
   `coalesced_count` — written by
-  [`recordModelRunOutcome`](../../api-gateway/internal/handlers/saved_query_models.go:1151).
-  A model below an upstream whose run failed gets a `skipped` row with `upstream_failed`, and
-  everything below that `upstream_skipped`, each linked to the row above it
-  ([`recordSkippedDownstream`](../../api-gateway/internal/handlers/saved_query_schedules.go:1914)).
+  [`recordModelRunOutcome`](../../api-gateway/internal/handlers/saved_query_models.go:1335).
+  A model below an upstream whose run failed gets a `skipped` row with `upstream_failed`
+  (`upstream_check_failed` when a data check held that upstream's table back, migration 138),
+  and everything below that `upstream_skipped`, each linked to the row above it
+  ([`recordSkippedDownstream`](../../api-gateway/internal/handlers/saved_query_schedules.go:2210)).
+  A model whose upstream completed but whose fan-out could not be handed to Temporal gets
+  `trigger_lost` instead (migration
+  [136](../../api-gateway/migrations/136_model_run_trigger_lost.sql)), with the same cascade
+  below it.
   A transient "already in progress" skip does not cascade — its holder wakes the same models.
   The schedules page renders these through
   [runProvenance.ts](../../frontend/src/components/explorer/runProvenance.ts).
 - **A schedule cannot be left waiting on nothing.** Deleting a pipeline or model pauses every
   active schedule whose *only* upstream it was, inside the delete's transaction and before the
   rows cascade
-  ([`pauseTriggersOrphanedBy`](../../api-gateway/internal/handlers/saved_query_schedules.go:2585)),
+  ([`pauseTriggersOrphanedBy`](../../api-gateway/internal/handlers/saved_query_schedules.go:2700)),
   with an `auto_paused_reason` saying an upstream was deleted (not which one, for the same
   private-model reason as the skip message); a saved-query delete reports the count
   as `paused_downstream_schedules`. Only active schedules are marked: one the user had already
   paused stays paused with no reason and no upstreams, and nothing reports it until a resume
   is refused (409, "choose new upstreams"). A plain saved query (materialization `none`) is refused as
   an upstream at write time
-  ([`refuseUnbuildableUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2621)),
+  ([`refuseUnbuildableUpstreams`](../../api-gateway/internal/handlers/saved_query_schedules.go:2736)),
   because its runs never succeed and so it could never wake anything.
 - **A Temporal that just failed is not re-dialled on every hop.** One failed fan-out start opens
-  a one-minute breaker ([`fanOutTemporalBreaker`](../../api-gateway/internal/handlers/saved_query_schedules.go:1700));
-  while it is open each hop goes straight to the in-process route instead of paying the dial
-  deadline again, so a chain with Temporal down no longer costs ~10 s per hop. After the
-  window exactly one dispatch is let through as the probe; the rest keep taking the in-process
-  route until it answers, and a probe that never answers expires after another window. A dial failure inside the lazily-created client is
-  not observed by the breaker — only a failed start is.
+  a one-minute breaker ([`fanOutTemporalBreaker`](../../api-gateway/internal/handlers/saved_query_schedules.go:2032));
+  while it is open a start is refused without dialling and its models are recorded as
+  `trigger_lost` at once, rather than each completion paying the dial deadline and then the
+  retry budget. After the window exactly one start is let through as the probe; the rest are
+  still refused until it answers, and a probe that never answers expires after another
+  window. A completion inside the window gets no retry of its own. A failed dial counts as
+  a failed start: with no client to hand the fan-out to, the retry budget runs out the same
+  way and opens the breaker.
 
 ---
 
@@ -536,7 +576,7 @@ because a policy that can erase the previous version destroys the feature it con
 
 `retention_days` is NULL out of the migration, so applying it deletes nothing anywhere until an
 admin calls `PUT /api/v1/explorer/version-retention`
-([main.go:1136](../../api-gateway/cmd/server/main.go:1136)). Reading the policy is member-level;
+([main.go:1480](../../api-gateway/cmd/server/main.go:1480)). Reading the policy is member-level;
 setting it is admin-only and audited, because the deletions it causes happen later on an
 unrelated request and the audit record is the only thing tying them back to a decision.
 
@@ -591,7 +631,7 @@ that re-derives itself whenever someone edits the SQL is a schedule that changes
 anyone asking for it. A person picks from the list, and what they picked stays picked.
 
 Table references come from a **deterministic parser**, not an LLM
-([`ExtractTableReferences`](../../api-gateway/internal/validators/table_references.go:93)) —
+([`ExtractTableReferences`](../../shared/go/sqlexec/stmt/table_references.go:93)) —
 a real lexer that tracks CTE names so a `WITH` alias is not reported as a table.
 
 Two matching rules that are easy to get backwards
@@ -626,38 +666,140 @@ hangs a schedule off an unrelated pipeline.
 
 ## 8. Engine support
 
-[`ResolveExplorerCapability`](../../api-gateway/internal/handlers/explorer_capability.go:86)
+[`ResolveExplorerCapability`](../../api-gateway/internal/handlers/explorer_capability.go:74)
 is the single source of truth for both the connections API and query/schema/export dispatch.
-Adding a warehouse means editing **only** that table.
+Adding an engine means editing that table, and — if it can be a model —
+[`modelDialect`](../../api-gateway/internal/handlers/saved_query_models.go:204) and the plan
+below (or, for a document store, [MongoDB models](#mongodb-models) below).
 
-| Connector | Dialect | Execution | Explorer | Can be a model |
-|---|---|---|---|---|
-| MySQL / MariaDB | `mysql` | direct | ✅ | ✅ |
-| PostgreSQL / Redshift | `postgresql` | direct | ✅ | ✅ |
-| SQL Server | `tsql` | direct | ✅ | ✅ |
-| Databricks | `databricks` | direct | ✅ | ❌ |
-| BigQuery | `bigquery` | delegated | ✅ | ❌ |
-| ClickHouse | `clickhouse` | delegated | ✅ | ❌ |
-| MongoDB | — | — | ❌ | ❌ |
+| Connector | Dialect | Execution | Explorer | Can be a model | A rebuild runs through |
+|---|---|---|---|---|---|
+| MySQL / MariaDB | `mysql` | direct | ✅ | ✅ | gateway driver |
+| PostgreSQL / Redshift | `postgresql` | direct | ✅ | ✅ | gateway driver, one transaction |
+| SQL Server | `tsql` | direct | ✅ | ✅ | gateway driver, one transaction |
+| Databricks | `databricks` | direct | ✅ | ✅ | Statement Execution API |
+| BigQuery | `bigquery` | delegated | ✅ | ✅ | connector `execute` |
+| Snowflake | `snowflake` | delegated | ✅ | ✅ | connector `execute` |
+| ClickHouse | `clickhouse` | delegated | ✅ | ✅ | connector `execute` |
+| Oracle | `oracle` | delegated | ✅ | ✅ | connector `execute` |
+| MongoDB | — (a pipeline) | delegated | find + pipeline | ✅ table mode only | connector `materialize` |
 
-**`SupportsMaterialization` is deliberately NOT derived from `ExecStrategy == direct`.**
-Databricks executes directly and queries perfectly well, but
-[`modelDialect`](../../api-gateway/internal/handlers/saved_query_models.go:178) has no case
-for it, so a rebuild would refuse at run time. Being direct is necessary, not sufficient:
-the materialization path needs a driver that can execute DDL, a narrower set than the read
-path. The flag and `modelDialect` are pinned in lockstep by
-`TestSupportsMaterializationMatchesModelDialect` — if you add a warehouse, that test is the
-one that tells you you have only done half the job.
+**`SupportsMaterialization` is deliberately NOT derived from whether the engine is delegated
+(`sqlexec.IsDelegated`) or the query language.** A model needs an engine rsync.ai can build on: a SQL engine `modelDialect` lists, or
+a document store whose model is a pipeline
+([`modelSupported`](../../api-gateway/internal/handlers/saved_query_documents.go:50)). The
+flag and `modelSupported` are pinned in lockstep by
+[`TestSupportsMaterializationMatchesModelDialect`](../../api-gateway/internal/handlers/explorer_capability_test.go:211)
+— if you add an engine, that test is the one that tells you you have only done half the job.
 
-The UI disables the materialization control **with a reason** rather than hiding it, so a
-BigQuery user learns why instead of hunting for a missing button.
+Every engine the Explorer queries today can back a model. The UI still disables the
+materialization control **with a reason** rather than hiding it when `supports_materialization`
+is `false`, for the next engine added to the Explorer before its model path.
+
+### MongoDB models
+
+A MongoDB model is a saved pipeline. Its `sql_text` is the pipeline preview's own request as
+JSON — `{"database"?, "collection", "pipeline": [...]}` — and the pipeline is stored as typed,
+so a 64-bit integer or a `$sort`'s key order survives
+([`documentModelQuery`](../../api-gateway/internal/handlers/saved_query_documents.go:35)).
+The Document Browser's **Pipeline** tab previews it
+(`POST /api/v1/explorer/documents/aggregate`, the first page only) and its **Saved
+pipelines** list saves it; the model dialog is the same one SQL models use.
+
+- **One write, appended by rsync.** The pipeline can name no write stage:
+  [`ValidateDocumentAggregate`](../../api-gateway/internal/validators/document_aggregate.go:72)
+  allows only read stages (an allowlist) and refuses `$out`, `$merge`, `$function`,
+  `$accumulator` and `$where` at any depth, inside `$facet` and `$lookup` too (50 stages,
+  depth 32, 128 KB at most) — on save, on preview and again on every run. The connector
+  enforces the same lists, pinned by `TestDocumentAggregateListsMatchConnector`. A run is
+  [`runDocumentModel`](../../api-gateway/internal/handlers/saved_query_documents.go:144) →
+  orchestrator `POST /api/v1/agent/explorer-materialize` → the connector's
+  [`materialize`](../../shared/mcp-connectors/public/database/mongodb/versions/v1.0.0/connector.py:1860),
+  which appends the one `$out` to the model's target. It is a read for authorization
+  (`modelStatementClass`), the same reasoning that makes a table-mode SELECT a read.
+- **Table mode only.** Statement mode runs SQL for its effect; a pipeline has no effect but
+  its result. `authorizeDocumentModel` refuses it and the dialog does not offer it.
+- **Build-then-swap from MongoDB itself.** `$out` builds into a temporary collection and
+  swaps at the end, so a failed run leaves the previous result. Until `target_owned`, the
+  result goes to `<target>__rsync_new` and is renamed onto the target **without**
+  `dropTarget`, so MongoDB refuses to take over a collection rsync.ai did not create
+  (`target_exists`); the staging collection is dropped on failure.
+- **Target** is `collection` (the pipeline's own database) or `database.collection`, the
+  same name rule as SQL targets. The target database passes the connection's read scope: a
+  connection pinned to one database reaches the databases this workspace's pipelines deliver
+  to on it — which is how a model reads bronze collections a CDC pipeline wrote
+  ([`documentModelConfig`](../../api-gateway/internal/handlers/saved_query_documents.go:120)) —
+  and anything else is refused by the connector.
+- **Bounded:** `maxTimeMS` is the model run's deadline, `allowDiskUse` is on, reads go to
+  the primary, and a run is never retried. `rows_affected` is the target's estimated
+  document count afterwards.
+- **No suggested upstreams.** Upstream suggestion and the Graph tab read table references
+  out of SQL; a pipeline yields none (every JSON string reads as an identifier, so even
+  `$lookup`'s `"from"` is not a reference). Set an `after_upstream` trigger by hand.
+
+### Engines with no driver in the gateway
+
+Postgres, Redshift, MySQL and SQL Server rebuild through `executeModelPlan` on one
+connection. The other five go through
+[`runEngineModel`](../../api-gateway/internal/handlers/saved_query_models_engines.go:87):
+each statement travels on its own, with no transaction around them, so what rollback buys on
+the driver path has to come from the shape of the plan
+([`buildEngineModelPlan`](../../api-gateway/internal/handlers/saved_query_models_engines.go:97)):
+
+| Engine | First run (not yet owned) | Owned rebuild |
+|---|---|---|
+| BigQuery, Snowflake, Databricks | `CREATE TABLE t AS …` | `CREATE OR REPLACE TABLE t AS …` — atomic on each engine |
+| ClickHouse | build `t__rsync_new`, then `RENAME TABLE` onto `t` | `CREATE OR REPLACE TABLE t ENGINE = MergeTree ORDER BY tuple() AS …` |
+| Oracle | `CREATE TABLE t AS …` | build-then-swap one statement at a time, after a catalog read (below) |
+
+The collision guarantee is the driver path's: a run that has not proven ownership only ever
+CREATEs or RENAMEs onto the target name, and every engine refuses that when the name is
+taken. A statement model sends its text once, as written.
+
+**Oracle** has no `CREATE OR REPLACE TABLE`, and each DDL statement commits on its own. An
+owned rebuild first reads `ALL_TABLES` for the target and the retired name
+([`oracleModelCatalogState`](../../api-gateway/internal/handlers/saved_query_models_engines.go:208)).
+A run that died between its two renames leaves the data only under the retired name; the
+next run renames it back before it builds anything. A failed catalog read fails the run
+before any statement is sent — "not knowing" is never read as "not there".
+
+**One statement, one attempt, a deadline on the warehouse.** BigQuery, Snowflake, ClickHouse
+and Oracle statements reach the connector through the orchestrator
+(`POST /api/v1/agent/explorer-query` with `write`, `model_run` and `timeout_seconds`). The
+orchestrator runs them through
+[`ExplorerExecuteModel`](../../backend-orchestrator/internal/agents/executor/executor.go:8578):
+never retried (a CREATE that timed out on our side may still be running), and as a
+`LongCall`, so the MCP client's 30 s cap does not apply
+([`callTimeout`](../../backend-orchestrator/internal/mcp/client.go:367)).
+[`modelStatementContext`](../../backend-orchestrator/cmd/orchestrator/explorer_model.go:28)
+lifts the server's write deadline for that one response. The gateway asks the warehouse to
+stop 5 s before the run's own deadline (`modelStatementMargin`), so the warehouse ends a slow
+statement and says why, rather than leaving it running after the run has failed:
+
+| Engine | Statement deadline |
+|---|---|
+| BigQuery | the job's `job_timeout_ms`; a client wait that runs out cancels the job ([warehouse_adapters.py:426](../../shared/mcp-connectors/public/warehouse_adapters.py:426)) |
+| Snowflake | `cursor.execute(timeout=)` ([connector.py:483](../../shared/mcp-connectors/public/database/snowflake/versions/v1.0.0/connector.py:483)) |
+| ClickHouse | `max_execution_time`; the HTTP read timeout is raised to the deadline + 30 s ([connector.py:1045](../../shared/mcp-connectors/public/database/clickhouse/versions/v1.0.0/connector.py:1045)) |
+| Oracle | `Connection.call_timeout` ([connector.py:4604](../../shared/mcp-connectors/public/database/oracle/versions/v1.0.0/connector.py:4604)) |
+| Databricks | submitted with `wait_timeout=0s` and polled; the run's deadline cancels the statement |
+
+Each connector's `/mcp` handler runs the call on a worker thread, so a statement that runs
+for minutes does not stall `/health` or another pipeline's call.
+
+**Known limits, not yet verified on a live warehouse:** `CREATE OR REPLACE` on a ClickHouse
+`Replicated*` database; ClickHouse's `max_execution_time` does not bound an asynchronous
+`ALTER` mutation in a statement model; Oracle before 12.2 caps identifiers at 30 bytes, so a
+long target name plus `__rsync_new` is refused; an Oracle statement model that creates a
+procedure, function, package or trigger loses its final `;` (anonymous `BEGIN`/`DECLARE`
+blocks keep theirs).
 
 ---
 
 ## 9. API
 
 All routes are workspace-scoped and auth-required
-([main.go:1123–1163](../../api-gateway/cmd/server/main.go:1123)).
+([main.go:1467–1550](../../api-gateway/cmd/server/main.go:1467)).
 
 **Saved queries**
 
@@ -682,6 +824,7 @@ All routes are workspace-scoped and auth-required
 | `GET`·`POST`·`PUT`·`DELETE` | `/api/v1/explorer/saved/:id/schedule` | detaching leaves the table |
 | `POST` | `/api/v1/explorer/saved/:id/schedule/pause` · `/resume` | |
 | `GET` | `/api/v1/explorer/saved/:id/upstreams` | viewer — read-only suggestion |
+| `GET` | `/api/v1/explorer/saved/:id/freshness` | viewer — the deadline, and the longest gap the schedules above the model can leave between rebuilds (`null` when unpredictable) (§12) |
 | `PUT` | `/api/v1/explorer/saved/:id/freshness` | declare or withdraw a deadline (§12) |
 | `GET` | `/api/v1/explorer/schedules` | viewer — all schedules in the workspace; `?saved_query_id=<uuid>` narrows it to one model (a non-uuid is a 400) |
 | `GET` | `/api/v1/explorer/freshness` | viewer — the workspace's freshness misses (§12) |
@@ -693,16 +836,34 @@ forbidden for the two clock types, and bounded at `maxScheduleUpstreams = 16`
 ([:147](../../api-gateway/internal/handlers/saved_query_schedules.go:147)). An empty set, a
 set over the cap, a duplicate within one request, and upstreams sent alongside a `cron` or
 `interval` type are each refused by name
-([`validateModelScheduleSpec`](../../api-gateway/internal/handlers/saved_query_schedules.go:2766));
+([`validateModelScheduleSpec`](../../api-gateway/internal/handlers/saved_query_schedules.go:2881));
 a duplicate is refused rather than deduplicated, because collapsing it would hide that the
 caller and the handler disagree about what the set is. Responses echo the set back with each
 producer's display name joined server-side, so the dialog and the schedules page can name a
 trigger without a second round trip.
 
+**Data checks** (migration 138; rules and reasoning in
+data-checks-design.md; routed at
+[main.go:1521](../../api-gateway/cmd/server/main.go:1521))
+
+| Method | Path | Role · notes |
+|---|---|---|
+| `GET` | `/api/v1/explorer/saved/:id/checks` | viewer — each check with its last 20 results, whether the engine can block, open proposals |
+| `POST` | `/api/v1/explorer/saved/:id/checks` | creator or admin — 201; a new `custom_sql` check on a scheduled model is **proposed** instead (200 `pending_approval`, a second open proposal is 409) |
+| `PUT` | `/api/v1/explorer/saved/:id/checks/:checkId` | creator or admin — replaces the check; a changed `custom_sql` query on a scheduled model is proposed, as above |
+| `DELETE` | `/api/v1/explorer/saved/:id/checks/:checkId` | creator or admin — past results keep the check's name and type |
+| `POST` | `/api/v1/explorer/saved/:id/checks/test` | viewer — Test now: runs the saved checks on the live table as the caller, records nothing |
+| `GET` | `/api/v1/explorer/saved/:id/runs/:runId/checks` | viewer — what each check saw on one run |
+| `POST` | `/api/v1/explorer/saved/:id/checks/pending/:pendingId/approve` · `/reject` | **admin** — optional `{note}`; approving applies the check |
+
+A blocking check that fails or cannot run leaves the table that was live in place: the run is
+`failed` with "Blocked by a data check — see the Checks tab", and the models below it are
+skipped with `upstream_check_failed`.
+
 **Internal (S2S)** — `POST /api/v1/internal/explorer/models/:id/run`
-([main.go:1215](../../api-gateway/cmd/server/main.go:1215)) and
+([main.go:1585](../../api-gateway/cmd/server/main.go:1585)) and
 `POST /api/v1/internal/explorer/freshness/sweep`
-([main.go:1222](../../api-gateway/cmd/server/main.go:1222)), behind
+([main.go:1605](../../api-gateway/cmd/server/main.go:1605)), behind
 `InternalServiceMiddleware`. These are the routes Temporal calls; the user-facing run route
 fail-closes without a session.
 
@@ -711,31 +872,32 @@ fail-closes without a session.
 ## 10. Operational notes
 
 - **Run timeout: 30 minutes** (`modelRunTimeout`,
-  [saved_query_models.go:71](../../api-gateway/internal/handlers/saved_query_models.go:71)).
+  [saved_query_models.go:72](../../api-gateway/internal/handlers/saved_query_models.go:72)).
   Event-driven runs get `timeout + 1 minute` **per run, not per batch**, so one slow model
   cannot eat the budget of the models queued behind it.
 - **One rebuild at a time per model** — a Postgres advisory lock
-  ([`acquireModelRunLock`](../../api-gateway/internal/handlers/saved_query_models.go:712)).
+  ([`acquireModelRunLock`](../../api-gateway/internal/handlers/saved_query_models.go:828)).
   The refresh workflow already serializes the event route's rebuilds of one model, so what
   the lock still buys is the other doors: a manual run, or a clock tick, overlapping one.
 - **Auto-pause is distinguishable from an operator pause.**
-  [`autoPauseModelSchedule`](../../api-gateway/internal/handlers/saved_query_schedules.go:2384)
+  [`autoPauseModelSchedule`](../../api-gateway/internal/handlers/saved_query_schedules.go:2499)
   writes `auto_paused_*`, not `paused_*`, because the resume path treats them differently.
   A machine pause means "this cannot succeed as configured" — a dropped connection, a
   demoted run-as user.
 - **The schedule paths are Temporal-optional.** An `after_upstream` schedule can be created,
   paused, resumed and deleted with no Temporal client at all, because nothing is registered
-  with it. Firing degrades rather than breaking: with no client every rebuild runs on the
-  in-process route, losing durability and coalescing but not the trigger.
+  with it. Firing is not: with no client, each completion's models get a `trigger_lost` row
+  instead of a rebuild, because there is no in-process route behind the fan-out any more.
 - **Deploy the adapter before the gateway.** The fan-out is the one place where "no Temporal"
   and "Temporal that does not know this workflow" are different failures. With no client the
-  gateway rebuilds in-process and the models still update. With a client but a worker that
-  predates `UpstreamFanOutWorkflow`, the start call **succeeds** — so the gateway takes the
-  Temporal route and skips the fallback — and the workflow task then fails on repeat against
-  a queue where no worker can pick it up. Nothing rebuilds and nothing logs an error on the
-  gateway side. Shipping `backend-temporal-adapter` first makes the window empty; shipping
-  the gateway first makes it as long as the gap. Rolling *back* has the same shape in
-  reverse, so roll the gateway back before the adapter.
+  start fails and the models below get `trigger_lost` rows. With a client but a worker that
+  predates `UpstreamFanOutWorkflow`, the start call **succeeds**, and the workflow task then
+  fails on repeat against a queue where no worker can pick it up. Nothing rebuilds and
+  nothing logs an error on the gateway side. Shipping `backend-temporal-adapter` first makes
+  the window empty; shipping the gateway first makes it as long as the gap. Rolling *back*
+  has the same shape in reverse, so roll the gateway back before the adapter. The next hop
+  needs no order of its own: an old gateway ignores `next_hop` and takes the hop itself, and
+  an old adapter never sends it.
 - **Deleting an upstream cascades to the upstream row, not to the schedule.** Both foreign
   keys in `saved_query_schedule_upstreams` are `ON DELETE CASCADE`, for the reason 095 gave
   for the column they replace: `SET NULL` would leave a row that names nothing, and
@@ -760,9 +922,9 @@ fail-closes without a session.
 | [SavedQueryHistoryDialog.tsx](../../frontend/src/components/explorer/SavedQueryHistoryDialog.tsx) | version history, diff, restore |
 | [SqlDiffView.tsx](../../frontend/src/components/explorer/SqlDiffView.tsx) · [sqlDiff.ts](../../frontend/src/components/explorer/sqlDiff.ts) | the differ |
 | [savedQueryUpdate.ts](../../frontend/src/components/explorer/savedQueryUpdate.ts) | pure update/response logic |
-| [explorer/schedules/page.tsx](../../frontend/src/app/%28dashboard%29/explorer/schedules/page.tsx) | workspace-wide schedules view, including the live **Now** column ([§13](#on-the-schedules-page)) |
-| [explorer/schedules/[id]/page.tsx](../../frontend/src/app/%28dashboard%29/explorer/schedules/%5Bid%5D/page.tsx) | one model: every run, filtered and paged, beside its details and controls ([§13](#the-per-model-page)) |
-| [scheduledModel.tsx](../../frontend/src/components/explorer/scheduledModel.tsx) | types and badges both schedule pages share, `describeCadence` (also used by the Model dialog), and `formatDuration` |
+| [models/page.tsx](../../frontend/src/app/%28dashboard%29/models/page.tsx) | Models: every model in the workspace, scheduled or Manual, including the live **Now** column ([§13](#on-the-schedules-page)) |
+| [models/[id]/page.tsx](../../frontend/src/app/%28dashboard%29/models/%5Bid%5D/page.tsx) | one model: every run, filtered and paged, beside its details and controls ([§13](#the-per-model-page)) |
+| [scheduledModel.tsx](../../frontend/src/components/explorer/scheduledModel.tsx) | types and badges both schedule pages share, and `describeCadence` (also used by the Model dialog) |
 | [cronSentence.ts](../../frontend/src/components/explorer/cronSentence.ts) | pure: a cron in words, or null where no short sentence is exact ([§4](#cron-and-interval)) |
 | [ModelDetailRows.tsx](../../frontend/src/components/explorer/ModelDetailRows.tsx) | the model page's *Run as* and *Lineage* values, each with its own request ([§13](#the-per-model-page)) |
 | [modelLineage.ts](../../frontend/src/components/explorer/modelLineage.ts) | pure: the chain around one model, what each node may say, the layout ([§13](#the-graph-tab)) |
@@ -774,6 +936,7 @@ fail-closes without a session.
 | [ModelRunPanel.tsx](../../frontend/src/components/explorer/ModelRunPanel.tsx) | the panel a node opens: now, recent runs, the run, its SQL |
 | [liveState.ts](../../frontend/src/components/explorer/liveState.ts) | pure: what a row's Now cell may say, given `/explorer/running` and `/explorer/freshness` |
 | [ModelLiveState.tsx](../../frontend/src/components/explorer/ModelLiveState.tsx) | the visible-only, non-overlapping poll; the Now cell, the Overdue badge, the expanded detail and the banner |
+| [ModelFreshnessDeadline.tsx](../../frontend/src/components/explorer/ModelFreshnessDeadline.tsx) | the model page's *Freshness* value and its dialog; warns when the deadline is under the schedule's gap ([§12](#a-deadline-shorter-than-the-schedules-gap)) |
 
 ---
 
@@ -813,7 +976,7 @@ as `21600000` would silently never fire, which is wrong in the quiet direction.
 ### The reference point is the last **succeeded** run
 
 `saved_queries.last_run_at` is the obvious column and the wrong one.
-[`stampLastRunOutcome`](../../api-gateway/internal/handlers/saved_query_models.go:1133)
+[`stampLastRunOutcome`](../../api-gateway/internal/handlers/saved_query_models.go:1335)
 writes it on every outcome **including failures**, so a model whose rebuild fails hourly
 would carry a reference point an hour old and read as fresh forever — precisely the model
 this feature exists to find.
@@ -830,7 +993,7 @@ can never be reported.
 A singleton Temporal workflow in the adapter
 ([`ModelFreshnessWorkflow`](../../backend-temporal-adapter/internal/workflows/model_freshness_workflow.go:92)),
 started at boot under a fixed workflow id with `USE_EXISTING`
-([`startModelFreshnessSweep`](../../backend-temporal-adapter/cmd/adapter/main.go:404)), so
+([`startModelFreshnessSweep`](../../backend-temporal-adapter/cmd/adapter/main.go:419)), so
 restarts and multiple adapter replicas converge on one monitor rather than N.
 
 It **sleeps first**, then sweeps. On the first run the adapter has just booted, which
@@ -850,7 +1013,7 @@ re-derives its answer from current state. Nothing is queued and nothing is caugh
 
 The activity is one S2S call to
 `POST /api/v1/internal/explorer/freshness/sweep`
-([`SweepModelFreshnessInternal`](../../api-gateway/internal/handlers/saved_query_freshness.go:587)),
+([`SweepModelFreshnessInternal`](../../api-gateway/internal/handlers/saved_query_freshness.go:656)),
 which loads facts, evaluates them, applies the decisions, and returns the counts. The
 evaluator
 ([`evaluateModelFreshness`](../../api-gateway/internal/handlers/saved_query_freshness.go:147))
@@ -880,7 +1043,7 @@ because "stale" alone does not tell an operator what to do:
 | `schedule_auto_paused` | the machine paused it: a dropped connection, a demoted run-as user (§10) |
 | `schedule_paused` | a person paused it and the deadline outlived their intent |
 | `no_upstreams` | an `after_upstream` schedule whose producer set is empty — active, fires never (§10) |
-| `overdue` | the trigger is wired and live; the rebuild is simply not landing |
+| `overdue` | the trigger is wired and live, and no rebuild succeeded within the deadline: the rebuild is failing or not firing, **or the deadline is shorter than the gap the schedule leaves** ([below](#a-deadline-shorter-than-the-schedules-gap)) |
 
 The order is load-bearing. `autoPauseModelSchedule` writes `status = 'paused'` **and**
 `auto_paused_at` together, so testing the human pause first would file every machine pause
@@ -890,6 +1053,50 @@ Resolutions are equally separated. `rebuilt` means the reference point moved for
 `deadline_widened` means it did not and the deadline did — someone moved the goalposts, and
 that is not the same event as a fix; `no_longer_tracked` means the deadline was cleared or
 the model stopped being a table, and the promise was withdrawn rather than met.
+
+### A deadline shorter than the schedule's gap
+
+`overdue` also covers a model that is healthy: every run succeeds, and the deadline is
+shorter than the time its schedule leaves between two rebuilds. Prod's Loan portfolio says
+*Overdue after 6h* and rebuilds once a day, after the Nightly at 02:00Z, so it opens a breach
+at 08:00 and closes it at the next 02:00, every day. The sweep is right — the promise is
+broken — but nothing told the person who made it that the schedule cannot keep it.
+
+`GET …/freshness` answers that gap beside the deadline
+([`GetSavedQueryFreshness`](../../api-gateway/internal/handlers/saved_query_freshness.go:411)),
+and the model page says so in both places a deadline shows: the *Freshness* row, and the
+dialog that sets it, which also offers a deadline that fits — the gap plus a tenth. It only
+warns. Saving a short deadline is allowed, the sweep, its breaches and the badges are
+unchanged, and no deadline is ever moved for anyone.
+
+The gap is worked out from every **clock** that can start the model
+([`modelRebuildInterval`](../../api-gateway/internal/handlers/model_rebuild_interval.go)): its
+own cron or interval; for an `after_upstream` schedule, the clocks of each upstream model and
+pipeline, at any depth; and every active workflow with a schedule trigger that refreshes the
+model or runs a pipeline above it, and those `after_pipeline` workflows' pipelines in turn. The
+ticks of all of them, over the next 800 days, are merged and the longest gap between two
+ticks is the answer.
+
+That answer is a **floor**, which is the direction a warning can afford to be wrong in. A
+rebuild can only start at some clock's tick, so the real longest gap is at least the
+longest gap between ticks. An `'all'` fan-in waits for more than one tick, and a condition
+step or a skipped run drops one; each only makes the real gap longer. An extra clock can only
+shorten the answer, so the walk can over-include safely; a missing one would make the warning
+false, so a source the walk cannot see makes the answer **unknown** (`null`) instead:
+
+| Unknown because | |
+|---|---|
+| a CDC pipeline above the model | rows land when the source writes |
+| a ring, or a model missing from the workspace | no answer is sound |
+| a cron the scheduler cannot read | |
+| more than 200 nodes or 32 distinct clocks | the walk is bounded per request |
+| nothing scheduled, or fewer than two ticks in 800 days | no gap to measure (`0 0 29 2 *` has one) |
+
+A manual workflow, a paused schedule and a draft or paused workflow contribute no clock —
+they cannot start a rebuild on their own. A cron in a zone with daylight saving keeps
+Temporal's rule: a `02:00` daily in `America/New_York` does not fire on the day that has no
+02:00, so its gap is 47 hours, not 24. The row's interval is read again when the model's own
+schedule changes; a change to an upstream's schedule shows on the next page load.
 
 ### Two writers would be one writer too many
 
@@ -919,8 +1126,9 @@ configuration problems, and rebuilding on a breach would paper over them: the au
 schedule would keep rebuilding under the credentials that made the machine pause it, and the
 `after_upstream` schedule with an empty producer set would look like it was working. The
 fifth, `overdue`, is a rebuild that is already failing — running it again on a timer is the
-retry loop the run history already has. Reporting a breach leaves the decision where the
-information is.
+retry loop the run history already has — or a deadline tighter than the schedule, which an
+extra rebuild would hide rather than fix ([above](#a-deadline-shorter-than-the-schedules-gap)).
+Reporting a breach leaves the decision where the information is.
 
 ---
 
@@ -944,7 +1152,7 @@ The obvious mechanism is a Temporal **search attribute**: upsert `ModelPhase` an
 and the way it fails is worth recording, because it fails green.
 
 This deployment runs Temporal with `DB=postgresql`
-([docker-compose.yml:346](../../docker-compose.yml:346),
+([docker-compose.yml:346](../../docker-compose.yml:347),
 [docker-compose.prod.yml:177](../../docker-compose.prod.yml:177),
 [docker-compose.quickstart.yml:546](../../docker-compose.quickstart.yml:546),
 [helm infra/temporal.yaml:90](../../deploy/helm/rsync-ai/templates/infra/temporal.yaml:90)), which selects
@@ -981,7 +1189,7 @@ before any blocking call, or a query arriving during the first `Await` finds no 
 
 | Query | Workflow | Answers |
 |---|---|---|
-| `model_refresh_state` | [`ModelRefreshWorkflow`:147](../../backend-temporal-adapter/internal/workflows/model_refresh_workflow.go:147) | phase, the completion being rebuilt now, how many are queued behind it, refreshes used against this run's budget |
+| `model_refresh_state` | [`ModelRefreshWorkflow`:147](../../backend-temporal-adapter/internal/workflows/model_refresh_workflow.go:115) | phase, the completion being rebuilt now, how many are queued behind it, refreshes used against this run's budget |
 | `freshness_sweep_state` | [`ModelFreshnessWorkflow`:112](../../backend-temporal-adapter/internal/workflows/model_freshness_workflow.go:112) | effective interval, ticks used, whether the last sweep succeeded and what it found |
 | `fanout_state` | [`UpstreamFanOutWorkflow`:144](../../backend-temporal-adapter/internal/workflows/upstream_fanout_workflow.go:144) | the completion being fanned out, how many children are dispatched of how many targets |
 
@@ -996,7 +1204,7 @@ implying a lifetime total the workflow does not have.
 
 ### The route, and why it takes no id
 
-`GET /api/v1/explorer/running` ([main.go:1194](../../api-gateway/cmd/server/main.go:1194))
+`GET /api/v1/explorer/running` ([main.go:1543](../../api-gateway/cmd/server/main.go:1543))
 is workspace-scoped, viewer-gated and read-only. It takes **no path parameter**, and that
 is the security property rather than an omission.
 
@@ -1060,9 +1268,11 @@ instead of starting another, and a timer tick that meets a Refresh's ask waits o
 timing the next ask from when it lands. A tab shown again while a Refresh's ask is out
 still resumes polling after it.
 
-### On the schedules page
+<a id="on-the-schedules-page"></a>
+### On the Models page
 
-`/explorer/schedules` has a **Now** column. It is read-only; nothing on it starts, stops or
+`/models` (Scheduled Queries at `/explorer/schedules` until the rename; the old links
+redirect) has a **Now** column. It is read-only; nothing on it starts, stops or
 signals a workflow.
 
 | The server said | The row reads |
@@ -1114,7 +1324,7 @@ from before the tab was hidden, and Refresh meeting the timer) and
 
 ### The per-model page
 
-Each name on `/explorer/schedules` links to `/explorer/schedules/<saved_query_id>`. The
+Each name on `/models` links to `/models/<saved_query_id>`. The
 row's inline history stays; it shows the last 50 runs and nothing older. The page is
 for one model at a time and reaches all of its runs.
 
@@ -1146,7 +1356,7 @@ window.
 - Pointing at a bar names the run under the chart (start time, status, duration); each
   bar carries the same sentence as its accessible name.
 - A duration under a second reads in milliseconds, here and in the table's Duration
-  column ([`formatDuration`](../../frontend/src/components/explorer/scheduledModel.tsx:119)).
+  column ([`formatDuration`](../../frontend/src/lib/duration.ts:34)).
   In tenths of a second, runs of 16 ms and 181 ms both read "0s" while their bars stood
   at 9% and 100%.
 
@@ -1163,7 +1373,7 @@ window.
 - A query with no live schedule is not a dead end. Deleting a schedule keeps every run it
   made, so when the schedule lookup returns nothing the page asks for the query itself
   (`GET /explorer/saved/:id`,
-  [page.tsx:299](../../frontend/src/app/%28dashboard%29/explorer/schedules/%5Bid%5D/page.tsx:299)).
+  [page.tsx:299](../../frontend/src/app/%28dashboard%29/models/%5Bid%5D/page.tsx:299)).
   If that answers, the page shows the query's name, a *Not scheduled* notice and the full
   runs table, with filters and paging. Run now, Pause/Resume and Edit schedule are left
   off, and the Details card keeps what the query row itself knows (Last run, Does,
@@ -1188,7 +1398,7 @@ Each upstream model links to its own page.
 **Trigger, Run as and Lineage** in the Details card:
 
 - **Trigger** shows a cron as a sentence with the expression under it in monospace
-  ([`TriggerCadence`](../../frontend/src/app/%28dashboard%29/explorer/schedules/%5Bid%5D/page.tsx:153)).
+  ([`TriggerCadence`](../../frontend/src/app/%28dashboard%29/models/%5Bid%5D/page.tsx:153)).
   A cron with no exact sentence is printed once, as typed ([§4](#cron-and-interval)).
 - **Run as** names the member every run of this schedule is authorized as
   ([`RunAsValue`](../../frontend/src/components/explorer/ModelDetailRows.tsx:34)). It reads
@@ -1198,7 +1408,7 @@ Each upstream model links to its own page.
     ([saved_query_schedules.go:596](../../api-gateway/internal/handlers/saved_query_schedules.go:596)).
     Editing the schedule does not change it.
   - Each run that the schedule or an upstream starts re-reads that member's role
-    ([`authorizeModelRun`](../../api-gateway/internal/handlers/saved_query_models.go:436)).
+    ([`authorizeModelRun`](../../api-gateway/internal/handlers/saved_query_models.go:472)).
     If they have left the workspace, are below admin, or are below what the model's SQL
     needs, the run is refused and the schedule pauses. *Run now* runs as whoever clicks
     it. The row's hover text says both.
@@ -1225,7 +1435,7 @@ Each of these two rows loads on its own. A failure reads in its row, for example
 load who runs this schedule (HTTP 500).*, and leaves the rest of the page alone.
 
 **Does** names the table a table model rebuilds. The name wraps after its dot, never
-inside a word ([`QualifiedName`](../../frontend/src/app/%28dashboard%29/explorer/schedules/%5Bid%5D/page.tsx:124)); the column is narrow, and
+inside a word ([`QualifiedName`](../../frontend/src/app/%28dashboard%29/models/%5Bid%5D/page.tsx:124)); the column is narrow, and
 `public.swipes_total` used to break as `public.swipes_tota` / `l`.
 
 Tests: [explorer-schedule-detail.test.tsx](../../frontend/src/__tests__/explorer-schedule-detail.test.tsx)
@@ -1244,7 +1454,7 @@ grey. It is not a workspace-wide map. A sibling that waits on the same upstream 
 another upstream of a downstream: the downstream says *+1 more upstream not shown* instead.
 
 **Where it comes from.** The tab calls no graph route. It does not use the workspace-wide
-`GET /explorer/asset-graph` ([main.go:1243](../../api-gateway/cmd/server/main.go:1243)) either.
+`GET /explorer/asset-graph` ([main.go:1556](../../api-gateway/cmd/server/main.go:1556)) either.
 The chain is built in the browser from `GET /explorer/schedules`, the same visibility-checked
 list the schedules page reads
 ([`buildModelLineage`](../../frontend/src/components/explorer/modelLineage.ts:122)). It walks up
@@ -1433,7 +1643,7 @@ and says a pipeline has no SQL of its own here.
 
 **Which SQL a run executed.** A run row stores no copy of the SQL. The run reads the
 model's SQL just before it executes (`runSavedQueryModel`,
-[saved_query_models.go:821](../../api-gateway/internal/handlers/saved_query_models.go:821)).
+[saved_query_models.go:942](../../api-gateway/internal/handlers/saved_query_models.go:942)).
 So the panel asks `GET /explorer/saved/:id/versions` once
 ([saved_queries.go:922](../../api-gateway/internal/handlers/saved_queries.go:922)). That route
 checks access again and returns the text as it was before each edit, newest first, at most
@@ -1523,7 +1733,7 @@ Recording these so they are not re-litigated as oversights:
   and the deadline itself is §12).
 - **Rebuilding a model because it went stale** — the sweep reports, it never triggers (§12).
 - **Second-person approval** — a workspace-policy question, not a hard-coded rule (§5).
-- **Document (MongoDB) browsing** — shipped as the Explorer's document browse mode ([document-browse-mode-plan.md](document-browse-mode-plan.md)); saving a document query is still a follow-up there.
+- **Document (MongoDB) browsing** — shipped as the Explorer's document browse mode ([document-browse-mode-plan.md](document-browse-mode-plan.md)); pipelines, saved pipelines and MongoDB models followed ([§8](#mongodb-models)).
 
 Open Data Explorer items — `DX-LimitDowngrade`, `DX-SqlGenResilience`,
 `DX-CornerCaseCoverage` — are tracked separately and are **not** part of

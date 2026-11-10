@@ -43,7 +43,7 @@ func TestApplyTransformsToData_LoadsProducerTransformsFromDB(t *testing.T) {
 		{"email": "alice@example.com", "name": "Alice"},
 	}
 
-	out, err := applyTransformsToData(context.Background(), db, execID, in, task, tableName)
+	out, err := applyTransformsToData(context.Background(), db, execID, in, task, tableName, nil)
 	if err != nil {
 		t.Fatalf("applyTransformsToData error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestApplyTransformsToData_DBErrorFailsClosed(t *testing.T) {
 	task := ExecutorTask{PipelineID: pipelineID}
 	in := []map[string]interface{}{{"email": "a@b.com"}}
 
-	_, err = applyTransformsToData(context.Background(), db, execID, in, task, "public.users")
+	_, err = applyTransformsToData(context.Background(), db, execID, in, task, "public.users", nil)
 	if err == nil {
 		t.Fatalf("expected fail-closed error on DB load failure, got nil")
 	}
@@ -96,7 +96,7 @@ func TestApplyTransformsToData_NonUUIDSkipsDBFallback(t *testing.T) {
 	task := ExecutorTask{PipelineID: "adhoc-test-pipeline"}
 	in := []map[string]interface{}{{"email": "a@b.com"}}
 
-	out, err := applyTransformsToData(context.Background(), db, "exec-1", in, task, "public.users")
+	out, err := applyTransformsToData(context.Background(), db, "exec-1", in, task, "public.users", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

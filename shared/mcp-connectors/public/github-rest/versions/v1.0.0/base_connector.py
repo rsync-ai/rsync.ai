@@ -221,6 +221,10 @@ class ExportResult:
     # caller can tell "complete" apart from "more rows exist, fetch again from
     # next_cursor". A complete fetch leaves this False. Prevents silent tail-drop.
     has_more: bool = False
+    # What may have left rows unread without failing the read (paging the spec
+    # does not document, a "more rows" flag with no cursor). The executor shows
+    # each one on the run.
+    warnings: List[str] = field(default_factory=list)
     # Blob (raw-bytes) passthrough envelopes — parallel to `records`, used only by the
     # blob move modality (universal-blob-passthrough plan §2). Each entry is a
     # {object_key, content_type, size, data_ref, sha256, source_file_modified} pointer
@@ -236,6 +240,7 @@ class ExportResult:
             "next_cursor": self.next_cursor,
             "stats": self.stats,
             "has_more": self.has_more,
+            "warnings": self.warnings,
             "blobs": self.blobs,
         }
 
@@ -472,40 +477,6 @@ def clear_trace_id() -> None:
     _trace_local.trace_id = 'no-trace-id'
 
 
-class TraceContextFilter(logging.Filter):
-    """
-    Logging filter that automatically adds trace_id to all log records.
-    Applied globally to ensure all logs include trace context.
-    """
-    def filter(self, record):
-        record.trace_id = get_trace_id()
-        return True
-
-
-def setup_traced_logging(logger_instance: logging.Logger, connector_name: str) -> None:
-    """
-    Configure a logger to include trace_id in all log messages.
-    Call this in __init__ of your connector if you want custom logging.
-    
-    Args:
-        logger_instance: The logger to configure
-        connector_name: Name of the connector for log prefix
-    """
-    # Add trace context filter
-    logger_instance.addFilter(TraceContextFilter())
-    logger_instance.addFilter(SensitiveDataScrubbingFilter())
-    
-    # Update formatter to include trace_id
-    log_format = f'%(asctime)s [{connector_name}] [trace_id=%(trace_id)s] %(message)s'
-    for handler in logger_instance.handlers:
-        handler.setFormatter(logging.Formatter(log_format))
-    
-    # If using root logger handlers
-    if not logger_instance.handlers:
-        logging.basicConfig(format=log_format, level=logging.INFO)
-
-
-# Setup default logger with trace support
 # >>> RSYNC_LOG_SCRUBBER_BEGIN — canonical source. Propagated to every versioned
 # base_connector.py copy by scripts/mcp-connectors/sync_log_scrubber.py. Keep the
 # regex set in lockstep with llm-service masking.py (scrub_error_for_llm) and
@@ -533,6 +504,68 @@ import re  # noqa: E402
 
 _SCRUB_REDACTED = "[redacted]"
 
+# Inside a URL: a long base64-ish blob, a 40+ path blob with no `/`, a 20+ run
+# of letters AND digits, and a credential-named query or fragment parameter.
+# A URL read as one blob became `…HubSpot-public-api-spec-[redacted].json`
+# while a key in a short query value went through. Mirror of masking._scrub_url.
+_SCRUB_B64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+_SCRUB_URL_PATH_BLOB = re.compile(r"[A-Za-z0-9+]{40,}={0,2}")
+_SCRUB_URL_TOKEN = re.compile(r"[A-Za-z0-9_\-]{20,}")
+_SCRUB_URL_QUERY_CRED = re.compile(
+    r"(?i)([?&;#][A-Za-z0-9_.\-]*(?:key|sig|signature|secret|token|password|passwd|pwd|auth|credential|code)=)[^&#\s'\"<>]*"
+)
+_SCRUB_URL_PATH_START = re.compile(r"[/?#]")
+_SCRUB_URL_QUERY_START = re.compile(r"[?#]")
+
+
+def _scrub_mixed_token(m):
+    t = m.group(0)
+    if any(c.isdigit() for c in t) and any(c.isalpha() for c in t):
+        return _SCRUB_REDACTED
+    return t
+
+
+def _scrub_url(url):
+    start = url.find("://") + 3
+    m = _SCRUB_URL_PATH_START.search(url, start)
+    end = m.start() if m else len(url)
+    head, path, query = url[:end], url[end:], ""
+    m = _SCRUB_URL_QUERY_START.search(path)
+    if m:
+        path, query = path[: m.start()], path[m.start():]
+    head = _SCRUB_B64.sub(_SCRUB_REDACTED, head)
+    path = _SCRUB_URL_TOKEN.sub(_scrub_mixed_token, _SCRUB_URL_PATH_BLOB.sub(_SCRUB_REDACTED, path))
+    query = _SCRUB_URL_QUERY_CRED.sub(rf"\1{_SCRUB_REDACTED}", query)
+    query = _SCRUB_URL_TOKEN.sub(_scrub_mixed_token, _SCRUB_B64.sub(_SCRUB_REDACTED, query))
+    return head + path + query
+
+
+class _ScrubRunStartRule:
+    """A rule that opens with a run of one character class, matched in linear
+    time with the output re.sub gives (mirror of masking._RunStartRule). From
+    every start inside a long run, Python's engine reads the rest of the run
+    again before it fails. The leftmost match only starts inside a run where
+    the previous match ended, so that position is tried as it is and every
+    other start must not follow a character of the run."""
+
+    def __init__(self, body, run_class):
+        self.pattern = body
+        self._at = re.compile(body)
+        self._after_run = re.compile(r"(?<!" + run_class + r")(?:" + body + r")")
+
+    def sub(self, repl, string):
+        out, pos = [], 0
+        while True:
+            m = (self._at.match(string, pos) if pos else None) or self._after_run.search(string, pos)
+            if m is None:
+                break
+            out.append(string[pos : m.start()])
+            out.append(m.expand(repl))
+            pos = m.end()
+        out.append(string[pos:])
+        return "".join(out)
+
+
 _SCRUB_PATTERNS = [
     # Postgres not-null/check DETAIL dumps the ENTIRE row — greedy to end of
     # string so a truncated dump can't leak a partial row.
@@ -541,8 +574,11 @@ _SCRUB_PATTERNS = [
     (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
     # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
     (re.compile(r"(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
-    # Credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(\w+://)[^/\s:@]+:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
+    # Credentials embedded in URLs: scheme://user:pass@host. The user name may
+    # be empty (redis://:pass@host); requiring one left that password in clear.
+    # `(?<!\w)`: without it Python's engine re-read a long word run from each of
+    # its starts (quadratic). The leftmost match starts there anyway.
+    (re.compile(r"(?<!\w)(\w+://)[^/\s:@]*:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
     # HTTP credential headers — must run before the KV rule.
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), f"Bearer {_SCRUB_REDACTED}"),
     # key=value / key: value pairs with credential-bearing key names.
@@ -567,11 +603,13 @@ _SCRUB_PATTERNS = [
     # Bare "key" is deliberately NOT a suffix — it would eat the Postgres
     # "Key (email)=" detail and schema metadata like partition_key. Character
     # classes are spelled out rather than \w because Python's \w is
-    # Unicode-aware and Go's is not.
+    # Unicode-aware and Go's is not. The key starts where its run of key
+    # characters does (a lookbehind, not Go's `\b`): from a `\b` inside a long
+    # run, Python's engine re-read the run from each start (quadratic).
     # MUST stay lockstep with masking.py + Go llmscrub + the sink's scrubLog.
     (
         re.compile(
-            r"\b([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
+            r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
             re.IGNORECASE,
         ),
         rf"\1={_SCRUB_REDACTED}",
@@ -589,10 +627,11 @@ _SCRUB_PATTERNS = [
     # "the user's") from being read as an opening quote — that misread consumed the
     # prose as the literal and left the real value in the clear. One rule, not two
     # passes: a separate `'…$` pass re-read this rule's own `'[redacted]'` output.
+    # `\\?\Z` takes a literal cut right after a backslash ('john\\) too.
     # MUST stay lockstep with masking.py + Go llmscrub.
-    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
+    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\\?\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
     # Email addresses appearing outside quotes.
-    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[email-redacted]"),
+    (_ScrubRunStartRule(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", r"[A-Za-z0-9._%+\-]"), "[email-redacted]"),
     # IPv4 addresses — client/host IPs are personal data under GDPR and aren't
     # needed for diagnosis. Octets validated 0-255 so version strings (8.0.32)
     # and ISO dates survive. MUST stay lockstep with masking + Go llmscrub.
@@ -600,8 +639,22 @@ _SCRUB_PATTERNS = [
         re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b"),
         "[ip-redacted]",
     ),
-    # Long base64-ish blobs (tokens, keys). 40+ keeps 32-hex trace ids.
-    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), _SCRUB_REDACTED),
+    # A dotted host name after lookup / dial tcp / host name "…" / server at "…".
+    # A dotted name elsewhere is kept: schema.table has the same shape.
+    # MUST stay lockstep with masking.py HOST_IN_ERROR_TEXT + Go llmscrub.
+    (
+        re.compile(
+            r'(?i)(\blookup\s+|\bdial\s+(?:tcp|udp)[46]?\s+|\bhost(?:\s+name)?\s+"|\bserver\s+at\s+")'
+            r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+"
+        ),
+        r"\1[host-redacted]",
+    ),
+    # URLs (readable, secrets inside taken), else long base64-ish blobs.
+    # MUST stay lockstep with masking.py + Go llmscrub (reURLOrBase64).
+    (
+        re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s'\"<>]+)|\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+        lambda m: _scrub_url(m.group(1)) if m.group(1) is not None else _SCRUB_REDACTED,
+    ),
     # Dashed SSN / US-phone shapes (ISO dates don't match — timestamps survive).
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[num-redacted]"),
     (re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b"), "[num-redacted]"),
@@ -684,9 +737,44 @@ _install_root_log_scrubber()
 # >>> RSYNC_LOG_SCRUBBER_END
 
 
+class TraceContextFilter(logging.Filter):
+    """
+    Logging filter that automatically adds trace_id to all log records.
+    Applied globally to ensure all logs include trace context.
+    """
+    def filter(self, record):
+        record.trace_id = get_trace_id()
+        return True
+
+
+def setup_traced_logging(logger_instance: logging.Logger, connector_name: str) -> None:
+    """
+    Configure a logger to include trace_id in all log messages.
+    Call this in __init__ of your connector if you want custom logging.
+    
+    Args:
+        logger_instance: The logger to configure
+        connector_name: Name of the connector for log prefix
+    """
+    # Add trace context filter + sensitive-data scrubber (redacts row values /
+    # credentials / PII from this connector's logs before they reach the log backend).
+    logger_instance.addFilter(TraceContextFilter())
+    logger_instance.addFilter(SensitiveDataScrubbingFilter())
+
+    # Update formatter to include trace_id
+    log_format = f'%(asctime)s [{connector_name}] [trace_id=%(trace_id)s] %(message)s'
+    for handler in logger_instance.handlers:
+        handler.setFormatter(logging.Formatter(log_format))
+    
+    # If using root logger handlers
+    if not logger_instance.handlers:
+        logging.basicConfig(format=log_format, level=logging.INFO)
+
+
+# Setup default logger with trace support
 logger = logging.getLogger(__name__)
-logger.addFilter(SensitiveDataScrubbingFilter())
 logger.addFilter(TraceContextFilter())
+logger.addFilter(SensitiveDataScrubbingFilter())
 for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [MCP-Base] [trace_id=%(trace_id)s] %(message)s'))
 
@@ -873,13 +961,6 @@ def detect_incremental_candidates(schema: Dict[str, Any]) -> List[Dict[str, Any]
     return candidates
 
 
-# Load optimization templates
-TEMPLATES_PATH = os.path.join(os.path.dirname(__file__), 'optimization_templates.json')
-OPTIMIZATION_TEMPLATES = {}
-if os.path.exists(TEMPLATES_PATH):
-    with open(TEMPLATES_PATH, 'r') as f:
-        OPTIMIZATION_TEMPLATES = json.load(f)
-
 # =============================================================================
 # CONNECTOR CATEGORY DEFINITIONS (Extensible - no hardcoded connector lists!)
 # =============================================================================
@@ -966,6 +1047,76 @@ STANDARD_OPERATION_DESCRIPTIONS = {
 }
 
 
+class _HeldOAuthToken:
+    """The OAuth token a connection config hands a connector -- held, never stored.
+
+    The gateway (connections.go enrichConfigWithOAuthToken) and the
+    orchestrator (connections/manager.go) read the token from the oauth_tokens
+    table and inject it into the connection config; the orchestrator refreshes
+    it on a 401 and re-issues the call (executor.go executeWithOAuthRetry). A
+    connector needs only the access token and when it
+    stops being worth sending, so that is all this holds. There is deliberately
+    no refresh here: no connector image carries a store to persist a refreshed
+    token, and a connector that refreshed would race the gateway's copy
+    (KI-OAUTH-TOKEN-STORE-UNREACHABLE-BY-ITS-ONLY-USERS).
+    """
+
+    def __init__(self, access_token: str, expires_at: Optional[float] = None,
+                 token_type: str = "Bearer", provider: Optional[str] = None):
+        self.access_token = access_token
+        self.expires_at = expires_at  # unix seconds; None = no known expiry
+        self.token_type = token_type
+        self.provider = provider
+
+    @staticmethod
+    def _parse_expiry(value: Any) -> Optional[float]:
+        """Unix seconds from epoch seconds or an RFC3339 string; None if unreadable.
+
+        The gateway writes expires_at as RFC3339; a provider token response
+        carries epoch seconds. An expiry nobody can read is treated as no
+        expiry: the token is sent, and the server's 401 -- which the
+        orchestrator answers with a refresh -- is the authority on it.
+        """
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        from datetime import datetime as _datetime, timezone as _timezone
+        try:
+            parsed = _datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_timezone.utc)
+        return parsed.timestamp()
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "_HeldOAuthToken":
+        expires_at = cls._parse_expiry(data.get("expires_at"))
+        if expires_at is None and data.get("expires_in") is not None:
+            try:
+                expires_at = float(data.get("created_at") or time.time()) + float(data["expires_in"])
+            except (TypeError, ValueError):
+                expires_at = None
+        return cls(
+            access_token=data["access_token"],
+            expires_at=expires_at,
+            token_type=data.get("token_type") or "Bearer",
+            provider=data.get("provider"),
+        )
+
+    def is_expired(self, buffer_seconds: int = 60) -> bool:
+        """True once the token is within `buffer_seconds` of its expiry."""
+        if self.expires_at is None:
+            return False
+        return time.time() >= self.expires_at - buffer_seconds
+
+
 class BaseMCPConnector(ABC):
     """
     Abstract base class for all MCP connectors.
@@ -986,11 +1137,15 @@ class BaseMCPConnector(ABC):
     - Included in all log messages automatically
     
     OAUTH SUPPORT:
-    - Set self.auth_type = "oauth" to enable OAuth
-    - Set self.oauth_provider = "hubspot" (or other provider name)
+    - The gateway / orchestrator inject a decrypted access_token into the
+      connection config; configure_from_connection() hands it to
+      set_oauth_token(), and auth_type becomes "oauth"
+    - A connector HOLDS that token -- it never stores or refreshes one. A 401
+      goes back to the caller; the orchestrator refreshes the token and
+      re-issues the call (executor.go executeWithOAuthRetry)
     - Use self._get_access_token() to get the current token
     - Use self._get_auth_headers() to get auth headers for API requests
-    - Falls back to API key if OAuth token not available
+    - Falls back to API key if no unexpired token is held
     """
     
     def __init__(self):
@@ -1000,7 +1155,6 @@ class BaseMCPConnector(ABC):
         self.supported_operations = []  # Override with actual supported operations
         self.supports_source = True  # Can be used as a source
         self.supports_destination = False  # Can be used as a destination (override if true)
-        self.optimization_category = None  # Auto-detected or manually set
         self._performance_target_ms = 2000  # Target: < 2 seconds
         
         # Capability Stats (standardized for Smart Planner)
@@ -1022,7 +1176,6 @@ class BaseMCPConnector(ABC):
         self.oauth_provider = None  # Override: "hubspot", "salesforce", etc.
         self.connection_id = None  # Set at runtime from config/env
         self._oauth_token = None  # Cached OAuth token
-        self._token_manager = None  # Lazy-loaded TokenManager instance
         
         # API key fallback (used if OAuth not available)
         self.api_key = os.getenv('MCP_API_KEY', '')
@@ -1050,77 +1203,33 @@ class BaseMCPConnector(ABC):
     # OAUTH HELPER METHODS (Generic for all connectors)
     # =========================================================================
     
-    def _get_token_manager(self):
-        """
-        Lazy-load the TokenManager instance.
-        Only loaded when OAuth is actually used.
-        """
-        if self._token_manager is None:
-            try:
-                from oauth.token_manager import TokenManager
-                self._token_manager = TokenManager()
-                self.log("TokenManager loaded for OAuth support")
-            except ImportError:
-                # oauth module is optional — connectors that manage their own auth
-                # (e.g. Google Sheets, Shopify) handle tokens via their own helpers
-                # and never call _get_token_manager() in a hot path.
-                # Log at DEBUG so the noise doesn't pollute production logs.
-                self.log("OAuth module not available - using API key fallback", level="debug")
-                return None
-        return self._token_manager
-    
     def _get_access_token(self) -> Optional[str]:
         """
         Get the current access token for API requests.
-        
+
         Priority:
-        1. OAuth token from TokenManager (if auth_type == "oauth")
-        2. API key from environment variable (fallback)
-        
+        1. The OAuth token the connection config handed in, while unexpired
+           (if auth_type == "oauth") -- see set_oauth_token()
+        2. API key (fallback)
+
         Returns:
             Access token string or None if not available
         """
         # If not using OAuth, return API key
         if self.auth_type != "oauth":
             return self.api_key or None
-        
-        # Try to get OAuth token
-        if self.connection_id:
-            manager = self._get_token_manager()
-            if manager:
-                token = manager.get_valid_token(
-                    self.connection_id,
-                    refresh_callback=self._create_refresh_callback()
-                )
-                if token:
-                    self._oauth_token = token
-                    return token.access_token
-        
-        # Check for cached token
+
+        # The held token, while it is current
         if self._oauth_token and not self._oauth_token.is_expired():
             return self._oauth_token.access_token
-        
+
         # Fallback to API key
         if self.api_key:
             self.log("OAuth token not available, falling back to API key", level="warning")
             return self.api_key
-        
+
         return None
-    
-    def _create_refresh_callback(self):
-        """
-        Create a refresh callback for the TokenManager.
-        Uses the oauth_registry to get provider-specific refresh logic.
-        """
-        if not self.oauth_provider:
-            return None
-        
-        try:
-            from oauth.token_manager import create_refresh_callback
-            return create_refresh_callback(self.oauth_provider)
-        except ImportError:
-            return None
-    
+
     def _get_auth_headers(self) -> Dict[str, str]:
         """
         Get authentication headers for API requests.
@@ -1186,7 +1295,8 @@ class BaseMCPConnector(ABC):
         Behaviors:
         - Rate limiting: default 10 req/s (configurable by env)
         - 429: respects Retry-After and retries boundedly
-        - OAuth: on 401, attempts refresh via TokenManager refresh callback and retries once
+        - OAuth: a 401 is returned to the caller. The connector holds tokens and never
+          refreshes them; the orchestrator refreshes and re-issues the call
         """
         import requests
 
@@ -1239,7 +1349,8 @@ class BaseMCPConnector(ABC):
 
         attempt = 0
         max_attempts = (getattr(self, "_rate_limiter", None).max_retries if getattr(self, "_rate_limiter", None) else 3) + 1
-        refreshed = False
+        # A read is safe to send again; a write is not (it may have landed).
+        retry_transient = str(method or "").upper() in ("GET", "HEAD")
 
         while attempt < max_attempts:
             attempt += 1
@@ -1316,23 +1427,16 @@ class BaseMCPConnector(ABC):
                         time.sleep(min(float(wait_time), 60.0))
                         continue
 
-                # 401 handling (OAuth refresh retry once)
-                if resp.status_code == 401 and self.auth_type == "oauth" and not refreshed and self.connection_id:
-                    manager = self._get_token_manager()
-                    refresh_cb = self._create_refresh_callback()
-                    if manager and refresh_cb:
-                        try:
-                            old_token = manager.get_token(self.connection_id)
-                            if old_token and getattr(old_token, "refresh_token", None):
-                                self.log("401 received; forcing OAuth refresh + retry", level="warning")
-                                new_token = refresh_cb(old_token)
-                                manager.store_token(self.connection_id, new_token)
-                                self._oauth_token = new_token
-                                req_headers["Authorization"] = f"Bearer {new_token.access_token}"
-                                refreshed = True
-                                continue
-                        except Exception as e:
-                            self.log(f"OAuth refresh failed: {_scrub_url_secrets(e)}", level="warning")
+                # A 5xx on a read is usually a blip (gateway, deploy): wait and
+                # send it again, honouring Retry-After if the server sent one.
+                if retry_transient and resp.status_code in (500, 502, 503, 504) and attempt < max_attempts:
+                    wait_time = (
+                        (self._rate_limiter.handle_429_response(dict(resp.headers)) if getattr(self, "_rate_limiter", None) else None)
+                        or (2 ** (attempt - 1))
+                    )
+                    self.log(f"HTTP {resp.status_code} on {method}; retry {attempt}/{max_attempts - 1}", level="warning")
+                    time.sleep(min(float(wait_time), 60.0))
+                    continue
 
                 data: Any = None
                 try:
@@ -1346,7 +1450,14 @@ class BaseMCPConnector(ABC):
 
                 success = 200 <= resp.status_code < 300
                 return success, int(resp.status_code), data, dict(resp.headers)
-            except requests.exceptions.Timeout:
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if retry_transient and attempt < max_attempts:
+                    self.log(f"HTTP {type(e).__name__} on {method}; retry {attempt}/{max_attempts - 1}", level="warning")
+                    time.sleep(min(float(2 ** (attempt - 1)), 60.0))
+                    continue
+                if isinstance(e, requests.exceptions.Timeout):
+                    return False, 0, None, {}
+                self.log(f"HTTP request error: {_scrub_url_secrets(e)}", level="error")
                 return False, 0, None, {}
             except Exception as e:
                 # requests exception text embeds the full URL incl. query-string
@@ -1384,20 +1495,20 @@ class BaseMCPConnector(ABC):
     
     def set_oauth_token(self, token_data: Dict[str, Any]) -> None:
         """
-        Set OAuth token directly (e.g., from connection config).
-        
+        Hold the OAuth token a connection config hands in (never stored).
+
         Args:
-            token_data: Token dictionary with access_token, refresh_token, expires_at, etc.
+            token_data: dict with access_token and, optionally, expires_at
+                (epoch seconds or RFC3339) or expires_in.
         """
-        try:
-            from oauth.token_manager import OAuthToken
-            self._oauth_token = OAuthToken.from_dict(token_data)
-            self._oauth_token.provider = self.oauth_provider
-            self.auth_type = "oauth"
-            self.log(f"OAuth token set for {self.oauth_provider}")
-        except ImportError:
-            self.log("OAuth module not available", level="error")
-    
+        if not isinstance(token_data, dict) or not token_data.get("access_token"):
+            self.log("OAuth token data carries no access_token; not set", level="warning")
+            return
+        self._oauth_token = _HeldOAuthToken.from_dict(token_data)
+        self._oauth_token.provider = self.oauth_provider
+        self.auth_type = "oauth"
+        self.log(f"OAuth token set for {self.oauth_provider}")
+
     # Per-connection auth/endpoint state. configure_from_connection() overwrites
     # these, but only conditionally, so they must be reset between connections.
     _CONNECTION_STATE_FIELDS = ('api_key', 'auth_type', 'base_url', '_oauth_token')
@@ -1462,21 +1573,11 @@ class BaseMCPConnector(ABC):
         self.log(f"Configured from connection: {self.connection_id}, auth_type: {self.auth_type}")
     
     def is_oauth_configured(self) -> bool:
-        """Check if OAuth is properly configured."""
+        """Check if OAuth is properly configured: a held, unexpired token."""
         if self.auth_type != "oauth":
             return False
-        
-        if self._oauth_token and not self._oauth_token.is_expired():
-            return True
-        
-        if self.connection_id:
-            manager = self._get_token_manager()
-            if manager:
-                token = manager.get_token(self.connection_id)
-                return token is not None and not token.is_expired()
-        
-        return False
-    
+        return bool(self._oauth_token) and not self._oauth_token.is_expired()
+
     def log(self, message: str, level: str = "info") -> None:
         """
         Log a message with automatic trace_id inclusion.
@@ -1503,7 +1604,7 @@ class BaseMCPConnector(ABC):
         return get_trace_id()
     
     # ============================================================================
-    # OPTIMIZATION HELPERS (Generic for all connectors)
+    # PERFORMANCE HELPERS (Generic for all connectors)
     # ============================================================================
     
     def _measure_performance(self, operation_name: str):
@@ -1526,7 +1627,7 @@ class BaseMCPConnector(ABC):
                 if duration_ms > self.connector._performance_target_ms:
                     logger.warning(
                         f"⚠️ {self.op_name} is SLOW ({duration_ms:.2f}ms > target {self.connector._performance_target_ms}ms). "
-                        f"Consider optimization! Check {self.connector.connector_type} in optimization_templates.json"
+                        "Narrow the request (see _apply_limits) or raise _performance_target_ms."
                     )
         
         return PerformanceMeasurer(self, operation_name)
@@ -1537,11 +1638,6 @@ class BaseMCPConnector(ABC):
         Generic for all connector types.
         """
         defaults = defaults or {}
-        
-        # Get category-specific defaults from templates
-        if self.optimization_category and self.optimization_category in OPTIMIZATION_TEMPLATES:
-            template_params = OPTIMIZATION_TEMPLATES[self.optimization_category].get('parameters', {})
-            defaults.update(template_params)
         
         # Apply defaults
         limits = {
@@ -1554,30 +1650,6 @@ class BaseMCPConnector(ABC):
         }
         
         return limits
-    
-    def _get_optimization_tips(self) -> List[str]:
-        """Get optimization tips for this connector category"""
-        if not self.optimization_category:
-            return ["Set self.optimization_category in __init__ for category-specific tips"]
-        
-        if self.optimization_category not in OPTIMIZATION_TEMPLATES:
-            return [f"No optimization template found for category: {self.optimization_category}"]
-        
-        template = OPTIMIZATION_TEMPLATES[self.optimization_category]
-        return template.get('principles', [])
-    
-    def _check_anti_patterns(self, code_snippet: str = None) -> List[str]:
-        """
-        Check for common anti-patterns that slow down schema discovery.
-        Can be used during development/testing.
-        """
-        if not self.optimization_category or self.optimization_category not in OPTIMIZATION_TEMPLATES:
-            return []
-        
-        template = OPTIMIZATION_TEMPLATES[self.optimization_category]
-        anti_patterns = template.get('anti_patterns', [])
-        
-        return [f"⚠️ Avoid: {pattern}" for pattern in anti_patterns]
     
     @abstractmethod
     def test_connection(self, params: Dict = None) -> Dict[str, Any]:
@@ -1768,7 +1840,6 @@ class BaseMCPConnector(ABC):
             "default_destination_operation": category_info.get("default_dest_op", "import"),
             "terminology": category_info.get("terminology", {}),
             "operations": operations,
-            "optimization_category": self.optimization_category,
             "performance_target_ms": self._performance_target_ms,
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -3402,28 +3473,50 @@ class RateLimitHandler:
         
         self.last_request_time = time.time()
     
+    # Rate-limit reset headers, after Retry-After. ClickUp, GitHub and Shopify
+    # send an epoch time (seconds, some in ms); the IETF draft sends a delta.
+    _RESET_HEADERS = ("x-ratelimit-reset", "ratelimit-reset", "x-rate-limit-reset")
+
     def handle_429_response(self, headers: Dict[str, str]) -> Optional[float]:
         """
-        Parse Retry-After header and return wait time in seconds.
-        
+        Read how long a 429 asks us to wait, in seconds.
+
+        ``Retry-After`` (seconds or an HTTP date) first, then a rate-limit
+        reset header: a value past 1e9 is an epoch time (past 1e12, in ms),
+        anything smaller is a delta. Header names match in any case.
+
         Returns:
-            Wait time in seconds, or None if no Retry-After header
+            Wait time in seconds, or None if no header says
         """
-        retry_after = headers.get("Retry-After") or headers.get("retry-after")
-        if not retry_after:
-            return None
-        
-        try:
-            # Try as integer (seconds)
-            return float(retry_after)
-        except ValueError:
-            # Try as HTTP date
+        lower = {str(k).lower(): v for k, v in (headers or {}).items()}
+        retry_after = lower.get("retry-after")
+        if retry_after:
             try:
-                from email.utils import parsedate_to_datetime
-                retry_time = parsedate_to_datetime(retry_after)
-                return max(0, (retry_time - datetime.now()).total_seconds())
-            except Exception:
-                return None
+                return max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    retry_time = parsedate_to_datetime(retry_after)
+                    # timestamp(), not now() subtraction: the parsed date is
+                    # tz-aware and datetime.now() is naive (TypeError).
+                    return max(0.0, retry_time.timestamp() - time.time())
+                except Exception:
+                    pass
+        for name in self._RESET_HEADERS:
+            raw = lower.get(name)
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 1e12:
+                value = value / 1000.0
+            if value > 1e9:
+                # Epoch seconds, truncated to a whole second: wait one more.
+                return max(0.0, value - time.time() + 1.0)
+            return max(0.0, value)
+        return None
 
 
 class OAuthHandler:
@@ -3682,23 +3775,83 @@ RESPONSE_DATA_KEYS = (
     "members", "objects", "value", "list",
 )
 
+_KEY_PATH_MISSING = object()
+
+
+def resolve_key_path(data: Any, path: str) -> Any:
+    """The value at ``path`` in ``data``: the literal key first (a key may hold a
+    dot, like ``@odata.nextLink``), then the dots walked as nested keys
+    (``artists.items``). ``_KEY_PATH_MISSING`` when neither is there."""
+    if not isinstance(data, dict) or not path:
+        return _KEY_PATH_MISSING
+    if path in data:
+        return data[path]
+    if "." not in path:
+        return _KEY_PATH_MISSING
+    cur: Any = data
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _KEY_PATH_MISSING
+        cur = cur[part]
+    return cur
+
+
+# A resource read by date window (``date_range``) reads this many days back to
+# today on its first run; later runs start at the run's since.
+DATE_RANGE_FIRST_RUN_DAYS = 365
+
+
+def date_range_params(
+    date_range: Dict[str, str],
+    since: Any = None,
+    today: Any = None,
+    days: int = DATE_RANGE_FIRST_RUN_DAYS,
+) -> Dict[str, str]:
+    """The two path params of a date-window read (Upstox
+    ``.../{to_date}/{from_date}``): the start is the day of ``since`` (or
+    ``today - days`` when there is none or it is unreadable), the end today, and
+    never before the start. ``format: date-time`` sends midnight UTC."""
+    from datetime import date, timedelta, timezone
+    today = today or datetime.now(timezone.utc).date()
+    start = None
+    m = re.match(r"\d{4}-\d{2}-\d{2}", str(since or ""))
+    if m:
+        try:
+            start = date.fromisoformat(m.group(0))
+        except ValueError:
+            start = None
+    if start is None:
+        start = today - timedelta(days=days)
+    end = max(today, start)
+    suffix = "T00:00:00Z" if date_range.get("format") == "date-time" else ""
+    return {
+        date_range["start"]: start.isoformat() + suffix,
+        date_range["end"]: end.isoformat() + suffix,
+    }
+
 
 class PaginationHandler:
     """
     Universal pagination handler supporting offset, page, cursor, and Link header strategies.
     
     Safety features:
-    - Caps on max pages and max records
+    - Caps on pages, records and time per call; a cap returns where to resume
     - Non-paginated API detection (stops if no pagination markers)
     - Duplicate detection (stops if same data returned twice)
-    - Partial failure handling (returns partial results + errors)
-    - Consecutive failure limit (stops after 3 consecutive failures)
+    - A failed page stops the run with the error — never skipped
     """
-    
+
     DEFAULT_MAX_PAGES = 10
     DEFAULT_MAX_RECORDS = 10000
-    MAX_CONSECUTIVE_FAILURES = 3
-    
+    # A position this loop found by probing (the spec documents no paging), handed
+    # out as the resume cursor so the next call keeps the paging it found:
+    # "rsync-probed:offset:<n>", "rsync-probed:page:<first>:<next>",
+    # "rsync-probed:link:<url>".
+    PROBED_PREFIX = "rsync-probed:"
+    # On a request made only to check that a short page was the last, these mean
+    # "no such page", not a failed read.
+    _PAST_END_STATUSES = (400, 404, 416, 422)
+
     def __init__(
         self,
         pagination_type: str = "offset",
@@ -3714,6 +3867,8 @@ class PaginationHandler:
         cursor_mode: str = "response",        # "response" | "last_item_id" (Stripe)
         id_field: str = "id",                 # record field used as cursor in last_item_id mode
         record_is_object: bool = False,       # 2xx body IS one record → wrap [obj]
+        page_start: int = 1,                  # first page number ("page" type): 0 or 1
+        record_columns: Optional[List[str]] = None,  # names for positional rows
     ):
         """
         Initialize pagination handler.
@@ -3732,6 +3887,13 @@ class PaginationHandler:
                 whole body IS the record (Twilio /Balance.json, Jira /myself). When
                 no records array is found, _extract_records wraps the object as a
                 one-row list instead of returning 0 rows.
+            page_start: Number of the first page for "page" pagination. ClickUp
+                numbers pages from 0; most APIs from 1 (the default). Comes from
+                the spec's page param (``default``/``minimum``) via the generator.
+            record_columns: Names for rows sent as arrays (``[ts, open, high,
+                ...]``), from the spec's prefixItems titles. Each array row is
+                zipped into an object; values past the names are kept as
+                ``field_<n>``. Object rows are left alone.
         """
         self.pagination_type = pagination_type.lower()
         self.pagination_param = pagination_param or self._default_param_name()
@@ -3743,6 +3905,8 @@ class PaginationHandler:
         self.cursor_mode = (cursor_mode or "response").strip().lower()
         self.id_field = (id_field or "id").strip()
         self.record_is_object = bool(record_is_object)
+        self.page_start = int(page_start) if page_start is not None else 1
+        self.record_columns = list(record_columns or [])
 
         # State tracking
         self.seen_cursors = set()
@@ -3752,6 +3916,10 @@ class PaginationHandler:
         # (max_pages / max_records). Initialized here so it's safe to read
         # before the first fetch.
         self.last_run_hit_cap = False
+        # Set by fetch_all_pages: what may have left rows unread without failing
+        # the read (paging the spec does not document, a "more rows" flag with
+        # no cursor). Shown on the run, never dropped.
+        self.last_run_warnings: List[str] = []
 
     def _default_param_name(self) -> str:
         """Get default pagination parameter name for type."""
@@ -3768,213 +3936,412 @@ class PaginationHandler:
         fetch_page_fn,
         max_pages: int = None,
         max_records: int = None,
-        initial_params: Dict = None
-    ) -> Tuple[List[Dict], List[Dict]]:
+        initial_params: Dict = None,
+        resume_cursor: Any = None,
+        probe_paging: bool = False,
+        time_budget_s: Optional[float] = None,
+    ) -> Tuple[List[Dict], List[Dict], Optional[str]]:
         """
-        Fetch all pages using the provided fetch function.
-        
+        Read pages until the API says the table ended, or a cap stops the call.
+
         Args:
             fetch_page_fn: Function(params) -> (success, status_code, data, headers)
                           Should call API and return tuple from _http_request_v2
-            max_pages: Maximum pages to fetch (defaults to DEFAULT_MAX_PAGES)
-            max_records: Maximum total records (defaults to DEFAULT_MAX_RECORDS)
-            initial_params: Initial request parameters
-        
+            max_pages: Requests this call may make (defaults to DEFAULT_MAX_PAGES)
+            max_records: Rows this call may return (defaults to DEFAULT_MAX_RECORDS)
+            initial_params: Query params sent with every page. A start position
+                under the pagination param is read as a resume position.
+            resume_cursor: Where to start: the ``final_cursor`` an earlier call
+                returned. Wins over a position in ``initial_params``.
+            probe_paging: The spec documents no paging for this resource. When page
+                one carries no cursor, try ``offset=<rows read>``, then ``page=1``
+                and ``page=2``, and follow whichever returns new rows; when none
+                does, keep the rows and add a warning.
+            time_budget_s: Start no new page after this many seconds (a cap, like
+                max_pages). One export call must answer inside the orchestrator's
+                30 s MCP call limit.
+
         Returns:
-            Tuple of (all_records, errors)
-            - all_records: List of all fetched records
-            - errors: List of error dicts (page number, error message)
+            (records, errors, final_cursor). A failed page stops the run with its
+            error in ``errors``; no page is ever skipped. ``final_cursor`` is where
+            the next call resumes, set only when rows remain (a cap stopped the run,
+            or a page failed); None when the API said the table ended.
+            ``last_run_hit_cap`` is True when a cap stopped the run, and
+            ``last_run_warnings`` lists what may have left rows unread.
         """
         max_pages = max_pages or self.DEFAULT_MAX_PAGES
         max_records = max_records or self.DEFAULT_MAX_RECORDS
-        initial_params = initial_params or {}
-        
-        all_records = []
-        errors = []
-        page_num = 0
-        consecutive_failures = 0
-        next_cursor = None
-        next_url = None
-        # Cap-stop tracking (read by ApiHandler.export_resource to set
-        # ExportResult.has_more). Stays False on a natural end (cursor/link
-        # exhausted, short last page, empty page, duplicate, error stop) and
-        # flips True only when a cap truncated the fetch: the max_records break
-        # below, or the `while ... else` (loop ran out of allowed pages).
-        hit_cap = False
+        base_params = dict(initial_params or {})
+        deadline = time.time() + time_budget_s if time_budget_s else None
 
-        # Allow callers to start from a non-zero offset/page/cursor
-        base_offset = 0
-        base_page = 1
-        if self.pagination_type in {"offset", "page"} and self.pagination_param:
+        # Per-run state: one handler serves every call of a connector.
+        self.seen_cursors = set()
+        self.seen_urls = set()
+        self.last_data_hash = None
+        self.last_run_hit_cap = False
+        self.last_run_warnings = []
+
+        mode = self.pagination_type
+        if mode == "cursor" and self.cursor_mode == "last_item_id":
+            mode = "last_item_id"
+        param = self.pagination_param
+        limit_param = self.limit_param
+        page_start = self.page_start
+        probed = None  # what probing found, once it found the paging
+
+        # Start position. A resume value of 0 is a real position (page 0 on a
+        # zero-based API): only an absent/empty value falls back to the start.
+        start = resume_cursor
+        if param and mode in ("offset", "page", "cursor", "last_item_id"):
+            # Popped: a resume URL re-sent as ?PageToken=https://… is a 400.
+            in_params = base_params.pop(param, None)
+            if start is None or start == "":
+                start = in_params
+        offset, page, cursor, next_url = 0, page_start, None, None
+        if isinstance(start, str) and start.startswith(self.PROBED_PREFIX):
+            kind, _, value = start[len(self.PROBED_PREFIX):].partition(":")
             try:
-                if self.pagination_type == "offset":
-                    base_offset = int(initial_params.get(self.pagination_param) or 0)
-                if self.pagination_type == "page":
-                    base_page = int(initial_params.get(self.pagination_param) or 1)
-            except Exception:
-                base_offset = 0
-                base_page = 1
-        base_cursor = initial_params.get(self.pagination_param) if self.pagination_type == "cursor" else None
+                if kind == "offset":
+                    offset = int(value)
+                    mode, param, limit_param = "offset", "offset", ""
+                elif kind == "page":
+                    first, _, nxt = value.partition(":")
+                    page_start, page = int(first), int(nxt)
+                    mode, param, limit_param = "page", "page", ""
+                elif kind == "link" and value:
+                    mode, next_url = "link", value
+                probed = kind
+            except ValueError:
+                pass
+        elif start is not None and start != "":
+            if mode == "offset":
+                offset = self._as_int(start, 0)
+            elif mode == "page":
+                page = self._as_int(start, page_start)
+            elif mode in ("cursor", "last_item_id"):
+                cursor = str(start)
+            elif mode == "link" and isinstance(start, str):
+                next_url = start
+        probe = (bool(probe_paging) and mode == "cursor" and cursor is None
+                 and probed is None and not self.record_is_object)
 
-        while page_num < max_pages and len(all_records) < max_records:
-            page_num += 1
-            
-            # Build pagination params
-            params = dict(initial_params)
-            
-            if self.pagination_type == "offset":
-                params[self.pagination_param] = base_offset + (page_num - 1) * self.max_page_size
-                if self.limit_param:
-                    params[self.limit_param] = self.max_page_size
-            elif self.pagination_type == "page":
-                params[self.pagination_param] = base_page + (page_num - 1)
-                if self.limit_param:
-                    params[self.limit_param] = self.max_page_size
-            elif self.pagination_type == "cursor":
-                _cur = None
-                if page_num == 1 and base_cursor:
-                    _cur = base_cursor
-                elif page_num > 1:
-                    if not next_cursor:
-                        break  # No more pages
-                    _cur = next_cursor
+        all_records: List[Dict] = []
+        errors: List[Dict] = []
+        requests = 0
+        largest = 0          # biggest page served so far (offset/page with a page size sent)
+        confirming = False   # this request only checks that a short first page was the last
+        hit_cap = False
+        failed = False
+
+        while True:
+            if requests and (requests >= max_pages or len(all_records) >= max_records
+                             or (deadline is not None and time.time() >= deadline)):
+                hit_cap = True
+                break
+
+            params = dict(base_params)
+            if mode == "offset":
+                params[param] = offset
+                if limit_param:
+                    params[limit_param] = self.max_page_size
+            elif mode == "page":
+                params[param] = page
+                if limit_param:
+                    params[limit_param] = self.max_page_size
+            elif mode in ("cursor", "last_item_id"):
                 # Some APIs return a next-page URL as the cursor rather than an
                 # opaque token — ABSOLUTE (modern Twilio meta.next_page_url) or
                 # ROOT-RELATIVE (legacy Twilio's top-level next_page_uri,
                 # Salesforce nextRecordsUrl). Follow it via _override_url —
                 # sending a URL as a query-param value 400s. Relative URLs are
                 # resolved against the connector's base (and every followed URL
-                # host-pinned) in ApiHandler's fetch_page_fn. Token cursors ride
-                # the pagination query param (with the page-size limit) as before.
-                if isinstance(_cur, str) and _cur.startswith(("http://", "https://", "/")):
-                    params["_override_url"] = _cur
-                    # A resume cursor arrives in initial_params under the
-                    # pagination param (copied into params above). Drop it —
-                    # otherwise every request of a resumed run re-sends the
-                    # stale URL as ?PageToken=https://…, the exact 400 this
-                    # branch exists to avoid.
-                    if self.pagination_param:
-                        params.pop(self.pagination_param, None)
+                # host-pinned) in ApiHandler's fetch_page_fn.
+                if isinstance(cursor, str) and cursor.startswith(("http://", "https://", "/")):
+                    params["_override_url"] = cursor
                 else:
-                    if _cur:
-                        params[self.pagination_param] = _cur
-                    if self.limit_param:
-                        params[self.limit_param] = self.max_page_size
-            elif self.pagination_type == "link":
-                if page_num > 1 and next_url:
-                    params["_override_url"] = next_url  # Signal to use this URL instead
-                elif self.limit_param:
-                    params[self.limit_param] = self.max_page_size
-            
-            # Fetch page
+                    if cursor:
+                        params[param] = cursor
+                    if limit_param:
+                        params[limit_param] = self.max_page_size
+            elif mode == "link":
+                if next_url:
+                    params["_override_url"] = next_url
+                elif limit_param:
+                    params[limit_param] = self.max_page_size
+
+            requests += 1
             success, status_code, data, headers = fetch_page_fn(params)
-            
+
             if not success:
-                consecutive_failures += 1
-                # Capture error body (truncated) for debuggability.
-                # This prevents opaque failures like "Operation failed" when the real cause is
-                # an invalid endpoint (404) or missing credentials (401).
-                preview = None
-                try:
-                    if data is None:
-                        preview = None
-                    elif isinstance(data, (dict, list)):
-                        preview = json.dumps(data, default=str)[:800]
-                    else:
-                        preview = str(data)[:800]
-                except Exception:
-                    preview = None
-                errors.append({
-                    "page": page_num,
-                    "status_code": status_code,
-                    "error": f"Request failed with status {status_code}",
-                    "data": preview,
-                })
-                
-                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
-                    logger.warning(f"Stopping after {consecutive_failures} consecutive failures")
-                    break
-                
-                continue  # Try next page
-            
-            # Reset failure counter on success
-            consecutive_failures = 0
-            
-            # Extract records from response
-            records = self._extract_records(data)
-            
-            if not records:
-                # No records - might be end of pagination or non-paginated API
-                if page_num == 1:
-                    # First page empty - might be valid empty result
-                    pass
-                logger.info(f"No records on page {page_num}, stopping pagination")
+                if confirming and status_code in self._PAST_END_STATUSES:
+                    break  # nothing past the short page: it was the last
+                # Stop here, never skip ahead: a skipped page is rows that
+                # silently never land. final_cursor below is this page.
+                errors.append(self._page_error(requests, status_code, data))
+                failed = True
                 break
-            
+            confirming = False
+
+            records = self._extract_records(data)
+            if not records:
+                logger.info(f"No records on page {requests}, stopping pagination")
+                break
+
             # Duplicate detection (non-paginated API returning same data)
-            data_hash = hash(json.dumps(records, sort_keys=True, default=str))
+            data_hash = self._hash_records(records)
             if data_hash == self.last_data_hash:
-                logger.warning(f"Duplicate data detected on page {page_num}, stopping (non-paginated API)")
+                logger.warning(f"Duplicate data detected on page {requests}, stopping (non-paginated API)")
                 break
             self.last_data_hash = data_hash
-            
-            # Add records
-            all_records.extend(records)
-            
-            # Check record limit
-            if len(all_records) >= max_records:
-                logger.info(f"Reached max_records limit ({max_records}), stopping")
-                all_records = all_records[:max_records]
-                hit_cap = True  # truncated by record cap → more rows may exist
+            received = len(records)
+
+            # The record cap cuts an offset page exactly (the next call resumes at
+            # the first row not returned). Other modes cannot resume mid-page, so
+            # they keep the whole page and stop at the top of the loop.
+            room = max_records - len(all_records)
+            if mode == "offset" and received > room:
+                all_records.extend(records[:room])
+                offset += room
+                hit_cap = True
                 break
-            
-            # Extract next page marker
-            if self.pagination_type == "cursor":
-                if self.cursor_mode == "last_item_id":
-                    # Stripe-style: has_more flag + starting_after = last record id
-                    has_more = bool(data.get("has_more")) if isinstance(data, dict) else False
-                    if not has_more:
-                        logger.info("No more pages (has_more=false)")
-                        break
-                    last_rec = records[-1] if records else {}
-                    next_cursor = str(last_rec.get(self.id_field) or "") if isinstance(last_rec, dict) else ""
-                    if not next_cursor or next_cursor in self.seen_cursors:
-                        logger.info("No more pages (last_item_id cursor exhausted or empty)")
-                        break
-                    self.seen_cursors.add(next_cursor)
+            all_records.extend(records)
+
+            if mode in ("offset", "page"):
+                # Advance by the rows actually RECEIVED, not by max_page_size: an
+                # API that caps pages below our size (asked 100, served 30) would
+                # otherwise skip the rows in between.
+                if mode == "offset":
+                    offset += received
                 else:
-                    next_cursor = self._extract_next_cursor(data)
-                    if not next_cursor or next_cursor in self.seen_cursors:
-                        logger.info("No more pages (cursor exhausted)")
+                    page += 1
+                # An explicit end-of-data flag in the body decides, both ways
+                # (ClickUp last_page, Stripe-style has_more, Jira isLast).
+                end = self._end_of_data_flag(data)
+                if end is True:
+                    logger.info("Last page (end-of-data flag in response)")
+                    break
+                if end is None and limit_param and received < self.max_page_size:
+                    if largest and received < largest:
+                        logger.info(f"Last page (received {received} < {largest})")
                         break
-                    self.seen_cursors.add(next_cursor)
-            elif self.pagination_type == "link":
-                next_url = self._extract_next_link(headers)
-                if not next_url or next_url in self.seen_urls:
+                    if not largest:
+                        # A short FIRST page: the table may end here, or the server
+                        # serves less than the page size we sent (the doc says 100,
+                        # the server caps at 50). One more request tells which.
+                        confirming = True
+                # With no page size sent the server's is unknown (ClickUp serves
+                # 100, others 20): a short page proves nothing — page until an
+                # empty page or a flag.
+                largest = max(largest, received)
+                continue
+
+            if mode == "last_item_id":
+                # Stripe-style: starting_after = the last record's id; has_more
+                # decides when present, else page until an empty page.
+                end = self._end_of_data_flag(data)
+                if end is True:
+                    logger.info("No more pages (has_more=false)")
+                    break
+                last_rec = records[-1]
+                nxt = str(last_rec.get(self.id_field) or "") if isinstance(last_rec, dict) else ""
+                if not nxt or nxt in self.seen_cursors:
+                    if end is False:
+                        self._warn(
+                            f"the API says more rows follow, but the last row has no new "
+                            f"'{self.id_field}' to page from — rows past {len(all_records)} may be missing"
+                        )
+                    break
+                self.seen_cursors.add(nxt)
+                cursor = nxt
+                continue
+
+            if mode == "cursor":
+                nxt = self._extract_next_cursor(data)
+                if nxt:
+                    if nxt in self.seen_cursors:
+                        logger.info("No more pages (cursor repeated)")
+                        break
+                    self.seen_cursors.add(nxt)
+                    cursor = nxt
+                    continue
+                end = self._end_of_data_flag(data)
+                if end is True:
+                    logger.info("No more pages (end-of-data flag in response)")
+                    break
+                if probe and requests == 1:
+                    found = self._probe_paging(fetch_page_fn, base_params, headers, len(all_records))
+                    requests += found["requests"]
+                    if found["mode"] == "end":
+                        break
+                    if found["mode"] == "link":
+                        mode, next_url, probed = "link", found["next"], "link"
+                        self.seen_urls.add(next_url)
+                        continue
+                    if found["mode"] in ("offset", "page"):
+                        rows = found["records"]
+                        self.last_data_hash = self._hash_records(rows)
+                        room = max_records - len(all_records)
+                        if found["mode"] == "offset":
+                            mode, param, limit_param, probed = "offset", "offset", "", "offset"
+                            offset = len(all_records) + min(len(rows), room)
+                            all_records.extend(rows[:room])
+                            if len(rows) > room:
+                                hit_cap = True
+                                break
+                        else:
+                            mode, param, limit_param, probed = "page", "page", "", "page"
+                            page_start, page = found["page_start"], found["next"]
+                            all_records.extend(rows)
+                        continue
+                    self._warn(f"paging not documented — rows past {len(all_records)} may be missing")
+                    break
+                if end is False:
+                    self._warn(
+                        f"the API says more rows follow but sent no cursor — "
+                        f"rows past {len(all_records)} may be missing"
+                    )
+                logger.info("No more pages (cursor exhausted)")
+                break
+
+            if mode == "link":
+                nxt_url = self._extract_next_link(headers or {})
+                if not nxt_url or nxt_url in self.seen_urls:
                     logger.info("No more pages (Link header exhausted)")
                     break
-                self.seen_urls.add(next_url)
-            else:
-                # Offset/page: check if we got fewer records than page size
-                if len(records) < self.max_page_size:
-                    logger.info(f"Last page (received {len(records)} < {self.max_page_size})")
-                    break
-        else:
-            # The while-condition went false without any natural-end break
-            # firing — i.e. page_num reached max_pages while pages were still
-            # being consumed. The fetch was truncated by the page cap.
-            hit_cap = True
+                self.seen_urls.add(nxt_url)
+                next_url = nxt_url
+                continue
 
-        # Record whether a cap truncated this run so export_resource can set
-        # ExportResult.has_more. Instance attr (not a return value) keeps the
-        # tuple signature stable for the many existing callers.
+            break  # "none" or an unknown type: one page
+
+        # Read by export_resource to set ExportResult.has_more — instance attrs
+        # keep the tuple signature stable for the many existing callers.
         self.last_run_hit_cap = hit_cap
 
-        # Return final cursor for resumption (if cursor-based pagination)
-        final_cursor = next_cursor if self.pagination_type == "cursor" else None
+        final_cursor = None
+        if hit_cap or failed:
+            final_cursor = self._resume_token(mode, probed, offset, page, page_start, cursor, next_url)
         return (all_records, errors, final_cursor)
-    
+
+    def _probe_paging(self, fetch_page_fn, base_params: Dict, headers: Dict, rows_read: int) -> Dict[str, Any]:
+        """Find the paging of a resource whose spec documents none, after page one
+        came back with no cursor. Tries, in order: a Link header; ``offset=<rows
+        read>``; ``page=1`` (zero-based numbering); ``page=2`` (one-based). A probe
+        that returns new rows names the mode; one that returns no rows means page
+        one was the whole table. A failed probe or the same rows again is no
+        answer: the next probe runs. Returns {"mode", "requests", ...}; mode
+        "none" means nothing worked."""
+        link = self._extract_next_link(headers or {})
+        if link:
+            return {"mode": "link", "requests": 0, "next": link}
+        first_hash = self.last_data_hash
+        requests = 0
+        for extra, mode, page_start, nxt in (
+            ({"offset": rows_read}, "offset", None, None),
+            ({"page": 1}, "page", 0, 2),
+            ({"page": 2}, "page", 1, 3),
+        ):
+            params = dict(base_params)
+            params.update(extra)
+            requests += 1
+            ok, _status, data, _headers = fetch_page_fn(params)
+            if not ok:
+                continue
+            records = self._extract_records(data)
+            if not records:
+                return {"mode": "end", "requests": requests}
+            if self._hash_records(records) == first_hash:
+                continue
+            logger.info(f"Paging not in the spec; found it by probing {extra}")
+            return {"mode": mode, "requests": requests, "records": records,
+                    "page_start": page_start, "next": nxt}
+        return {"mode": "none", "requests": requests}
+
+    def _resume_token(self, mode, probed, offset, page, page_start, cursor, next_url) -> Optional[str]:
+        """Where the next call starts, as the string it passes back."""
+        if probed == "offset":
+            return f"{self.PROBED_PREFIX}offset:{offset}"
+        if probed == "page":
+            return f"{self.PROBED_PREFIX}page:{page_start}:{page}"
+        if probed == "link":
+            return f"{self.PROBED_PREFIX}link:{next_url}" if next_url else None
+        if mode == "offset":
+            return str(offset)
+        if mode == "page":
+            return str(page)
+        if mode in ("cursor", "last_item_id"):
+            return str(cursor) if cursor else None
+        if mode == "link":
+            return next_url or None
+        return None
+
+    def _warn(self, message: str) -> None:
+        logger.warning(message)
+        self.last_run_warnings.append(message)
+
+    @staticmethod
+    def _hash_records(records: List[Any]) -> int:
+        return hash(json.dumps(records, sort_keys=True, default=str))
+
+    @staticmethod
+    def _as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _page_error(page: int, status_code: int, data: Any) -> Dict[str, Any]:
+        # The error body (truncated) says why: an invalid endpoint (404) or
+        # missing credentials (401) instead of an opaque "Operation failed".
+        preview = None
+        try:
+            if isinstance(data, (dict, list)):
+                preview = json.dumps(data, default=str)[:800]
+            elif data is not None:
+                preview = str(data)[:800]
+        except Exception:
+            preview = None
+        return {
+            "page": page,
+            "status_code": status_code,
+            "error": f"Request failed with status {status_code}",
+            "data": preview,
+        }
+
+    # Top-level boolean end-of-data flags: name → value that means "no more pages".
+    _END_FLAGS = (
+        ("has_more", False), ("hasMore", False),
+        ("last_page", True), ("lastPage", True),
+        ("is_last", True), ("isLast", True),
+    )
+
+    def _end_of_data_flag(self, data: Any) -> Optional[bool]:
+        """True = the response says this is the last page, False = it says more
+        pages follow, None = no such flag. Only real booleans count: Laravel's
+        ``last_page`` is the page COUNT (an int), not an end marker."""
+        if not isinstance(data, dict):
+            return None
+        for key, end_value in self._END_FLAGS:
+            v = data.get(key)
+            if isinstance(v, bool):
+                return v == end_value
+        return None
+
     def _extract_records(self, data: Any) -> List[Dict]:
+        """The records of one response, positional rows named by
+        ``record_columns`` (see ``_find_records`` for where they are found)."""
+        records = self._find_records(data)
+        if not self.record_columns:
+            return records
+        cols = self.record_columns
+        return [
+            {(cols[i] if i < len(cols) else f"field_{i + 1}"): v for i, v in enumerate(r)}
+            if isinstance(r, (list, tuple)) else r
+            for r in records
+        ]
+
+    def _find_records(self, data: Any) -> List[Any]:
         """Extract records array from API response.
 
         Resolution order:
@@ -3993,11 +4360,17 @@ class PaginationHandler:
         if not isinstance(data, dict):
             return []
 
-        # 1. Explicit key from vendor registry / resource config
+        # 1. Explicit key from vendor registry / resource config. A dotted key
+        # names a nested path (Spotify ``artists.items``); column discovery walks
+        # it too (connector.py.j2 _extract_first_row).
         if self.response_data_key:
-            v = data.get(self.response_data_key)
+            v = resolve_key_path(data, self.response_data_key)
             if isinstance(v, list):
                 return v
+            # One entity under the records key (Upstox {"status", "data": {...}}):
+            # the object is the row, not the envelope around it.
+            if self.record_is_object and isinstance(v, dict) and v:
+                return [v]
 
         # 2. Well-known common keys (in priority order) — shared constant
         for key in RESPONSE_DATA_KEYS:
@@ -4044,16 +4417,10 @@ class PaginationHandler:
         if not isinstance(data, dict):
             return None
 
-        # 1. Explicit cursor path from vendor registry (dot-path)
+        # 1. Explicit cursor path from vendor registry (dot-path, or a literal
+        # key that holds a dot)
         if self.cursor_path:
-            parts = self.cursor_path.split(".")
-            value = data
-            for part in parts:
-                if isinstance(value, dict) and part in value:
-                    value = value[part]
-                else:
-                    value = None
-                    break
+            value = resolve_key_path(data, self.cursor_path)
             if value and isinstance(value, str):
                 return value
 
@@ -4103,6 +4470,17 @@ class PaginationHandler:
             # Salesforce-style full-URL pagination
             ["nextRecordsUrl"],
             ["nextPageUrl"],
+            # OData v4 (Microsoft Dataverse / Dynamics 365) — the server-driven
+            # paging continuation is a SINGLE JSON key literally named
+            # "@odata.nextLink" (the '.' is part of the key, NOT a nested path) whose
+            # value is a FULL next-page URL carrying an opaque $skiptoken. It is one
+            # path segment here; the cursor loop follows the ABSOLUTE URL via
+            # _override_url (same as Salesforce nextRecordsUrl / Twilio next_page_uri).
+            # Dataverse always emits absolute https:// nextLinks — a bare
+            # service-relative nextLink (some SAP OData gateways) is NOT resolved here
+            # (it would need urljoin against the request URL; out of scope for this
+            # entry). Without this an OData list silently stops after page 1.
+            ["@odata.nextLink"],
         ]
         for path in _CURSOR_PATHS:
             value = data
@@ -4312,6 +4690,8 @@ class ApiHandler:
         incremental_field: Optional[str] = None,
         resource_config: Optional[Dict[str, Any]] = None,
         prior_watermark: Optional[Dict[str, Any]] = None,
+        resume_cursor: Any = None,
+        time_budget_s: Optional[float] = None,
     ) -> ExportResult:
         """
         Export data from an API resource with pagination.
@@ -4334,17 +4714,32 @@ class ApiHandler:
             prior_watermark: The watermark from the previous incremental run
                 ({"field": ..., "value": ...}). Echoed back on a 0-row re-run so
                 the executor keeps the checkpoint instead of resetting it.
+            resume_cursor: The next_cursor an earlier call returned; the read
+                starts there.
+            time_budget_s: Start no new page after this many seconds.
 
         Returns:
-            ExportResult with records, errors, next_cursor, has_more, and stats.
-            stats carries `watermark`/`max_watermark` (MAX of incremental_field
-            over ALL records, not just the last) when applicable; has_more is
-            True only when a cap truncated the fetch.
+            ExportResult with records, errors, next_cursor, has_more, warnings
+            and stats. stats carries `watermark`/`max_watermark` (MAX of
+            incremental_field over ALL records, not just the last) when
+            applicable. has_more is True when a cap stopped the read, and
+            next_cursor is then where the next call resumes. A failed page fails
+            the export (success False) — the rows before it are not a table.
         """
         logger.info(
             "ApiHandler.export_resource: %s (%s), max_pages=%d, max_records=%d, incremental_field=%s",
             resource, endpoint, max_pages, max_records, incremental_field,
         )
+
+        # A read by date window (Upstox .../{to_date}/{from_date}): the window is
+        # the run's since (sent as the start param) to today. A date saved on the
+        # connection is dropped, so it can never freeze the range.
+        date_range = (resource_config or {}).get("date_range")
+        if date_range:
+            window = (date_range["start"], date_range["end"])
+            params = dict(params or {})
+            params.update(date_range_params(date_range, since=params.get(window[0])))
+            config = {k: v for k, v in (config or {}).items() if k not in window}
 
         # Build a per-call PaginationHandler when resource_config overrides are supplied.
         # This is critical for multi-resource connectors where different resources use
@@ -4372,6 +4767,13 @@ class ApiHandler:
                 cursor_mode=str(resource_config.get("cursor_mode") or "response"),
                 id_field=str(resource_config.get("id_field") or "id"),
                 record_is_object=bool(resource_config.get("record_is_object")),
+                # 0 is a real value (zero-based pages) — never `or` it away.
+                page_start=(
+                    int(resource_config["page_start"])
+                    if resource_config.get("page_start") is not None
+                    else 1
+                ),
+                record_columns=resource_config.get("record_columns") or None,
             )
         else:
             pag_handler = self.pagination_handler
@@ -4455,7 +4857,20 @@ class ApiHandler:
             max_pages=max_pages,
             max_records=max_records,
             initial_params=params or {},
+            resume_cursor=resume_cursor,
+            probe_paging=bool((resource_config or {}).get("paging_undocumented")),
+            time_budget_s=time_budget_s,
         )
+
+        # Settings in the URL that are part of a row's key (the instrument a
+        # candle belongs to) are not in the response: copy them onto each row.
+        for p in (resource_config or {}).get("stamp_params") or []:
+            v = (config or {}).get(p)
+            if v in (None, ""):
+                continue
+            for rec in records:
+                if isinstance(rec, dict):
+                    rec.setdefault(p, v)
         
         # Compute watermark as the MAX of incremental_field over ALL records.
         # Using records[-1] is wrong whenever the API returns results in DESC or
@@ -4491,12 +4906,15 @@ class ApiHandler:
         if watermark is None and not records and incremental_field and prior_watermark:
             watermark = prior_watermark
 
-        # has_more reflects whether a cap (max_pages / max_records) truncated the
-        # fetch. Read it off the handler that just ran (set in fetch_all_pages).
+        # has_more: a cap (pages / records / time) stopped the read, and
+        # final_cursor is where the next call resumes. Read off the handler
+        # that just ran (set in fetch_all_pages).
         has_more = bool(getattr(pag_handler, "last_run_hit_cap", False))
+        warnings = list(getattr(pag_handler, "last_run_warnings", None) or [])
 
-        # Build result
-        success = len(records) > 0 or len(errors) == 0
+        # A failed page fails the export, even with rows before it: reported as
+        # a success, those rows land as the whole table and the rest is lost.
+        success = not errors
         stats = {
             "total_records": len(records),
             "total_errors": len(errors),
@@ -4504,6 +4922,8 @@ class ApiHandler:
             "max_records": max_records,
             "has_more": has_more,
         }
+        if warnings:
+            stats["warnings"] = warnings
 
         if watermark:
             stats["watermark"] = watermark
@@ -4517,6 +4937,7 @@ class ApiHandler:
             next_cursor=final_cursor,
             stats=stats,
             has_more=has_more,
+            warnings=warnings,
         )
 
 

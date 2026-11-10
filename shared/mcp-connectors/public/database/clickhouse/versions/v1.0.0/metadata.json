@@ -102,6 +102,10 @@
       {"name": "limit", "type": "integer", "required": false, "default": 10000},
       {"name": "offset", "type": "integer", "required": false, "default": 0}
     ]},
+    {"name": "execute", "type": "destination", "description": "Run exactly one SQL statement verbatim (Explorer writes, models DDL/DML); a read returns rows, anything else rows_affected", "method": "clickhouse_execute", "parameters": [
+      {"name": "query", "type": "string", "required": true, "description": "The statement; 'statement' and 'sql' are accepted aliases"},
+      {"name": "timeout_seconds", "type": "integer", "required": false, "description": "Server-side deadline, sent as max_execution_time"}
+    ]},
     {"name": "ensure_table", "type": "destination", "description": "Create / migrate the destination table from canonical column types (MergeTree/ReplacingMergeTree)", "method": "clickhouse_ensure_table", "parameters": [
       {"name": "table", "type": "string", "required": true},
       {"name": "columns", "type": "array", "required": true},

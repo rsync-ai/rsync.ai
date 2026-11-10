@@ -53,17 +53,6 @@ const (
 	sinkPresenceAbsent
 )
 
-func (p sinkPresence) String() string {
-	switch p {
-	case sinkPresencePresent:
-		return "present"
-	case sinkPresenceAbsent:
-		return "absent"
-	default:
-		return "unknown"
-	}
-}
-
 // sinkStatusNotFound is the sink container's literal answer when it holds no worker
 // for a consumer group. It is the ONLY value that means absence — "stopped" and
 // "crashed" mean the worker is registered and the container's own supervisor owns

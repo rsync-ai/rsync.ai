@@ -1,7 +1,8 @@
 {
-  "_about": "Shared contract for destination_config.max_file_interval_seconds. The worker (objectFlushIntervalOverride in main.go, cdc_flush_interval_test.go) and the kafka-mcp-sink connector (flush_interval_error in versions/v1.0.0/connector.py, shared/mcp-connectors/tests/test_kafka_sink_flush_interval.py) both run every case, so the connector never lets through a value the worker refuses, or refuses one the worker accepts. expect is the interval in seconds, \"unset\" (keep the 30-second default) or \"refused\".",
+  "_about": "Shared contract for destination_config.max_file_interval_seconds. The worker (objectFlushIntervalOverride in main.go, cdc_flush_interval_test.go) and the kafka-mcp-sink connector (flush_interval_error in versions/v1.0.0/connector.py, shared/mcp-connectors/tests/test_kafka_sink_flush_interval.py) both run every case, so the connector never lets through a value the worker refuses, or refuses one the worker accepts. expect is the interval in seconds, \"unset\" (keep the default_seconds default, which both sides name in their refusal) or \"refused\".",
   "min_seconds": 1,
   "max_seconds": 240,
+  "default_seconds": 240,
   "cases": [
     {"name": "number", "value": 120, "expect": 120},
     {"name": "number at the lower bound", "value": 1, "expect": 1},

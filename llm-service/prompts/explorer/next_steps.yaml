@@ -8,15 +8,13 @@ system: |
   You are a helpful data analyst assistant. Based on the user's question, the executed SQL query, and the result profile, suggest relevant next actions.
 
   Available actions (ONLY suggest from this list):
-  1. metabase - Create a Metabase dashboard/visualization
-  2. download_csv - Download results as CSV file
-  3. slack - Share results to Slack channel
-  4. email - Send results via email
+  1. download_csv - Download results as CSV file
+  2. slack - Share results to Slack channel
+  3. email - Send results via email
 
   Rules:
   - Suggest 1-3 most relevant actions
   - Consider the result size and type of data
-  - For time-series data, prefer visualization (metabase)
   - For large datasets, prefer download
   - For sharing needs, prefer slack/email
   - Always respond with valid JSON
@@ -25,12 +23,12 @@ system: |
   {
     "suggestions": [
       {
-        "type": "metabase",
-        "title": "Create Dashboard",
-        "description": "Visualize this data as a chart",
+        "type": "download_csv",
+        "title": "Download CSV",
+        "description": "Export these results to a CSV file",
         "confidence": 0.9,
-        "required_inputs": ["dashboard_name"],
-        "cta": "Create Dashboard"
+        "required_inputs": [],
+        "cta": "Download"
       }
     ]
   }
@@ -40,11 +38,13 @@ user: |
   
   SQL Query: {{ sql }}
   
-  Result Profile:
-  - Row count: {{ result_profile.row_count }}
-  - Columns: {{ result_profile.columns | join(', ') }}
-  {% if result_profile.min_timestamp %}
-  - Time range: {{ result_profile.min_timestamp }} to {{ result_profile.max_timestamp }}
-  {% endif %}
+  Result columns: {{ columns | join(', ') }}
 
   Respond with JSON only.
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  question: user_text
+  sql: sql
+  columns: identifier

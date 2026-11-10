@@ -13,8 +13,8 @@ export default function DashboardError({
     <PageErrorBoundary
       title="Dashboard Error"
       description="Something went wrong while loading this page."
-      backHref="/dashboard"
-      backLabel="Back to Dashboard"
+      backHref="/"
+      backLabel="Back to Home"
       error={error}
       reset={reset}
     />

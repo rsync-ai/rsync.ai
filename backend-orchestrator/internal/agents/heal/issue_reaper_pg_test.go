@@ -5,7 +5,7 @@
 // This lives beside issue_sweep_pg_test.go and reuses its fixture on purpose:
 // that fixture already seeds the one row that separates a correct reaper from a
 // destructive one — a cdc_pipeline-typed issue whose component_id is a
-// replication SLOT NAME, not a UUID (cdc_wal_watchdog.go:305-307).
+// replication SLOT NAME, not a UUID (cdc_wal_watchdog.go:572-576).
 //
 // A reaper written as "close every pipeline issue whose component_id matches no
 // pipeline" passes the happy-path test and silently closes that alarm too, because
@@ -116,5 +116,102 @@ func TestPGReapLeavesIssuesWithALivePipelineAlone(t *testing.T) {
 		if !exists || resolved {
 			t.Fatalf("issue %q: exists=%v resolved=%v, want still present and open", id, exists, resolved)
 		}
+	}
+}
+
+// Fixture for a slot that outlives its pipeline. pgHealPurge needs no change: the
+// connection hangs off the fixture workspace, so deleting that cascades to it and
+// from it to cdc_resources, and the issue row carries pgHealPipelineID.
+const (
+	pgHealConnectionID  = "bbbbbbbb-0000-4000-8000-000000000004"
+	pgHealOutlivingSlot = "rsync_slot_outlived_probe"
+)
+
+// TestPGReapLeavesAWALAlarmWhoseSlotOutlivedItsPipeline — the WAL watchdog keys its
+// row by slot and writes the pipeline's id as component_id while the pipeline exists.
+// Deleting the pipeline does not delete the slot: cdc_resources.pipeline_id is ON
+// DELETE SET NULL (migration 064), a failed drop leaves it 'failed' (postgresql.go
+// MarkResourceFailed), and the watchdog goes on reading the slot's retained WAL every
+// tick. But its upsert never clears resolved_at, so once the reaper closed the row on
+// "no such pipeline" the alarm stayed hidden for as long as the slot pinned WAL —
+// forever, for a WARNING slot, which nothing drops.
+//
+// Whether the watchdog still watches the slot is the rule, so the test runs over
+// every status its listing reads, and the control is the one it doesn't: a slot
+// dropped and marked 'deleted' is never observed again, and only the reaper can
+// close its row.
+func TestPGReapLeavesAWALAlarmWhoseSlotOutlivedItsPipeline(t *testing.T) {
+	for _, tc := range []struct {
+		slotStatus string
+		wantReaped bool
+	}{
+		{"active", false},
+		{"inactive", false},
+		{"failed", false},
+		{"orphaned", false},
+		{"deleted", true}, // control: the watchdog no longer lists it
+	} {
+		t.Run(tc.slotStatus, func(t *testing.T) {
+			db := pgHealDB(t)
+			issueID := pgSeedOpenIssue(t, db)
+			walIssueID := "cdc-wal-" + pgHealOutlivingSlot
+
+			mustExec := func(q string, args ...interface{}) {
+				t.Helper()
+				if _, err := db.Exec(q, args...); err != nil {
+					t.Fatalf("%.60q: %v", q, err)
+				}
+			}
+			mustExec(`INSERT INTO connections (id, user_id, workspace_id, name, type, connector_type, config)
+			          VALUES ($1::uuid, $2::uuid, $3::uuid, 'reaper-verify-source', 'source', 'postgresql', 'x')`,
+				pgHealConnectionID, pgHealUserID, pgHealWorkspaceID)
+			mustExec(`INSERT INTO cdc_resources (pipeline_id, connection_id, resource_type, resource_name, status, database_type)
+			          VALUES ($1::uuid, $2::uuid, 'replication_slot', $3, 'active', 'postgresql')`,
+				pgHealPipelineID, pgHealConnectionID, pgHealOutlivingSlot)
+			// The row as the watchdog wrote it while the pipeline still existed.
+			mustExec(`INSERT INTO sentinel_active_issues
+			          (id, type, severity, component_id, component_type, description, detected_at, last_occurrence)
+			          VALUES ($1, 'high_lag', 'warning', $2, 'cdc_pipeline',
+			                  'replication slot is retaining WAL', NOW(), NOW())`,
+				walIssueID, pgHealPipelineID)
+
+			mustExec(`DELETE FROM pipelines WHERE id = $1::uuid`, pgHealPipelineID)
+			var orphaned bool
+			if err := db.QueryRow(`SELECT pipeline_id IS NULL FROM cdc_resources WHERE resource_name = $1`,
+				pgHealOutlivingSlot).Scan(&orphaned); err != nil {
+				t.Fatalf("the slot row did not survive the pipeline delete: %v", err)
+			}
+			if !orphaned {
+				t.Fatal("the slot row still names the deleted pipeline; the fixture is not the state prod reaches")
+			}
+			mustExec(`UPDATE cdc_resources SET status = $1 WHERE resource_name = $2`, tc.slotStatus, pgHealOutlivingSlot)
+
+			n, err := pgHealWorker(db).reapOrphanedIssues(context.Background())
+			if err != nil {
+				t.Fatalf("reapOrphanedIssues: %v", err)
+			}
+			want := 1 // the connector-down issue, whose pipeline is gone and nothing watches
+			if tc.wantReaped {
+				want = 2
+			}
+			if n != want {
+				t.Errorf("reaped %d issues, want %d", n, want)
+			}
+			if _, resolved := pgIssueState(t, db, issueID); !resolved {
+				t.Error("the connector-down issue of the deleted pipeline was left open")
+			}
+			exists, resolved := pgIssueState(t, db, walIssueID)
+			if !exists {
+				t.Fatal("reaper DELETEd the WAL alarm")
+			}
+			if resolved != tc.wantReaped {
+				if tc.wantReaped {
+					t.Errorf("a WAL alarm whose slot was dropped stayed open: nothing else will ever close it")
+				} else {
+					t.Errorf("reaper closed the WAL alarm of a slot the watchdog still watches (status %q): "+
+						"its upsert never reopens a row, so the alarm is hidden while the slot pins WAL", tc.slotStatus)
+				}
+			}
+		})
 	}
 }

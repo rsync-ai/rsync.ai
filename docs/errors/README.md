@@ -263,15 +263,22 @@ ALTER TABLE `your_database`.`your_table` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`
 ## schema-drift
 
 **Code:** `SCHEMA_DRIFT_DETECTED` · config error · shown to the user · ~10 minutes.
+Also `SCHEMA_DRIFT_HANDLED` (info) and `SCHEMA_DRIFT_APPLY_FAILED` (warning).
 
-The source schema has changed — a column was added, removed, or retyped — and the
-destination is out of sync.
+The source schema has changed. rsync.ai handles column changes on its own, for batch and CDC
+alike: an added or retyped column is applied to the destination, and a dropped column is
+kept there and no longer written. Those alerts carry `SCHEMA_DRIFT_HANDLED`, or
+`SCHEMA_DRIFT_APPLY_FAILED` when the destination refused the change. Only a dropped source
+table waits for a decision, and only that alert carries `SCHEMA_DRIFT_DETECTED`.
 
 **Fix**
 
-1. Open the pipeline's **Schema** tab to see the detected drift.
-2. Approve the proposed schema migration, **or**
-3. Run the pipeline in `reload` mode to recreate destination tables.
+1. Open the schema changes page for the pipeline (the alert's **Review change** link) to
+   see what changed and what rsync.ai did with it.
+2. For a dropped table, **Approve** drops the destination table and **Reject** keeps it.
+   Either way the table leaves the pipeline.
+3. If the destination is still out of sync, run the pipeline in `reload` mode to recreate
+   its tables.
 
 ## postgres-schema-not-visible
 
@@ -702,12 +709,23 @@ A single-node replica set is enough — you do not need extra members.
 **Code:** `MONGODB_RESUME_TOKEN_INVALID` · warning · ~10 minutes.
 
 The change-stream resume token is no longer in the oplog, so streaming cannot continue from
-where it left off. rsync.ai re-snapshots the affected collections from a fresh position — no
-data is lost, but the snapshot re-reads them.
+where it left off. Retrying, Resume and Reload all start from that lost position and fail the
+same way, and rsync.ai does not re-snapshot on its own: the connector's stored position has
+to be cleared, which re-snapshots the affected collections.
 
 **Fix**
 
-1. No manual command is needed; rsync.ai re-snapshots from a fresh change-stream position.
+1. Clear the lost position with a CDC recovery (the endpoint needs `CDC_RECOVERY_ENABLED=true`
+   on the orchestrator; send `"dry_run": true` first to see the plan):
+
+   ```bash
+   curl -X POST "$RSYNC_URL/api/v1/pipelines/<pipeline-id>/cdc/recover" \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"operator":"<you>","reason":"resume token lost","snapshot_mode":"initial","reset_offsets":true}'
+   ```
+
+   The connector is stopped, its offsets are cleared, and it starts again: it re-snapshots the
+   affected collections from a fresh change-stream position and streams on from there.
 2. To prevent recurrence, size the oplog so tokens survive longer downtime:
 
    ```javascript
@@ -716,8 +734,6 @@ data is lost, but the snapshot re-reads them.
    // Increase the oplog size (example: 16 GB):
    db.adminCommand({ replSetResizeOplog: 1, size: 16384 })
    ```
-
-3. Re-run or resume this pipeline.
 
 ## mongodb-change-stream-access
 

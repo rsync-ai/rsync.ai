@@ -2,12 +2,13 @@
 
 import { forwardRef, useImperativeHandle, useMemo, useRef } from "react"
 import CodeMirror, { EditorView, keymap, type ReactCodeMirrorRef } from "@uiw/react-codemirror"
-import { sql, PostgreSQL, MySQL, StandardSQL, type SQLDialect } from "@codemirror/lang-sql"
+import { sql, type SQLDialect } from "@codemirror/lang-sql"
 import { autocompletion, closeCompletion } from "@codemirror/autocomplete"
 import { Prec } from "@codemirror/state"
 import { oneDark } from "@codemirror/theme-one-dark"
 import { useTheme } from "next-themes"
 import { buildSchemaLookup, type ForeignKeyLike } from "@/lib/explorer/sqlCompletions"
+import { codeMirrorDialect, type ExplorerSqlDialect } from "@/lib/explorer/sqlDialect"
 import { cn } from "@/lib/utils"
 import {
   buildSqlCompletionSources,
@@ -37,7 +38,7 @@ export interface SqlEditorProps {
   /** Foreign keys for join-key hints offered after `ON` in a JOIN. */
   foreignKeys?: ForeignKeyLike[]
   /** Connector dialect — switches CodeMirror's SQL parser per-engine. */
-  dialect?: "postgresql" | "mysql" | "redshift" | "databricks" | "generic"
+  dialect?: ExplorerSqlDialect
   /** Triggered on Cmd/Ctrl+Enter so callers can run the query without
    *  clicking the button. */
   onSubmit?: () => void
@@ -112,11 +113,14 @@ export function runFromEditor(view: EditorView, onSubmit?: () => void): boolean 
  *  - Good SQL dialect support out of the box
  *  - Mobile-friendly (Monaco doesn't ship a touch keyboard story)
  *
- * Autocomplete strategy:
- *  - After FROM / JOIN: suggest tables (schema-qualified if available)
- *  - After "tablename." or "alias.": suggest that table's columns
- *  - Anywhere else: tables + columns + SQL keywords (keywords come from
- *    the dialect keyword source, paired in via buildSqlCompletionSources)
+ * Autocomplete strategy (by what the caret can be typing — sqlSlotAt):
+ *  - Start of a statement: statement keywords (SELECT, WITH, …)
+ *  - After FROM / JOIN / INTO / UPDATE: tables only, by name, inserting the
+ *    schema-qualified name; after JOIN the foreign-key joins come first
+ *  - After a table: clause keywords (WHERE, LEFT JOIN, ORDER BY, …)
+ *  - Inside an expression: the statement's columns and aliases, then keywords
+ *  - After "tablename." or "alias.": that table's columns
+ *  Keywords are a curated list (sqlKeywords.ts), not the dialect's full word list.
  *
  * Keyboard shortcuts:
  *  - Cmd/Ctrl+Enter → onSubmit (run query)
@@ -186,26 +190,13 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   // that left the range alone.
   const lastSelectionRef = useRef<{ from: number; to: number }>({ from: 0, to: 0 })
 
-  // Resolve a CodeMirror SQL dialect from our string union. Falls back
-  // to StandardSQL for engines we don't have a dedicated parser for
-  // (databricks, redshift) — keywords + syntax highlighting still work.
-  const sqlDialect: SQLDialect = useMemo(() => {
-    switch (dialect) {
-      case "mysql":
-        return MySQL
-      case "postgresql":
-      case "redshift":
-        return PostgreSQL
-      default:
-        return StandardSQL
-    }
-  }, [dialect])
+  // Resolve a CodeMirror SQL dialect from our string union (codeMirrorDialect).
+  const sqlDialect: SQLDialect = useMemo(() => codeMirrorDialect(dialect), [dialect])
 
   // Schema-aware completion is computed by the pure `sqlCompletions` /
-  // `sqlCompletionSources` modules (unit-tested independently). The source
-  // resolves alias/table/schema-qualified columns after a dot, a schema's
-  // tables after `schema.`, and tables + columns + FK join-keys at a word
-  // boundary. Memoized so we don't rebuild it on every keystroke.
+  // `sqlCompletionSources` modules (unit-tested independently, including
+  // CodeMirror's own ranking in sqlCompletionRanking.test.ts). Memoized so we
+  // don't rebuild it on every keystroke.
   const schemaLookup = useMemo(() => buildSchemaLookup(tables), [tables])
   const schemaCompletions = useMemo(
     () => createSchemaCompletionSource(schemaLookup, foreignKeys),
@@ -223,10 +214,9 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
       }),
       autocompletion({
         // Completion sources: our schema-aware source (tables / columns /
-        // FK-join hints) plus the dialect keyword completer. `override`
-        // REPLACES the language-data sources, so the keyword source that
-        // sql() registers must be re-added explicitly — otherwise SELECT /
-        // WHERE / JOIN / … never complete. See buildSqlCompletionSources.
+        // FK joins) plus our keyword source. `override` REPLACES the
+        // language-data sources, so sql()'s own keyword completer is not
+        // used. See buildSqlCompletionSources.
         override: buildSqlCompletionSources(schemaCompletions, sqlDialect),
         defaultKeymap: true,
       }),

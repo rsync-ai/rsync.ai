@@ -290,7 +290,7 @@ joins under the bare value.
 
 | Consumer | Group id it actually joins | Source |
 |---|---|---|
-| Per-topic consumers (the schema-drift healer's, only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`) | `rsync.go-orchestrator-group-rsync.<topic>` | [manager.go:1038](internal/kafka/manager.go#L1038) |
+| Per-topic consumers (the schema-drift healer's, only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`) | `rsync.go-orchestrator-group-rsync.<topic>` | [manager.go:1024](internal/kafka/manager.go#L1024) |
 | API Gateway, domain events | `rsync.api-gateway-domain-events` | `api-gateway/internal/handlers/domain_events.go` |
 
 Both halves are qualified — `KAFKA_GROUP_ID` once at the point it is read

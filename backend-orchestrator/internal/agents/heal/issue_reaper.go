@@ -43,7 +43,7 @@ const uuidTextPattern = `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-
 
 // reapOrphanedIssuesQuery closes pipeline issues whose pipeline is gone.
 //
-// Three guards, each load-bearing:
+// Four guards, each load-bearing:
 //
 //  1. component_type IN ('cdc_pipeline','batch_pipeline') — the only two types
 //     whose component_id is meant to be a pipeline id at all. 'infrastructure'
@@ -52,7 +52,7 @@ const uuidTextPattern = `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-
 //     permanent normal state.
 //
 //  2. The UUID shape guard — component_type alone is NOT sufficient to conclude
-//     component_id is a pipeline id. cdc_wal_watchdog.go:305-307 writes
+//     component_id is a pipeline id. cdc_wal_watchdog.go:572-576 writes
 //     component_type='cdc_pipeline' with the replication SLOT NAME as
 //     component_id whenever the slot has no pipeline attached. That row matches
 //     no pipeline by construction, and the problem it reports — an unattached
@@ -63,6 +63,16 @@ const uuidTextPattern = `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-
 //  3. NOT EXISTS over `p.id::text = c.component_id`, cast in that direction for
 //     the reason spelled out on issueSweepCandidatesQuery: casting the other way
 //     cannot fail for any value either column can hold.
+//
+//  4. Not a WAL alarm whose slot the watchdog still watches. Its row is keyed by
+//     slot and carries the pipeline's id while the pipeline exists, but the slot
+//     can outlive the pipeline: cdc_resources.pipeline_id is ON DELETE SET NULL
+//     and a failed drop leaves the slot 'failed', so the watchdog keeps reading
+//     its retained WAL. Its upsert never clears resolved_at, so a row closed here
+//     would stay hidden for as long as the slot pins WAL — for good, at WARNING,
+//     where nothing drops the slot. The status list is the watchdog's own
+//     (checkWALRetention); once a slot leaves it ('deleted' after the drop) the
+//     watchdog never resolves the row and this guard lets it be reaped.
 //
 // It sets resolved_at rather than DELETEing. The row is the healer's record that
 // the alarm fired and when; a DELETE would erase the evidence, and an operator
@@ -76,6 +86,13 @@ const reapOrphanedIssuesQuery = `
 		  AND c.component_id ~ $1
 		  AND NOT EXISTS (
 		      SELECT 1 FROM pipelines p WHERE p.id::text = c.component_id
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM cdc_resources cr
+		      WHERE c.id = 'cdc-wal-' || cr.resource_name
+		        AND cr.resource_type = 'replication_slot'
+		        AND cr.database_type = 'postgresql'
+		        AND cr.status IN ('active', 'inactive', 'failed', 'orphaned')
 		  )
 		RETURNING c.id
 	`

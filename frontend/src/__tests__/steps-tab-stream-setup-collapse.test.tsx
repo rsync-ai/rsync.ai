@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { cleanup, render, screen, fireEvent, within } from "@testing-library/react"
+import { act, cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
 const push = vi.fn()
@@ -47,6 +47,7 @@ const SETUP_STAGES = [
 
 let planStages: { id: string; display_name: string; status: string }[]
 let planMetadata: Record<string, unknown> | undefined
+let estimatedTime: number | undefined
 let connectorTypes: Record<string, string>
 // data_loading_strategy is an OBJECT, and normalizeStrategyMode only reads the
 // literal "cdc" — the plan's own `mode` is hardcoded "batch" by the workflow
@@ -57,7 +58,7 @@ function reply(url: string) {
   if (url.includes("/state")) {
     return {
       execution_id: "e1",
-      execution_plan: { pipeline_id: "p1", mode: "batch", stages: planStages, metadata: planMetadata },
+      execution_plan: { pipeline_id: "p1", mode: "batch", stages: planStages, metadata: planMetadata, estimated_time: estimatedTime },
     }
   }
   if (url.includes("/events")) return { events: [] }
@@ -90,6 +91,7 @@ function reply(url: string) {
 beforeEach(() => {
   planStages = [...SETUP_STAGES]
   planMetadata = undefined
+  estimatedTime = undefined
   connectorTypes = {}
   strategy = { mode: "cdc" }
   authFetch.mockImplementation(async (url: string) => ({
@@ -214,6 +216,83 @@ describe("Steps/DAG view switch", () => {
   })
 })
 
+/**
+ * Prod, 2026-10-23, KYC (a CDC pipeline): opening Steps/DAG showed the
+ * Graph/Timeline switch and the right-edge copilot tab for a moment, then took
+ * them away. The tab applies the plan from /state first and only then asks for
+ * the pipeline itself, and until that answers the mode comes from the plan,
+ * which the workflow always writes as "batch". Measured: the switch appeared at
+ * 469 ms, when /state returned, and went at 981 ms, when GET /pipelines/:id did.
+ * So nothing whose shape depends on the mode may draw before the mode is known.
+ */
+describe("Steps/DAG before the pipeline's mode is known", () => {
+  const isPipelineGet = (url: string) => url.endsWith("/pipelines/p1")
+
+  // Answers everything at once except GET /pipelines/:id, which waits for release().
+  function holdPipelineGet(pipelineReply?: { ok: boolean; status: number }) {
+    let release!: () => void
+    const held = new Promise<void>((r) => {
+      release = r
+    })
+    authFetch.mockImplementation(async (url: string) => {
+      const u = String(url)
+      if (isPipelineGet(u)) {
+        await held
+        if (pipelineReply) return { ...pipelineReply, json: async () => ({}) }
+      }
+      return { ok: true, status: 200, json: async () => reply(u) }
+    })
+    return async () => {
+      await act(async () => release())
+    }
+  }
+
+  // The plan from /state is in hand and the pipeline request is in flight.
+  async function untilPipelineRequested() {
+    await waitFor(() => expect(authFetch.mock.calls.some(([u]) => isPipelineGet(String(u)))).toBe(true))
+    await act(async () => {})
+  }
+
+  const viewSwitch = () => screen.queryByRole("group", { name: "Steps view" })
+  const copilotTab = () => screen.queryByRole("button", { name: "Open Pipeline Copilot" })
+
+  it("CDC: no Graph/Timeline switch or copilot tab while the pipeline is still loading", async () => {
+    const release = holdPipelineGet()
+    render(<StepsDAGTab pipelineId="p1" />)
+    await untilPipelineRequested()
+
+    expect(viewSwitch()).toBeNull()
+    expect(copilotTab()).toBeNull()
+
+    await release()
+    await screen.findByTestId("setup-toggle")
+    expect(viewSwitch()).toBeNull()
+    expect(copilotTab()).toBeNull()
+  })
+
+  it("control: a batch pipeline gets both once its mode is known", async () => {
+    strategy = { mode: "batch" }
+    const release = holdPipelineGet()
+    render(<StepsDAGTab pipelineId="p1" />)
+    await untilPipelineRequested()
+    expect(viewSwitch()).toBeNull()
+
+    await release()
+    expect(await screen.findByRole("group", { name: "Steps view" })).toBeInTheDocument()
+    expect(copilotTab()).toBeInTheDocument()
+  })
+
+  it("control: a failed pipeline request still settles the mode, from the plan as before", async () => {
+    const release = holdPipelineGet({ ok: false, status: 500 })
+    render(<StepsDAGTab pipelineId="p1" />)
+    await untilPipelineRequested()
+    expect(viewSwitch()).toBeNull()
+
+    await release()
+    expect(await screen.findByRole("group", { name: "Steps view" })).toBeInTheDocument()
+  })
+})
+
 describe("Steps/DAG labels", () => {
   it("names connectors the way the rest of the app does", async () => {
     // prettyConnectorLabel title-cased the id, so the live strip read
@@ -234,7 +313,7 @@ describe("Steps/DAG labels", () => {
     strategy = { mode: "batch" }
     render(<StepsDAGTab pipelineId="p1" />)
     await screen.findByTestId("dag")
-    expect(screen.getByTestId("steps-count")).toHaveTextContent("Steps: 3")
+    expect(within(screen.getByRole("region", { name: "Steps" })).getByText("3")).toBeInTheDocument()
     expect(screen.queryByText(/Nodes:/)).toBeNull()
   })
 
@@ -298,5 +377,50 @@ describe("Steps/DAG insight chips name the pipeline", () => {
     expect(push).toHaveBeenCalledTimes(1)
     const prompt = new URL(push.mock.calls[0][0] as string, "http://x").searchParams.get("prompt") ?? ""
     expect(prompt).toContain(`(pipeline ${PIPELINE_ID})`)
+  })
+})
+
+// Mode, step count and run-time estimate were a footer under a 540 px canvas,
+// below the fold. They are a row of cards above the graph now.
+describe("Steps summary cards", () => {
+  it("batch: Mode, Steps and Estimated time sit above the graph", async () => {
+    strategy = { mode: "batch" }
+    estimatedTime = 20
+    render(<StepsDAGTab pipelineId="p1" />)
+    const dag = await screen.findByTestId("dag")
+    const mode = screen.getByRole("region", { name: "Mode" })
+    expect(within(mode).getByText("Batch")).toBeInTheDocument()
+    expect(within(screen.getByRole("region", { name: "Estimated time" })).getByText("~20s")).toBeInTheDocument()
+    expect(mode.compareDocumentPosition(dag) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.queryByText(/Est\. Time:/)).toBeNull()
+  })
+
+  it("CDC: no run-time estimate, a stream has no end", async () => {
+    estimatedTime = 20
+    render(<StepsDAGTab pipelineId="p1" />)
+    await screen.findByTestId("live-stream-graph")
+    expect(within(screen.getByRole("region", { name: "Mode" })).getByText("CDC")).toBeInTheDocument()
+    expect(screen.queryByRole("region", { name: "Estimated time" })).toBeNull()
+  })
+
+  it("leaves Mode out when neither the pipeline nor its plan names one, rather than say it could not load", async () => {
+    strategy = {} as { mode: string }
+    const answer = authFetch.getMockImplementation()!
+    authFetch.mockImplementation(async (url: string) => {
+      const r = await answer(url)
+      if (!String(url).includes("/state")) return r
+      const body = await r.json()
+      return { ...r, json: async () => ({ ...body, execution_plan: { ...body.execution_plan, mode: undefined } }) }
+    })
+    render(<StepsDAGTab pipelineId="p1" />)
+    await screen.findByRole("region", { name: "Steps" })
+    expect(screen.queryByRole("region", { name: "Mode" })).toBeNull()
+  })
+
+  it("loads as skeleton cards, not a spinner", async () => {
+    authFetch.mockImplementation(() => new Promise(() => {}))
+    render(<StepsDAGTab pipelineId="p1" />)
+    const statuses = screen.getAllByRole("status").map((s) => s.textContent)
+    expect(statuses).toEqual(expect.arrayContaining([expect.stringContaining("Loading steps…")]))
   })
 })

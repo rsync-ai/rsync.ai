@@ -77,16 +77,17 @@ export function ConnectionScopeSection({
   namespaceKind,
   value,
   onChange,
-  pinnedDatabase,
+  pinnedNamespace,
   loadNamespaces,
 }: {
   // namespace_model table_namespace: "database", "schema" or "dataset".
   namespaceKind: string
   value: ScopeValue
   onChange: (v: ScopeValue) => void
-  // The database a database-namespace connection names: it is then pinned to
-  // it and the Scope does not apply (the connector ignores it too).
-  pinnedDatabase?: string
+  // The database a database-namespace connection names, or the dataset a
+  // dataset-namespace one (BigQuery) names: it is then pinned to it and the
+  // Scope does not apply (the connector ignores it too).
+  pinnedNamespace?: string
   loadNamespaces: () => Promise<NamespaceListing>
 }) {
   const kinds = plural(namespaceKind)
@@ -94,13 +95,23 @@ export function ConnectionScopeSection({
   const [listing, setListing] = useState<NamespaceListing | null>(null)
   const [loadError, setLoadError] = useState("")
 
-  if (pinnedDatabase) {
+  if (pinnedNamespace) {
     return (
       <div data-testid="connection-scope" className="space-y-2 rounded-lg border p-4">
         <h3 className="text-sm font-semibold">Scope</h3>
+        {/* A BigQuery dataset is required, so it has no "leave it empty" way out. */}
         <p data-testid="connection-scope-pinned" className="text-xs text-zinc-500 dark:text-zinc-400">
-          This connection reads one database, <span className="font-mono">{pinnedDatabase}</span>. Leave the
-          database empty to reach every database on the server and choose which ones here.
+          {namespaceKind === "dataset" ? (
+            <>
+              This connection reads one dataset, <span className="font-mono">{pinnedNamespace}</span>. To read
+              another, change the dataset above or add a connection for it.
+            </>
+          ) : (
+            <>
+              This connection reads one database, <span className="font-mono">{pinnedNamespace}</span>. Leave the
+              database empty to reach every database on the server and choose which ones here.
+            </>
+          )}
         </p>
       </div>
     )

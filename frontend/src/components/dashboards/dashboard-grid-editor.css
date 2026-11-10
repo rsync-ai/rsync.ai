@@ -1,0 +1,92 @@
+/*
+ * The dashboard editor's grid, over react-grid-layout's own styles (imported before
+ * this file): a tile's resize handles show all the time, not on hover only, and are
+ * 24 px targets (WCAG 2.5.8); the drop space and the column guides are in the theme's
+ * colours, not RGL's red. Colours are the theme's tokens, so both themes follow.
+ */
+
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle {
+  width: 24px;
+  height: 24px;
+  opacity: 1;
+  transform: none;
+  z-index: 2;
+}
+
+/* The mark inside each handle: a bar on an edge, an angle at the corner. */
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle::after {
+  border: 0;
+  border-radius: 9999px;
+  background: hsl(var(--muted-foreground) / 0.55);
+  transition: background-color 120ms ease;
+}
+
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-e {
+  top: 50%;
+  right: 0;
+  margin-top: -12px;
+  transform: none;
+}
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-e::after {
+  top: 4px;
+  right: 3px;
+  bottom: auto;
+  width: 4px;
+  height: 16px;
+}
+
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-s {
+  bottom: 0;
+  left: 50%;
+  margin-left: -12px;
+  transform: none;
+}
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-s::after {
+  right: 4px;
+  bottom: 3px;
+  width: 16px;
+  height: 4px;
+}
+
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-se::after {
+  right: 4px;
+  bottom: 4px;
+  width: 9px;
+  height: 9px;
+  border-radius: 0 0 3px 0;
+  background: none;
+  border-right: 3px solid hsl(var(--muted-foreground) / 0.55);
+  border-bottom: 3px solid hsl(var(--muted-foreground) / 0.55);
+}
+
+.dashboard-grid-editor .react-grid-item:hover > .react-resizable-handle::after,
+.dashboard-grid-editor .react-grid-item.resizing > .react-resizable-handle::after {
+  background-color: hsl(var(--foreground) / 0.7);
+}
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle:hover::after {
+  background-color: hsl(var(--primary));
+}
+.dashboard-grid-editor .react-grid-item:hover > .react-resizable-handle.react-resizable-handle-se::after,
+.dashboard-grid-editor .react-grid-item.resizing > .react-resizable-handle.react-resizable-handle-se::after {
+  background: none;
+  border-color: hsl(var(--foreground) / 0.7);
+}
+.dashboard-grid-editor .react-grid-item > .react-resizable-handle.react-resizable-handle-se:hover::after {
+  background: none;
+  border-color: hsl(var(--primary));
+}
+
+/* Where the tile will land. */
+.dashboard-grid-editor .react-grid-item.react-grid-placeholder {
+  background: hsl(var(--primary) / 0.12);
+  border: 1px dashed hsl(var(--primary) / 0.7);
+  border-radius: 0.5rem;
+  opacity: 1;
+}
+
+/* The 12 columns, drawn under the tiles while one is dragged or resized. */
+.dashboard-column-guides > div {
+  border-radius: 4px;
+  background: hsl(var(--primary) / 0.06);
+  box-shadow: inset 0 0 0 1px hsl(var(--primary) / 0.18);
+}

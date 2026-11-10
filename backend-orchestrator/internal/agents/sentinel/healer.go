@@ -1,7 +1,6 @@
 package sentinel
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,7 +10,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -90,7 +88,11 @@ func (h *Healer) DetermineAction(issue *Issue) HealingAction {
 	case IssueTypeConnectorDown:
 		return HealingActionRestartConsumer
 	case IssueTypeInfrastructureDown:
-		return HealingActionAlert // Critical infrastructure needs manual intervention
+		// None. The healer cannot repair an outage, and the people who can are already told:
+		// publishInstanceIssueAlert sends the INFRASTRUCTURE_DOWN push before healing is
+		// considered. This used to be a webhook "heal" that needed SENTINEL_ALERT_WEBHOOK_URL,
+		// which no deployment sets, so every outage also logged a failed repair.
+		return ""
 	case IssueTypeRepeatedFailure:
 		return HealingActionCircuitBreak
 	default:
@@ -183,8 +185,6 @@ func (h *Healer) ExecuteHealing(ctx context.Context, issue *Issue, action Healin
 		err, details = h.restartConsumer(ctx, issue.ComponentID)
 	case HealingActionScaleUp:
 		err, details = h.scaleUpConsumers(ctx, issue)
-	case HealingActionAlert:
-		err, details = h.sendAlert(ctx, issue)
 	default:
 		err = fmt.Errorf("unknown healing action: %s", action)
 		details = make(map[string]interface{})
@@ -391,64 +391,6 @@ func (h *Healer) scaleUpConsumers(ctx context.Context, issue *Issue) (error, map
 		}
 	}
 
-	return nil, details
-}
-
-// sendAlert sends an alert for critical issues
-func (h *Healer) sendAlert(ctx context.Context, issue *Issue) (error, map[string]interface{}) {
-	log.WithFields(log.Fields{
-		"issue_id":     issue.ID,
-		"severity":     issue.Severity,
-		"component_id": issue.ComponentID,
-		"description":  issue.Description,
-	}).Error("🚨 CRITICAL ALERT: Manual intervention required")
-	
-	details := map[string]interface{}{
-		"component_id": issue.ComponentID,
-		"severity":     issue.Severity,
-		"description":  issue.Description,
-		"method":       "alert",
-	}
-	
-	webhookURL := strings.TrimSpace(os.Getenv("SENTINEL_ALERT_WEBHOOK_URL"))
-	if webhookURL == "" {
-		// Fail closed: if alerting is configured as an action, it must have a real sink.
-		return fmt.Errorf("alert webhook not configured (SENTINEL_ALERT_WEBHOOK_URL)"), details
-	}
-
-	payload := map[string]interface{}{
-		"event_type":  "sentinel_alert",
-		"timestamp":   time.Now().UTC().Format(time.RFC3339),
-		"issue":       issue,
-		"component_id": issue.ComponentID,
-		"severity":    issue.Severity,
-		"type":        issue.Type,
-		"description": issue.Description,
-		"metadata":    issue.Metadata,
-	}
-	b, _ := json.Marshal(payload)
-
-	req, _ := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		details["error"] = err.Error()
-		return fmt.Errorf("alert webhook request failed: %w", err), details
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	details["http_status"] = resp.StatusCode
-	if len(respBody) > 0 {
-		details["response_body"] = string(respBody)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("alert webhook returned status %d", resp.StatusCode), details
-	}
-	
 	return nil, details
 }
 

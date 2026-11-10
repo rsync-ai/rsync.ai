@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +140,7 @@ func TestCascadeSkipReason_OnlyAStableStopTellsTheModelsBelow(t *testing.T) {
 		{"no result", nil, ""},
 		{"succeeded", &modelRunResult{Status: "succeeded"}, ""},
 		{"failed", &modelRunResult{Status: "failed", Error: "boom"}, skipUpstreamFailed},
+		{"blocked by a data check", &modelRunResult{Status: "failed", Error: modelCheckBlockedError, CheckBlocked: true}, skipUpstreamCheckFailed},
 		{"refused and paused", &modelRunResult{Status: "skipped", AutoPauseReason: "identity"}, skipUpstreamSkipped},
 		// Another run of the same model is in flight; it will wake the same consumers.
 		{"already in progress", &modelRunResult{Status: "skipped", Error: "already in progress"}, ""},
@@ -182,8 +184,10 @@ func TestRecordSkippedDownstream_TheWholeSubtreeIsRecordedOnceAndLinkedHopByHop(
 	expectDownstreamLookup(mock, provModelC, [2]string{"sd", provModelD})
 	expectDownstreamLookup(mock, provModelD)
 
-	recordSkippedDownstream(db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: 1},
-		skipUpstreamFailed)
+	if err := recordSkippedDownstream(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: 1},
+		skipUpstreamFailed); err != nil {
+		t.Fatal(err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
@@ -195,8 +199,10 @@ func TestRecordSkippedDownstream_StopsAtTheChainBound(t *testing.T) {
 	failOnSwallowedError(t)
 
 	// Past the bound: no lookup at all, so a ring cannot make the cascade loop.
-	recordSkippedDownstream(db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, Depth: maxTriggerChainDepth + 1},
-		skipUpstreamFailed)
+	if err := recordSkippedDownstream(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, Depth: maxTriggerChainDepth + 1},
+		skipUpstreamFailed); err != nil {
+		t.Fatal(err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
@@ -210,8 +216,31 @@ func TestRecordSkippedDownstream_WalksAHopExactlyAtTheBound(t *testing.T) {
 	failOnSwallowedError(t)
 
 	expectDownstreamLookup(mock, provUpstream)
-	recordSkippedDownstream(db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, Depth: maxTriggerChainDepth},
-		skipUpstreamFailed)
+	if err := recordSkippedDownstream(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, Depth: maxTriggerChainDepth},
+		skipUpstreamFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The cascade's lookup error comes back to the caller. It used to be logged and dropped,
+// which was all a goroutine could do; the /downstream endpoint answers 500 on it instead,
+// so the workflow retries rather than reading "nothing below".
+func TestRecordSkippedDownstream_ALookupErrorComesBack(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`WHERE u.upstream_saved_query_id = \$1::uuid`).WillReturnError(errors.New("connection reset"))
+	if err := recordSkippedDownstream(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: 1},
+		skipUpstreamFailed); err == nil {
+		t.Fatal("a lookup error was swallowed")
+	}
+	mock.ExpectQuery(`WHERE u.upstream_saved_query_id = \$1::uuid`).WillReturnError(errors.New("connection reset"))
+	if err := recordChainDepthSkips(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: maxTriggerChainDepth + 1}); err == nil {
+		t.Fatal("a lookup error was swallowed")
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
@@ -229,21 +258,41 @@ func TestRecordChainDepthSkips_TheModelPastTheBoundGetsARowSayingSo(t *testing.T
 			upstreamKindModel, provUpstream, provRunA, "", int64(depth), int64(0)).
 		WillReturnRows(sqlmock.NewRows([]string{"run_id"}).AddRow(provRunB))
 
-	recordChainDepthSkips(db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: depth})
+	if err := recordChainDepthSkips(context.Background(), db.DB, modelRefreshSource{Kind: upstreamKindModel, ID: provUpstream, RunID: provRunA, Depth: depth}); err != nil {
+		t.Fatal(err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-var unsatisfiedQuery = `WITH me AS[\s\S]*MAX\(r.started_at\)[\s\S]*s.upstream_policy = 'all'[\s\S]*SELECT COALESCE\(u.upstream_pipeline_id, u.upstream_saved_query_id\)::text\s+FROM me[\s\S]*IS DISTINCT FROM NULLIF\(\$2, ''\)::uuid[\s\S]*ur.status = 'succeeded' AND ur.finished_at > me.baseline[\s\S]*'PIPELINE_COMPLETED' AND e.received_at > me.baseline`
+var unsatisfiedQuery = `WITH me AS[\s\S]*MAX\(r.started_at\)[\s\S]*s.upstream_policy = 'all'[\s\S]*SELECT COALESCE\(u.upstream_pipeline_id, u.upstream_saved_query_id\)::text,[\s\S]*ur.status = 'succeeded'[\s\S]*'PIPELINE_COMPLETED'\s+AND e.received_at > COALESCE\(me.baseline, '-infinity'::timestamptz\)[\s\S]*cdc_table_watermarks w[\s\S]*pipeline_sink_lag l[\s\S]*l.total_lag = 0\)\s+FROM me[\s\S]*IS DISTINCT FROM NULLIF\(\$2, ''\)::uuid`
+
+// upstreamFactRows is the shape unsatisfiedUpstreams scans: one row of facts per upstream.
+func upstreamFactRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "is_model", "baseline", "model_succeeded_at", "pipeline_completed_at",
+		"is_cdc", "watermark_source_time", "sink_caught_up_at"})
+}
 
 func TestUnsatisfiedUpstreams_ReturnsTheStaleSiblingsExcludingTheOneFiring(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
+	baseline := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectQuery(unsatisfiedQuery).
 		WithArgs(provSchedule, provUpstream).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(provModelB).AddRow(provRunA))
+		WillReturnRows(upstreamFactRows().
+			// A model upstream last rebuilt before the baseline: stale.
+			AddRow(provModelB, true, baseline, baseline.Add(-time.Minute), nil, false, nil, nil).
+			// A CDC pipeline whose sink drained after the baseline: fresh, so not listed.
+			AddRow(provRunB, false, baseline, nil, nil, true, nil, baseline.Add(time.Minute)).
+			// A batch pipeline that has not completed since: stale.
+			AddRow(provRunA, false, baseline, nil, nil, false, nil, nil))
+	// The stale model is a cron model, with no upstreams to watch: unknown, so it still waits.
+	mock.ExpectQuery(ancestryQuery).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(ancestryRows().
+			AddRow(provModelB, baseline.Add(-2*time.Minute), nil, false, nil, nil, false, nil))
 
 	got, err := unsatisfiedUpstreams(context.Background(), db.DB, provSchedule, provUpstream)
 	if err != nil {
@@ -283,7 +332,7 @@ func TestRunSavedQueryModelInternal_AFanInWaitingOnASiblingRecordsASkipInsteadOf
 	expectEventSchedule(mock)
 	mock.ExpectQuery(unsatisfiedQuery).
 		WithArgs(provSchedule, provUpstream).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(provModelB))
+		WillReturnRows(upstreamFactRows().AddRow(provModelB, true, nil, nil, nil, false, nil, nil))
 	mock.ExpectQuery(`INSERT INTO saved_query_runs[\s\S]*'skipped'`).
 		WithArgs(savedQueryID, provSchedule, skipWaitingOnUpstreams,
 			"waiting on 1 upstream that has not rebuilt since this model's last build", provActor,
@@ -359,107 +408,123 @@ func TestRunSavedQueryModelInternal_AnUnknownKindStillExcludesTheFiringUpstream(
 	}
 }
 
-// G11.
+// G11. One failed start opens the breaker for the window, inside which no completion
+// dials; once the window passes a start goes through again, and Temporal answering —
+// success or already started — closes it.
 func TestFanOutBreaker_OneFailureStopsTheDialsForTheWindowOnly(t *testing.T) {
+	fastFanOutRetry(t)
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	b := &fanOutBreaker{window: time.Minute, now: func() time.Time { return now }}
 
-	resolves, dispatches := 0, 0
+	resolves := 0
 	var next error
 	resolve := func() upstreamFanOutDispatch {
 		resolves++
-		return func(context.Context, upstreamFanOut) error { dispatches++; return next }
+		return func(context.Context, upstreamFanOut) error { return next }
 	}
-	fire := func() bool {
-		d := b.guard(resolve)
-		if d == nil {
-			return false
-		}
-		_ = d(context.Background(), upstreamFanOut{})
-		return true
-	}
+	start := func() error { return startUpstreamFanOut(context.Background(), b, resolve, upstreamFanOut{}) }
 
-	if !fire() {
-		t.Fatal("a fresh breaker refused to dial")
+	if err := start(); err != nil {
+		t.Fatalf("a fresh breaker: %v", err)
 	}
 	next = errors.New("context deadline exceeded")
-	fire()
-	now = now.Add(30 * time.Second)
-	if fire() {
-		t.Fatal("dialled Temporal again inside the window after it failed")
+	if err := start(); err == nil {
+		t.Fatal("a start that kept failing returned nil")
 	}
-	if resolves != 2 {
-		t.Errorf("resolved the dispatcher %d times, want 2: an open breaker must not even build a client", resolves)
+	now = now.Add(30 * time.Second)
+	before := resolves
+	if err := start(); !errors.Is(err, errFanOutBreakerOpen) {
+		t.Fatalf("inside the window: %v, want errFanOutBreakerOpen", err)
+	}
+	if resolves != before {
+		t.Errorf("resolved the dispatcher %d times inside the window: an open breaker must not even build a client", resolves-before)
 	}
 
 	now = now.Add(31 * time.Second)
 	next = serviceerror.NewWorkflowExecutionAlreadyStarted("started", "", "")
-	if !fire() {
-		t.Fatal("the window passed but the breaker still refused")
+	if err := start(); err != nil {
+		t.Fatalf("the window passed and Temporal answered already-started: %v", err)
 	}
-	// Already started is Temporal answering, so it closes the breaker.
-	if !b.allow() {
+	if !b.until.IsZero() {
 		t.Error("an already-started answer left the breaker open")
 	}
 
 	next = errors.New("unavailable")
-	fire()
+	_ = start()
 	next = nil
 	now = now.Add(2 * time.Minute)
-	fire()
-	if !b.allow() || dispatches != 5 {
-		t.Errorf("a success after the window must close the breaker (allow=%v, dispatches=%d)", b.allow(), dispatches)
+	if err := start(); err != nil || !b.until.IsZero() {
+		t.Errorf("a success after the window must close the breaker (err=%v, until=%v)", err, b.until)
 	}
 }
 
-// When the window passes, one dispatch probes Temporal and the others keep rebuilding
-// in-process until it answers; a completion burst must not all dial a Temporal that is
-// still down.
+// When the window passes, one start probes Temporal and every other completion is refused
+// until it answers: a burst must not all dial a Temporal that is still down, each holding
+// the client mutex for the dial deadline.
 func TestFanOutBreaker_AfterTheWindowOnlyOneProbeDials(t *testing.T) {
+	fastFanOutRetry(t)
+	var mu sync.Mutex
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	b := &fanOutBreaker{window: time.Minute, now: func() time.Time { return now }}
-	failing := func() upstreamFanOutDispatch {
-		return func(context.Context, upstreamFanOut) error { return errors.New("unavailable") }
-	}
+	b := &fanOutBreaker{window: time.Minute, now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now }}
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
 
-	_ = b.guard(failing)(context.Background(), upstreamFanOut{})
-	now = now.Add(61 * time.Second)
+	_ = startUpstreamFanOut(context.Background(), b,
+		resolveTo(func(context.Context, upstreamFanOut) error { return errors.New("unavailable") }), upstreamFanOut{})
+	advance(61 * time.Second)
 
-	probe := b.guard(failing)
-	if probe == nil {
-		t.Fatal("the window passed but no probe was let through")
-	}
+	dialling, release, probeDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		probeDone <- startUpstreamFanOut(context.Background(), b, resolveTo(func(context.Context, upstreamFanOut) error {
+			close(dialling)
+			<-release
+			return nil
+		}), upstreamFanOut{})
+	}()
+	<-dialling
 	for i := 0; i < 3; i++ {
-		if b.guard(failing) != nil {
-			t.Fatal("a second dispatch dialled while the probe was still out")
+		resolves := 0
+		err := startUpstreamFanOut(context.Background(), b, func() upstreamFanOutDispatch { resolves++; return nil }, upstreamFanOut{})
+		if !errors.Is(err, errFanOutBreakerOpen) || resolves != 0 {
+			t.Fatalf("a second start while the probe was out: err=%v, resolves=%d", err, resolves)
 		}
 	}
-	_ = probe(context.Background(), upstreamFanOut{})
-	if b.guard(failing) != nil {
-		t.Fatal("a failed probe must reopen the breaker for another window")
+	close(release)
+	if err := <-probeDone; err != nil {
+		t.Fatalf("the probe: %v", err)
 	}
+	if !b.acquire() {
+		t.Fatal("a probe that got through left the breaker open")
+	}
+}
 
-	// A probe that never reports is given up on after a window, not held forever.
-	now = now.Add(61 * time.Second)
-	if b.guard(failing) == nil {
-		t.Fatal("no probe after the reopened window")
+// A probe that never answers is given up on after a window, so a lost one cannot keep
+// Temporal bypassed for good.
+func TestFanOutBreaker_AProbeThatNeverAnswersIsGivenUpOn(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	b := &fanOutBreaker{window: time.Minute, now: func() time.Time { return now }, until: now.Add(-time.Second)}
+	if !b.acquire() {
+		t.Fatal("no probe after the window")
 	}
-	if b.guard(failing) != nil {
-		t.Fatal("second probe while the first is out")
+	if b.acquire() {
+		t.Fatal("a second probe while the first is out")
 	}
 	now = now.Add(61 * time.Second)
-	if b.guard(failing) == nil {
+	if !b.acquire() {
 		t.Fatal("a probe that never answered kept Temporal bypassed")
 	}
+}
 
-	// A dispatcher that cannot be built releases the probe at once.
-	now = now.Add(61 * time.Second)
-	b = &fanOutBreaker{window: time.Minute, now: func() time.Time { return now }, until: now.Add(-time.Second)}
-	if b.guard(func() upstreamFanOutDispatch { return nil }) != nil {
-		t.Fatal("nil dispatcher")
+// No client is a failed start, not a released probe. getTemporalClient returns nil when
+// its dial fails, after holding the client mutex for the dial's deadline; releasing the
+// probe would let the very next completion pay that again.
+func TestFanOutBreaker_NoClientReopensTheWindow(t *testing.T) {
+	fastFanOutRetry(t)
+	b := closedBreaker()
+	if err := startUpstreamFanOut(context.Background(), b, func() upstreamFanOutDispatch { return nil }, upstreamFanOut{}); err == nil {
+		t.Fatal("no client returned nil")
 	}
-	if b.guard(failing) == nil {
-		t.Fatal("a probe with no dispatcher was never released")
+	if b.acquire() {
+		t.Fatal("no client left the breaker closed")
 	}
 }
 

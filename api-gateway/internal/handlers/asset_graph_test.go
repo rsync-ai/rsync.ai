@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -525,9 +526,9 @@ func TestAssetGraph_ProducedRowWithoutItsPipelineIsDropped(t *testing.T) {
 // claim this endpoint exists to make. The flag has to survive into the response.
 func TestAssetGraph_TruncationSurvivesIntoStats(t *testing.T) {
 	g := buildAssetGraph(assetGraphInput{
-		Truncated: assetGraphTruncation{Pipelines: true, ProducedTables: true, Models: true},
+		Truncated: assetGraphTruncation{Pipelines: true, ProducedTables: true, Models: true, Charts: true, Dashboards: true},
 	})
-	want := assetGraphTruncation{Pipelines: true, ProducedTables: true, Models: true}
+	want := assetGraphTruncation{Pipelines: true, ProducedTables: true, Models: true, Charts: true, Dashboards: true}
 	if g.Stats.Truncated != want {
 		t.Errorf("truncated = %+v, want %+v", g.Stats.Truncated, want)
 	}
@@ -874,5 +875,224 @@ func TestAssetGraph_OldUnnamedRunDoesNotDuplicateANamedTable(t *testing.T) {
 	}
 	if got := len(writesFrom(g, "pipeline:p1")); got != 1 {
 		t.Errorf("pipeline writes %d tables, want 1", got)
+	}
+}
+
+// The layer badge: a table a pipeline writes is a pipeline table, not a layer, whether
+// or not its stats row named it; a model and the table it builds carry the model's
+// workspace layer by name; a model with no layer and the table it builds carry none —
+// the graph never guesses one.
+func TestAssetGraph_Layers(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{
+			{ID: "p1", Name: "Orders sync", ConnectionID: connA},
+			{ID: "p2", Name: "Events to GCS", ConnectionID: connB},
+		},
+		Produced: []tableProducer{
+			pipeWrites("p1", "Orders sync", connA, "analytics.orders", "orders"),
+			pipeWroteUnnamed("p2", "Events to GCS", connB, "app.events", "events"),
+		},
+		Models: []modelAsset{
+			{
+				ID: "m1", Name: "Clean orders", ConnectionID: connA, Layer: "Staging",
+				SQLText:         "SELECT * FROM analytics.orders",
+				Materialization: "table", TargetTable: "analytics.clean_orders",
+			},
+			{
+				ID: "m2", Name: "Revenue", ConnectionID: connA, Layer: "Marts",
+				SQLText:         "SELECT sum(total) FROM analytics.clean_orders",
+				Materialization: "table", TargetTable: "analytics.revenue",
+			},
+			{
+				ID: "m3", Name: "Scratch", ConnectionID: connA,
+				SQLText:         "SELECT * FROM analytics.revenue",
+				Materialization: "table", TargetTable: "analytics.scratch",
+			},
+		},
+	})
+
+	got := map[string]string{}
+	for _, n := range g.Nodes {
+		if n.Kind != assetKindPipeline {
+			got[n.Kind+" "+n.Name] = fmt.Sprintf("%q pipeline_table=%v", n.Layer, n.PipelineTable)
+		}
+	}
+	want := map[string]string{
+		"table analytics.orders":       `"" pipeline_table=true`,
+		"table app.events":             `"" pipeline_table=true`,
+		"model Clean orders":           `"Staging" pipeline_table=false`,
+		"table analytics.clean_orders": `"Staging" pipeline_table=false`,
+		"model Revenue":                `"Marts" pipeline_table=false`,
+		"table analytics.revenue":      `"Marts" pipeline_table=false`,
+		"model Scratch":                `"" pipeline_table=false`,
+		"table analytics.scratch":      `"" pipeline_table=false`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("layers = %v\nwant     %v", got, want)
+	}
+	for _, n := range g.Nodes {
+		if n.Kind == assetKindPipeline && (n.Layer != "" || n.PipelineTable) {
+			t.Errorf("a pipeline is a producer, not a layer or a table; %s has %q/%v", n.ID, n.Layer, n.PipelineTable)
+		}
+	}
+}
+
+// A MongoDB model's sql_text is a stored pipeline (documentModelQuery), not SQL, and the
+// SQL extractor finds no table in JSON — so a document model drew no reads edge and had
+// no upstream at all. This is the #1340 live chain, shape for shape: a CDC pipeline
+// lands rsync_layers_test.subscriptions, silver aggregates it into a qualified target,
+// gold aggregates silver into a bare collection name, which the connector writes into
+// the pipeline's own database (_materialize_target), and a report joins gold through
+// $lookup.
+func TestAssetGraph_DocumentModelsReadTheCollectionsTheirPipelinesName(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Subscriptions CDC", ConnectionID: connA}},
+		Produced: []tableProducer{pipeWrites("p1", "Subscriptions CDC", connA,
+			"rsync_layers_test.subscriptions", "subscriptions")},
+		Models: []modelAsset{
+			{
+				ID: "silver", Name: "Subscriptions silver", ConnectionID: connA, ConnectorType: "mongodb",
+				Materialization: matTable, TargetTable: "rsync_layers_test.subscriptions_silver", Layer: "silver",
+				SQLText: `{"database":"rsync_layers_test","collection":"subscriptions","pipeline":[{"$match":{}}]}`,
+			},
+			{
+				ID: "gold", Name: "Subscriptions by plan", ConnectionID: connA, ConnectorType: "mongodb",
+				Materialization: matTable, TargetTable: "subscriptions_gold_by_plan", Layer: "gold",
+				SQLText: `{"database": "rsync_layers_test", "collection": "subscriptions_silver",
+					"pipeline": [{"$group": {"_id": "$plan", "subscriptions": {"$sum": 1}}}]}`,
+			},
+			{
+				ID: "report", Name: "Plan report", ConnectionID: connA, ConnectorType: "mongodb",
+				Materialization: matNone,
+				SQLText: `{"database":"rsync_layers_test","collection":"plans","pipeline":[
+					{"$lookup":{"from":"subscriptions_gold_by_plan","localField":"_id","foreignField":"_id","as":"totals"}}]}`,
+			},
+		},
+	})
+
+	for id, want := range map[string][]string{
+		"silver": {"pipeline:p1"},
+		"gold":   {"model:silver"},
+		"report": {"model:gold"},
+	} {
+		if got := modelByID(t, g, id).Upstreams; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s upstreams = %v, want %v", id, got, want)
+		}
+	}
+	// plans has no producer here: an input without one is reported, never dropped.
+	if got := modelByID(t, g, "report").Unresolved; !reflect.DeepEqual(got, []string{"rsync_layers_test.plans"}) {
+		t.Errorf("report unresolved = %v, want [rsync_layers_test.plans]", got)
+	}
+	if got := len(edgeKinds(g, assetEdgeReads)); got != 3 {
+		t.Errorf("reads edges = %d, want 3", got)
+	}
+	var tables []string
+	for _, n := range g.Nodes {
+		if n.Kind == assetKindTable {
+			tables = append(tables, n.Name)
+		}
+	}
+	sort.Strings(tables)
+	want := []string{"rsync_layers_test.subscriptions", "rsync_layers_test.subscriptions_gold_by_plan",
+		"rsync_layers_test.subscriptions_silver"}
+	if !reflect.DeepEqual(tables, want) {
+		t.Errorf("tables = %v, want %v", tables, want)
+	}
+}
+
+// A pipeline that names no database runs in the connection's pinned one, which the graph
+// cannot see. Its collections stay bare names, matched by name alone exactly as an
+// unqualified SQL reference is, and its bare target is not guessed into a database. A
+// stored pipeline rsync.ai would refuse to run reads nothing — it is never parsed as SQL.
+func TestAssetGraph_DocumentModelWithoutADatabaseMatchesByName(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Orders CDC", ConnectionID: connA}},
+		Produced:  []tableProducer{pipeWrites("p1", "Orders CDC", connA, "shop.orders", "orders")},
+		Models: []modelAsset{
+			{
+				ID: "m1", Name: "Daily orders", ConnectionID: connA, ConnectorType: "mongodb",
+				Materialization: matTable, TargetTable: "orders_daily",
+				SQLText: `{"collection":"orders","pipeline":[{"$match":{}}]}`,
+			},
+			{
+				ID: "bad", Name: "Writes elsewhere", ConnectionID: connA, ConnectorType: "mongodb",
+				Materialization: matTable, TargetTable: "copied",
+				SQLText: `{"collection":"orders","pipeline":[{"$out":"copied_too"}]}`,
+			},
+		},
+	})
+
+	if got := modelByID(t, g, "m1").Upstreams; !reflect.DeepEqual(got, []string{"pipeline:p1"}) {
+		t.Errorf("upstreams = %v, want [pipeline:p1]", got)
+	}
+	if !hasNode(g, assetKindTable+":"+producedTableKey(connA, producedTable{TableName: "orders_daily"})) {
+		t.Errorf("a bare target with no database stays bare; nodes = %+v", g.Nodes)
+	}
+	bad := modelByID(t, g, "bad")
+	if len(bad.Upstreams) != 0 || len(bad.Unresolved) != 0 {
+		t.Errorf("a pipeline rsync.ai refuses reads nothing: upstreams=%v unresolved=%v", bad.Upstreams, bad.Unresolved)
+	}
+}
+
+// A chart is drawn after the model it is drawn from, and a dashboard after the charts
+// it shows. Each needs its other end in the graph: a chart whose model is not here, or
+// a dashboard none of whose charts is, would be an edge from a node nobody can draw.
+func TestAssetGraph_ChartsAndDashboardsFollowTheirModels(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Models: []modelAsset{
+			{ID: "m1", Name: "Revenue", ConnectionID: connA, SQLText: "SELECT 1"},
+		},
+		Charts: []chartAsset{
+			{ID: "c1", Name: "Revenue by day", ModelID: "m1", Type: "line"},
+			{ID: "c2", Name: "Revenue total", ModelID: "m1", Type: "scorecard"},
+			{ID: "c3", Name: "Another warehouse's", ModelID: "m-elsewhere", Type: "bar"},
+		},
+		Dashboards: []dashboardAsset{
+			{ID: "d1", Name: "Finance", ChartIDs: []string{"c1", "c3"}, ChartCount: 4},
+			{ID: "d2", Name: "Elsewhere", ChartIDs: []string{"c3"}, ChartCount: 1},
+		},
+	})
+
+	chart := assetNode{}
+	for _, n := range g.Nodes {
+		if n.ID == "chart:c1" {
+			chart = n
+		}
+	}
+	if want := (assetNode{ID: "chart:c1", Kind: assetKindChart, Name: "Revenue by day", RefID: "c1",
+		ConnectionID: connA, ChartType: "line"}); chart != want {
+		t.Errorf("chart node = %+v, want %+v", chart, want)
+	}
+	if hasNode(g, "chart:c3") || hasNode(g, "dashboard:d2") {
+		t.Errorf("a chart with no model here, or a dashboard with no chart here, was drawn: %+v", g.Nodes)
+	}
+	for _, n := range g.Nodes {
+		if n.ID == "dashboard:d1" && (n.Charts != 4 || n.RefID != "d1" || n.Name != "Finance") {
+			t.Errorf("dashboard node = %+v, want Finance with all 4 of its charts counted", n)
+		}
+	}
+	if !hasNode(g, "dashboard:d1") {
+		t.Fatalf("dashboard d1 not drawn: %+v", g.Nodes)
+	}
+
+	wantDraws := []assetEdge{
+		{From: "model:m1", To: "chart:c1", Kind: assetEdgeDraws, Evidence: assetEvidenceDeclared},
+		{From: "model:m1", To: "chart:c2", Kind: assetEdgeDraws, Evidence: assetEvidenceDeclared},
+	}
+	if got := edgeKinds(g, assetEdgeDraws); !reflect.DeepEqual(got, wantDraws) {
+		t.Errorf("draws = %+v, want %+v", got, wantDraws)
+	}
+	wantShows := []assetEdge{
+		{From: "chart:c1", To: "dashboard:d1", Kind: assetEdgeShows, Evidence: assetEvidenceDeclared},
+	}
+	if got := edgeKinds(g, assetEdgeShows); !reflect.DeepEqual(got, wantShows) {
+		t.Errorf("shows = %+v, want %+v", got, wantShows)
+	}
+	if g.Stats.Charts != 2 || g.Stats.Dashboards != 1 || g.Stats.Edges[assetEdgeDraws] != 2 || g.Stats.Edges[assetEdgeShows] != 1 {
+		t.Errorf("stats = %+v, want 2 charts, 1 dashboard, 2 draws, 1 shows", g.Stats)
+	}
+	// Where data is looked at is not an upstream of anything.
+	if m := modelByID(t, g, "m1"); len(m.Upstreams) != 0 || len(m.Unresolved) != 0 {
+		t.Errorf("a chart changed its model's refresh: %+v", m)
 	}
 }

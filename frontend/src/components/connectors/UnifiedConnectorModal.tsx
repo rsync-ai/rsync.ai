@@ -4,6 +4,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { getConnectorStatusBadge, getConnectorConfidenceBadge, getConnectorConfidenceReasons, MCPConnector } from "@/lib/types/mcp-connector"
 import { GenericConnectorForm } from "./GenericConnectorForm"
 import { ConnectionLogo } from "./ConnectionLogo"
+import { ConnectorGeneratedByNote } from "./ConnectorGeneratedByNote"
 import { Badge } from "@/components/ui/badge"
 import { Circle, Container, Info } from "lucide-react"
 
@@ -102,7 +103,7 @@ export function UnifiedConnectorModal({
 
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange} closeOnOutsideClick={false}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <div className="flex items-start gap-4">
@@ -126,6 +127,9 @@ export function UnifiedConnectorModal({
               <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-3">
                 {connector.description}
               </p>
+
+              {/* The catalog list omits generated_by, so the note reads it. */}
+              <ConnectorGeneratedByNote connector={connector} lookUp className="-mt-1 mb-3" />
 
               {/* Status Badges */}
               <div className="flex flex-wrap items-center gap-2">

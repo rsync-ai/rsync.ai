@@ -21,9 +21,10 @@ import (
 
 // The zero-credential try-it path.
 //
-// `sample-data` is the only auth_type "none" connector in the catalog, so it is
-// the one source a brand-new install can connect to without first producing a
-// credential. That alone does not get anyone to a completed sync: a pipeline
+// `sample-data` is the only auth_type "none" connector that needs no outside
+// service (`nse-india` needs no credential either, but reads NSE's public archive
+// over the network), so it is the one source a brand-new install can connect to
+// without first producing a credential. That alone does not get anyone to a completed sync: a pipeline
 // needs two steps, and intent.go:417 returns "plan has insufficient steps" for
 // len(steps) < 2. Every destination in the catalog wants a credential the new
 // user does not have yet.

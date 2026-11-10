@@ -20,7 +20,8 @@ vi.mock("next/navigation", () => ({
 
 import { buildAgenticStagesFromEvents } from "@/components/pipeline/PipelineLiveStatePanel"
 import { StageTimeline } from "@/components/pipeline/StageTimeline"
-import { formatDuration, stageDurationMs } from "@/components/pipeline/dagHelpers"
+import { stageDurationMs } from "@/components/pipeline/dagHelpers"
+import { formatDuration } from "@/lib/duration"
 import { stageLabel } from "@/lib/pipeline/stageDefinitions"
 
 type Ev = Parameters<typeof buildAgenticStagesFromEvents>[0][number]

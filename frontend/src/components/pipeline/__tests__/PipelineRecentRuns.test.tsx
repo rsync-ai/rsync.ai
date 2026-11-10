@@ -4,15 +4,40 @@
  * The rate is succeeded / finished over the same window; a run still in flight
  * counts toward neither side. Below three finished runs no percentage is shown,
  * because it would overstate what we know.
+ *
+ * Launch review PR2: the ten pills are a bar chart of the last 50 runs (the
+ * gateway's cap), and a click on a bar opens its run.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
 const authFetch = vi.fn()
 vi.mock("@/lib/api/auth-fetch", () => ({
   authFetch: (...args: unknown[]) => authFetch(...args),
+}))
+const push = vi.fn()
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push }) }))
+// The chart as its bars: one button per category, so a test can click one.
+vi.mock("@/components/charts/EChartNoSSR", () => ({
+  EChartNoSSR: ({
+    settings,
+    rows,
+    onCategoryClick,
+  }: {
+    settings: { x: { categories: string[] } }
+    rows: { outcome: string }[]
+    onCategoryClick?: (i: number) => void
+  }) => (
+    <div data-testid="recent-runs-chart">
+      {settings.x.categories.map((c, i) => (
+        <button key={c} type="button" data-outcome={rows[i].outcome} onClick={() => onCategoryClick?.(i)}>
+          bar {i}
+        </button>
+      ))}
+    </div>
+  ),
 }))
 
 import { PipelineRecentRuns, summarizeRecentRuns, type TrendRun } from "@/components/pipeline/PipelineRecentRuns"
@@ -25,7 +50,10 @@ function respond(body: unknown, ok = true) {
   authFetch.mockResolvedValue({ ok, status: ok ? 200 : 500, json: async () => body })
 }
 
-beforeEach(() => authFetch.mockReset())
+beforeEach(() => {
+  authFetch.mockReset()
+  push.mockReset()
+})
 afterEach(() => cleanup())
 
 describe("summarizeRecentRuns", () => {
@@ -54,22 +82,41 @@ describe("summarizeRecentRuns", () => {
 })
 
 describe("PipelineRecentRuns", () => {
-  it("renders one linked pill per run and the N-of-M sentence", async () => {
+  it("draws one bar per run, oldest first, and the N-of-M sentence", async () => {
     respond({
       finished_runs: 10,
       succeeded_runs: 9,
       avg_duration_ms: 252_000,
-      recent_executions: Array.from({ length: 10 }, (_, i) => run(`e${i}`, i === 3 ? "failed" : "completed", 250_000)),
+      recent_executions: Array.from({ length: 10 }, (_, i) => ({
+        ...run(`e${i}`, i === 3 ? "failed" : "completed", 250_000),
+        start_time: `2026-09-18T${String(20 - i).padStart(2, "0")}:00:00Z`,
+      })),
     })
     render(<PipelineRecentRuns pipelineId="p1" />)
     expect(await screen.findByTestId("pipeline-recent-runs-summary")).toHaveTextContent(
       "9 of the last 10 finished runs succeeded · average 4m 12s"
     )
-    expect(screen.getByText("90% succeeded")).toBeInTheDocument()
-    const pills = screen.getAllByRole("link").filter((a) => a.getAttribute("href")?.startsWith("/executions/"))
-    expect(pills).toHaveLength(10)
-    expect(pills[0]).toHaveAttribute("href", "/executions/e9")
-    expect(authFetch.mock.calls[0][0]).toContain("/pipelines/p1/trends?limit=10")
+    expect(screen.getByText("Recent runs · 90% succeeded")).toBeInTheDocument()
+    expect(screen.getByText(/^Last 10 runs\./)).toBeInTheDocument()
+    const bars = within(screen.getByTestId("recent-runs-chart")).getAllByRole("button")
+    expect(bars).toHaveLength(10)
+    // e3 is the fourth-newest, so the seventh bar from the left.
+    expect(bars[6]).toHaveAttribute("data-outcome", "Failed")
+    expect(authFetch.mock.calls[0][0]).toContain("/pipelines/p1/trends?limit=50")
+  })
+
+  it("opens the run a bar stands for", async () => {
+    respond({ recent_executions: [run("newer", "completed", 1000), { ...run("older", "failed", 1000), start_time: "2026-09-18T09:00:00Z" }] })
+    render(<PipelineRecentRuns pipelineId="p1" />)
+    fireEvent.click(await screen.findByRole("button", { name: "bar 0" }))
+    expect(push).toHaveBeenCalledWith("/executions/older")
+  })
+
+  it("does not draw the CDC stream's row as a run", async () => {
+    respond({ recent_executions: [run("p1", "running"), run("e1", "completed", 1000)] })
+    render(<PipelineRecentRuns pipelineId="p1" />)
+    expect(await screen.findByText(/^Last 1 run\./)).toBeInTheDocument()
+    expect(within(screen.getByTestId("recent-runs-chart")).getAllByRole("button")).toHaveLength(1)
   })
 
   it("says No runs yet for a pipeline that never ran", async () => {
@@ -86,14 +133,13 @@ describe("PipelineRecentRuns", () => {
   })
 
   // The gateway reads each run's executions row since the postflight-failed fix,
-  // so it can now say "cancelled". That must not render as a pulsing Running pill.
-  it("a cancelled run is its own pill, not a running one", async () => {
+  // so it can now say "cancelled". That must not be drawn or counted as running.
+  it("a cancelled run is its own outcome, not a running one", async () => {
     respond({ finished_runs: 1, succeeded_runs: 1, recent_executions: [run("c1", "cancelled"), run("d1", "completed", 1000)] })
     render(<PipelineRecentRuns pipelineId="p1" />)
     const summary = await screen.findByTestId("pipeline-recent-runs-summary")
-    const pill = screen.getByRole("link", { name: /^Cancelled/ })
-    expect(pill).toHaveAttribute("href", "/executions/c1")
-    expect(pill.className).not.toContain("animate-pulse")
+    const bars = within(screen.getByTestId("recent-runs-chart")).getAllByRole("button")
+    expect(bars[1]).toHaveAttribute("data-outcome", "Cancelled")
     expect(summary).toHaveTextContent("1 of the last 1 finished run succeeded")
     expect(summary).not.toHaveTextContent("running")
   })

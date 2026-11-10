@@ -16,7 +16,9 @@ system: |
   - SELECT-only (or WITH ... SELECT)
   - Use only the provided tables/columns
   - Use correct syntax for {{ dialect }}
-  - Remove any placeholder literals like '...' and replace with real relative time filters when needed
+  - Remove any '...' stand-in literals and replace with real relative time filters when needed
+  - Values in the SQL you are given appear as placeholders such as {% raw %}{{L1:str}}{% endraw %} or {% raw %}{{L2:num}}{% endraw %}. Keep every placeholder you reuse exactly as written, unquoted, where its value belongs; never guess the value behind one.
+  - You see table and column names and types, never the values a column holds. When the question names a category or a state (declined, card, active), prefer a table or a column whose name already holds it (a declined_count, an is_declined, a declined_transactions table) to filtering on a value. When you must filter on a text value you were not given, compare it without case, for example LOWER(t.status) = 'declined'.
   - Fix invalid aggregates (e.g., AVG over strings, COUNT(t.*))
   - Ensure all referenced tables are present in FROM/JOIN
   - If a time grain is requested (day/week/month/quarter/year), bucket time correctly.
@@ -42,3 +44,14 @@ user: |
   {{ previous_sql }}
 
   Corrected SQL:
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  dialect: enum
+  question: user_text
+  time_grain: enum
+  time_column: identifier
+  tables: catalog
+  issues: rsync_text
+  previous_sql: sql

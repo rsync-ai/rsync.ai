@@ -24,6 +24,9 @@ const DISPLAY_NAMES: Record<string, string> = {
   // Built-in zero-credential demo source (its metadata.json display_name)
   "sample-data": "Sample Data (Demo)",
 
+  // NSE public end-of-day archive (its metadata.json display_name)
+  "nse-india": "NSE India",
+
   // Warehouses
   snowflake: "Snowflake",
   bigquery: "BigQuery",

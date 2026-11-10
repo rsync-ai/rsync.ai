@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,18 +21,22 @@ import (
 	"api-gateway/internal/cache"
 	"api-gateway/internal/db"
 	"api-gateway/internal/security"
+	"api-gateway/internal/services"
 	"api-gateway/internal/telemetry"
 	"api-gateway/internal/validators"
 
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/crypto"
 	"github.com/rsync-ai/shared/pgdriver"
+	"github.com/rsync-ai/shared/sqlexec"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/rsync-ai/shared/sqlexec/mask"
 )
 
 // Global schema cache instance (initialized in main)
@@ -411,6 +416,23 @@ type Connection struct {
 	LastTestError    *string                `json:"last_test_error,omitempty"`  // Nullable
 	CreatedAt        time.Time              `json:"created_at"`
 	UpdatedAt        time.Time              `json:"updated_at"`
+	// WeekStart is the connection's first day of the week, 1 (Monday, ISO) to 7
+	// (Sunday), and FiscalYearStartMonth the month its fiscal year starts, 1 to 12
+	// (migration 147, decision 14): a chart's week, quarter and year grains start on
+	// them. GetConnection only.
+	WeekStart            int `json:"week_start,omitempty"`
+	FiscalYearStartMonth int `json:"fiscal_year_start_month,omitempty"`
+	// LastTableCheck is the last table check of an API connection (migration 142,
+	// runTableCheck): one page of every table read, no row kept. Returned by
+	// GetConnection, and by CreateConnection when the check ended in time; nil when
+	// never checked.
+	LastTableCheck json.RawMessage `json:"last_table_check,omitempty"`
+	// TableCheckPending: CreateConnection's check was still running when the save
+	// answered; its answer is stored on the connection when it ends.
+	TableCheckPending bool `json:"table_check_pending,omitempty"`
+	// TableCheckSupported: the connection's connector gets the table check
+	// (connectorChecksTables), so its page offers "Check tables". GetConnection only.
+	TableCheckSupported bool `json:"table_check_supported,omitempty"`
 	// TokenExpiresAt / IsExpired are computed for OAuth-backed connections from the
 	// linked oauth_tokens row (the connection's own `status` column does not track
 	// token expiry). Omitted for non-OAuth connections. (BUG-2/10)
@@ -466,6 +488,10 @@ type UpdateConnectionRequest struct {
 	Config           map[string]interface{} `json:"config"`
 	Status           string                 `json:"status"`
 	ConnectorVersion string                 `json:"connector_version"` // Optional: upgrade connector version
+	// WeekStart (1 Monday … 7 Sunday) and FiscalYearStartMonth (1 … 12) are the
+	// connection's calendar for chart grains; omitted → left as they are.
+	WeekStart            *int `json:"week_start,omitempty"`
+	FiscalYearStartMonth *int `json:"fiscal_year_start_month,omitempty"`
 	// ForceSave skips the pre-save connectivity test that runs when the edit
 	// changes the config — the same opt-out CreateConnectionRequest offers.
 	ForceSave bool `json:"force_save"`
@@ -712,10 +738,12 @@ func GetConnection(c *gin.Context) {
 	var lastTestedAt sql.NullTime
 	var lastTestStatus sql.NullString
 	var lastTestError sql.NullString
+	var lastTableCheck []byte
 
 	err := database.QueryRow(`
 		SELECT id, user_id, name, type, connector_type, connector_version, sync_mode, cdc_mode, description, config, status,
-		       last_tested_at, last_test_status, last_test_error, created_at, updated_at
+		       last_tested_at, last_test_status, last_test_error, last_table_check, created_at, updated_at,
+		       week_start, fiscal_year_start_month
 		FROM connections
 		WHERE `+whereClause+`
 		ORDER BY created_at DESC
@@ -723,7 +751,8 @@ func GetConnection(c *gin.Context) {
 	`, connectionID, wsID).Scan(
 		&conn.ID, &conn.UserID, &conn.Name, &conn.Type, &conn.ConnectorType, &connectorVersion,
 		&syncMode, &cdcMode, &description, &configEncrypted, &conn.Status,
-		&lastTestedAt, &lastTestStatus, &lastTestError, &conn.CreatedAt, &conn.UpdatedAt,
+		&lastTestedAt, &lastTestStatus, &lastTestError, &lastTableCheck, &conn.CreatedAt, &conn.UpdatedAt,
+		&conn.WeekStart, &conn.FiscalYearStartMonth,
 	)
 
 	if err == sql.ErrNoRows {
@@ -791,6 +820,10 @@ func GetConnection(c *gin.Context) {
 	if lastTestError.Valid {
 		conn.LastTestError = &lastTestError.String
 	}
+	if len(lastTableCheck) > 0 {
+		conn.LastTableCheck = json.RawMessage(lastTableCheck)
+	}
+	conn.TableCheckSupported = connectorChecksTables(conn.ConnectorType)
 
 	// Compute OAuth token expiry so the UI can flag expired connections. (BUG-2/10)
 	applyTokenExpiry(database, userID, &conn)
@@ -802,6 +835,7 @@ func GetConnection(c *gin.Context) {
 
 // CreateConnection creates a new connection
 func CreateConnection(c *gin.Context) {
+	requestStart := time.Now()
 	traceID := getTraceID(c)
 
 	var req CreateConnectionRequest
@@ -933,10 +967,18 @@ func CreateConnection(c *gin.Context) {
 		cdcMode = nil
 	}
 
-	// Set default for connector_version
-	connectorVersion := req.ConnectorVersion
-	if connectorVersion == "" {
+	// A new connection is pinned to the connector version "latest" means
+	// today, so a version published later cannot move the pipelines built on
+	// it. When latest.json cannot be read, it is stored as "latest" and its
+	// first run pins it (services.VersionResolver.ResolveConnectorVersion).
+	connectorVersion := strings.TrimSpace(req.ConnectorVersion)
+	if services.IsFloatingVersion(connectorVersion) {
 		connectorVersion = "latest"
+		if v, verr := services.NewVersionResolver("").CurrentVersion(req.ConnectorType); verr == nil && !services.IsFloatingVersion(v) {
+			connectorVersion = v
+		} else {
+			log.Warnf("⚠️  Creating connection %q unpinned: cannot resolve %s@latest (%v); its first run pins it", req.Name, req.ConnectorType, verr)
+		}
 	}
 
 	// Pre-save connectivity test (fail-closed by default). The previous
@@ -993,6 +1035,17 @@ func CreateConnection(c *gin.Context) {
 					"message":  "Connectivity test could not complete (request cancelled or timed out). Retry, or set force_save=true to bypass.",
 					"trace_id": traceID,
 				})
+				return
+			}
+			// The connector's image failed to build: a retry fails the same way, so
+			// answer its cause (the end of the build log), not "still being set up".
+			if isConnectorBuildFailedMessage(testErr) {
+				log.WithFields(log.Fields{
+					"trace_id":       traceID,
+					"user_id":        userID,
+					"connector_type": req.ConnectorType,
+				}).Warn("CreateConnection not saved: the connector image failed to build")
+				respondConnectorBuildFailedOnSave(c, traceID, testErr)
 				return
 			}
 			// The connector's container is still being built/started on demand:
@@ -1086,6 +1139,23 @@ func CreateConnection(c *gin.Context) {
 		invalidateLifecycleCache(req.ConnectorType)
 	}
 
+	// The test checked one endpoint; read one page of every other table too, so a
+	// table the connector cannot read is found now rather than on the first run. It
+	// warns and never blocks the save: the connection is already stored.
+	var tableCheck json.RawMessage
+	tableCheckDone, tableCheckRan := false, false
+	if testPassed && connectorChecksTables(req.ConnectorType) {
+		checkConfig := make(map[string]interface{}, len(req.Config)+1)
+		for k, v := range req.Config {
+			checkConfig[k] = v
+		}
+		if _, has := checkConfig["connector_version"]; !has && connectorVersion != "" {
+			checkConfig["connector_version"] = connectorVersion
+		}
+		tableCheckRan = true
+		tableCheck, tableCheckDone = runTableCheck(c, database, connectionID, workspaceID, req.ConnectorType, checkConfig, tableCheckSaveDeadline-time.Since(requestStart))
+	}
+
 	log.WithFields(log.Fields{
 		"trace_id":       traceID,
 		"user_id":        userID,
@@ -1137,6 +1207,10 @@ func CreateConnection(c *gin.Context) {
 	if m, ok := cdcMode.(string); ok {
 		conn.CDCMode = m
 	}
+	if tableCheckRan {
+		conn.LastTableCheck = tableCheck
+		conn.TableCheckPending = !tableCheckDone
+	}
 	conn.Slug = connectionSlug(conn.Name)
 	applyTokenExpiry(database, userID, &conn)
 	c.JSON(http.StatusCreated, conn)
@@ -1144,6 +1218,7 @@ func CreateConnection(c *gin.Context) {
 
 // UpdateConnection updates an existing connection
 func UpdateConnection(c *gin.Context) {
+	requestStart := time.Now()
 	rawID := strings.TrimSpace(c.Param("id"))
 	if rawID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -1160,6 +1235,16 @@ func UpdateConnection(c *gin.Context) {
 	var req UpdateConnectionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "invalid_request", "Invalid request payload", err)
+		return
+	}
+	if req.WeekStart != nil && (*req.WeekStart < 1 || *req.WeekStart > 7) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_week_start",
+			"message": "week_start is the first day of the week, 1 (Monday) to 7 (Sunday)"})
+		return
+	}
+	if req.FiscalYearStartMonth != nil && (*req.FiscalYearStartMonth < 1 || *req.FiscalYearStartMonth > 12) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_fiscal_year_start_month",
+			"message": "fiscal_year_start_month is the month the fiscal year starts, 1 (January) to 12 (December)"})
 		return
 	}
 
@@ -1219,6 +1304,16 @@ func UpdateConnection(c *gin.Context) {
 	if req.Description != nil {
 		updates = append(updates, "description = $"+strconv.Itoa(argIdx))
 		args = append(args, *req.Description)
+		argIdx++
+	}
+	if req.WeekStart != nil {
+		updates = append(updates, "week_start = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.WeekStart)
+		argIdx++
+	}
+	if req.FiscalYearStartMonth != nil {
+		updates = append(updates, "fiscal_year_start_month = $"+strconv.Itoa(argIdx))
+		args = append(args, *req.FiscalYearStartMonth)
 		argIdx++
 	}
 
@@ -1369,6 +1464,9 @@ func UpdateConnection(c *gin.Context) {
 	// The stored verdict describes the OLD config, so a changed config always
 	// rewrites it: 'success' on a clean pass, NULL when the test was skipped
 	// (force_save, internal connector, OAuth soft-pass).
+	// updateTestPassed: the edited settings passed their pre-save test, so their
+	// tables are checked once the edit is stored.
+	updateTestPassed := false
 	if configChanged {
 		traceID := getTraceID(c)
 		testPassed := false
@@ -1398,6 +1496,16 @@ func UpdateConnection(c *gin.Context) {
 						"message":  "Connectivity test could not complete (request cancelled or timed out). Retry, or set force_save=true to bypass.",
 						"trace_id": traceID,
 					})
+					return
+				}
+				// Image failed to build — its cause, same as CreateConnection.
+				if isConnectorBuildFailedMessage(testErr) {
+					log.WithFields(log.Fields{
+						"trace_id":       traceID,
+						"connection_id":  connectionID,
+						"connector_type": existingConnectorType,
+					}).Warn("UpdateConnection not saved: the connector image failed to build")
+					respondConnectorBuildFailedOnSave(c, traceID, testErr)
 					return
 				}
 				// Connector still deploying — retryable, same as CreateConnection.
@@ -1457,6 +1565,13 @@ func UpdateConnection(c *gin.Context) {
 		updates = append(updates, "last_test_error = $"+strconv.Itoa(argIdx))
 		args = append(args, nil)
 		argIdx++
+		// The last table check read the old settings: clear it, and drop the answer
+		// of any check of them still running.
+		updates = append(updates, "last_table_check = NULL")
+		if connectorChecksTables(existingConnectorType) {
+			supersedeTableChecks(connectionID)
+		}
+		updateTestPassed = testPassed
 	}
 
 	updates = append(updates, "updated_at = $"+strconv.Itoa(argIdx))
@@ -1509,6 +1624,13 @@ func UpdateConnection(c *gin.Context) {
 		}
 	}
 
+	// Read one page of every table with the edited settings (as CreateConnection):
+	// it warns and never blocks the edit, which is already stored.
+	tableCheckAnswered := gin.H{}
+	if updateTestPassed && connectorChecksTables(existingConnectorType) {
+		tableCheckAnswered = tableCheckAnswer(runTableCheck(c, database, connectionID, wsID, existingConnectorType, testConfig, tableCheckSaveDeadline-time.Since(requestStart)))
+	}
+
 	// Log audit with old/new version if connector_version was changed
 	auditData := map[string]interface{}{
 		"name":   req.Name,
@@ -1532,9 +1654,16 @@ func UpdateConnection(c *gin.Context) {
 			"connector_version": req.ConnectorVersion,
 			"message":           "Connection updated successfully",
 		}
+		for k, v := range tableCheckAnswered {
+			response[k] = v
+		}
 
 		if hasBreaking && len(breakingChanges) > 0 {
-			response["warning"] = fmt.Sprintf("Version %s contains breaking changes. Running pipelines will continue using %s.", req.ConnectorVersion, oldVersion)
+			// A connection's pipelines run the version stored on it, so this
+			// edit moves them: a manual run or CDC restart picks it up next; a
+			// scheduled run keeps the version its pipeline's last manual run
+			// recorded.
+			response["warning"] = fmt.Sprintf("Version %s contains breaking changes. Pipelines on this connection use it from their next manual run or CDC restart (scheduled runs keep the version recorded at their last manual run); runs in progress finish on %s. Set the version back to %s to roll back.", req.ConnectorVersion, oldVersion, oldVersion)
 			response["breaking_changes"] = breakingChanges
 		}
 
@@ -1544,10 +1673,14 @@ func UpdateConnection(c *gin.Context) {
 
 	logAudit(c, "update_connection", "connection", connectionID, auditData)
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"id":      connectionID,
 		"message": "Connection updated successfully",
-	})
+	}
+	for k, v := range tableCheckAnswered {
+		response[k] = v
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // pipelineNeedsConnection is the WHERE predicate, over pipelines with the connection id
@@ -1674,16 +1807,17 @@ func unreleasedCDCMessage(objects []cdcSourceObject) string {
 		"the only record of them, and a replication slot left behind keeps the source database from " +
 		"freeing disk space. They are dropped automatically, so try again in a few minutes. " +
 		"They can only be dropped while the source database can be reached: if it can't, this " +
-		"connection stays blocked until you delete it anyway with force=true and then drop them " +
-		"on the source yourself."
+		"connection stays blocked until you delete it anyway with force=true, which tries once " +
+		"more to drop them and names any it could not, for you to drop on the source yourself."
 }
 
 // DeleteConnection deletes a connection.
 //
 // It refuses (409) while a pipeline needs the connection, and while a replication slot
-// or publication created on its source is still undropped. ?force=true deletes despite
-// undropped slots and publications (same authorization) and returns warnings naming
-// each one and how to drop it; pipelines still block a forced delete.
+// or publication created on its source is still undropped. ?force=true (same
+// authorization) tries once more to drop them, deletes despite any that remain, and
+// returns warnings naming each one and how to drop it; pipelines still block a forced
+// delete.
 func DeleteConnection(c *gin.Context) {
 	rawID := strings.TrimSpace(c.Param("id"))
 	if rawID == "" {
@@ -1818,7 +1952,7 @@ func DeleteConnection(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":         unreleasedCDCMessage(undropped),
 				"cdc_resources": undropped,
-				"hint":          "Try again in a few minutes. To delete now, repeat the request with force=true and drop the listed objects on the source database.",
+				"hint":          "Try again in a few minutes. To delete now, repeat the request with force=true: it tries once more to drop them, and names any left for you to drop on the source database.",
 			})
 			return
 		}
@@ -1833,13 +1967,17 @@ func DeleteConnection(c *gin.Context) {
 	})
 }
 
-// forceDeleteConnection is DeleteConnection with ?force=true: it deletes even though
-// replication slots or publications on the source are undropped, and returns a warning
-// for each one saying how to drop it. The connection row is locked first, so no new
-// slot, publication or pipeline can reference it between reading the list and the
-// delete; the list returned is exactly what the delete erased. Pipelines still block.
+// forceDeleteConnection is DeleteConnection with ?force=true. It first has the
+// orchestrator drop the replication slots and publications that deleted pipelines
+// left on the source (releaseConnectionSourceObjects), then deletes even though some
+// may still be undropped, and returns a warning for each one saying how to drop it.
+// The connection row is locked first, so no new slot, publication or pipeline can
+// reference it between reading the list and the delete; the list returned is exactly
+// what the delete erased. Pipelines still block.
 func forceDeleteConnection(c *gin.Context, database *sql.DB, connectionID, wsID string, refusedForPipelines func() bool) {
 	ctx := c.Request.Context()
+	releaseConnectionSourceObjects(ctx, connectionID)
+
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
@@ -1906,6 +2044,25 @@ func forceDeleteConnection(c *gin.Context, database *sql.DB, connectionID, wsID 
 		"warnings":                warnings,
 		"undropped_cdc_resources": undropped,
 	})
+}
+
+// connectionReleaseTimeout is how long a forced delete waits for the orchestrator to
+// drop what is left on the source. The orchestrator stops itself after 20s.
+const connectionReleaseTimeout = 25 * time.Second
+
+// releaseConnectionSourceObjects asks the orchestrator to drop, now, the replication
+// slots and publications that deleted pipelines left on the connection's source: the
+// CDC reconciler's drop, for one connection. It must run before the forced delete,
+// which cascades away the cdc_resources rows and the credentials a drop needs.
+// The orchestrator drops only objects whose pipeline is gone.
+//
+// Best-effort: an object that could not be dropped stays recorded, so the forced
+// delete reads it back and names it with the SQL to drop it, as it did before.
+func releaseConnectionSourceObjects(ctx context.Context, connectionID string) {
+	postOrchestratorStep(ctx, "/api/v1/cdc/connections/"+url.PathEscape(connectionID)+"/release",
+		map[string]string{"connection_id": connectionID}, "connection "+connectionID,
+		connectionReleaseTimeout, "Source object release",
+		"the forced delete names what is left on the source")
 }
 
 // SampleResult represents the result of sampling data
@@ -2044,7 +2201,7 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 			fmt.Sscanf(v, "%d", &portInt)
 		}
 
-		tlsMode := resolveMySQLTLSMode(config, host)
+		tlsMode := sqlexec.ResolveMySQLTLSMode(config, host)
 		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=5s&tls=%s",
 			user, password, host, portInt, database, tlsMode)
 
@@ -2055,7 +2212,7 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 		user, _ := config["user"].(string)
 		password, _ := config["password"].(string)
 		database, _ := config["database"].(string)
-		sslMode := resolvePostgresSSLMode(config, host)
+		sslMode := sqlexec.ResolvePostgresSSLMode(config, host)
 
 		portInt := 5432
 		switch v := port.(type) {
@@ -2075,7 +2232,7 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 	}
 
 	// Open connection
-	conn, err := sql.Open(driverName, dsn)
+	conn, err := openExplorerDB(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
@@ -2086,8 +2243,15 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 	conn.SetMaxIdleConns(0)
 	conn.SetConnMaxLifetime(10 * time.Second)
 
+	// One session, so the MySQL session settings beginReadOnly makes hold for the read.
+	dbc, err := conn.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire db connection: %w", err)
+	}
+	defer dbc.Close()
+
 	// Test connection with context
-	if err := conn.PingContext(ctx); err != nil {
+	if err := dbc.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("connection ping failed: %w", err)
 	}
 
@@ -2096,8 +2260,14 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 		return nil, err
 	}
 
-	// Execute query with timeout
-	rows, err := conn.QueryContext(ctx, query, args...)
+	// Execute query, read-only, under the caller's deadline on the server too
+	// (read_only_reads.go): a table can be a view whose read writes.
+	tx, err := sqlexec.BeginReadOnly(ctx, dbc, driverName, sqlexec.TimeUntilDeadline(ctx, 5*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -2137,8 +2307,8 @@ func sampleDataFromConnection(ctx context.Context, connectorType string, config 
 			}
 
 			// Redact PII + secrets in preview (but avoid masking generic ids)
-			if shouldRedactColumnName(colName) {
-				val = redactForPreview(val)
+			if mask.ShouldRedactColumnName(colName) {
+				val = mask.RedactForPreview(val)
 			}
 
 			rowMap[colName] = val
@@ -2229,131 +2399,54 @@ func buildSampleQuery(driverName string, table string, limit int) (string, []int
 	}
 }
 
-// isSecretColumnName checks if a column name likely contains secrets/credentials.
-// These should always be redacted in previews/Explorer results.
-func isSecretColumnName(colName string) bool {
-	lowerName := strings.ToLower(strings.TrimSpace(colName))
-	secretKeywords := []string{
-		"password", "passwd", "pwd",
-		"secret", "client_secret",
-		"token", "access_token", "refresh_token", "id_token",
-		"api_key", "apikey",
-		"private_key", "secret_key",
+var (
+	errSampleConnNotFound = errors.New("connection not found")
+	errSampleConnDecrypt  = errors.New("connection config could not be decrypted")
+)
+
+// loadSampleConnection loads a connection of workspace wsID for sampling: its
+// connector type and decrypted config, with the pinned connector_version
+// injected. The table preview and Ask rsync.ai's sample_rows
+// (AssistantSamples.Read) both load through it.
+func loadSampleConnection(database *sql.DB, connectionID, wsID string) (string, map[string]interface{}, error) {
+	// Pull connector_version too so the preview call routes to the same MCP
+	// container the pipeline pinned. Without this the orchestrator defaults to
+	// "latest" and may route to a regenerated container whose code lags the
+	// on-disk version (e.g. v1.0.1 image baked before the F-13 prefix-strip
+	// landed), causing `unknown operation 'shopify.<table>'` HTTP 500s on
+	// every preview.
+	var connectorType, configEncrypted string
+	var connectorVersion sql.NullString
+	err := database.QueryRow(`
+		SELECT connector_type, config, connector_version
+		FROM connections
+		WHERE id = $1 AND workspace_id = $2
+	`, connectionID, wsID).Scan(&connectorType, &configEncrypted, &connectorVersion)
+	if err == sql.ErrNoRows {
+		return "", nil, errSampleConnNotFound
 	}
-	for _, keyword := range secretKeywords {
-		if strings.Contains(lowerName, keyword) {
-			return true
+	if err != nil {
+		return "", nil, err
+	}
+	configJSON, err := crypto.DecryptString(configEncrypted)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %v", errSampleConnDecrypt, err)
+	}
+	var config map[string]interface{}
+	json.Unmarshal([]byte(configJSON), &config)
+	if config == nil {
+		config = map[string]interface{}{}
+	}
+	// Inject the pinned version into the config map so SampleViaOrchestrator
+	// → executor.SampleRows can honour it (executor reads
+	// `connector_version` from config and falls back to `version` /
+	// "latest" only if absent).
+	if connectorVersion.Valid && strings.TrimSpace(connectorVersion.String) != "" {
+		if _, has := config["connector_version"]; !has {
+			config["connector_version"] = connectorVersion.String
 		}
 	}
-	return false
-}
-
-// ambiguousPIIKeywords are the PII keywords short enough to appear INSIDE
-// ordinary English words, so they are matched per-token instead of as bare
-// substrings. Every one of these had a real false positive: "tin" fires on
-// dis-TIN-ct / rou-TIN-g / set-TIN-g, "nin" on run-NIN-g / war-NIN-g, "sin" on
-// u-SIN-g / bu-SIN-ess, "pan" on com-PAN-y / ex-PAN-sion, "cell" on ex-CELL-ent.
-// `SELECT COUNT(DISTINCT id) AS distinct_ids` came back as `***`, which is what
-// surfaced this.
-var ambiguousPIIKeywords = map[string]bool{
-	"tin": true, "nin": true, "sin": true, "pan": true, "cell": true,
-}
-
-// columnNameTokens splits a column name into lowercase word tokens, breaking on
-// separators, digits, and camelCase transitions: "customerPAN2" → [customer pan 2],
-// "distinct_ids" → [distinct ids].
-func columnNameTokens(colName string) []string {
-	var tokens []string
-	var cur []rune
-	runes := []rune(strings.TrimSpace(colName))
-	flush := func() {
-		if len(cur) > 0 {
-			tokens = append(tokens, strings.ToLower(string(cur)))
-			cur = nil
-		}
-	}
-	for i, r := range runes {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
-			// lower→upper marks a camelCase boundary ("customerPan").
-			if r >= 'A' && r <= 'Z' && i > 0 && runes[i-1] >= 'a' && runes[i-1] <= 'z' {
-				flush()
-			}
-			cur = append(cur, r)
-		case r >= '0' && r <= '9':
-			flush()
-		default:
-			flush()
-		}
-	}
-	flush()
-	return tokens
-}
-
-// isPIIColumnName checks if a column name likely contains PII.
-// Keep this focused on true PII fields (email/phone/id numbers) and avoid generic "id"/"*_id".
-//
-// This drives PREVIEW display only, and it is keyed on the RESULT column name —
-// `SELECT email AS x` already renders unredacted, and the caller can query the
-// connection freely in the first place. So it is a legibility guard, not an
-// access control: a false positive (an aggregate rendered as `***`) costs more
-// than the marginal case it would catch.
-func isPIIColumnName(colName string) bool {
-	lowerName := strings.ToLower(strings.TrimSpace(colName))
-	piiKeywords := []string{
-		// Contact
-		"email", "e-mail",
-		"phone", "mobile", "cell", "msisdn",
-
-		// Government / identity numbers
-		"ssn", "social_security", "social-security",
-		"national_id", "national-id",
-		"id_number", "id-number",
-		"passport", "passport_number", "passport-number",
-		"driver_license", "driver_licence", "drivers_license", "drivers_licence",
-		"tax_id", "tax-id", "tin",
-		"aadhar", "aadhaar",
-		"nin", "sin",
-
-		// Payments (PII-sensitive)
-		"credit_card", "cc_number", "card_number", "pan",
-	}
-
-	var tokens []string
-	for _, keyword := range piiKeywords {
-		if ambiguousPIIKeywords[keyword] {
-			if tokens == nil {
-				tokens = columnNameTokens(colName)
-			}
-			for _, tok := range tokens {
-				if tok == keyword {
-					return true
-				}
-			}
-			continue
-		}
-		if strings.Contains(lowerName, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
-// shouldRedactColumnName decides whether to redact a column in previews.
-func shouldRedactColumnName(colName string) bool {
-	return isSecretColumnName(colName) || isPIIColumnName(colName)
-}
-
-// redactForPreview redacts a value for preview display
-func redactForPreview(value interface{}) string {
-	if value == nil {
-		return ""
-	}
-	str := fmt.Sprintf("%v", value)
-	if len(str) > 4 {
-		return str[:2] + "***"
-	}
-	return "***"
+	return connectorType, config, nil
 }
 
 // SampleConnectionData samples data from a connection for preview purposes
@@ -2394,69 +2487,29 @@ func SampleConnectionData(c *gin.Context) {
 		return
 	}
 
-	// Get connection details — pull connector_version too so the preview
-	// call routes to the same MCP container the pipeline pinned. Without
-	// this the orchestrator defaults to "latest" and may route to a
-	// regenerated container whose code lags the on-disk version (e.g.
-	// v1.0.1 image baked before the F-13 prefix-strip landed), causing
-	// `unknown operation 'shopify.<table>'` HTTP 500s on every preview.
-	var connectorType, configEncrypted string
-	var connectorVersion sql.NullString
-	err := database.QueryRow(`
-		SELECT connector_type, config, connector_version
-		FROM connections
-		WHERE id = $1 AND workspace_id = $2
-	`, connectionID, wsID).Scan(&connectorType, &configEncrypted, &connectorVersion)
-
-	if err == sql.ErrNoRows {
+	connectorType, config, err := loadSampleConnection(database, connectionID, wsID)
+	switch {
+	case errors.Is(err, errSampleConnNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
 		return
-	}
-
-	if err != nil {
-		// Structured 502 (not a bare 500) so the preview UI shows an actionable
-		// message for every failure path, matching the upstream-error handling
-		// below. (BUG-13)
-		log.WithError(err).WithFields(log.Fields{
-			"trace_id":      getTraceID(c),
-			"user_id":       userID,
-			"connection_id": connectionID,
-		}).Error("SampleConnectionData failed to load connection from db")
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":   "data sampling failed; check your connection and try again",
-			"details": "Could not load connection details. The connection may have been deleted or modified. Try refreshing the connection list.",
-		})
-		return
-	}
-
-	// Decrypt config
-	configJSON, err := crypto.DecryptString(configEncrypted)
-	if err != nil {
+	case errors.Is(err, errSampleConnDecrypt):
 		log.WithError(err).WithFields(log.Fields{
 			"trace_id":      getTraceID(c),
 			"user_id":       userID,
 			"connection_id": connectionID,
 		}).Warn("SampleConnectionData failed to decrypt config")
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":   "data sampling failed; check your connection and try again",
-			"details": "Connection credentials could not be decrypted. Contact support if this persists.",
-		})
+		sampleFailed(c, http.StatusInternalServerError,
+			"Connection credentials could not be decrypted. Contact support if this persists.")
 		return
-	}
-
-	var config map[string]interface{}
-	json.Unmarshal([]byte(configJSON), &config)
-	if config == nil {
-		config = map[string]interface{}{}
-	}
-	// Inject the pinned version into the config map so SampleViaOrchestrator
-	// → executor.SampleRows can honour it (executor reads
-	// `connector_version` from config and falls back to `version` /
-	// "latest" only if absent).
-	if connectorVersion.Valid && strings.TrimSpace(connectorVersion.String) != "" {
-		if _, has := config["connector_version"]; !has {
-			config["connector_version"] = connectorVersion.String
-		}
+	case err != nil:
+		log.WithError(err).WithFields(log.Fields{
+			"trace_id":      getTraceID(c),
+			"user_id":       userID,
+			"connection_id": connectionID,
+		}).Error("SampleConnectionData failed to load connection from db")
+		sampleFailed(c, http.StatusInternalServerError,
+			"Could not load connection details. The connection may have been deleted or modified. Try refreshing the connection list.")
+		return
 	}
 
 	// Log credential access for sampling
@@ -2477,18 +2530,27 @@ func SampleConnectionData(c *gin.Context) {
 		}
 		log.Errorf("sample data failed for connection: %v", err)
 		// Surface the upstream connector/orchestrator detail (built verbatim by
-		// sampleViaOrchestrator) instead of a bare HTTP 500, so the UI can show
-		// an actionable message (e.g. missing scope, auth expired, table not
-		// found) rather than just "HTTP 500". Use 502 because the failure is an
-		// upstream connector error, not an api-gateway fault. (BUG-13)
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":   "data sampling failed; check your connection and try again",
-			"details": cleanSampleError(err),
-		})
+		// sampleViaOrchestrator) so the UI can show an actionable message (e.g.
+		// missing scope, auth expired, table not found). 424: the connector the
+		// preview depends on failed, not the gateway. (BUG-13)
+		sampleFailed(c, http.StatusFailedDependency, cleanSampleError(err))
 		return
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// sampleFailed answers a failed table preview with the reason in `details`.
+// It used to be a 502 on every path, but app.rsync.ai sits behind Cloudflare,
+// which swaps an origin 502 or 504 for its own HTML page, so the reason never
+// reached the browser and the preview showed "HTTP 502". 424 (the connector the
+// preview depends on failed) and 500 (the gateway's own failure) pass through.
+// Pinned by sample_preview_status_test.go; the class by edge_replaced_status_test.go.
+func sampleFailed(c *gin.Context, status int, details string) {
+	c.JSON(status, gin.H{
+		"error":   "data sampling failed; check your connection and try again",
+		"details": details,
+	})
 }
 
 // cleanSampleError strips internal prefixes from a sampling error so the UI shows
@@ -2690,7 +2752,10 @@ func TestConnection(c *gin.Context) {
 	// This avoids requiring an orchestrator-side MCP connector just to validate credentials.
 	if strings.Contains(strings.ToLower(connectorType), "databricks") {
 		ctx := c.Request.Context()
-		_, err := executeDatabricksQuery(ctx, testConfig, "SELECT 1", 1)
+		eng, err := explorerEngine(connectorType, testConfig)
+		if err == nil {
+			_, err = eng.Query(ctx, "SELECT 1", nil, sqlexec.Limits{Rows: 1, Mask: true})
+		}
 		success := err == nil
 		testError := ""
 		if err != nil {
@@ -2728,9 +2793,10 @@ func TestConnection(c *gin.Context) {
 	ctx := c.Request.Context()
 	success, testError := performConnectionTestWithOAuthRetry(ctx, connectorType, testConfig)
 	// Scrub DSN/host/credential fragments and any row values from the driver
-	// error before it is persisted to last_test_error or echoed to the client.
-	// The raw testError is retained only for in-process auth-error classification.
-	scrubbedTestError := llmscrub.Scrub(testError)
+	// error before it is persisted to last_test_error or echoed to the client; a
+	// failed image build keeps its log whole (scrubTestError). The raw testError
+	// is retained only for in-process auth-error classification.
+	scrubbedTestError := scrubTestError(testError)
 	// "Still being set up" is not a verdict on the connection — the connector's
 	// container is being built/started on demand. Don't record it as a failed test.
 	connectorDeploying := !success && isConnectorDeployingMessage(testError)
@@ -2898,6 +2964,20 @@ func performConnectionTestWithOAuthRetry(ctx context.Context, connectorType stri
 	return ok, testErr
 }
 
+// configValueString renders one decoded config value as the string the orchestrator
+// hands a connector. JSON numbers decode to float64, and %v prints a whole one of
+// 1e6 or more as "1e+06", which an integer parser rejects, so the setting would be
+// silently ignored. The orchestrator's utils.ConfigString does the same.
+func configValueString(v interface{}) string {
+	switch t := v.(type) {
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 // performConnectionTest performs actual connection testing via MCP
 func performConnectionTest(ctx context.Context, connectorType string, config map[string]interface{}) (bool, string) {
 	// Call Agent Orchestrator's Connection Test endpoint
@@ -2923,7 +3003,7 @@ func performConnectionTest(ctx context.Context, connectorType string, config map
 	configStrings := make(map[string]string)
 	connectorVersion := "latest"
 	for k, v := range config {
-		strVal := fmt.Sprintf("%v", v)
+		strVal := configValueString(v)
 		if k == "connector_version" && strVal != "" {
 			connectorVersion = strVal
 			continue // keep out of config to avoid confusing the MCP connector
@@ -3557,55 +3637,15 @@ func GetConnectionMetadata(c *gin.Context) {
 		ctx := context.Background()
 		cached, err := schemaCache.Get(ctx, connectionID)
 		if err == nil && cached != nil {
-			// Cache hit - return cached response
-			//
-			// IMPORTANT: Older cached payloads may contain invalid negative row_count values
-			// from upstream connectors (e.g. MySQL TABLE_ROWS quirks). Sanitize on read so
-			// UIs never see negative counts, even if the cache predates our sanitization.
-			// Best-effort: if sanitize fails, fall back to serving cached bytes as-is.
-			var payload map[string]interface{}
-			if err := json.Unmarshal(cached, &payload); err == nil {
-				if tablesAny, ok := payload["tables"].([]interface{}); ok {
-					changed := false
-					for _, tAny := range tablesAny {
-						m, ok := tAny.(map[string]interface{})
-						if !ok {
-							continue
-						}
-						rc, ok := m["row_count"]
-						if !ok || rc == nil {
-							continue
-						}
-						// json.Unmarshal numbers as float64 in interface{}.
-						// But older cached payloads might contain strings; handle both.
-						switch v := rc.(type) {
-						case float64:
-							if v < 0 {
-								m["row_count"] = float64(0)
-								m["is_exact_count"] = false
-								changed = true
-							}
-						case string:
-							if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f < 0 {
-								m["row_count"] = float64(0)
-								m["is_exact_count"] = false
-								changed = true
-							}
-						}
-					}
-					if changed {
-						if sanitized, err := json.Marshal(payload); err == nil {
-							cached = sanitized
-							// Best-effort: update cache so future reads are already sanitized.
-							_ = schemaCache.Set(ctx, connectionID, cached)
-						}
-					}
-				}
+			// The cache holds every table; answer this request's filter and page from
+			// it. An entry that cannot be read falls through to a fresh discovery.
+			if body, ok := cachedMetadataResponse(cached, parseMetadataQuery(c)); ok {
+				log.WithField("connection_id", connectionID).Debug("Returning cached schema")
+				c.Header("X-Cache-Status", "HIT")
+				c.Data(http.StatusOK, "application/json", body)
+				return
 			}
-			log.WithField("connection_id", connectionID).Debug("Returning cached schema")
-			c.Header("X-Cache-Status", "HIT")
-			c.Data(http.StatusOK, "application/json", cached)
-			return
+			log.WithField("connection_id", connectionID).Warn("Unreadable cached schema; rediscovering")
 		}
 	}
 
@@ -3767,87 +3807,10 @@ func GetConnectionMetadata(c *gin.Context) {
 		}
 	}
 
-	// Parse query parameters for filtering/pagination
-	search := c.Query("search")
-	limitStr := c.DefaultQuery("limit", "25")
-	offsetStr := c.DefaultQuery("offset", "0")
-	includeColumns := c.DefaultQuery("include_columns", "true") == "true"
-	sortBy := c.DefaultQuery("sort_by", "name") // name, size, relevance
-	tablesParam := c.Query("tables")            // Comma-separated exact table names (for post-selection schema fetch)
-
-	limit := 25
-	if s := strings.TrimSpace(limitStr); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			limit = v
-		}
-	}
-	if limit > maxMetadataPageSize {
-		limit = maxMetadataPageSize
-	}
-	offset := 0
-	if s := strings.TrimSpace(offsetStr); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
-			offset = v
-		}
-	}
-
-	// Filter to specific tables if requested (for suggestions flow)
-	tablesToProcess := agentResponse.Tables
-	if tablesParam != "" {
-		requestedTables := strings.Split(tablesParam, ",")
-		requestedSet := make(map[string]bool)
-		for _, t := range requestedTables {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				// Normalize: try both with and without schema prefix
-				requestedSet[t] = true
-				requestedSet[strings.ToLower(t)] = true
-				// Also try just the table name part (for qualified names like "db.table")
-				if parts := strings.Split(t, "."); len(parts) > 1 {
-					requestedSet[parts[len(parts)-1]] = true
-					requestedSet[strings.ToLower(parts[len(parts)-1])] = true
-				}
-			}
-		}
-
-		filtered := make([]TableMetadata, 0)
-		for _, table := range agentResponse.Tables {
-			tableName := table.Name
-			tableNameLower := strings.ToLower(tableName)
-			qualifiedName := tableName
-			if table.Schema != "" {
-				qualifiedName = table.Schema + "." + tableName
-			}
-			qualifiedNameLower := strings.ToLower(qualifiedName)
-
-			if requestedSet[tableName] || requestedSet[tableNameLower] ||
-				requestedSet[qualifiedName] || requestedSet[qualifiedNameLower] {
-				filtered = append(filtered, table)
-			}
-		}
-		tablesToProcess = filtered
-		log.WithFields(log.Fields{
-			"trace_id":      traceID,
-			"connection_id": connectionID,
-			"filtered":      len(filtered),
-			"total":         len(agentResponse.Tables),
-		}).Debug("GetConnectionMetadata filtered to requested tables")
-	}
-
-	// Apply search/sorting/column filtering
-	filteredTables := filterAndSortTables(tablesToProcess, search, sortBy, includeColumns)
-	total := len(filteredTables)
-
-	// Apply pagination
-	end := offset + limit
-	if end > total {
-		end = total
-	}
-	if offset > total {
-		offset = total
-	}
-
-	paginatedTables := filteredTables[offset:end]
+	// Same filter and page as a cache hit.
+	q := parseMetadataQuery(c)
+	paginatedTables, total, offset := metadataPage(agentResponse.Tables, q)
+	limit := q.Limit
 
 	discoveredAt := time.Now().UTC().Format(time.RFC3339)
 	if agentResponse.DiscoveredAt != "" {
@@ -4173,10 +4136,11 @@ func rankTablesByLLM(ctx context.Context, tables []TableMetadata, intent string,
 		Name     string `json:"name"`
 		DataType string `json:"data_type,omitempty"`
 	}
+	// Names and types only. A row count describes the customer's data, so it
+	// stays here: the shortlist orders by it, and the answer falls back to it.
 	type tableInfo struct {
 		Name       string       `json:"name"`
 		SchemaName string       `json:"schema_name,omitempty"`
-		RowCount   int64        `json:"row_count,omitempty"`
 		Columns    []columnInfo `json:"columns,omitempty"`
 	}
 	type rankRequest struct {
@@ -4199,7 +4163,6 @@ func rankTablesByLLM(ctx context.Context, tables []TableMetadata, intent string,
 		reqTables = append(reqTables, tableInfo{
 			Name:       t.Name,
 			SchemaName: t.Schema,
-			RowCount:   t.RowCount,
 			Columns:    cols,
 		})
 	}
@@ -4222,6 +4185,7 @@ func rankTablesByLLM(ctx context.Context, tables []TableMetadata, intent string,
 		return nil, fmt.Errorf("build rank request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(req)
 
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	resp, err := httpClient.Do(req)

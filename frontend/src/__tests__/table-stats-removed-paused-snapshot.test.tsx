@@ -4,9 +4,9 @@
  *  #19  A table taken out of the selection keeps its stats row (`status:
  *       "removed"`): its rows are still at the destination and its counts are
  *       still in the totals. It must read "Removed", never "Running", and the
- *       summary says how many there are (`tables_removed`).
- *  #14  A paused pipeline's tables are not moving: the row badge and the summary
- *       tile read "Paused", not "Running".
+ *       Tables card says how many there are (`tables_removed`).
+ *  #14  A paused pipeline's tables are not moving: the row badge and the Tables
+ *       card read "Paused", not "Running".
  *  #7/#11  Snapshot rows (`snapshot_rows` / `applied_snapshot_rows`) get their
  *       own columns next to I/U/D, and a legend says what each counter measures
  *       — none of them is the destination's current row count.
@@ -21,6 +21,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { act, render, screen, waitFor } from "@testing-library/react"
 import "@testing-library/jest-dom"
+import { cardFact } from "./statCards"
 
 const authFetch = vi.fn()
 vi.mock("@/lib/api/auth-fetch", () => ({
@@ -68,12 +69,6 @@ function cellUnder(heading: string, rowIndex = 0): string {
   return (row.querySelectorAll("td")[col]?.textContent || "").trim()
 }
 
-/** The value of a summary tile, found by its label. */
-function tile(label: string): string | null {
-  const el = screen.queryAllByText(label).find((e) => e.nextElementSibling?.className.includes("text-lg"))
-  return el ? (el.nextElementSibling?.textContent || "").trim() : null
-}
-
 const statusCell = (rowIndex: number) => cellUnder("Status", rowIndex)
 
 beforeEach(() => {
@@ -93,10 +88,10 @@ describe("#19 removed tables", () => {
     expect(statusCell(1)).toBe("Removed")
     // Its counts are still drawn: the data is still at the destination.
     expect(cellUnder("Captured I", 1)).toBe("4")
-    expect(tile("Removed")).toBe("1")
+    expect(cardFact("Tables", "removed")).toBe("1")
   })
 
-  it("control: no removed table, no Removed tile", async () => {
+  it("control: no removed table, no removed count", async () => {
     serve({
       summary: { mode: "cdc", total_tables: 1, tables_running: 1, tables_completed: 0, tables_failed: 0 },
       tables: [cdcRow("orders")],
@@ -104,7 +99,7 @@ describe("#19 removed tables", () => {
     render(<TableStatisticsPanel pipelineId="p1" mode="cdc" />)
     await waitFor(() => expect(screen.getByText("orders")).toBeInTheDocument())
 
-    expect(tile("Removed")).toBeNull()
+    expect(cardFact("Tables", "removed")).toBeNull()
     expect(screen.queryByText("Removed")).not.toBeInTheDocument()
   })
 })
@@ -152,8 +147,8 @@ describe("#14 paused pipeline", () => {
 
     expect(statusCell(0)).toBe("Paused")
     expect(statusCell(1)).toBe("Paused")
-    expect(tile("Paused")).toBe("2")
-    expect(tile("Running")).toBeNull()
+    expect(cardFact("Tables", "paused")).toBe("2")
+    expect(cardFact("Tables", "running")).toBeNull()
     expect(screen.queryByText("Running")).not.toBeInTheDocument()
   })
 
@@ -172,8 +167,8 @@ describe("#14 paused pipeline", () => {
     await waitFor(() => expect(screen.getByText("orders")).toBeInTheDocument())
 
     expect(statusCell(0)).toBe("Running")
-    expect(tile("Running")).toBe("2")
-    expect(tile("Paused")).toBeNull()
+    expect(cardFact("Tables", "running")).toBe("2")
+    expect(cardFact("Tables", "paused")).toBeNull()
   })
 
   it("a removed row stays Removed while paused", async () => {
@@ -207,8 +202,8 @@ describe("#7/#11 snapshot rows and what the counters mean", () => {
     expect(h.indexOf("Applied Snapshot")).toBeLessThan(h.indexOf("Applied I"))
     expect(cellUnder("Captured Snapshot")).toBe("1,500")
     expect(cellUnder("Applied Snapshot")).toBe("1,490")
-    expect(tile("Captured Snapshot Rows")).toBe("1,500")
-    expect(tile("Applied Snapshot Rows")).toBe("1,490")
+    expect(cardFact("Changes captured", "snapshot rows")).toBe("1,500")
+    expect(cardFact("Changes applied", "snapshot rows")).toBe("1,490")
 
     const bodyCells = Array.from(document.querySelectorAll("table tbody tr")).map((r) => r.querySelectorAll("td").length)
     for (const n of bodyCells) expect(n).toBe(h.length)

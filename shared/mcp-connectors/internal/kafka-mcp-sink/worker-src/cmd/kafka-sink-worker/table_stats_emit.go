@@ -4,7 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 )
+
+// processCounterEpochMs is when this process started the TABLE_STATS totals it keeps
+// only in memory, counts.bytes_committed and counts.dlq_rows, at zero (Unix ms). Both
+// builders send it as metadata.counter_epoch_ms. A restart reports those totals from
+// zero again, and the api-gateway projector, seeing a newer epoch, adds them to the
+// stored totals instead of waiting for them to pass the old ones: before this, a
+// restarted sink's committed bytes went uncharged. The row counts are seeded from the
+// stored totals (cdc_counter_ledger.go) and are not covered by it.
+var processCounterEpochMs = time.Now().UnixMilli()
 
 // noteTableStatsEmit is the single place a TABLE_STATS publish failure is handled.
 //

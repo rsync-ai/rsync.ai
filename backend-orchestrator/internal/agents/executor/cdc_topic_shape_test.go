@@ -1,6 +1,10 @@
 package executor
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +14,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/connectorpaths"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
+	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 )
 
 // A CDC data topic used to be born with one partition however many brokers the customer
@@ -151,5 +156,83 @@ func TestCDCTopicShapeParamNamesMatchTheDebeziumConnector(t *testing.T) {
 			t.Errorf("the orchestrator sends %q but %s/connector.py never reads it: "+
 				"Connect gets no shape and the broker auto-creates at 1 partition", name, version)
 		}
+	}
+}
+
+// TestCDCStartRefusesWithoutATopicShape: when the orchestrator could not read the
+// cluster it used to start Debezium anyway, with no topic.creation.* at all. Connect
+// then creates no data topic, and on a broker with auto-create off (rsync.ai's own, and
+// every Helm test cluster) the connector writes to topics that never exist: the run
+// reports running and no change is ever delivered. With auto-create on, the broker picks
+// a partition count and replication factor rsync.ai never chose. Either way the start
+// must stop, before it provisions anything on the source, and say why.
+func TestCDCStartRefusesWithoutATopicShape(t *testing.T) {
+	task := ExecutorTask{
+		TaskID:      "task-shape",
+		PipelineID:  "pl-shape",
+		Operation:   "data_transfer",
+		Source:      &ConnectorConfig{Type: "mysql", Config: map[string]string{"host": "db.internal", "database": "shop"}},
+		Destination: &ConnectorConfig{Type: "s3", Config: map[string]string{"bucket": "lake"}},
+		Params: map[string]interface{}{
+			"sync_mode":    "cdc",
+			"cdc_provider": "debezium",
+			"tables":       []interface{}{"shop.orders"},
+		},
+	}
+
+	// Kafka Connect answers, so the only thing missing is the shape.
+	connect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"version":"3.7.0"}`))
+	}))
+	defer connect.Close()
+	t.Setenv("KAFKA_CONNECT_URL", connect.URL)
+
+	start := func(a *Agent) (resp ExecutorResponse, sent []string, panicked interface{}) {
+		a.connectorCallStub = func(_ context.Context, req mcp.ExecuteRequest) (*mcp.ExecuteResponse, error) {
+			sent = append(sent, fmt.Sprintf("%s.%s(topic_partitions=%v topic_replication_factor=%v)",
+				req.Connector, req.Operation, req.Params["topic_partitions"], req.Params["topic_replication_factor"]))
+			return &mcp.ExecuteResponse{Error: "stub: no connector here"}, nil
+		}
+		resp, panicked = runPastGuard(func() ExecutorResponse {
+			return a.executeStreamingDataTransfer(context.Background(), task, "", "trace-shape")
+		})
+		return resp, sent, panicked
+	}
+
+	// Control: a cluster the orchestrator can see starts Debezium, with the shape. A
+	// refusal below is the missing shape, not a start that fails whatever it is given.
+	t.Run("control: a readable cluster starts with its shape", func(t *testing.T) {
+		a := &Agent{clusterShapeStub: func() (kafka.CDCTopicShape, bool) {
+			return kafka.CDCTopicShape{Partitions: 1, ReplicationFactor: 1, MinInsyncReplicas: 1}, true
+		}}
+		resp, sent, panicked := start(a)
+		want := "debezium.start_sync(topic_partitions=1 topic_replication_factor=1)"
+		if panicked != nil || len(sent) != 1 || sent[0] != want {
+			t.Fatalf("connector calls = %v (panic %v, response %q); want exactly %s", sent, panicked, resp.Error, want)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		a    *Agent
+	}{
+		{"no Kafka manager", &Agent{}},
+		{"a Kafka manager that cannot see the cluster", &Agent{kafkaManager: &kafka.Manager{}}},
+		{"a cluster that reports no shape", &Agent{clusterShapeStub: func() (kafka.CDCTopicShape, bool) {
+			return kafka.CDCTopicShape{}, false
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, sent, panicked := start(tc.a)
+			if panicked != nil {
+				t.Fatalf("the start went past the shape check into the data plane (%v); want it refused first", panicked)
+			}
+			if len(sent) != 0 {
+				t.Errorf("connector calls = %v; want none: a start with no topic shape must not reach Debezium", sent)
+			}
+			if resp.Status != "failed" || !strings.Contains(resp.Error, "could not read the Kafka cluster") {
+				t.Errorf("response = %s %q; want failed, saying the Kafka cluster could not be read", resp.Status, resp.Error)
+			}
+		})
 	}
 }

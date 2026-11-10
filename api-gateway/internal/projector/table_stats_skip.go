@@ -104,17 +104,6 @@ func (p *EventProjector) skipTableStats(reason tableStatsSkipReason, raw, meta m
 	return nil
 }
 
-// TableStatsSkipCounts reports how many TABLE_STATS events this projector has dropped,
-// per reason, since it started. Reasons that never fired are included with 0 so a reader
-// can tell "none dropped" from "not reported".
-func (p *EventProjector) TableStatsSkipCounts() map[string]uint64 {
-	out := make(map[string]uint64, numTableStatsSkipReasons)
-	for r := tableStatsSkipReason(0); r < numTableStatsSkipReasons; r++ {
-		out[r.String()] = p.tableStatsSkips[r].Load()
-	}
-	return out
-}
-
 func truncateLabel(s string) string {
 	if len(s) > maxSkipLabelLen {
 		return s[:maxSkipLabelLen]

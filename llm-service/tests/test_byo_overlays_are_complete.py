@@ -38,6 +38,7 @@ FAKE_ENV = {
     "JWT_SECRET": "FAKEPLACEHOLDER",
     "MINIO_ACCESS_KEY": "FAKEPLACEHOLDER",
     "MINIO_SECRET_KEY": "FAKEPLACEHOLDER",
+    "MINIO_KMS_SECRET_KEY": "FAKEPLACEHOLDER",
     "BLOB_STAGING_ACCESS_KEY": "FAKEPLACEHOLDER",
     "BLOB_STAGING_SECRET_KEY": "FAKEPLACEHOLDER",
     "POSTGRES_PASSWORD": "FAKEPLACEHOLDER",
@@ -497,7 +498,7 @@ _DELIBERATELY_INERT_PROFILES = {
     "generate": (
         "the connector generator probes context7-mcp with a 3s timeout inside a "
         "try/except and carries on without it (llm-service/src/agents/"
-        "tool_generator/service.py:869-928), so its absence costs a "
+        "tool_generator/service.py:861-928), so its absence costs a "
         "documentation lookup, not a run"
     ),
     "connectors": (

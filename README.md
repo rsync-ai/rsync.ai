@@ -4,14 +4,14 @@
 [![License: source-available](https://img.shields.io/badge/license-source--available-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
 [![Deploy: Helm](https://img.shields.io/badge/deploy-Helm%20chart-0F1689?logo=helm&logoColor=white)](#kubernetes)
-[![Connectors](https://img.shields.io/badge/connectors-20-16a34a)](docs/connectors/reference.md)
+[![Connectors](https://img.shields.io/badge/connectors-22-16a34a)](docs/connectors/reference.md)
 [![Docs](https://img.shields.io/badge/docs-read%20the%20guides-64748b)](docs/README.md)
 
 > **Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled
 > models, and lineage.** Describe a pipeline in plain English, approve the plan, and see
 > exactly what ran, failed, or became stale.
 
-![The rsync.ai pipeline builder resolving "MySQL to PostgreSQL" and pausing on a Choose Sync Mode gate before any row moves](docs/assets/pipeline-creation.png)
+![The rsync.ai pipeline builder pausing on Confirm Pipeline before any row moves: PostgreSQL to Google Cloud Storage, with CDC (snapshot + changes) taken from the request and Batch or CDC (changes only) as the other choices](docs/assets/pipeline-creation.webp)
 
 *You describe the pipeline in plain English. It resolves the plan, then stops for your
 approval — batch, CDC, or changes-only — before a single row moves.*
@@ -19,7 +19,7 @@ approval — batch, CDC, or changes-only — before a single row moves.*
 rsync.ai moves data between databases, warehouses, object stores and APIs. You describe the
 job in a sentence; an agent turns it into an explicit, staged plan, pauses for you when
 something is ambiguous, and executes it on Temporal so a long sync survives restarts. Batch
-and change-data-capture are both first-class. Twenty-one connectors ship in the box.
+and change-data-capture are both first-class. Twenty connectors ship in the box.
 
 It is unrelated to [`rsync(1)`](https://rsync.samba.org/), the file-synchronisation
 tool — this moves rows between systems, not files between hosts.
@@ -42,36 +42,39 @@ others, or build a competing product from it. The [full summary is below](#licen
   scheduled SQL need an admin's approval, and a freshness deadline flags a table that
   stopped moving.
   → [Scheduled SQL models](docs/solutions/scheduled-sql-models-with-dependency-triggers.md)
-- **Data Explorer and lineage.** Query what you connected in English or SQL, and see which
-  pipelines write which tables and which models read them. Lineage is table-level, and the
-  lineage view is recent — its page states how far it has been verified.
+- **Data Explorer and lineage.** Query what you connected in SQL (Ask rsync.ai can draft it
+  from a question in English), and see which pipelines write which tables and which models
+  read them. Lineage is table-level, and the lineage view is recent — its page states how far
+  it has been verified.
   → [Data Explorer](docs/explorer/README.md) ·
   [Lineage and observability](docs/solutions/data-lineage-and-pipeline-observability.md)
-- **Versioned MCP connectors.** Each of the 20 connectors runs as its own versioned
+- **Versioned MCP connectors.** Each of the 22 connectors runs as its own versioned
   container, so you can upgrade or pin one without touching the rest.
   → [Connector reference](docs/connectors/reference.md)
 
 More guides: [all solutions](docs/solutions/README.md).
 
-![The rsync.ai Data Explorer: a plain-English question turned into SQL against a Postgres source, with the result rows below](docs/assets/explorer.webp)
+![The rsync.ai Data Explorer on a BigQuery warehouse: a SQL query ranking merchants by declined card transactions, with the schema browser on the left and the first result rows below](docs/assets/explorer.webp)
 
-*Ask in plain English, review the SQL it wrote, run it against a connected source. Here: how
-many swipes went left versus right.*
+*Write SQL against a connected source and get the rows back. From there, download them, chart
+them, or save the query and schedule it as a table. Here: the merchants with the most declined
+card transactions.*
 
-![A finished pipeline run in rsync.ai: status Success, duration 3m 49s, data freshness, and a run log whose stages report "Data transfer complete! Processed 1183074 rows"](docs/assets/run-detail.webp)
+![A batch pipeline's page in rsync.ai: Customers & Lending — Nightly, Core Banking DB to Fintech Data Lake, status Completed, and a chart of its last 4 runs by duration and outcome — all 4 succeeded, average 42s](docs/assets/pipeline-overview.webp)
 
-*A finished run, stage by stage: what each one did, the rows it moved, and how stale the
-destination has become since. Nothing here was typed in by hand.*
+*One pipeline's page: source to destination, how its last run ended, and its recent runs
+charted by how long each took and whether it succeeded. Click a bar to open that run.*
 
-![The rsync.ai pipelines list: 13 pipelines with type, source and destination, live status, and last run](docs/assets/pipelines.webp)
+![The rsync.ai pipelines list: three pipelines with type, source and destination, live status, and last run — two CDC pipelines running and a scheduled batch pipeline that succeeded](docs/assets/pipelines.webp)
 
 *Every pipeline in a workspace on one screen: batch or CDC, source to destination, and
 whether it is running right now.*
 
-![The rsync.ai lineage view: the Total swipes model writes public.swipes_total, the Swipes total check model runs after it and writes public.swipes_total_check](docs/assets/lineage.webp)
+![The rsync.ai lineage view for one pipeline: Customers & Lending — Nightly writes three tables, silver models read them and write silver tables, gold models build on those, and the models that need attention are flagged](docs/assets/lineage.webp)
 
-*Lineage across pipelines and scheduled SQL models: which table a model writes, which model
-reads it, and which one runs after which.*
+*Lineage across pipelines and scheduled SQL models: which tables a pipeline writes, which
+models read them, and which one runs after which. A model is flagged Needs attention when its
+refresh does not follow the data it reads, or its SQL reads a table nothing here writes.*
 
 ## How it compares
 
@@ -88,8 +91,10 @@ the middle: get the data moving *and* keep it modelled, on hardware you control.
 | **Airflow / n8n** | General orchestration and automation, enormously flexible | A pipeline is a first-class object with row counts, lineage and CDC built in, rather than something you assemble from operators or nodes. |
 
 **Where it is honestly weaker.** There is no managed option — every install is yours to run.
-The catalogue is 20 connectors, not hundreds. Data-quality assertions are not built yet. And
-the Kubernetes path is younger than the Docker one (see [Project status](#project-status)). If
+The catalogue is 22 connectors, not hundreds. Data checks are new and shallow next to dbt's
+tests, and a failing check holds a table back only on Postgres, Redshift, MySQL, SQL Server and
+Oracle (and a ClickHouse table's first build); on Snowflake, BigQuery and Databricks it can only
+warn. And the Kubernetes path is younger than the Docker one (see [Project status](#project-status)). If
 you want someone else carrying the pager, use a managed tool.
 
 ## Quick start
@@ -171,7 +176,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.8`, the current release. Both halves of the install come
+> **Which code you get.** `v0.2.0`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -238,6 +243,8 @@ helm install rsync-ai ./deploy/helm/rsync-ai \
   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
+  --set secrets.blobStagingAccessKey="$(openssl rand -hex 16)" \
+  --set secrets.blobStagingSecretKey="$(openssl rand -base64 32)" \
   --set frontend.publicUrl=https://app.example.com \
   --set frontend.apiUrl=https://api.example.com \
   -f my-values.yaml   # at least connectors.fleet
@@ -268,6 +275,8 @@ per-provider value files ship for EKS, GKE and AKS. See the
 >   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
 >   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
 >   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
+>   --set secrets.blobStagingAccessKey="$(openssl rand -hex 16)" \
+>   --set secrets.blobStagingSecretKey="$(openssl rand -base64 32)" \
 >   --set frontend.publicUrl=https://app.example.com \
 >   --set frontend.apiUrl=https://api.example.com
 > ```
@@ -297,12 +306,12 @@ per-provider value files ship for EKS, GKE and AKS. See the
 | **It asks instead of guessing** | When the source is ambiguous — which tables, which schema, which key — the run pauses on a human-in-the-loop gate rather than picking for you. |
 | **Durable execution** | Stages run as Temporal workflows, so a multi-hour sync survives a restart, a redeploy, or a crashed worker. |
 | **You can answer "why did it do that?"** | Every run emits domain events carrying stage state, row counts and a trace id, and the UI shows them stage by stage. |
-| **A SQL and NL query surface** | The [Data Explorer](#the-data-explorer) queries the systems you connected — no second BI tool to stand up first. |
+| **A SQL query surface** | The [Data Explorer](#the-data-explorer) queries the systems you connected — no second BI tool to stand up first. With an LLM configured, Ask rsync.ai drafts the SQL from a question and opens it there. |
 | **Your infrastructure, your keys** | One Docker command or one Helm chart. Credentials are encrypted at rest with a key you hold; point the LLM at OpenAI or at the [Ollama](docs/deployment/ollama.md) the installer bundles, or run without one. |
 
 ## Connectors
 
-**20 connectors ship in the box** — every one is a source, 16 are also destinations, and
+**22 connectors ship in the box** — every one is a source, 16 are also destinations, and
 five support change data capture. Each runs as its own versioned container, so you can
 upgrade or pin one without touching the rest.
 
@@ -312,7 +321,7 @@ upgrade or pin one without touching the rest.
 | **Data warehouse** | Snowflake, Google BigQuery, Databricks | — |
 | **Document** | MongoDB | MongoDB |
 | **Object storage** | AWS S3, Google Cloud Storage, Azure Blob Storage | — |
-| **APIs** | Stripe, Shopify, GitHub, Notion, Google Sheets | — |
+| **APIs** | Stripe, Shopify, GitHub, Notion, Google Sheets, NSE India, Upstox | — |
 | **Demo and reference** | Sample Data (credential-free demo source), Widgets-GraphQL (GraphQL example) | — |
 
 The [connector reference](docs/connectors/reference.md) is generated from the connector
@@ -323,8 +332,8 @@ add your own, start with the
 
 ## The Data Explorer
 
-Once data has landed somewhere, you can query it without leaving rsync.ai. Ask a question in
-English and get SQL back, or write the SQL yourself; browse the schema; then keep the
+Once data has landed somewhere, you can query it without leaving rsync.ai. Write SQL, or have
+Ask rsync.ai draft it from a question and open it here; browse the schema; then keep the
 useful ones — as a saved query with versions and diffs, or as a **model**: a table that
 rebuilds itself on a cron, an interval, or after a given pipeline finishes. Results export
 to CSV, TSV and JSON. See the [Data Explorer guide](docs/explorer/README.md) and the deep
@@ -368,7 +377,7 @@ dive on [saved queries, models and schedules](docs/explorer/saved-queries-and-mo
 | [Oracle Cloud (free)](docs/deployment/oracle-cloud.md) | Free 4 OCPU / 24 GB VM |
 | [Connector reference](docs/connectors/reference.md) | Every shipped source and destination |
 | [Connector developer guide](docs/connectors/developer-guide.md) | Build a new connector |
-| [Data Explorer](docs/explorer/README.md) | SQL, natural-language queries, saved models and schedules |
+| [Data Explorer](docs/explorer/README.md) | SQL, saved models and schedules, charts and dashboards |
 | [Architecture](docs/architecture/overview.md) | System design and data flows |
 | [API reference](docs/api/README.md) | REST + WebSocket endpoints |
 | [Environment variables](docs/deployment/env-vars.md) | Full configuration reference |

@@ -1,0 +1,34 @@
+{
+  "_about": [
+    "What each destination creates for a PostgreSQL NUMERIC column declared with no precision and no scale.",
+    "No fixed-width type holds every value such a column can hold, so a PostgreSQL destination gets plain NUMERIC and every other destination stores the exact value as text (product decision, 2026-09-28). A destination table that already exists keeps its column type.",
+    "Batch: PostgreSQL discovery reports such a column with the bare type \"numeric\". A bare \"decimal\" keeps meaning a fixed-width decimal, because MySQL and Oracle report constrained columns that way. shared/mcp-connectors/tests/test_unconstrained_numeric_golden.py checks canonical_to_ddl against batch_ddl and fixed_decimal.",
+    "CDC: Debezium sends such a column as io.debezium.data.VariableScaleDecimal. The kafka-sink-worker's unconstrained_numeric_golden_test.go checks mapConnectFieldToDDLType against cdc_ddl. An empty string means the worker names no type, so the destination connector creates its text type."
+  ],
+  "marker": "numeric",
+  "batch_ddl": {
+    "postgresql": {"column": "NUMERIC", "lone_key": "NUMERIC", "composite_key": "NUMERIC"},
+    "mysql": {"column": "TEXT", "lone_key": "VARCHAR(768)", "composite_key": "VARCHAR(191)"},
+    "sqlserver": {"column": "NVARCHAR(MAX)", "lone_key": "NVARCHAR(450)", "composite_key": "NVARCHAR(200)"},
+    "oracle": {"column": "CLOB", "lone_key": "VARCHAR2(400)", "composite_key": "VARCHAR2(200)"},
+    "clickhouse": {"column": "String", "lone_key": "String", "composite_key": "String"},
+    "snowflake": {"column": "VARCHAR", "lone_key": "VARCHAR", "composite_key": "VARCHAR"},
+    "databricks": {"column": "STRING", "lone_key": "STRING", "composite_key": "STRING"}
+  },
+  "fixed_decimal": {
+    "postgresql": "NUMERIC(38,9)",
+    "mysql": "DECIMAL(38,9)",
+    "sqlserver": "DECIMAL(38,9)",
+    "oracle": "NUMBER",
+    "clickhouse": "Decimal(38, 9)",
+    "snowflake": "NUMBER(38,9)",
+    "databricks": "DECIMAL(38,9)"
+  },
+  "cdc_ddl": {
+    "postgresql": "NUMERIC",
+    "mysql": "TEXT",
+    "sqlserver": "",
+    "oracle": "",
+    "clickhouse": ""
+  }
+}

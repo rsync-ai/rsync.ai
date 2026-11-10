@@ -16,13 +16,13 @@ import { PipelinesTable, type PipelineListItem } from "../PipelinesTable"
 
 const STATUSES: Array<[string, RegExp]> = [
   ["running", /^running$/i],
-  ["passed", /^completed$/i],
+  ["passed", /^succeeded$/i],
   ["paused", /^paused$/i],
   ["stopped", /^stopped$/i],
   ["scheduled", /^scheduled$/i],
   ["idle", /^idle$/i],
   ["failed", /^failed$/i],
-  ["waiting_for_user", /awaiting user/i],
+  ["waiting_for_user", /^waiting for you$/i],
   ["cancelled", /^cancelled$/i],
   ["pending", /^pending$/i],
 ]

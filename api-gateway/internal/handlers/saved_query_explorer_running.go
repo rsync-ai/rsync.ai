@@ -162,6 +162,10 @@ type runningModelRow struct {
 	SavedQueryID string
 	Name         string
 	ScheduleID   string
+	// WaitsForAll is a fan-in on upstream_policy 'all' with more than one upstream. The
+	// next landing does not rebuild it, so its idle reason must not say it does. With one
+	// upstream the policy changes nothing (describeUpstreamNextRun on the page agrees).
+	WaitsForAll bool
 }
 
 // RunningModelWork is one row of the answer.
@@ -207,12 +211,20 @@ type modelRefreshVerdict struct {
 // history, and that answer is a real ModelRefreshState carrying the phase and counts
 // from whenever the loop ended. Without the reject condition, a model that finished
 // rebuilding an hour ago would render as running with an hour-old batch underneath it.
+// modelIdleMessage is the Now column's idle reason. Never started and closed are one
+// thing to the person reading it, so they read the same. A model that waits for all its
+// upstreams reads modelIdleAllMessage instead (listRunningModelWork).
+const (
+	modelIdleMessage    = "not rebuilding now; it rebuilds when an upstream finishes"
+	modelIdleAllMessage = "not rebuilding now; it rebuilds once every upstream has run since its last rebuild"
+)
+
 func classifyModelRefreshQuery(detail *modelRefreshStateView, rejected bool, err error) modelRefreshVerdict {
 	switch {
 	case rejected:
 		return modelRefreshVerdict{
 			State:   runningStateIdle,
-			Message: "no open refresh loop; the last run has closed",
+			Message: modelIdleMessage,
 		}
 
 	case err == nil:
@@ -221,7 +233,7 @@ func classifyModelRefreshQuery(detail *modelRefreshStateView, rejected bool, err
 			// and not a transport fault either.
 			return modelRefreshVerdict{
 				State:   runningStateRunning,
-				Message: "the refresh loop answered with no state",
+				Message: "it answered without saying what it is doing",
 			}
 		}
 		return modelRefreshVerdict{State: runningStateRunning, DetailAvailable: true, Detail: detail}
@@ -230,7 +242,7 @@ func classifyModelRefreshQuery(detail *modelRefreshStateView, rejected bool, err
 		// No execution by that id has ever existed. The overwhelmingly common case: a
 		// loop lives only as long as a burst of upstream completions, so most models
 		// have no workflow at all most of the time.
-		return modelRefreshVerdict{State: runningStateIdle, Message: "no refresh loop has run for this model"}
+		return modelRefreshVerdict{State: runningStateIdle, Message: modelIdleMessage}
 
 	case isQueryFailed(err):
 		// The server reached a worker and the worker refused. That is only possible for
@@ -239,7 +251,7 @@ func classifyModelRefreshQuery(detail *modelRefreshStateView, rejected bool, err
 		// Reporting it as unreachable would blame the network for a deploy.
 		return modelRefreshVerdict{
 			State:   runningStateRunning,
-			Message: "the refresh loop is running but did not answer this query: " + err.Error(),
+			Message: "it is running but would not say what it is doing: " + err.Error(),
 		}
 
 	default:
@@ -296,6 +308,9 @@ func listRunningModelWork(ctx context.Context, rows []runningModelRow, query mod
 			defer func() { <-sem }()
 			detail, rejected, err := query(ctx, out[i].WorkflowID)
 			v := classifyModelRefreshQuery(detail, rejected, err)
+			if v.State == runningStateIdle && rows[i].WaitsForAll {
+				v.Message = modelIdleAllMessage
+			}
 			out[i].State = v.State
 			out[i].DetailAvailable = v.DetailAvailable
 			out[i].Detail = v.Detail
@@ -352,7 +367,10 @@ func temporalModelRefreshQuerier(tc client.Client) modelRefreshQuerier {
 // become visible just because it happens to be rebuilding.
 func runningModelWorkQuery() string {
 	return `
-		SELECT sq.id::text, sq.name, s.schedule_id
+		SELECT sq.id::text, sq.name, s.schedule_id,
+		       (s.upstream_policy = 'all'
+		        AND (SELECT COUNT(*) FROM saved_query_schedule_upstreams u
+		             WHERE u.schedule_id = s.schedule_id) > 1)
 		FROM saved_query_schedules s
 		JOIN saved_queries sq ON sq.id = s.saved_query_id
 		WHERE sq.workspace_id = $1
@@ -399,7 +417,7 @@ func ListRunningModelWork(c *gin.Context) {
 	models := make([]runningModelRow, 0)
 	for rows.Next() {
 		var r runningModelRow
-		if err := rows.Scan(&r.SavedQueryID, &r.Name, &r.ScheduleID); err != nil {
+		if err := rows.Scan(&r.SavedQueryID, &r.Name, &r.ScheduleID, &r.WaitsForAll); err != nil {
 			log.WithError(err).Error("scan running model work")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list running model work"})
 			return

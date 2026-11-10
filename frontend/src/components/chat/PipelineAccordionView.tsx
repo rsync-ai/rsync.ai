@@ -34,9 +34,9 @@ import {
   StopCircle,
   ChevronDown
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatRelativeTime } from '@/lib/utils'
 import { extractErrorMessage } from '@/lib/pipeline/errorUtils'
-import { GenericHitlForm, type JsonSchema } from './GenericHitlForm'
+import { GenericHitlForm, UnsupportedHitlNotice, type JsonSchema } from './GenericHitlForm'
 import { getPipelineCDCStatus, restartPipelineCDC } from '@/lib/api/pipelines'
 import { ConnectionLogo } from '@/components/connectors/ConnectionLogo'
 import { displayConnectorName } from '@/lib/connector-display'
@@ -53,6 +53,8 @@ import {
   runningStageTimeLabel,
 } from './runningStageLabel'
 import { dependencyStatusLabel } from '@/lib/pipeline/dependencyStatus'
+import { chatHitlAction } from '@/lib/pipeline/chatHitlAction'
+import { ResumePausedRun } from '@/components/pipeline/ResumePausedRun'
 import {
   normalizePipelineStatus,
   RUNTIME_PHASE_WAITING_FOR_DATA,
@@ -98,7 +100,7 @@ export interface PipelineState {
       started_at?: string
       completed_at?: string
       actual_duration_ms?: number
-      /** SECONDS, legacy — see the note on ExecutionPlanStage in DAGVisualization. */
+      /** SECONDS, legacy — see the note on ExecutionPlanStage in dagTypes. */
       actual_duration?: number
       estimated_duration?: number
       error_message?: string
@@ -129,7 +131,6 @@ interface PipelineAccordionViewProps {
   onSelectTables?: (details?: Record<string, unknown>) => void
   onConfigureConnections?: (details?: Record<string, unknown>) => void
   onGenerateConnectors?: (details?: Record<string, unknown>) => void
-  onViewMonitoring?: () => void
   // Set to true briefly after user responds to HITL to show "Resuming…" instead of
   // the stale blocking card while Temporal processes the signal (~5-7s lag).
   resumingFromHITL?: boolean
@@ -143,6 +144,64 @@ interface PipelineAccordionViewProps {
 function formatDuration(ms: number | undefined): string | null {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return null
   return sharedFormatDuration(ms)
+}
+
+/**
+ * One plain sentence for a step of a planned graph, from the node kind and config
+ * the plan carries (`node_kind`, `node_config`). The panel used to print both as
+ * raw "Node Kind" / "Node Config" JSON, which a user cannot read. `null` when the
+ * stage is not a graph step or its kind has no sentence.
+ */
+export function describePlannedStep(
+  metadata: Record<string, unknown> | undefined,
+  connectors: { source?: string; destination?: string } = {},
+): string | null {
+  const kind = typeof metadata?.node_kind === 'string' ? metadata.node_kind.toLowerCase() : ''
+  if (!kind) return null
+  const config = (metadata?.node_config && typeof metadata.node_config === 'object'
+    ? metadata.node_config
+    : {}) as Record<string, unknown>
+  const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '')
+  const connector = (fallback?: string) =>
+    displayConnectorName(text(config.connector_type) || fallback) || ''
+
+  switch (kind) {
+    case 'source': {
+      const from = connector(connectors.source) || 'the source'
+      const listed = [config.selected_tables, config.tables].find(Array.isArray) as unknown[] | undefined
+      const names = (listed ?? [config.collection, config.table]).map(text).filter(Boolean)
+      return names.length > 0
+        ? `Reads ${names.join(', ')} from ${from}.`
+        : `Reads the tables you select from ${from}.`
+    }
+    case 'destination':
+      return `Writes the data to ${connector(connectors.destination) || 'the destination'}.`
+    case 'transform': {
+      const steps = Array.isArray(config.transforms) ? config.transforms.length : 0
+      return steps > 0
+        ? `Transforms the data (${steps} ${steps === 1 ? 'step' : 'steps'}).`
+        : 'Transforms the data.'
+    }
+    case 'wait': {
+      const seconds = Number(config.wait_seconds)
+      const d = Number.isFinite(seconds) && seconds > 0 ? formatDuration(seconds * 1000) : null
+      return d ? `Waits ${d} before the next step.` : 'Waits before the next step.'
+    }
+    case 'notification': {
+      const channel = text(config.channel)
+      return channel ? `Sends a notification to ${channel}.` : 'Sends a notification.'
+    }
+    case 'condition':
+      return 'Checks a condition to choose the next step.'
+    case 'split':
+      return 'Splits the flow into parallel branches.'
+    case 'merge':
+      return 'Joins the branches back together.'
+    case 'api_call':
+      return 'Calls an external API.'
+    default:
+      return null
+  }
 }
 
 /**
@@ -167,19 +226,6 @@ function elapsedSince(iso?: string): string | null {
   if (Number.isNaN(t)) return null
   const ms = Math.max(0, Date.now() - t)
   return formatDuration(ms)
-}
-
-function formatAgo(iso?: string): string | null {
-  if (!iso) return null
-  const t = new Date(iso).getTime()
-  if (isNaN(t)) return null
-  const diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000))
-  if (diffSec < 5) return 'just now'
-  if (diffSec < 60) return `${diffSec}s ago`
-  const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin}m ago`
-  const diffHr = Math.floor(diffMin / 60)
-  return `${diffHr}h ago`
 }
 
 function StageIcon({ status }: { status: string }) {
@@ -509,13 +555,11 @@ function StageActivityPanel({
   stageId,
   startedAt,
   label,
-  onViewMonitoring,
 }: {
   pipelineId: string
   stageId: string
   startedAt?: string
   label?: string
-  onViewMonitoring?: () => void
 }) {
   const [elapsed, setElapsed] = useState<string>("")
   const [lastEvent, setLastEvent] = useState<string | null>(null)
@@ -577,8 +621,6 @@ function StageActivityPanel({
     return () => { cancelled = true; clearInterval(t) }
   }, [pipelineId, isExecutor])
 
-  const accentColor = isExecutor ? 'violet' : 'blue'
-
   return (
     <div className={cn(
       "rounded-xl border p-4 space-y-3",
@@ -628,21 +670,16 @@ function StageActivityPanel({
           Data is transferring in the background. Large tables may take several minutes.
         </p>
       )}
-      {onViewMonitoring && isExecutor && (
-        <button
-          onClick={onViewMonitoring}
+      {isExecutor && pipelineId && (
+        <Link
+          href={`/pipelines/${pipelineId}?tab=monitor&from=chat`}
           className="text-xs font-medium text-violet-600 dark:text-violet-400 underline underline-offset-2 hover:text-violet-800"
         >
-          Open Monitoring for live events →
-        </button>
+          Watch the data flow →
+        </Link>
       )}
     </div>
   )
-}
-
-// Keep old name as alias for backward compat within this file
-function LiveExecutionPanel(props: Parameters<typeof StageActivityPanel>[0]) {
-  return <StageActivityPanel {...props} />
 }
 
 export function PipelineAccordionView({
@@ -653,7 +690,6 @@ export function PipelineAccordionView({
   onSelectTables,
   onConfigureConnections,
   onGenerateConnectors,
-  onViewMonitoring,
   resumingFromHITL = false,
 }: PipelineAccordionViewProps) {
   // Scroll the card into view when this accordion first mounts (pipeline just started).
@@ -882,7 +918,7 @@ export function PipelineAccordionView({
     executionPlan: normalizedState.execution_plan,
   })
 
-  const lastUpdate = formatAgo(normalizedState.last_heartbeat_at || normalizedState.updated_at)
+  const lastUpdate = formatRelativeTime(normalizedState.last_heartbeat_at || normalizedState.updated_at, { seconds: true, empty: "" })
   const localProgress = getDisplayProgress(normalizedState, looksLikeCDC)
   // When runtime is available, let it dictate which banner shows. The local
   // percent/text remain because /runtime doesn't expose stage-by-stage progress.
@@ -1397,7 +1433,6 @@ export function PipelineAccordionView({
                                 ? 'Waiting for infrastructure to be ready…'
                                 : undefined
                           }
-                          onViewMonitoring={stage.id === 'executor' ? onViewMonitoring : undefined}
                         />
                       )}
                       {/* HITL action inline (keeps it in-sequence, not pinned at top) */}
@@ -1425,10 +1460,22 @@ export function PipelineAccordionView({
                                   ? (blockingDetails.ui_hints as Record<string, unknown>)
                                   : {}
                               const widget = String(uiHints.widget || '')
+                              const action = chatHitlAction(
+                                { blockingType, requestType, widget },
+                                {
+                                  selectTables: Boolean(onSelectTables),
+                                  configureConnections: Boolean(onConfigureConnections),
+                                  generateConnectors: Boolean(onGenerateConnectors),
+                                },
+                              )
+
+                              if (action === 'resume' && state.pipeline_id) {
+                                return <ResumePausedRun pipelineId={state.pipeline_id} onResumed={onRefresh} />
+                              }
 
                               // Prefer the existing, rich popup selectors for known HITL types.
                               // This avoids requiring users to type table names manually.
-                              if ((widget === 'table_selector' || requestType.includes('table')) && onSelectTables) {
+                              if (action === 'select_tables' && onSelectTables) {
                                 return (
                                   <div className="flex flex-wrap gap-2">
                                     <Button size="sm" onClick={() => onSelectTables(blockingDetails)}>
@@ -1438,12 +1485,7 @@ export function PipelineAccordionView({
                                 )
                               }
 
-                              if (
-                                (widget === 'connection_configurator' ||
-                                  requestType.includes('connection') ||
-                                  requestType.includes('connections')) &&
-                                onConfigureConnections
-                              ) {
+                              if (action === 'configure_connections' && onConfigureConnections) {
                                 return (
                                   <div className="flex flex-wrap gap-2">
                                     <Button size="sm" onClick={() => onConfigureConnections(blockingDetails)}>
@@ -1453,9 +1495,8 @@ export function PipelineAccordionView({
                                 )
                               }
 
-                              if ((widget === 'connector_generator' || requestType.includes('connector') || requestType.includes('connectors')) && onGenerateConnectors) {
+                              if (action === 'generate_connectors' && onGenerateConnectors) {
                                 const rows = extractRequiredConnectorRows(blockingDetails)
-                                const missingCount = rows.filter((r) => r.isMissing).length
                                 const firstMissing = rows.find((r) => r.isMissing) || null
                                 return (
                                   <div className="space-y-3">
@@ -1539,22 +1580,18 @@ export function PipelineAccordionView({
                                 )
                               }
 
-                              // Otherwise, fall back to a minimal JSON-schema based form for unknown/new agents.
-                              if (isJsonSchema(blockingDetails.input_schema)) {
-                                return (
-                                  <GenericHitlForm
-                                    schema={blockingDetails.input_schema}
-                                    onSubmit={(data) => {
-                                      // Generic submit: pass payload to the best available callback.
-                                      if (onSelectTables) onSelectTables({ ...blockingDetails, ...data })
-                                      else if (onConfigureConnections) onConfigureConnections({ ...blockingDetails, ...data })
-                                      else if (onGenerateConnectors) onGenerateConnectors({ ...blockingDetails, ...data })
-                                    }}
-                                  />
-                                )
-                              }
-
-                              return null
+                              // Nothing in this build answers the request. Say so, and show its
+                              // schema read-only: no handler here posts to its endpoint, and
+                              // handing the answer to one that answers something else opened
+                              // the table picker for a request about something else.
+                              return (
+                                <div className="space-y-3">
+                                  <UnsupportedHitlNotice blockingType={blockingType} />
+                                  {isJsonSchema(blockingDetails.input_schema) && (
+                                    <GenericHitlForm schema={blockingDetails.input_schema} />
+                                  )}
+                                </div>
+                              )
                             })()}
                           </div>
                         </div>
@@ -1593,14 +1630,22 @@ export function PipelineAccordionView({
                         </Alert>
                       )}
 
+                      {/* A planned graph step, in words */}
+                      {(() => {
+                        const planned = describePlannedStep(stage.metadata, resolvedConnectors)
+                        return planned ? <p className="text-xs text-muted-foreground">{planned}</p> : null
+                      })()}
+
                       {/* Stage-specific detail cards (structured, not raw key-value dump) */}
                       {Boolean(stage.metadata && Object.keys(stage.metadata).length > 0) && (() => {
-                        // Fields already shown elsewhere (header strip, warnings above) — skip them in the detail section
+                        // Fields already shown elsewhere (header strip, warnings above, the
+                        // planned-step sentence) — skip them in the detail section
                         const SKIP_KEYS = new Set([
                           'duration_ms', 'result_summary', 'destination_schema_warning',
                           'source_connector_type', 'destination_connector_type',
                           'source_connection_name', 'destination_connection_name',
                           'execution_plan', 'run_mode',
+                          'node_kind', 'node_config', 'requires_hitl', 'hitl_prompt',
                         ])
                         // Human-readable labels for known keys
                         const LABELS: Record<string, string> = {
@@ -1709,7 +1754,7 @@ export function PipelineAccordionView({
             and reports at least one dependency. Replaces guessing about why
             a CDC pipeline is producing 0 rows. */}
         {runtime && runtime.dependencies && runtime.dependencies.length > 0 && (
-          <DependencyHealthPanel deps={runtime.dependencies} aggregate={runtime.health} />
+          <DependencyHealthPanel deps={runtime.dependencies} aggregate={runtime.health} pipelineStatus={state.status} />
         )}
 
         {/* CDC live banner — streaming pipeline is active */}
@@ -1723,14 +1768,11 @@ export function PipelineAccordionView({
               <p className="font-medium text-green-900 dark:text-green-200">CDC stream is live</p>
             </div>
             <p className="text-sm text-green-700 dark:text-green-400 mt-1 ml-5">
-              Changes from your source are being streamed in real-time. Check the Monitoring tab to see event throughput.
+              Changes from your source are being streamed in real time. The pipeline&apos;s Data flow tab shows the events.
             </p>
             <div className="flex gap-2 mt-3 ml-5">
               <Button asChild size="sm" className="bg-gradient-to-r from-violet-600 to-indigo-600 text-white">
-                <Link href={`/pipelines/${state.pipeline_id}`}>View Pipeline</Link>
-              </Button>
-              <Button asChild size="sm" variant="outline">
-                <Link href="/chat">New Pipeline</Link>
+                <Link href={`/pipelines/${state.pipeline_id}?tab=monitor&from=chat`}>Watch the data flow →</Link>
               </Button>
             </div>
           </div>
@@ -1751,11 +1793,6 @@ export function PipelineAccordionView({
               {String(runtime?.message || 'Streaming is set up, but no data has reached the destination yet').replace(/[.\s]+$/, '')}.
               {' '}Check that the source has changes to capture, and the connector state above.
             </p>
-            <div className="flex gap-2 mt-3 ml-7">
-              <Button asChild size="sm" variant="outline">
-                <Link href={`/pipelines/${state.pipeline_id}`}>View Pipeline</Link>
-              </Button>
-            </div>
           </div>
         )}
 
@@ -1765,14 +1802,6 @@ export function PipelineAccordionView({
             <div className="flex items-center gap-2">
               <CheckCircle2 className="h-5 w-5 text-green-600" />
               <p className="font-medium text-green-900 dark:text-green-200">Pipeline completed successfully!</p>
-            </div>
-            <div className="flex gap-2 mt-3">
-              <Button asChild size="sm" className="bg-gradient-to-r from-violet-600 to-indigo-600 text-white">
-                <Link href={`/pipelines/${state.pipeline_id}`}>View Pipeline</Link>
-              </Button>
-              <Button asChild size="sm" variant="outline">
-                <Link href="/chat">New Pipeline</Link>
-              </Button>
             </div>
           </div>
         )}
@@ -1804,7 +1833,15 @@ function depDot(status: RuntimeHealth): string {
   }
 }
 
-function DependencyHealthPanel({ deps, aggregate }: { deps: RuntimeDep[]; aggregate: RuntimeHealth }) {
+function DependencyHealthPanel({
+  deps,
+  aggregate,
+  pipelineStatus,
+}: {
+  deps: RuntimeDep[]
+  aggregate: RuntimeHealth
+  pipelineStatus?: string
+}) {
   const wrapperTone =
     aggregate === 'unhealthy'
       ? 'border-red-200 bg-red-50/50 dark:border-red-900/40 dark:bg-red-950/10'
@@ -1824,7 +1861,7 @@ function DependencyHealthPanel({ deps, aggregate }: { deps: RuntimeDep[]; aggreg
             <div className="min-w-0 flex-1">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate text-foreground">{depLabel(dep)}</span>
-                <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep)}</span>
+                <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep, pipelineStatus)}</span>
               </div>
               {dep.status !== 'healthy' && dep.last_error ? (
                 <p className="text-[11px] text-muted-foreground mt-0.5 break-words">{dep.last_error}</p>

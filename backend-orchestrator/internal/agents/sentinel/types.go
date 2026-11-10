@@ -76,6 +76,12 @@ const (
 	// one is raised on the way there, and also when Connect cannot be reached at all, where
 	// no restart is possible (cdc_capture_down.go).
 	IssueTypeCaptureStopped IssueType = "capture_stopped"
+	// IssueTypeRowsParked — the CDC sink set changes aside in its dead-letter queue instead
+	// of writing them (the destination refused them, or they could not be converted), and
+	// committed past them. Distinct from every lag signal: a parked change is consumed, so
+	// Kafka lag reads 0 and the drain check sees a healthy sink, yet the change is not in the
+	// destination and will not get there on its own (cdc_rows_parked.go).
+	IssueTypeRowsParked IssueType = "rows_parked"
 )
 
 // IssueSeverity represents the severity of an issue
@@ -95,7 +101,6 @@ const (
 	HealingActionRestartConsumer HealingAction = "restart_consumer"
 	HealingActionProvisionTopic  HealingAction = "provision_topic"
 	HealingActionScaleUp         HealingAction = "scale_up"
-	HealingActionAlert           HealingAction = "alert"
 	HealingActionCircuitBreak    HealingAction = "circuit_break"
 )
 
@@ -171,10 +176,6 @@ type SentinelConfig struct {
 	// Issue deduplication
 	IssueCooldownPeriod time.Duration
 
-	// Anomaly detection
-	AnomalyStdDevThreshold float64
-	AnomalyWindowSize      int
-
 	// Stale component eviction — how long to keep a dead component in memory before removing it
 	StaleComponentTTL time.Duration
 
@@ -199,8 +200,6 @@ func DefaultSentinelConfig() *SentinelConfig {
 		CircuitBreakerCooldown:       10 * time.Minute,
 		IssueCooldownPeriod:          5 * time.Minute,
 		StaleComponentTTL:            10 * time.Minute,
-		AnomalyStdDevThreshold:       3.0,
-		AnomalyWindowSize:            100,
 		EnableMetricsExport:          true,
 		MetricsOTLPEndpoint:          "http://otel-collector:4318",
 		MetricExportInterval:         30 * time.Second,

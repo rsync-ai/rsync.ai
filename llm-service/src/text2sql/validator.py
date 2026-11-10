@@ -137,6 +137,23 @@ def _out_of_scope_column_refs(ast: exp.Expression) -> list[str]:
     return out
 
 
+# Nodes that write, wherever they sit in a SELECT: a CTE can hold a MERGE
+# (PostgreSQL 17) and SELECT ... INTO creates a table. sqlglot's DML and DDL
+# bases cover a write node it adds under either; the rest are named.
+WRITE_NODES = (
+    exp.DML,
+    exp.DDL,
+    exp.Drop,
+    exp.Alter,
+    exp.TruncateTable,
+    exp.Into,
+    exp.Command,
+    exp.Grant,
+    exp.Revoke,
+    exp.LoadData,
+)
+
+
 def validate_sql(
     sql: str,
     dialect: str,
@@ -201,14 +218,12 @@ def validate_sql(
             return result
 
     # Check for dangerous operations within the query
-    # Note: sqlglot expression classes vary by version; keep this list conservative.
-    dangerous_types = (exp.Delete, exp.Update, exp.Insert, exp.Drop, exp.Create, exp.Alter)
     for node in ast.walk():
-        if isinstance(node, dangerous_types):
+        if isinstance(node, WRITE_NODES):
             result.add_error(
                 code="DANGEROUS_OPERATION",
                 message=f"Dangerous operation found: {type(node).__name__}",
-                fix_hint="Remove any INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, or TRUNCATE operations.",
+                fix_hint="Remove any INSERT, UPDATE, DELETE, MERGE, DROP, CREATE, ALTER, TRUNCATE or SELECT INTO.",
             )
             return result
 
@@ -589,36 +604,3 @@ def _has_time_bucketing(ast: exp.Expression, grain: TimeGrain, dialect: str) -> 
 
     patterns = grain_patterns.get(grain, [])
     return any(p in sql_lower for p in patterns)
-
-
-def extract_fix_hints(result: ValidationResult, spec: QuerySpec, schema: TypedSchema) -> list[str]:
-    """
-    Generate actionable fix hints from validation errors.
-
-    These hints are designed to help the repair loop converge faster.
-    """
-    hints = []
-
-    for error in result.errors:
-        if error.fix_hint:
-            hints.append(error.fix_hint)
-        elif error.code == "UNKNOWN_TABLE":
-            hints.append(f"Available tables: {', '.join(schema.table_names[:10])}")
-        elif error.code == "UNKNOWN_COLUMN":
-            # Try to find the table and list its columns
-            if error.field and "." in str(error.field):
-                table_name = str(error.field).split(".")[0]
-                table = schema.get_table(table_name)
-                if table:
-                    hints.append(f"Columns in {table_name}: {', '.join(table.column_names[:10])}")
-
-    # Add hints for temporal columns if time grain is requested
-    if spec.time_grain and not spec.time_column:
-        temporal_cols = []
-        for table in schema.tables:
-            for col in table.get_temporal_columns():
-                temporal_cols.append(f"{table.name}.{col.name}")
-        if temporal_cols:
-            hints.append(f"Available time columns: {', '.join(temporal_cols[:5])}")
-
-    return hints

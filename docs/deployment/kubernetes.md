@@ -258,6 +258,8 @@ secrets:
   postgresPassword: "<openssl rand -hex 24>"
   minioAccessKey: "<openssl rand -base64 16>"
   minioSecretKey: "<openssl rand -base64 24>"
+  blobStagingAccessKey: "<openssl rand -hex 16>"
+  blobStagingSecretKey: "<openssl rand -base64 32>"
 frontend:
   apiUrl: https://api.example.com      # the address the BROWSER calls
   publicUrl: https://app.example.com   # NextAuth builds callback URLs from it

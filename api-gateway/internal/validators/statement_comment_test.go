@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"api-gateway/internal/security"
+
+	"github.com/rsync-ai/shared/sqlexec/stmt"
 )
 
 // The classifier and the statement validator have to agree about the same SQL.
@@ -125,7 +127,7 @@ func TestRemoveComments_KeepsMySQLExecutableCommentBodies(t *testing.T) {
 	})
 
 	t.Run("an ordinary block comment is still a comment", func(t *testing.T) {
-		if got := removeComments("SELECT 1 /* DROP TABLE t */"); got != "SELECT 1 " {
+		if got := stmt.RemoveComments("SELECT 1 /* DROP TABLE t */"); got != "SELECT 1 " {
 			t.Fatalf("removeComments = %q, want %q", got, "SELECT 1 ")
 		}
 	})

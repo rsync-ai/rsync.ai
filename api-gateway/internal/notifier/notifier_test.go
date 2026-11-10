@@ -67,6 +67,30 @@ func TestSlackPayload_InteractiveDriftButtons(t *testing.T) {
 	})
 }
 
+// Only a dropped source table waits for a decision, so only SCHEMA_DRIFT_DETECTED gets
+// buttons. A Slack click resolves to whatever change is pending on the pipeline: a
+// button on "column added, applied automatically" would approve or reject a different
+// change, one the user never saw in that message.
+func TestAwaitsDriftDecision(t *testing.T) {
+	cases := []struct {
+		name       string
+		se         *structuredErrorView
+		pipelineID string
+		want       bool
+	}{
+		{"dropped table awaiting a decision", &structuredErrorView{Code: "SCHEMA_DRIFT_DETECTED"}, "pl-9", true},
+		{"change rsync.ai handled", &structuredErrorView{Code: "SCHEMA_DRIFT_HANDLED"}, "pl-9", false},
+		{"change the destination refused", &structuredErrorView{Code: "SCHEMA_DRIFT_APPLY_FAILED"}, "pl-9", false},
+		{"no pipeline to act on", &structuredErrorView{Code: "SCHEMA_DRIFT_DETECTED"}, "", false},
+		{"no structured error", nil, "pl-9", false},
+	}
+	for _, tc := range cases {
+		if got := awaitsDriftDecision(tc.se, tc.pipelineID); got != tc.want {
+			t.Errorf("%s: awaitsDriftDecision = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestAbsoluteActionURL pins the delivery-time host-prefixing that makes
 // Slack buttons + email links resolve outside the app. The persisted
 // action_url is a relative path (e.g. /pipelines/{id}/schema-changes); we

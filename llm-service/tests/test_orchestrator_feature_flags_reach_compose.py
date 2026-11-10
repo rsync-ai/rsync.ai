@@ -7,7 +7,7 @@ into a container automatically -- only the keys named in that service's
 passes through can never be set: the operator writes it in `.env`, nothing
 happens, and there is no error to tell them why. That silent disagreement is
 the defect, and it has now happened three times in this repo
-(RSYNC_SCHEMA_DRIFT_AUTOAPPLY, RSYNC_LLM_DIAGNOSER_ENABLED, and the
+(RSYNC_SCHEMA_DRIFT_AUTOAPPLY, since retired, RSYNC_LLM_DIAGNOSER_ENABLED, and the
 RETENTION_* family below).
 
 This guard makes the class self-detecting: every `*_ENABLED` flag the

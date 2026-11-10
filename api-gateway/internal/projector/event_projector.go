@@ -50,17 +50,13 @@ type EventProjector struct {
 	// pipeline. See the call site.
 	OnPipelineCompleted func(ctx context.Context, pipelineID, executionID string)
 
-	// OnPipelineDataLanded is the CDC counterpart of OnPipelineCompleted: a CDC pipeline
-	// never completes, so "run after pipeline" fires when the sink reports that rows
-	// landed, at most once per pipeline per window. occurrence names the window and takes
-	// the place of an execution id. Same nil contract and same no-redelivery rule as
-	// OnPipelineCompleted. See cdc_data_landed.go.
-	OnPipelineDataLanded func(ctx context.Context, pipelineID, occurrence string)
-
-	// dataLandedInterval is the OnPipelineDataLanded window; zero means the default.
-	dataLandedInterval time.Duration
-	landedMu           sync.Mutex
-	landedWindow       map[string]int64 // pipeline_id -> last window fired
+	// OnPipelineWaiting is called once per PIPELINE_WAITING this projector stores, after
+	// the wait is on the pipeline_progress row, so a handler that re-reads the row sees
+	// it (handlers.NotifyPipelineAwaitingInput, which tells the owner of a scheduled run
+	// that stopped to ask a question). Wired by main.go like OnPipelineCompleted, nil
+	// means nothing is listening, and it is outside the offset-commit contract the same
+	// way.
+	OnPipelineWaiting func(ctx context.Context, pipelineID, executionID, blockingType string)
 
 	// Per-reason counts of TABLE_STATS events dropped before projection. See
 	// table_stats_skip.go.
@@ -113,13 +109,11 @@ type BlockingReason struct {
 func NewEventProjector(db *sql.DB, brokers []string) *EventProjector {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &EventProjector{
-		db:                 db,
-		brokers:            brokers,
-		ctx:                ctx,
-		cancel:             cancel,
-		lastSeq:            make(map[string]int64),
-		dataLandedInterval: cdcAfterPipelineIntervalFromEnv(),
-		landedWindow:       make(map[string]int64),
+		db:      db,
+		brokers: brokers,
+		ctx:     ctx,
+		cancel:  cancel,
+		lastSeq: make(map[string]int64),
 	}
 }
 
@@ -227,9 +221,11 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 	// model again — a DROP/CREATE of a user's table, on a replay of an event from
 	// weeks ago.
 	//
-	// Errors are swallowed inside the hook rather than returned, for the same reason:
-	// a returned error skips the offset commit, and the redelivery would arrive with
-	// `stored` false and fire nothing anyway. The hook owns its own retry story.
+	// Errors are swallowed inside the hook rather than returned. A returned error does
+	// not stop the offset commit (consumeLoop commits a failed projection too, so a
+	// poison event cannot block the partition), so it would retry nothing, and a
+	// redelivery would arrive with `stored` false and fire nothing anyway. The hook
+	// owns its own retry story.
 	if stored && eventType == "PIPELINE_COMPLETED" && p.OnPipelineCompleted != nil {
 		pipelineID, _ := raw["pipeline_id"].(string)
 		executionID, _ := raw["execution_id"].(string)
@@ -238,15 +234,8 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 		}
 	}
 	if eventType == "TABLE_STATS" {
-		progress, err := p.upsertTableStatsProgress(raw)
-		if err != nil {
+		if err := p.upsertTableStats(raw); err != nil {
 			log.Printf("Event Projector: Failed to upsert table stats: %v", err)
-		} else if stored {
-			// CDC "run after pipeline". Gated on `stored` for the same reason as the
-			// completion hook above — a replayed TABLE_STATS must not rebuild anything —
-			// and on a committed upsert, so the applied count it compared against is the
-			// one now in the table. Throttled and deduped per window inside.
-			p.maybeFireDataLanded(progress)
 		}
 	}
 
@@ -321,8 +310,10 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 		event.Metadata = event.BlockingReason.Details
 	}
 
+	// total_steps is the run's plan length. The v2 workflow's events carry no progress
+	// block; their plan rides in metadata.execution_plan, the length the adapter writes.
 	if event.Progress.TotalSteps == 0 {
-		event.Progress.TotalSteps = 7
+		event.Progress.TotalSteps = planStageCount(event.Metadata)
 	}
 
 	// Merge metadata (preserve existing artifacts)
@@ -359,11 +350,25 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 		return err
 	}
 
+	// An event with neither a total nor a plan defaults only a new row. Over an existing
+	// row it binds 0, which GREATEST below turns into the stored total: a default of 7
+	// there outvoted an executor-only run's 1, and the row read 7/7 for a 1-step run.
+	if event.Progress.TotalSteps == 0 && err == sql.ErrNoRows {
+		event.Progress.TotalSteps = 7
+	}
+
 	// Guard: don't let late heartbeats/progress events overwrite a terminal status, or a
 	// streaming run's 'running', for the same execution. See lateEventWouldRegressStatus.
 	if err == nil && existingStatus.Valid && existingExecID.Valid &&
 		lateEventWouldRegressStatus(existingStatus.String, existingExecID.String, event.Status, event.ExecutionID) {
 		// Best-effort: ignore the late event; the stored row is already further along.
+		return nil
+	}
+
+	// Guard: a run replaced by a newer one still emits its last events as its workflow
+	// exits, and by then the row is the newer run's. See runSuperseded.
+	if err == nil && existingExecID.Valid && existingExecID.String != event.ExecutionID &&
+		p.runSuperseded(event.ExecutionID) {
 		return nil
 	}
 
@@ -526,7 +531,27 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 			event.EventType, event.Summary, event.Stage, displayPipeline)
 	}
 
+	// A run that stopped to ask a question. Here, not beside OnPipelineCompleted: the
+	// handler re-reads this row to check the run is still waiting, so it fires once the
+	// wait is on it, and never for an event a guard above dropped (a replaced run's, or
+	// one older than the row). Gated on `stored` for the replay reason given there.
+	if stored && event.EventType == "PIPELINE_WAITING" && p.OnPipelineWaiting != nil {
+		blockingType := ""
+		if event.BlockingReason != nil {
+			blockingType = event.BlockingReason.Type
+		}
+		p.OnPipelineWaiting(p.ctx, event.PipelineID, event.ExecutionID, blockingType)
+	}
+
 	return nil
+}
+
+// planStageCount returns the stage count of metadata.execution_plan, or 0 when the
+// event carries no plan. Mirrors the temporal adapter's deriveProgressFromExecutionPlan.
+func planStageCount(meta map[string]interface{}) int {
+	plan, _ := meta["execution_plan"].(map[string]interface{})
+	stages, _ := plan["stages"].([]interface{})
+	return len(stages)
 }
 
 // lateEventWouldRegressStatus reports whether a progress event that arrives for the
@@ -561,6 +586,44 @@ func lateEventWouldRegressStatus(existingStatus, existingExecID, incomingStatus,
 		return is == "processing"
 	}
 	return false
+}
+
+// runSupersededSQL: a run is superseded when its own execution was closed by
+// someone else (it is no longer running or pending) AND a newer run of the same
+// pipeline started after it. The gateway does both when a new run replaces a
+// parked one (handlers/pipeline_run_overlap.go); a run whose newer sibling failed
+// to start keeps its open execution and still owns the row.
+//
+// Kept identical to the copy in backend-temporal-adapter/internal/workflows
+// (run_superseded.go), which guards the adapter's writes to the same rows.
+const runSupersededSQL = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM executions mine
+		JOIN executions newer ON newer.pipeline_id = mine.pipeline_id
+		WHERE mine.id = $1::uuid
+		  AND mine.status NOT IN ('running', 'pending')
+		  AND newer.id <> newer.pipeline_id
+		  AND COALESCE(newer.trigger_source, '') <> 'cdc'
+		  AND newer.start_time > mine.start_time)`
+
+// runSuperseded reports whether a newer run owns the pipeline that executionID
+// belongs to. It fails open: no execution id, an id that is not a UUID, or a
+// query error all read as "not superseded", so the event projects as it did
+// before the check existed.
+func (p *EventProjector) runSuperseded(executionID string) bool {
+	if p.db == nil || executionID == "" {
+		return false
+	}
+	if _, err := uuid.Parse(executionID); err != nil {
+		return false
+	}
+	var superseded bool
+	if err := p.db.QueryRow(runSupersededSQL, executionID).Scan(&superseded); err != nil {
+		log.Printf("⚠️ [EventProjector] run superseded check failed (projecting as usual) execution_id=%s: %v", executionID, err)
+		return false
+	}
+	return superseded
 }
 
 // maybePersistStreamingSyncMode updates pipelines.sync_mode/cdc_mode when the workflow indicates a streaming run.
@@ -899,32 +962,25 @@ func (p *EventProjector) noteEnvelopeGap(raw map[string]interface{}, field strin
 
 // upsertTableStats projects TABLE_STATS domain events into pipeline_run_table_stats.
 // Counters are cumulative; we use GREATEST() to handle out-of-order delivery.
+// A dropped event returns nil and is counted and logged by skipTableStats.
 func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
-	_, err := p.upsertTableStatsProgress(raw)
-	return err
-}
-
-// upsertTableStatsProgress is upsertTableStats, also reporting whether a sink-sourced CDC
-// event advanced the table's applied counter (for OnPipelineDataLanded). A dropped event
-// returns nil and is counted and logged by skipTableStats.
-func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (appliedProgress, error) {
 	pipelineID, _ := raw["pipeline_id"].(string)
 	executionID, _ := raw["execution_id"].(string)
 	if pipelineID == "" {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingPipelineID, raw, nil)
+		return p.skipTableStats(tableStatsSkipMissingPipelineID, raw, nil)
 	}
 
 	meta, _ := raw["metadata"].(map[string]interface{})
 	if meta == nil {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingMetadata, raw, nil)
+		return p.skipTableStats(tableStatsSkipMissingMetadata, raw, nil)
 	}
 
 	mode, _ := meta["mode"].(string)
 	if mode == "" {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingMode, raw, meta)
+		return p.skipTableStats(tableStatsSkipMissingMode, raw, meta)
 	}
 	if mode != "batch" && mode != "cdc" {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipUnsupportedMode, raw, meta)
+		return p.skipTableStats(tableStatsSkipUnsupportedMode, raw, meta)
 	}
 	// For CDC table stats we normalize execution_id to pipeline_id so the DB can enforce
 	// uniqueness and ON CONFLICT can work with a regular unique index.
@@ -955,7 +1011,7 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 
 	tableObj, _ := meta["table"].(map[string]interface{})
 	if tableObj == nil {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingTable, raw, meta)
+		return p.skipTableStats(tableStatsSkipMissingTable, raw, meta)
 	}
 
 	schemaName, _ := tableObj["schema"].(string)
@@ -965,7 +1021,7 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 		qualifiedName = tableName
 	}
 	if tableName == "" {
-		return appliedProgress{}, p.skipTableStats(tableStatsSkipEmptyTableName, raw, meta)
+		return p.skipTableStats(tableStatsSkipEmptyTableName, raw, meta)
 	}
 
 	// Where the rows LANDED, which schema_name/qualified_name above do not say: for CDC
@@ -997,6 +1053,12 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 	// Parse timestamps
 	startedAt, _ := meta["started_at"].(string)
 	completedAt, _ := meta["completed_at"].(string)
+	// A batch 'running' event is a per-flush update, not the end of the table. Sinks
+	// before the fix stamped completed_at on every flush, which stored an end time on a
+	// table still copying.
+	if mode == "batch" && status == "running" {
+		completedAt = ""
+	}
 
 	// Batch counters
 	var insertedRows, readRows, bytesRead, filesWritten sql.NullInt64
@@ -1155,9 +1217,10 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 	}
 
 	// Destination-committed byte volume (emitted by the kafka-mcp-sink in BOTH batch
-	// and CDC TABLE_STATS as a cumulative counts.bytes_committed). Feeds the display
-	// column below AND the data-transfer billing ledger. Absent on older sinks /
-	// non-sink emitters → stays NULL and no ledger row is written (back-compatible).
+	// and CDC TABLE_STATS as a cumulative counts.bytes_committed, from zero since
+	// metadata.counter_epoch_ms when it sends one). Feeds the display column below AND
+	// the data-transfer billing ledger. Absent on older sinks / non-sink emitters →
+	// stays NULL and no ledger row is written (back-compatible).
 	if counts, ok := meta["counts"].(map[string]interface{}); ok && counts != nil {
 		if v, ok := counts["bytes_committed"].(float64); ok {
 			bytesCommitted = sql.NullInt64{Int64: int64(v), Valid: true}
@@ -1190,7 +1253,7 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 	// the run-events guard above). FK stays strict.
 	tx, err := p.db.Begin()
 	if err != nil {
-		return appliedProgress{}, err
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -1204,31 +1267,29 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 		pipelineID, executionID, qualifiedName,
 	).Scan(&oldBytes)
 
-	// OnPipelineDataLanded: read the applied high-water mark BEFORE the GREATEST-upsert,
-	// for the same ordering reason as oldBytes above. Only for the sink's applied
-	// counters, and only when something is listening, so every other event — cdcstats'
-	// captured counters, the batch lane, every projector without the hook — issues
-	// exactly the statements it did before. A failed read means "unknown", never
-	// "increased": it cannot fire the trigger.
-	landedSource, _ := meta["source"].(string)
-	trackLanded := p.OnPipelineDataLanded != nil && mode == "cdc" && appliedTotalEvents.Valid &&
-		strings.ToLower(strings.TrimSpace(landedSource)) == "kafka_mcp_sink"
-	var priorApplied int64
-	priorAppliedKnown := false
-	if trackLanded {
+	// A sink that stamps counter_epoch_ms reports bytes_committed and dlq_rows from
+	// zero since its process started (table_stats_counter_epoch.go). Turn them into
+	// the stored total plus what this event adds, so the GREATEST() below keeps the
+	// sum and the ledger below charges the bytes a restarted sink committed.
+	var epochState epochOutcome
+	if epoch := counterEpochOf(meta); epoch > 0 && (bytesCommitted.Valid || dlqRows.Valid) {
+		var stored storedEpoch
+		var oldDLQ int64
 		err := tx.QueryRow(
-			`SELECT COALESCE(applied_total_events, 0) FROM pipeline_run_table_stats
+			`SELECT counter_epoch_ms, epoch_bytes_committed, epoch_dlq_rows, COALESCE(dlq_rows, 0)
+			 FROM pipeline_run_table_stats
 			 WHERE pipeline_id = $1::uuid AND execution_id = $2::uuid AND qualified_name = $3`,
 			pipelineID, executionID, qualifiedName,
-		).Scan(&priorApplied)
-		switch {
-		case err == nil:
-			priorAppliedKnown = true
-		case errors.Is(err, sql.ErrNoRows):
-			priorApplied, priorAppliedKnown = 0, true
-		default:
-			log.WithError(err).WithField("pipeline_id", pipelineID).
-				Warn("Event Projector: could not read the prior applied count; not firing after-pipeline models for this TABLE_STATS event")
+		).Scan(&stored.epoch, &stored.bytesRaw, &stored.dlqRaw, &oldDLQ)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		epochState = epochDeltas(stored, epoch, bytesCommitted, dlqRows)
+		if bytesCommitted.Valid {
+			bytesCommitted.Int64 = oldBytes + epochState.bytesDelta
+		}
+		if dlqRows.Valid {
+			dlqRows.Int64 = oldDLQ + epochState.dlqDelta
 		}
 	}
 
@@ -1263,8 +1324,11 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 				-- slips past (it is never counted as read), so it must not run here.
 				WHEN GREATEST(COALESCE(pipeline_run_table_stats.dlq_rows, 0), COALESCE(EXCLUDED.dlq_rows, 0)) > 0
 				THEN 'degraded'
-				-- Recovery: if we have a terminal completion marker AND read==written for batch, mark completed
+				-- Recovery: if we have a terminal completion marker AND read==written for batch, mark completed.
+				-- A 'running' event is a per-flush update, where read==written always holds: it
+				-- may keep a completed row completed, never complete one that is still copying.
 				WHEN EXCLUDED.mode = 'batch'
+				     AND (EXCLUDED.status <> 'running' OR pipeline_run_table_stats.status = 'completed')
 				     AND (EXCLUDED.status = 'completed' OR EXCLUDED.completed_at IS NOT NULL OR pipeline_run_table_stats.completed_at IS NOT NULL)
 				     AND GREATEST(COALESCE(pipeline_run_table_stats.read_rows, 0), COALESCE(EXCLUDED.read_rows, 0))
 				         = GREATEST(COALESCE(pipeline_run_table_stats.inserted_rows, 0), COALESCE(EXCLUDED.inserted_rows, 0))
@@ -1358,7 +1422,19 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 		destSchema, destQualifiedName, orchestrationExecutionID,
 		snapshotRows, appliedSnapshotRows, capturedFromApplied,
 	); err != nil {
-		return appliedProgress{}, err
+		return err
+	}
+
+	// The epoch and raw totals the next event from this sink is compared with. Not
+	// written for an event from an older process, which leaves them as they are.
+	if epochState.record {
+		if _, err := tx.Exec(
+			`UPDATE pipeline_run_table_stats SET counter_epoch_ms = $4, epoch_bytes_committed = $5, epoch_dlq_rows = $6
+			 WHERE pipeline_id = $1::uuid AND execution_id = $2::uuid AND qualified_name = $3`,
+			pipelineID, executionID, qualifiedName, counterEpochOf(meta), epochState.bytesRaw, epochState.dlqRaw,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Append the positive committed-byte delta to the append-only billing ledger and
@@ -1377,17 +1453,9 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 			)
 			SELECT charge_workspace_bytes(workspace_id, bytes) FROM ledger
 		`, pipelineID, executionID, qualifiedName, mode, bytesCommitted.Int64-oldBytes); err != nil {
-			return appliedProgress{}, err
+			return err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return appliedProgress{}, err
-	}
-	progress := appliedProgress{pipelineID: pipelineID}
-	if trackLanded && priorAppliedKnown {
-		progress.increased = appliedTotalEvents.Int64 > priorApplied
-		progress.appliedAt = lastAppliedTs.String
-	}
-	return progress, nil
+	return tx.Commit()
 }

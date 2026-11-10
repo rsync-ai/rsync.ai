@@ -355,6 +355,22 @@ def test_a_refusal_names_something_the_caller_can_do_instead(client):
     assert any("openapi" in s.lower() for s in body["suggestions"]), body["suggestions"]
 
 
+def test_an_overwrite_is_refused_rather_than_saved_as_a_new_version(client, tmp_path):
+    """This service always saves a new version (DeploymentService.deploy), so an
+    overwrite request is refused, before any rendering or write (P4a)."""
+    res = client.post(
+        "/v1/generate",
+        json={"api_name": "x", "openapi_spec": "{}", "overwrite": True, "output_dir": str(tmp_path)},
+    )
+    assert res.status_code == 400, res.text
+    body = res.json()
+    assert body["success"] is False
+    assert body["error_stage"] == "overwrite", body
+    assert "new version" in body["error_message"], body["error_message"]
+    assert body["error"] == body["error_message"]
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_an_unparseable_document_is_refused_at_the_conversion_stage(client):
     """Distinct stage from an unsupported input: the caller sent the right FIELD."""
     res = client.post(
@@ -363,6 +379,66 @@ def test_an_unparseable_document_is_refused_at_the_conversion_stage(client):
     assert res.status_code == 400, res.text
     body = res.json()
     assert body["error_stage"] == "spec_conversion", body
+    assert body["error"] == body["error_message"]
+
+
+def test_a_spec_over_the_size_limit_is_refused_with_its_size(client, tmp_path):
+    """Refused before the parse, with the size and the limit (P4b), and nothing written."""
+    from src.utils.spec_limits import SPEC_MAX_BYTES, too_large_message
+
+    res = client.post(
+        "/v1/generate",
+        json={"api_name": "x", "openapi_spec": "a" * (SPEC_MAX_BYTES + 1), "output_dir": str(tmp_path)},
+    )
+    assert res.status_code == 413, res.text
+    body = res.json()
+    assert body["success"] is False
+    assert body["error_stage"] == "spec_size", body
+    assert body["error_message"] == too_large_message(SPEC_MAX_BYTES + 1, is_json=False)
+    assert body["error"] == body["error_message"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_json_spec_over_the_yaml_limit_gets_past_the_size_check(client, tmp_path):
+    """JSON is read up to 30 MB. This one has no paths, so it is refused — by the
+    converter, which means the size check let it through."""
+    spec = '{"openapi": "3.0.0", "info": {"title": "x", "version": "1"}, "x": "' + "a" * 6_000_000 + '"}'
+    res = client.post("/v1/generate", json={"api_name": "x", "openapi_spec": spec, "output_dir": str(tmp_path)})
+    body = res.json()
+    assert body["error_stage"] == "spec_conversion", body
+
+
+def test_malformed_json_over_the_yaml_limit_is_not_read_as_yaml(client, tmp_path):
+    """Read as YAML it would need ~45x its size in memory: refused instead, with
+    where the JSON breaks."""
+    spec = '{"a": 1\n "b": 2' + " " * 6_000_000 + "}"
+    res = client.post("/v1/generate", json={"api_name": "x", "openapi_spec": spec, "output_dir": str(tmp_path)})
+    assert res.status_code == 413, res.text
+    body = res.json()
+    assert body["error_stage"] == "spec_size", body
+    assert body["error_message"].startswith(
+        "The API spec is 6.0 MB and is not valid JSON (line 2, column 2: Expecting a comma)."
+    ), body["error_message"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_spec_whose_parse_will_not_fit_in_memory_is_refused(client, monkeypatch, tmp_path):
+    from src.utils import spec_limits
+
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.max").write_text("1000000000\n")
+    (cgroup / "memory.current").write_text("990000000\n")  # 10 MB free
+    (cgroup / "memory.stat").write_text("inactive_file 0\n")
+    monkeypatch.setattr(spec_limits, "_CGROUP_ROOT", str(cgroup))
+
+    res = client.post(
+        "/v1/generate", json={"api_name": "x", "openapi_spec": "openapi: 3.0.0\n" + "#" * 1_000_000}
+    )
+    assert res.status_code == 503, res.text
+    body = res.json()
+    assert body["error_stage"] == "spec_size", body
+    assert "has 10 MB free right now" in body["error_message"], body["error_message"]
     assert body["error"] == body["error_message"]
 
 
@@ -418,6 +494,47 @@ def test_a_category_the_scaffolder_cannot_render_is_noted_not_refused(client):
     ).json()
     assert body["success"] is True, body
     assert any("not_a_category" in n for n in body["metadata"]["notes"]), body["metadata"]
+
+
+def test_a_saved_connector_is_built_but_not_started(client, monkeypatch):
+    """A generated connector's code runs only once a pipeline uses it.
+
+    The orchestrator's infra preflight starts it then. The cloud service's three
+    persist paths are pinned in
+    ``src/agents/tool_generator/tests/test_generation_does_not_start_the_connector.py``.
+    """
+    from unittest import mock
+
+    import src.lifecycle.scaffold_routes as route
+
+    monkeypatch.setenv("RSYNC_MANAGED_CONNECTORS", "true")
+    deploy = mock.AsyncMock(
+        return_value=mock.MagicMock(
+            success=True, error_message=None, output_path="/tools/public/widget-api", version="v1.0.0"
+        )
+    )
+    monkeypatch.setattr(route, "DeploymentService", lambda: mock.MagicMock(deploy=deploy))
+
+    res = client.post(
+        "/v1/generate",
+        json={"api_name": "widget_api", "openapi_spec": SPEC, "save_artifacts": True},
+    )
+    assert res.status_code == 200, res.text
+    kwargs = deploy.await_args.kwargs
+    assert kwargs["build_docker"] is True, "managed mode should still build the image"
+    assert kwargs["start_container"] is False, "the community route started the generated connector"
+
+
+def test_health_tells_the_gateway_this_image_cannot_fetch_a_spec(monkeypatch):
+    """The api-gateway probes this before an agent or Ask rsync.ai may generate by URL."""
+    import asyncio
+
+    import src.lifecycle.main as entrypoint
+
+    monkeypatch.delenv("RSYNC_CONNECTOR_CATALOG_SHARED", raising=False)
+    body = asyncio.run(entrypoint.health())
+    assert body["generate_from_url"] is False
+    assert body["catalog_shared"] is True
 
 
 def test_the_route_is_behind_the_same_s2s_gate_as_deploy(monkeypatch):
@@ -627,9 +744,11 @@ def test_the_lifecycle_image_serves_a_generate_request(oss_image_tree):
 # entrypoint grew the route, self-hosters would get a wizard that cannot run; if
 # the cloud one lost it, cloud users would silently get the upload screen.
 
-FRONTEND_DISCOVERY_CLIENT = os.path.join(
-    LLM_DIR, "..", "frontend", "src", "lib", "api", "discovery.ts"
-)
+# Joined from REPO_ROOT, one segment per argument, so
+# test_ci_filter_covers_every_guard_subject.py can read it as this guard's
+# subject: a frontend-only PR changing the probe path must run this file.
+REPO_ROOT = os.path.normpath(os.path.join(LLM_DIR, ".."))
+FRONTEND_DISCOVERY_CLIENT = os.path.join(REPO_ROOT, "frontend", "src", "lib", "api", "discovery.ts")
 DISCOVERY_ROUTES = os.path.join(SRC_DIR, "agents", "tool_generator", "discovery_routes.py")
 
 

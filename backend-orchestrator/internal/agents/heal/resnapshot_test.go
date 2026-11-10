@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin/binding"
+
+	"github.com/rsync-ai/backend-orchestrator/internal/handlers"
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
 )
 
@@ -27,8 +30,8 @@ import (
 // cause is known and named, the remedy is known — and what surfaces is a
 // developer's error message with no next step in it.
 //
-// Registering an executor changes that to OutcomeHITLRequested carrying the
-// diagnosis, which is what the self-healing panel renders.
+// Registering an executor changes that to an escalation carrying the suggested
+// re-snapshot, which is what the self-healing panel renders.
 
 // resnapshotDiagnosis is the diagnosis diagnose.go actually produces for this
 // class, copied field-for-field so these tests break if it drifts.
@@ -54,10 +57,10 @@ func TestReSnapshotReachesAnOperatorInsteadOfAWiringError(t *testing.T) {
 			"The diagnoser identified an unrecoverable CDC position and the healer "+
 			"answered with a message about its own registry.", res.Outcome, res.Error)
 	}
-	if res.Outcome != OutcomeHITLRequested {
+	if res.Outcome != OutcomeEscalated {
 		t.Fatalf("outcome = %q, want %q — a re-snapshot re-reads the entire source, so "+
-			"it must be offered to a human, never applied silently",
-			res.Outcome, OutcomeHITLRequested)
+			"it must be handed to a human, never applied silently",
+			res.Outcome, OutcomeEscalated)
 	}
 	if res.HITLPrompt == "" {
 		t.Error("HITLPrompt is empty — the panel would render an empty recommendation")
@@ -121,10 +124,11 @@ func TestNoRuleEmitsReSnapshotInsideTheAutoBand(t *testing.T) {
 	}
 }
 
-// Run is reached once a human approves (Healer.ApproveHITL). It must go through
-// the guarded recovery endpoint rather than re-implementing re-provisioning:
-// that endpoint already enforces the CDC_RECOVERY_ENABLED flag, the
-// connector-must-be-FAILED precondition, and the workspace-role check.
+// Run is reached only from Heal's auto band, which no rule reaches
+// (TestNoRuleEmitsReSnapshotInsideTheAutoBand). If one ever does, Run must go
+// through the guarded recovery endpoint rather than re-implementing
+// re-provisioning: that endpoint already enforces the CDC_RECOVERY_ENABLED flag,
+// the connector-must-be-FAILED precondition, and the workspace-role check.
 func TestReSnapshotRunGoesThroughTheGuardedRecoveryEndpoint(t *testing.T) {
 	var gotPath, gotMethod, gotMode string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +157,27 @@ func TestReSnapshotRunGoesThroughTheGuardedRecoveryEndpoint(t *testing.T) {
 	// re-read of history; "initial" would re-snapshot everything.
 	if gotMode != "recovery" {
 		t.Errorf("snapshot_mode = %q, want %q", gotMode, "recovery")
+	}
+}
+
+// The mock above accepts any body, so it cannot see the endpoint refuse one. The
+// healer's request is checked here against the endpoint's own request type and
+// its binding rules: it once left out `operator`, which the handler requires, so
+// with CDC_RECOVERY_ENABLED on every healer re-snapshot would have answered 400.
+func TestReSnapshotRequestSatisfiesTheRecoveryEndpointContract(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := (&ReSnapshotExecutor{OrchestratorURL: srv.URL}).Run(context.Background(), diagnose.Signal{PipelineID: "p1"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var req handlers.CDCRecoverRequest
+	if err := binding.JSON.BindBody(body, &req); err != nil {
+		t.Fatalf("the recovery endpoint would refuse the healer's request with 400: %v\nbody: %s", err, body)
 	}
 }
 

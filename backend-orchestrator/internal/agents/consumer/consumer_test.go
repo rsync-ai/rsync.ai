@@ -46,65 +46,6 @@ func TestHealthMonitor_RegisterConsumer(t *testing.T) {
 	}
 }
 
-func TestHealthMonitor_RecordHeartbeat(t *testing.T) {
-	config := DefaultConfig()
-	monitor := NewHealthMonitor(config)
-
-	monitor.RegisterConsumer("test-1", "group-1", "topic-1", nil)
-	monitor.RecordHeartbeat("test-1")
-
-	health := monitor.GetConsumerHealth("test-1")
-	if health == nil {
-		t.Fatal("Expected non-nil health after heartbeat")
-	}
-
-	if time.Since(health.LastHeartbeat) > time.Second {
-		t.Error("Heartbeat not recorded recently")
-	}
-}
-
-func TestHealthMonitor_UpdateMetrics(t *testing.T) {
-	config := DefaultConfig()
-	monitor := NewHealthMonitor(config)
-
-	monitor.RegisterConsumer("test-1", "group-1", "topic-1", nil)
-	monitor.UpdateMetrics("test-1", 1000, 5000, 150.5)
-
-	health := monitor.GetConsumerHealth("test-1")
-	if health.CurrentLag != 1000 {
-		t.Errorf("Expected lag 1000, got %d", health.CurrentLag)
-	}
-
-	if health.MessagesProcessed != 5000 {
-		t.Errorf("Expected processed 5000, got %d", health.MessagesProcessed)
-	}
-
-	if health.MessagesPerSecond != 150.5 {
-		t.Errorf("Expected throughput 150.5, got %f", health.MessagesPerSecond)
-	}
-}
-
-func TestHealthMonitor_GetConsumersByStatus(t *testing.T) {
-	config := DefaultConfig()
-	monitor := NewHealthMonitor(config)
-
-	h1 := monitor.RegisterConsumer("test-1", "group-1", "topic-1", nil)
-	h2 := monitor.RegisterConsumer("test-2", "group-1", "topic-1", nil)
-
-	h1.Status = HealthHealthy
-	h2.Status = HealthUnhealthy
-
-	healthy := monitor.GetConsumersByStatus(HealthHealthy)
-	if len(healthy) != 1 {
-		t.Errorf("Expected 1 healthy consumer, got %d", len(healthy))
-	}
-
-	unhealthy := monitor.GetConsumersByStatus(HealthUnhealthy)
-	if len(unhealthy) != 1 {
-		t.Errorf("Expected 1 unhealthy consumer, got %d", len(unhealthy))
-	}
-}
-
 func TestScalingRules_Evaluate_NoAction(t *testing.T) {
 	config := DefaultConfig()
 	rules := NewScalingRules(config)
@@ -247,10 +188,9 @@ func TestDockerSpawner_Simulate(t *testing.T) {
 		t.Errorf("Expected topic 'topic-1', got '%s'", result.Topic)
 	}
 
-	// List should show the consumer
-	instances, _ := spawner.List(context.Background())
-	if len(instances) != 1 {
-		t.Errorf("Expected 1 instance, got %d", len(instances))
+	// The spawner should track the consumer
+	if n := len(spawner.instances); n != 1 {
+		t.Errorf("Expected 1 instance, got %d", n)
 	}
 
 	// Terminate
@@ -259,9 +199,8 @@ func TestDockerSpawner_Simulate(t *testing.T) {
 		t.Fatalf("Terminate failed: %v", err)
 	}
 
-	instances, _ = spawner.List(context.Background())
-	if len(instances) != 0 {
-		t.Errorf("Expected 0 instances after terminate, got %d", len(instances))
+	if n := len(spawner.instances); n != 0 {
+		t.Errorf("Expected 0 instances after terminate, got %d", n)
 	}
 }
 

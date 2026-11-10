@@ -114,16 +114,3 @@ def group(name: str) -> str:
     """
     # Deliberately the same computation, not a parallel copy of it.
     return topic(name)
-
-
-def in_namespace(name: str, namespace: str) -> bool:
-    """Report whether ``name`` belongs to ``namespace``, prefixed or not.
-
-    A deployment that adopts the prefix still has live topics minted under the
-    bare names, so a guard that recognized only the qualified form would quietly
-    misclassify every one of them.
-    """
-    name = (name or "").strip()
-    if not name or not namespace:
-        return False
-    return name.startswith(namespace) or name.startswith(topic(namespace))

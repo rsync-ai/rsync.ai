@@ -36,6 +36,10 @@ COPY . /app/
 # build.additional_contexts. connector.py imports it (guarded) to delegate the
 # BigQuery warehouse operations; no physical copy lives in this version dir.
 COPY --from=shared warehouse_adapters.py /app/warehouse_adapters.py
+# Stable batch paging, shipped the same way (sql_paging.py).
+COPY --from=shared sql_paging.py /app/sql_paging.py
+# The canonical column-type map discover_schema reports columns in.
+COPY --from=shared canonical_types.py /app/canonical_types.py
 
 # Copy base_connector to shared location if present, then remove the per-connector
 # copy so imports always resolve to the shared library (fix-once semantics).

@@ -161,8 +161,9 @@ def _qualify_topic(name: str) -> str:
 _DEFAULT_MAX_RETRIES = "30"
 _DEFAULT_RETRIABLE_RESTART_WAIT_MS = "10000"
 
-# How often a MongoDB or PostgreSQL source emits a heartbeat, and the namespace its
-# heartbeat topic lives in. Each source's reason is in its branch of _build_config.
+# How often a MongoDB, PostgreSQL or MySQL/MariaDB source emits a heartbeat, and the
+# namespace its heartbeat topic lives in. Each source's reason is in its branch of
+# _build_config.
 _DEFAULT_HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
 _DEFAULT_HEARTBEAT_TOPICS_PREFIX = "heartbeat"
 
@@ -244,8 +245,9 @@ def _topic_creation(args: Dict[str, Any]) -> Dict[str, str]:
     and most managed clusters) is created, listed, subscribable, and rejects every
     acks=all produce with NOT_ENOUGH_REPLICAS.
 
-    Empty when the orchestrator passed nothing — an older orchestrator, or one that
-    could not read the broker count — which leaves auto-create exactly as it was.
+    Empty when the orchestrator passed nothing — an older orchestrator; the current
+    one refuses a CDC start whose cluster it cannot read — which leaves auto-create
+    exactly as it was.
     """
     partitions = _as_int(args.get("topic_partitions"))
     replication = _as_int(args.get("topic_replication_factor"))
@@ -1235,6 +1237,19 @@ class DebeziumConnector:
                     "table.include.list": mysql_include_list,
                 }
             )
+            # Heartbeats, so an idle source is distinguishable from a dead stream. A
+            # MySQL/MariaDB connector writes nothing while the captured tables are quiet,
+            # and the binlog position it commits only moves when it emits a record, so
+            # "no writes for an hour" and "stuck for an hour" looked the same and the
+            # Sentinel could not alarm on either. Each heartbeat is a record on the
+            # heartbeat topic whether or not the source changed, and the freshness
+            # watchdog (cdc_source_freshness.go checkSourceFreshness) reads that topic's
+            # end offset as proof of life. No heartbeat.action.query: rsync.ai never
+            # writes to the source.
+            #
+            # It does not stop the binlog expiring under a stopped pipeline
+            # (binlog_expire_logs_seconds); that check stays in BACKLOG.md.
+            _enable_heartbeat(cfg, args, "CDC_MYSQL_HEARTBEAT_INTERVAL_MS")
             # Optional signaling table for incremental snapshots
             signal = args.get("signal_data_collection") or args.get("signal.table") or args.get("signal_data_collection")
             if isinstance(signal, str) and signal.strip():
@@ -1292,8 +1307,10 @@ class DebeziumConnector:
             # It does NOT make the position a liveness beacon: on a database with no
             # writes at all there is no new LSN, and the heartbeat repeats the old one.
             # Only heartbeat.action.query would move it, and that writes to the source,
-            # which rsync.ai never does. The Sentinel's freshness watchdog therefore still
-            # skips PostgreSQL (cdc_source_freshness.go heartbeatAdvancesAnIdlePosition).
+            # which rsync.ai never does. Each heartbeat is still a record on the
+            # heartbeat topic, so the Sentinel's freshness watchdog judges PostgreSQL by
+            # its position OR that topic's end offset moving (cdc_source_freshness.go
+            # checkSourceFreshness).
             #
             # The same commit clears a finished incremental snapshot from the stored
             # offset (#25). Debezium 3.1 closes the snapshot in memory while idle
@@ -1382,9 +1399,8 @@ class DebeziumConnector:
             # (cdc_source_freshness.go) a liveness beacon, so "idle but alive" stops
             # looking like "dead".
             #
-            # PostgreSQL heartbeats too, for a different reason (see its branch). MySQL's
-            # time-based binlog expiry is the same class of risk as the oplog and is
-            # tracked separately in BACKLOG.md rather than changed blind here.
+            # PostgreSQL and MySQL/MariaDB heartbeat too, for different reasons (see
+            # their branches).
             _enable_heartbeat(cfg, args, "CDC_MONGO_HEARTBEAT_INTERVAL_MS")
             # Every database the collections come from (a server-level
             # connection spans several); the connection's database otherwise.

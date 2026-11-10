@@ -48,7 +48,11 @@ import { canEditSavedQuery } from "@/lib/workspace/roles"
 import { SavedQueryEditDialog } from "./SavedQueryEditDialog"
 import { SavedQueryHistoryDialog } from "./SavedQueryHistoryDialog"
 import { SavedQueryModelDialog } from "./SavedQueryModelDialog"
-import { formatAbsoluteTime, formatNextRunOrDue, nextRunRefetchDelay } from "./scheduleTime"
+import { LayerBadge, layerPosition } from "@/components/explorer/modelLayer"
+import { useWorkspaceLayers } from "@/lib/hooks/useWorkspaceLayers"
+import type { WorkspaceLayer } from "@/lib/api/modelLayers"
+import { formatNextRunOrDue, nextRunRefetchDelay } from "./scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // Saved queries are workspace-scoped server-side records (migration 084), unlike
 // Query History which stays a per-browser localStorage scratchpad. The two are
@@ -75,6 +79,8 @@ export interface SavedQuery {
   // destination and therefore carries no target_table.
   materialization?: string
   target_table?: string
+  /** The name of the workspace layer the model is in, or absent when it is in none (migration 135). */
+  layer?: string
   last_run_status?: string
   last_run_error?: string
   /** The engine behind connection_id. "" once that connection is deleted. */
@@ -85,6 +91,11 @@ export interface SavedQuery {
    * Optional so an older payload reads as "unknown" rather than "unsupported".
    */
   supports_materialization?: boolean
+  /**
+   * What sql_text holds, from the same capability table: "sql", or "document" — a
+   * MongoDB pipeline as `{"database", "collection", "pipeline"}`.
+   */
+  query_language?: string
   /** "" when the query has no schedule; otherwise the live schedule's status. */
   schedule_status?: string
   /**
@@ -102,8 +113,14 @@ interface SavedQueriesProps {
   currentSql: string
   /** The NL prompt that produced currentSql, if any. Stored for provenance. */
   currentQuestion?: string
-  /** Load a saved query back into the editor. */
-  onLoad: (sql: string, question?: string) => void
+  /** Load a saved query back into the editor; its id lets the Explorer chart it. */
+  onLoad: (sql: string, question?: string, id?: string) => void
+  /**
+   * "document" on a MongoDB connection, where currentSql is a pipeline (see
+   * buildDocumentQueryText). Only the wording changes; the server decides what the
+   * text is from the connection, never from this.
+   */
+  queryLanguage?: "sql" | "document"
 }
 
 /**
@@ -150,7 +167,7 @@ function statementClassBadge(cls: string) {
  * in a list, and a failing scheduled rebuild is invisible unless the list says so —
  * nobody opens a dialog to check on something they believe is fine.
  */
-function modelBadges(q: SavedQuery) {
+function modelBadges(q: SavedQuery, layers: WorkspaceLayer[] | null) {
   const hasTarget = q.materialization === "table" && !!q.target_table
   const isStatement = q.materialization === "statement"
   // Deliberately NOT gated on what the query does. A schedule and a materialization
@@ -161,6 +178,7 @@ function modelBadges(q: SavedQuery) {
   if (!hasTarget && !isStatement && !q.schedule_status && q.last_run_status !== "failed") return null
   return (
     <>
+      {(hasTarget || isStatement) && <LayerBadge layer={q.layer} position={layerPosition(layers, q.layer)} />}
       {hasTarget && (
         <Badge
           variant="outline"
@@ -230,7 +248,9 @@ export function SavedQueries({
   currentSql,
   currentQuestion,
   onLoad,
+  queryLanguage = "sql",
 }: SavedQueriesProps) {
+  const isPipeline = queryLanguage === "document"
   const [items, setItems] = useState<SavedQuery[]>([])
   const [loading, setLoading] = useState(false)
   const [saveOpen, setSaveOpen] = useState(false)
@@ -250,6 +270,7 @@ export function SavedQueries({
   // only possible outcome is that 403.
   const { role: workspaceRole, can } = useWorkspaceRole()
   const { user } = useCurrentUser()
+  const { layers } = useWorkspaceLayers()
   const canSaveQuery = can("save_query")
   const canSchedule = can("schedule_query")
 
@@ -394,8 +415,12 @@ export function SavedQueries({
             !canSaveQuery
               ? `Saving a query needs the member role or higher. Your role is ${workspaceRole || "unknown"}.`
               : hasSaveableSql
-                ? "Save the current query"
-                : "Write or generate a query first"
+                ? isPipeline
+                  ? "Save the current pipeline"
+                  : "Save the current query"
+                : isPipeline
+                  ? "Write a valid pipeline in the Pipeline tab first"
+                  : "Write or generate a query first"
           }
         >
           <BookmarkPlus className="h-3.5 w-3.5 mr-1" />
@@ -421,7 +446,9 @@ export function SavedQueries({
           </div>
         ) : items.length === 0 ? (
           <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
-            No saved queries yet. Run something useful, then Save current.
+            {isPipeline
+              ? "No saved pipelines yet. Write one in the Pipeline tab, then Save current."
+              : "No saved queries yet. Run something useful, then Save current."}
           </div>
         ) : (
           <div className="space-y-2">
@@ -436,7 +463,7 @@ export function SavedQueries({
                 tabIndex={0}
                 className="p-3 border rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-900 cursor-pointer transition-colors"
                 onClick={() => {
-                  onLoad(q.sql_text, q.nl_prompt)
+                  onLoad(q.sql_text, q.nl_prompt, q.id)
                   toast.info(`Loaded "${q.name}"`)
                 }}
                 onKeyDown={(e) => {
@@ -445,7 +472,7 @@ export function SavedQueries({
                   if (e.target !== e.currentTarget) return
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault()
-                    onLoad(q.sql_text, q.nl_prompt)
+                    onLoad(q.sql_text, q.nl_prompt, q.id)
                     toast.info(`Loaded "${q.name}"`)
                   }
                 }}
@@ -460,7 +487,7 @@ export function SavedQueries({
                       <Users className="h-3 w-3 shrink-0 text-zinc-400" aria-label="Shared with workspace" />
                     )}
                     {statementClassBadge(q.statement_class)}
-                    {modelBadges(q)}
+                    {modelBadges(q, layers)}
                   </div>
                   <div className="flex items-center gap-0.5 shrink-0">
                     {/*
@@ -567,7 +594,7 @@ export function SavedQueries({
         )}
       </div>
 
-      <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
+      <Dialog open={saveOpen} onOpenChange={setSaveOpen} closeOnOutsideClick={false}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Save query</DialogTitle>
@@ -614,7 +641,9 @@ export function SavedQueries({
             </div>
 
             <div className="rounded-md border bg-zinc-50 dark:bg-zinc-900 p-2">
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1">SQL</div>
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1">
+                {isPipeline ? "Pipeline" : "SQL"}
+              </div>
               <pre className="font-mono text-xs whitespace-pre-wrap break-all max-h-32 overflow-auto">
                 {currentSql}
               </pre>
@@ -649,9 +678,12 @@ export function SavedQueries({
           savedQueryName={modelQuery.name}
           materialization={modelQuery.materialization ?? "none"}
           targetTable={modelQuery.target_table}
+          layer={modelQuery.layer}
           statementClass={modelQuery.statement_class}
           supportsMaterialization={modelQuery.supports_materialization}
           connectorType={modelQuery.connector_type}
+          connectionId={modelQuery.connection_id}
+          queryLanguage={modelQuery.query_language}
           lastRunStatus={modelQuery.last_run_status}
           lastRunError={modelQuery.last_run_error}
           open

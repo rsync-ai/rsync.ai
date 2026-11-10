@@ -74,6 +74,10 @@ func TestTableSelectionWaitingDetails_TableListAndKeysUnchanged(t *testing.T) {
 		// would show the destination's instead.
 		"source_connection_id":      "conn-mongo-orders",
 		"destination_connection_id": "conn-gcs-lake",
+		// Always written, so a transform-step pause's flag never survives the
+		// gateway's metadata merge into this ordinary wait.
+		"review_transforms_only": false,
+		"preselected_tables":     []string{},
 	}
 	if !reflect.DeepEqual(details, want) {
 		t.Fatalf("details = %#v\nwant %#v", details, want)
@@ -123,5 +127,35 @@ func TestTableSelectionWaitingDetails_ForwardsDiscoveryTotals(t *testing.T) {
 	details = tableSelectionWaitingDetails(result, nil)
 	if details["total_tables_available"] != 2 || details["tables_truncated"] != false {
 		t.Fatalf("whole list totals = %#v / %#v, want 2 / false", details["total_tables_available"], details["tables_truncated"])
+	}
+}
+
+// The one-time transform-step pause for tables named in chat
+// (transforms_review_gate.go) carries the named tables, so the chat opens the
+// transform step instead of the picker. The flag needs a non-empty list: a
+// review step with no tables would resume with nothing.
+func TestTableSelectionWaitingDetails_ForwardsTransformsReview(t *testing.T) {
+	result := tableSelectionResultFixture()
+	result["review_transforms_only"] = true
+	result["preselected_tables"] = []string{"public.users", " "}
+	details := tableSelectionWaitingDetails(result, taskPayloadFixture())
+	if details["review_transforms_only"] != true {
+		t.Fatalf("review_transforms_only = %#v, want true", details["review_transforms_only"])
+	}
+	if !reflect.DeepEqual(details["preselected_tables"], []string{"public.users"}) {
+		t.Fatalf("preselected_tables = %#v, want [public.users]", details["preselected_tables"])
+	}
+
+	// After a JSON round trip the list is []interface{}.
+	result["preselected_tables"] = []interface{}{"public.users", "public.orders"}
+	if got := tableSelectionWaitingDetails(result, nil)["preselected_tables"]; !reflect.DeepEqual(got, []string{"public.users", "public.orders"}) {
+		t.Fatalf("round-tripped preselected_tables = %#v", got)
+	}
+
+	// No tables: no review step, an ordinary picker.
+	result["preselected_tables"] = []interface{}{}
+	details = tableSelectionWaitingDetails(result, nil)
+	if details["review_transforms_only"] != false || !reflect.DeepEqual(details["preselected_tables"], []string{}) {
+		t.Fatalf("empty list = %#v / %#v, want false / []", details["review_transforms_only"], details["preselected_tables"])
 	}
 }

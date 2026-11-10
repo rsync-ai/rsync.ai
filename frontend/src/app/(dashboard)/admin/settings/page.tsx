@@ -7,43 +7,35 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 import { toast } from "sonner"
 import { AlertTriangle, Save, UserPlus } from "lucide-react"
-import { adminUpdateSettings } from "@/lib/api/admin"
+import { adminGetSettings, adminUpdateSettings, type AdminReadFailure } from "@/lib/api/admin"
+import { AIModelsCard } from "@/components/admin/AIModelsCard"
+import { useFeatureFlags } from "@/config/features"
 
 export default function AdminSettingsPage() {
   const [loading, setLoading] = useState(true)
-  const [pageStatus, setPageStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
   const [registrationMode, setRegistrationMode] = useState("open")
   const [loadFailed, setLoadFailed] = useState(false)
   const [saving, setSaving] = useState(false)
+  // The AI models routes exist only while the assistant is on.
+  const { assistant } = useFeatureFlags()
 
   const load = useCallback(async () => {
     setLoading(true)
-    setPageStatus(null)
+    setFailure(null)
     setLoadFailed(false)
-    try {
-      const res = await authFetch("/api/v1/admin/settings", { method: "GET" })
-      if (res.status === 401) { window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`; return }
-      if (res.status === 403) { setPageStatus(403); setLoading(false); return }
-      if (res.status === 429) {
-        setPageStatus(429)
-        setRetryAfter(parseInt(res.headers.get("Retry-After") || "", 10))
-        setLoading(false)
-        return
-      }
-      // Every other non-2xx used to fall through to res.json(), which SUCCEEDS —
-      // the API returns {"error": "..."} on failure. So the catch never ran,
-      // `?.registration_mode` was undefined, and `|| "open"` rendered Open
-      // Registration over a read that never came back, with Save live to write
-      // that invention back to an invite-only instance.
-      if (!res.ok) throw new Error(`settings read failed with ${res.status}`)
-      const json = await res.json()
-      setRegistrationMode(json.settings?.registration_mode || "open")
-    } catch {
+    const r = await adminGetSettings()
+    if (r.ok) {
+      setRegistrationMode(r.data.settings?.registration_mode || "open")
+    } else if (r.status === 401 || r.status === 403 || r.status === 429) {
+      setFailure(r)
+    } else {
+      // Any other failure must not fall through to the form: `|| "open"` would
+      // render Open Registration over a read that never came back, with Save
+      // live to write that invention back to an invite-only instance.
       setLoadFailed(true)
     }
     setLoading(false)
@@ -63,16 +55,14 @@ export default function AdminSettingsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Instance settings" />
       <AdminNav />
 
       {loading ? (
         <LoadingState />
-      ) : pageStatus === 403 ? (
-        <AccessDeniedState />
-      ) : pageStatus === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : loadFailed ? (
         // No form here on purpose. Showing the controls would mean showing a
         // registration mode we never read, and leaving Save reachable would let
@@ -132,6 +122,7 @@ export default function AdminSettingsPage() {
               </div>
             </CardContent>
           </Card>
+          {assistant && <AIModelsCard />}
         </div>
       )}
     </div>

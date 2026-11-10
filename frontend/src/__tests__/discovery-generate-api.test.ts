@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 
 import { authFetch } from "@/lib/api/auth-fetch"
-import { DiscoveryError, generateFromSession } from "@/lib/api/discovery"
+import { DiscoveryError, generateFromSession, moveConnectionsToConnectorVersion } from "@/lib/api/discovery"
 
 // Generating a connector the deterministic paths can't build needs an LLM. On an
 // install without one, api-gateway (connector_generator.go) answers 503 with
@@ -61,5 +61,48 @@ describe("generateFromSession errors", () => {
       },
     })
     expect((await thrown()).message).toBe("Bad Gateway")
+  })
+})
+
+// An overwrite rewrites the connector's current version in place; the gateway
+// refuses it with 409 while a run uses that version (connector_overwrite.go).
+describe("generateFromSession overwrite", () => {
+  const ok = { ok: true, status: 200, json: async () => ({ success: true, version: "v1.0.0" }) }
+  const sent = () => JSON.parse(String(mockFetch.mock.calls.at(-1)![1].body))
+
+  it("sends overwrite only when asked", async () => {
+    mockFetch.mockResolvedValue(ok)
+    await generateFromSession("acme", "session-1", { forceRegenerate: true })
+    expect(sent()).toMatchObject({ force_regenerate: true, overwrite: false })
+    await generateFromSession("acme", "session-1", { forceRegenerate: true, overwrite: true })
+    expect(sent()).toMatchObject({ force_regenerate: true, overwrite: true })
+  })
+
+  it("throws the gateway's sentence when a run uses the version", async () => {
+    const msg = "acme v1.0.0 is in use by a run of Orders sync, so it was not overwritten."
+    mockFetch.mockResolvedValue(failure({ success: false, code: "connector_in_use", error: msg, error_message: msg }, 409))
+    const e = await thrown()
+    expect(e.status).toBe(409)
+    expect(e.message).toBe(msg)
+  })
+})
+
+describe("moveConnectionsToConnectorVersion", () => {
+  it("posts the ids and version to the connector's bulk endpoint", async () => {
+    mockFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ success: true, connector_version: "v1.0.1" }) })
+    const res = await moveConnectionsToConnectorVersion("acme crm", "v1.0.1", ["c1", "c2"])
+    expect(res.connector_version).toBe("v1.0.1")
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(String(url)).toMatch(/\/api\/v1\/connectors\/acme%20crm\/connections\/version$/)
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(String(init.body))).toEqual({ version: "v1.0.1", connection_ids: ["c1", "c2"] })
+  })
+
+  it("throws the gateway's error, so nothing looks moved", async () => {
+    mockFetch.mockResolvedValue(failure({ error: "Nothing was changed." }, 404))
+    await expect(moveConnectionsToConnectorVersion("acme", "v1.0.1", ["c1"])).rejects.toMatchObject({
+      status: 404,
+      message: "Nothing was changed.",
+    })
   })
 })

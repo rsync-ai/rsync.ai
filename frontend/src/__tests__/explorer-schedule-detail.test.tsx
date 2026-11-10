@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import ModelSchedulePage from "@/app/(dashboard)/explorer/schedules/[id]/page"
-import ScheduledQueriesPage from "@/app/(dashboard)/explorer/schedules/page"
+import ModelSchedulePage from "@/app/(dashboard)/models/[id]/page"
+import ScheduledQueriesPage from "@/app/(dashboard)/models/page"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // The per-model page: every run of one model, filterable and paged, with the controls
 // to act on it. The failure modes worth guarding are all quiet ones — a page that
@@ -23,7 +23,7 @@ const graph = vi.hoisted(() => ({ props: [] as Record<string, unknown>[] }))
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: nav.push, refresh: vi.fn(), replace: nav.replace }),
-  usePathname: () => "/explorer/schedules/q-1",
+  usePathname: () => "/models/q-1",
   useParams: () => ({ id: "q-1" }),
   useSearchParams: () => new URLSearchParams(nav.search),
 }))
@@ -34,7 +34,32 @@ vi.mock("@/components/explorer/ModelLineageGraph", () => ({
   },
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
+// ECharts draws on a canvas jsdom does not have: a chart stands in as its accessible
+// name and a button per category, holding the kind (outcome) its row has.
+vi.mock("@/components/charts/EChartNoSSR", () => ({
+  EChartNoSSR: ({
+    settings,
+    rows,
+    onCategoryClick,
+  }: {
+    settings: { description: string; x: { categories: string[] } }
+    rows: { kind?: string }[]
+    onCategoryClick?: (i: number) => void
+  }) => (
+    <div role="img" aria-label={settings.description}>
+      {settings.x.categories.map((c, i) => (
+        <button key={c} type="button" data-kind={rows[i]?.kind} onClick={() => onCategoryClick?.(i)}>
+          {c}
+        </button>
+      ))}
+    </div>
+  ),
+}))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: role.canSchedule ? "admin" : "viewer",
@@ -287,19 +312,82 @@ describe("per-model schedule page", () => {
     })
     const user = userEvent.setup()
     render(<ModelSchedulePage />)
-    const chartBars = () =>
-      within(screen.getByRole("list", { name: "Run durations, oldest first" })).getAllByRole("listitem")
+    const runChart = () => screen.getByRole("img", { name: /How long each run on this page took/ })
+    const chartBars = () => within(runChart()).getAllByRole("button")
 
     const table = await screen.findByRole("table")
     // The same runs as the table, oldest first where the table is newest first.
-    expect(chartBars().map((b) => b.dataset.status)).toEqual(["succeeded", "failed", "skipped"])
+    expect(chartBars().map((b) => b.dataset.kind)).toEqual(["succeeded", "failed", "skipped"])
     expect(within(table).getAllByRole("row")).toHaveLength(4)
-    const chart = screen.getByRole("list", { name: "Run durations, oldest first" })
-    expect(chart.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(runChart().compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    // A bar finds its run in the table: the row is marked current.
+    await user.click(chartBars()[1])
+    const current = within(table)
+      .getAllByRole("row")
+      .filter((r) => r.getAttribute("aria-current") === "true")
+    expect(current).toHaveLength(1)
+    expect(within(current[0]).getByText("Failed")).toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "Failed" }))
-    await waitFor(() => expect(chartBars().map((b) => b.dataset.status)).toEqual(["failed"]))
+    await waitFor(() => expect(chartBars().map((b) => b.dataset.kind)).toEqual(["failed"]))
     expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(2)
+  })
+
+  it("sums up the newest runs in cards that a status filter does not change", async () => {
+    serve((url) => {
+      if (!url.startsWith("/api/v1/explorer/saved/q-1/runs")) return undefined
+      return new URL(url, "http://x").searchParams.get("status") === "failed"
+        ? res(200, { runs: [run("r-2", { status: "failed", started_at: "2026-09-15T03:00:00Z", duration_ms: 1_000 })] })
+        : res(200, {
+            runs: [
+              run("r-4", { status: "skipped", duration_ms: 0 }),
+              run("r-3", { duration_ms: 3_000 }),
+              run("r-2", { status: "failed", started_at: "2026-09-15T03:00:00Z", duration_ms: 1_000 }),
+              run("r-1", { duration_ms: 5_000 }),
+            ],
+          })
+    })
+    const user = userEvent.setup()
+    render(<ModelSchedulePage />)
+
+    const card = async (title: string) => within(await screen.findByRole("region", { name: title }))
+    // 2 of the 3 runs that did work succeeded; the skip is neither.
+    expect((await card("Success rate")).getByText("67%")).toBeInTheDocument()
+    expect((await card("Success rate")).getByText("2 of 3 succeeded, last 4 runs (1 skipped: not counted)")).toBeInTheDocument()
+    expect((await card("Median run time")).getByText("3s")).toBeInTheDocument()
+    expect((await card("Last failure")).getByText(formatAbsoluteTime("2026-09-15T03:00:00Z"))).toBeInTheDocument()
+
+    const unfiltered = () =>
+      (authFetch as Mock).mock.calls.filter(([u]) => /\/saved\/q-1\/runs\?limit=\d+$/.test(String(u))).length
+    const before = unfiltered()
+    await user.click(screen.getByRole("button", { name: "Failed" }))
+    await waitFor(() => expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(2))
+    expect((await card("Success rate")).getByText("67%")).toBeInTheDocument()
+    // Filtering alone does not read the newest page again: the cards already have it.
+    expect(unfiltered()).toBe(before)
+
+    // A new run fails, and Refresh is clicked while the table is still on failures:
+    // the cards read the newest unfiltered page again and move.
+    serve((url) => {
+      if (!url.startsWith("/api/v1/explorer/saved/q-1/runs")) return undefined
+      return new URL(url, "http://x").searchParams.get("status") === "failed"
+        ? res(200, { runs: [run("r-5", { status: "failed", started_at: "2026-09-16T03:00:00Z", duration_ms: 1_000 })] })
+        : res(200, {
+            runs: [
+              run("r-5", { status: "failed", started_at: "2026-09-16T03:00:00Z", duration_ms: 1_000 }),
+              run("r-4", { status: "skipped", duration_ms: 0 }),
+              run("r-3", { duration_ms: 3_000 }),
+              run("r-2", { status: "failed", started_at: "2026-09-15T03:00:00Z", duration_ms: 1_000 }),
+              run("r-1", { duration_ms: 5_000 }),
+            ],
+          })
+    })
+    await user.click(screen.getByRole("button", { name: "Refresh" }))
+    await waitFor(async () => expect((await card("Success rate")).getByText("50%")).toBeInTheDocument())
+    expect(
+      (await card("Last failure")).getByText(`${formatAbsoluteTime("2026-09-16T03:00:00Z")} · the newest run`),
+    ).toBeInTheDocument()
   })
 
   it("says the history could not be loaded, rather than that there is none", async () => {
@@ -398,6 +486,65 @@ describe("per-model schedule page", () => {
     )
   })
 
+  // Delete sat only inside the Edit schedule dialog, and a user looking for it on this
+  // page did not find it. It is beside Pause now, and asks first: Pause is the
+  // reversible one.
+  it("removes the schedule from the page, after asking, and goes back to the list", async () => {
+    const deletes = () =>
+      (authFetch as Mock).mock.calls.filter(
+        ([url, init]) => url === "/api/v1/explorer/saved/q-1/schedule" && init?.method === "DELETE",
+      ).length
+    serve((url, init) =>
+      url === "/api/v1/explorer/saved/q-1/schedule" && init?.method === "DELETE"
+        ? res(200, { deleted: true })
+        : url.startsWith("/api/v1/explorer/saved/q-1/runs")
+          ? res(200, { runs: [] })
+          : undefined,
+    )
+    const user = userEvent.setup()
+    render(<ModelSchedulePage />)
+
+    await user.click(await screen.findByRole("button", { name: "Remove schedule" }))
+    const confirm = await screen.findByRole("alertdialog", { name: "Remove this schedule?" })
+    expect(confirm).toHaveTextContent("The saved query and the table it built are not affected")
+    await user.click(within(confirm).getByRole("button", { name: "Cancel" }))
+    expect(deletes()).toBe(0)
+
+    await user.click(screen.getByRole("button", { name: "Remove schedule" }))
+    await user.click(
+      within(await screen.findByRole("alertdialog", { name: "Remove this schedule?" })).getByRole("button", {
+        name: "Remove schedule",
+      }),
+    )
+    await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/models"))
+    expect(deletes()).toBe(1)
+    const { toast } = await import("sonner")
+    expect(toast.success).toHaveBeenCalledWith("Schedule removed")
+  })
+
+  it("stays on the page and says why when the removal is refused", async () => {
+    serve((url, init) =>
+      url === "/api/v1/explorer/saved/q-1/schedule" && init?.method === "DELETE"
+        ? res(403, { error: "Removing a schedule needs the admin role" })
+        : url.startsWith("/api/v1/explorer/saved/q-1/runs")
+          ? res(200, { runs: [] })
+          : undefined,
+    )
+    const user = userEvent.setup()
+    render(<ModelSchedulePage />)
+
+    await user.click(await screen.findByRole("button", { name: "Remove schedule" }))
+    await user.click(
+      within(await screen.findByRole("alertdialog", { name: "Remove this schedule?" })).getByRole("button", {
+        name: "Remove schedule",
+      }),
+    )
+    const { toast } = await import("sonner")
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Removing a schedule needs the admin role"))
+    expect(nav.push).not.toHaveBeenCalled()
+    expect(screen.getByRole("button", { name: "Remove schedule" })).toBeEnabled()
+  })
+
   it("says a fan-in on all runs once all its upstreams have run", async () => {
     const upstreams = [
       { kind: "model", id: "m-1", name: "q_two" },
@@ -431,6 +578,7 @@ describe("per-model schedule page", () => {
     expect(await screen.findByRole("button", { name: /run now/i })).toBeDisabled()
     expect(screen.getByRole("button", { name: /pause/i })).toBeDisabled()
     expect(screen.getByRole("button", { name: /edit schedule/i })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Remove schedule" })).toBeDisabled()
   })
 
   // A schedule is a row of its own: made after the query, by whoever scheduled it, and its
@@ -495,7 +643,7 @@ describe("per-model schedule page", () => {
     await user.click(screen.getByRole("tab", { name: "Graph" }))
     expect(await screen.findByText("lineage graph of revenue_rollup")).toBeInTheDocument()
     expect(screen.queryByRole("table")).not.toBeInTheDocument()
-    expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?tab=graph", { scroll: false })
+    expect(nav.replace).toHaveBeenCalledWith("/models/q-1?tab=graph", { scroll: false })
     expect(graph.props.at(-1)).toMatchObject({
       modelId: "q-1",
       modelName: "revenue_rollup",
@@ -517,7 +665,7 @@ describe("per-model schedule page", () => {
 
     await user.click(screen.getByRole("tab", { name: "Runs" }))
     expect(await screen.findByRole("table")).toBeInTheDocument()
-    expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?from=list", { scroll: false })
+    expect(nav.replace).toHaveBeenCalledWith("/models/q-1?from=list", { scroll: false })
   })
 
   // The history itself is tested in model-freshness-history.test.tsx. Here: that it is
@@ -537,7 +685,7 @@ describe("per-model schedule page", () => {
 
     await user.click(screen.getByRole("tab", { name: "Freshness" }))
     expect(await screen.findByText("No freshness misses recorded.")).toBeInTheDocument()
-    expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?tab=freshness", { scroll: false })
+    expect(nav.replace).toHaveBeenCalledWith("/models/q-1?tab=freshness", { scroll: false })
     expect(requested(HISTORY)).toBe(1)
 
     await user.click(screen.getByRole("button", { name: "Refresh" }))
@@ -578,7 +726,7 @@ describe("per-model schedule page", () => {
     await waitFor(() => expect(graph.props.at(-1)!.reloadTick).toBe(tick + 1))
   })
 
-  it("says what the refresh loop is doing for a model that runs after its upstreams", async () => {
+  it("says what a model that runs after its upstreams is doing", async () => {
     serve(
       (url) => {
         if (url.startsWith("/api/v1/explorer/saved/q-1/runs")) return res(200, { runs: [] })
@@ -591,7 +739,7 @@ describe("per-model schedule page", () => {
                 workflow_id: "model-refresh-q-1",
                 state: "idle",
                 detail_available: false,
-                message: "no open refresh loop; the last run has closed",
+                message: "not rebuilding now; it rebuilds when an upstream finishes",
               },
             ],
             count: 1,
@@ -609,7 +757,7 @@ describe("per-model schedule page", () => {
       },
     )
     render(<ModelSchedulePage />)
-    expect(await screen.findByText("Idle: no open refresh loop; the last run has closed")).toBeInTheDocument()
+    expect(await screen.findByText("Idle: not rebuilding now; it rebuilds when an upstream finishes")).toBeInTheDocument()
   })
 
   it("starts the Runs and Details cards on one row, with the notices and the tabs above both", async () => {
@@ -717,7 +865,7 @@ describe("per-model schedule page", () => {
     await waitFor(() => expect(runAs).toHaveTextContent("Could not load who runs this schedule (HTTP 500)."))
   })
 
-  it("counts the models and pipelines chained both ways, and the count opens the graph", async () => {
+  it("counts the models and pipelines chained both ways, and the count opens a popup listing them and their tables", async () => {
     const root = {
       ...SCHEDULE,
       schedule_type: "after_upstream",
@@ -732,6 +880,7 @@ describe("per-model schedule page", () => {
       schedule_id: `sch-${id}`,
       saved_query_id: id,
       name: id,
+      target_table: `analytics.${id}`,
       schedule_type: "after_upstream",
       schedule_spec: {},
       upstreams: [{ kind: "model", id: upstreamId, name: upstreamId }],
@@ -742,6 +891,15 @@ describe("per-model schedule page", () => {
         if (url === "/api/v1/explorer/schedules") {
           return res(200, { schedules: [root, downstream("d-1", "q-1"), downstream("d-2", "d-1")], count: 3 })
         }
+        if (url === "/api/v1/pipelines/p-1") {
+          return res(200, {
+            id: "p-1",
+            name: "orders_sync",
+            selected_tables: ["public.orders", "public.customers"],
+            destination_connection: { name: "BigQuery prod" },
+          })
+        }
+        // m-1 is another member's private model: its own route answers 404 (the default).
         return undefined
       },
       root,
@@ -749,10 +907,38 @@ describe("per-model schedule page", () => {
     const user = userEvent.setup()
     render(<ModelSchedulePage />)
 
-    const button = await screen.findByRole("button", { name: "2 upstream · 2 downstream" })
+    // d-2 waits on d-1, not on this model: the count says which of the two are direct.
+    const button = await screen.findByRole("button", { name: "2 upstream · 2 downstream (1 direct)" })
     await user.click(button)
+    const dialog = await screen.findByRole("dialog", { name: "Linked to this model" })
+    // The count does not leave the Details tab on its own.
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute("aria-selected", "false")
+    await within(dialog).findByText("orders_sync")
+
+    expect(
+      within(dialog).getByRole("heading", { name: "Upstream: pipelines and models this one runs after (2)" }),
+    ).toBeInTheDocument()
+    expect(within(dialog).getByRole("heading", { name: "Downstream: models that run after this one (2)" })).toBeInTheDocument()
+    expect(within(dialog).getByRole("link", { name: "orders_sync" })).toHaveAttribute("href", "/pipelines/p-1")
+    expect(within(dialog).getByText("Copies public.orders, public.customers into BigQuery prod")).toBeInTheDocument()
+    // The name a downstream's upstream list gave m-1 is not its own route vouching for it.
+    expect(within(dialog).getByText("A model you can't open")).toBeInTheDocument()
+    expect(within(dialog).queryByText("stg_orders")).not.toBeInTheDocument()
+    expect(within(dialog).getByRole("link", { name: "d-1" })).toHaveAttribute("href", "/models/d-1?tab=graph")
+    expect(within(dialog).getByText("Writes analytics.d-1")).toBeInTheDocument()
+    expect(within(dialog).getByText("Writes analytics.d-2")).toBeInTheDocument()
+    const d2 = within(dialog).getByRole("link", { name: "d-2" }).closest("li") as HTMLElement
+    expect(d2).toHaveTextContent("2 hops away")
+    // A model's own schedule row already vouched for it; only the rest are asked.
+    expect(requested("/api/v1/pipelines/p-1")).toBe(1)
+    expect(requested("/api/v1/explorer/saved/m-1")).toBe(1)
+    expect(requested("/api/v1/explorer/saved/d-1")).toBe(0)
+    expect(requested("/api/v1/explorer/saved/d-2")).toBe(0)
+
+    await user.click(within(dialog).getByRole("button", { name: "Open the graph" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
     expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute("aria-selected", "true")
-    expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?tab=graph", { scroll: false })
+    expect(nav.replace).toHaveBeenCalledWith("/models/q-1?tab=graph", { scroll: false })
 
     const before = requested("/api/v1/explorer/schedules")
     await user.click(screen.getByRole("button", { name: "Refresh" }))
@@ -823,16 +1009,17 @@ describe("per-model page — freshness deadline", () => {
     role.canSchedule = true
   })
 
-  // The schedules list does not carry the deadline; the row reads the query's own GET.
-  function serveDeadline(initial: number | null) {
+  // The schedules list does not carry the deadline; the row reads GET …/freshness, which
+  // also answers the longest gap the schedules above the model leave between rebuilds.
+  function serveDeadline(initial: number | null, interval: number | null = null) {
     let stored = initial
     serve((url, init) => {
       if (url === "/api/v1/explorer/saved/q-1/freshness" && init?.method === "PUT") {
         stored = JSON.parse(String(init.body)).deadline_seconds
         return res(200, { saved_query_id: "q-1", deadline_seconds: stored })
       }
-      if (url === "/api/v1/explorer/saved/q-1") {
-        return res(200, { id: "q-1", ...(stored == null ? {} : { freshness_deadline_seconds: stored }) })
+      if (url === "/api/v1/explorer/saved/q-1/freshness") {
+        return res(200, { saved_query_id: "q-1", deadline_seconds: stored, rebuild_interval_seconds: interval })
       }
       return undefined
     })
@@ -844,7 +1031,7 @@ describe("per-model page — freshness deadline", () => {
     render(<ModelSchedulePage />)
 
     const cell = await detail("Freshness")
-    expect(await within(cell).findByText("Alert if older than 6h")).toBeInTheDocument()
+    expect(await within(cell).findByText("Flag Overdue after 6h")).toBeInTheDocument()
     const schedulesBefore = requested("/api/v1/explorer/schedules?saved_query_id=q-1")
     const freshnessBefore = requested("/api/v1/explorer/freshness")
 
@@ -852,11 +1039,22 @@ describe("per-model page — freshness deadline", () => {
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "1 day" }))
     await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Save" }))
 
-    expect(await within(cell).findByText("Alert if older than 1d")).toBeInTheDocument()
+    expect(await within(cell).findByText("Flag Overdue after 1d")).toBeInTheDocument()
     await waitFor(() => {
       expect(requested("/api/v1/explorer/schedules?saved_query_id=q-1")).toBeGreaterThan(schedulesBefore)
       expect(requested("/api/v1/explorer/freshness")).toBeGreaterThan(freshnessBefore)
     })
+  })
+
+  it("says when the deadline is shorter than the gap the schedule leaves between rebuilds", async () => {
+    // Loan portfolio: Overdue after 6h, rebuilt once a day after the Nightly.
+    serveDeadline(21600, 86400)
+    render(<ModelSchedulePage />)
+
+    const cell = await detail("Freshness")
+    expect(await within(cell).findByRole("note")).toHaveTextContent(
+      "Its schedule can leave 1d between rebuilds, so it shows Overdue between them.",
+    )
   })
 
   it("locks the control below the model-run role, and says why", async () => {
@@ -886,22 +1084,24 @@ describe("schedules list", () => {
     )
     render(<ScheduledQueriesPage />)
     const link = await screen.findByRole("link", { name: "revenue_rollup" })
-    expect(link).toHaveAttribute("href", "/explorer/schedules/q-1")
+    expect(link).toHaveAttribute("href", "/models/q-1")
   })
 
-  it("opens the model's page from anywhere on its row, but not from its Edit buttons", async () => {
+  it("opens the model's page from anywhere on its row, but not from its actions menu", async () => {
     ;(authFetch as Mock).mockImplementation(async (url: string) =>
       url === "/api/v1/explorer/schedules" ? res(200, { schedules: [SCHEDULE], count: 1 }) : res(200, {}),
     )
-    const user = userEvent.setup()
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
     render(<ScheduledQueriesPage />)
 
     await user.click(await screen.findByText("Every day at 03:00 (UTC)"))
     expect(nav.push).toHaveBeenCalledTimes(1)
-    expect(nav.push).toHaveBeenCalledWith("/explorer/schedules/q-1")
+    expect(nav.push).toHaveBeenCalledWith("/models/q-1")
 
-    await user.click(screen.getByRole("button", { name: "Edit the SQL of revenue_rollup" }))
-    await user.click(screen.getByRole("button", { name: "Edit the schedule of revenue_rollup" }))
+    await user.click(screen.getByRole("button", { name: "Actions for revenue_rollup" }))
+    await user.click(await screen.findByRole("menuitem", { name: /Edit query/ }))
+    await user.click(screen.getByRole("button", { name: "Actions for revenue_rollup" }))
+    await user.click(await screen.findByRole("menuitem", { name: /Edit schedule/ }))
     expect(nav.push).toHaveBeenCalledTimes(1)
   })
 
@@ -917,7 +1117,7 @@ describe("schedules list", () => {
     )
     render(<ScheduledQueriesPage />)
 
-    const badge = await screen.findByText("failed")
+    const badge = await screen.findByText("Failed")
     expect(badge.parentElement).toHaveAttribute("title", "relation analytics.orders does not exist")
     expect(screen.queryByText(/run history/i)).not.toBeInTheDocument()
     expect((authFetch as Mock).mock.calls.some(([url]) => String(url).includes("/runs"))).toBe(false)

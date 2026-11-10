@@ -23,8 +23,9 @@
  * end into an invisible one.
  *
  * Case (e) is the control. Without it, a blanket `disabled` — which would break
- * PipelineAccordionView's live generic arm, the one caller that still has
- * somewhere to send the data — looks exactly like a correct fix.
+ * any caller that does have somewhere to send the data — looks exactly like a
+ * correct fix. (PipelineAccordionView's generic arm handed the data to the table
+ * picker; it is read-only too now: chat-hitl-card-every-blocking-type.test.tsx.)
  */
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest"
@@ -192,8 +193,8 @@ describe("a generic park says so instead of offering a button that discards the 
 
 describe("GenericHitlForm decides read-only from the presence of a handler", () => {
   it("CONTROL: a caller that does pass onSubmit keeps a working, enabled form", () => {
-    // PipelineAccordionView still passes one. If a fix disabled Submit
-    // unconditionally, this is the case that catches it — the panel-side
+    // A caller with an endpoint for the request passes one. If a fix disabled
+    // Submit unconditionally, this is the case that catches it — the panel-side
     // assertions above cannot tell the two apart.
     const onSubmit = vi.fn()
     const schema: JsonSchema = {

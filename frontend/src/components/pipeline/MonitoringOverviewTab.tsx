@@ -4,12 +4,12 @@
  * Monitoring → Overview: "is this pipeline healthy right now, and if not, where?"
  *
  * Four tiles (two for a batch pipeline), a short list of the tables that need
- * attention, one line about automated decisions. The
- * Throughput and Dependencies cards below it stay the detail view.
+ * attention. The Throughput and Dependencies cards below
+ * it stay the detail view.
  *
  * Three reads, each independent so one failure never blanks the others:
  *   - /runtime            — mode, phase, pending_events, the latest run's id
- *   - /monitoring/overview — the newest Kafka lag reading and agent decisions
+ *   - /monitoring/overview — the newest Kafka lag reading
  *   - /table-stats        — per-table status, failed rows and last write
  * A failed poll keeps the last good numbers and says so on the tile (the F-242
  * lesson: never let a read error look like an empty, healthy pipeline).
@@ -23,17 +23,18 @@
 import Link from "next/link"
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react"
 
-import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { RowsSkeleton, StatCardsSkeleton } from "@/components/kit/PageSkeleton"
+import { Skeleton } from "@/components/ui/skeleton"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { formatSpanCoarse } from "@/lib/duration"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import type { PipelineRuntime, RuntimeDep, RuntimePhase } from "@/lib/hooks/usePipelineRuntime"
 import { backlogIncludesLoadRows, isSettingUp } from "@/lib/pipeline/loadStatus"
-import { formatAbsoluteTime, formatAge, formatCount } from "@/lib/transform-format"
+import { formatCount } from "@/lib/transform-format"
+import { formatAbsoluteTime, formatRelativeTime, cn } from "@/lib/utils"
 import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
-import { cn } from "@/lib/utils"
-import type { TableStatsSummaryPayload } from "./executionSummary"
+import { degradedTableLabel, type TableStatsSummaryPayload } from "./executionSummary"
 
 export const OVERVIEW_POLL_MS = 30_000
 
@@ -42,10 +43,6 @@ export const OVERVIEW_POLL_MS = 30_000
 const STALE_WRITE_MS = 5 * 60_000
 
 const ATTENTION_LIMIT = 5
-
-// The overview's agent query stops at 20 rows (monitoring.go fetchAgentReasoning),
-// so a count of 20 means "20 or more".
-const AGENT_DECISIONS_CAP = 20
 
 const BATCH_IN_FLIGHT: ReadonlySet<RuntimePhase> = new Set<RuntimePhase>([
   "initializing",
@@ -59,11 +56,6 @@ const BATCH_IN_FLIGHT: ReadonlySet<RuntimePhase> = new Set<RuntimePhase>([
 // ---------------------------------------------------------------------------
 
 type OverviewPayload = {
-  agent_reasoning?: {
-    total_decisions: number
-    recent_decisions?: Array<{ confidence?: number | null }>
-  }
-  agent_reasoning_error?: string
   data_plane?: {
     /** Changes in Kafka the sink has not read yet, from the newest status poll. */
     sink_lag_messages?: number | null
@@ -85,6 +77,8 @@ export type AttentionTable = {
   applied_snapshot_rows?: number | null
   last_applied_ts?: string | null
   dlq_rows?: number | null
+  // Batch: the run put this table back to where it started (table_stats.go rewoundSQL).
+  rewound?: boolean
   completed_at?: string | null
 }
 
@@ -141,7 +135,7 @@ export function cdcFreshness(tables: AttentionTable[], backlogged: boolean, read
   }
   const stale = readAtMs - Date.parse(newest) > STALE_WRITE_MS
   return {
-    value: formatAge(newest),
+    value: formatRelativeTime(newest),
     detail: backlogged && stale ? "since the last write, with changes waiting" : "since the last change was written",
     tone: backlogged && stale ? "warn" : "ok",
     title: formatAbsoluteTime(newest),
@@ -162,7 +156,7 @@ export function batchFreshness(phase: string | undefined, tables: AttentionTable
     }
   }
   return {
-    value: formatAge(newest),
+    value: formatRelativeTime(newest),
     detail: failed ? "since the last run ended in failure" : "since the last run finished",
     tone: failed ? "bad" : "ok",
     title: formatAbsoluteTime(newest),
@@ -187,10 +181,17 @@ export function batchFreshness(phase: string | undefined, tables: AttentionTable
  * "unknown"/absent is NOT "stopped": a batch pipeline has no such dependency, and a
  * CDC pipeline mid-setup has one nobody has probed yet. Only an explicit unhealthy
  * verdict is allowed to turn a zero red.
+ *
+ * A paused or stopped pipeline is the exception the phase answers instead: the probe
+ * sweeps running pipelines only (workers/dependency_probe.go), so its verdict is
+ * frozen at whatever the last running probe saw — usually healthy, which read as a
+ * green "Capturing" on a stopped pipeline. Pause and Stop both park the connector.
  */
-export type CaptureState = "capturing" | "degraded" | "stopped" | "unknown"
+export type CaptureState = "capturing" | "degraded" | "stopped" | "pipeline_paused" | "pipeline_stopped" | "unknown"
 
-export function captureState(deps: RuntimeDep[] | undefined): CaptureState {
+export function captureState(deps: RuntimeDep[] | undefined, phase?: string): CaptureState {
+  if (phase === "paused") return "pipeline_paused"
+  if (phase === "stopped") return "pipeline_stopped"
   const dep = deps?.find((d) => d.kind === "debezium_task")
   if (!dep) return "unknown"
   switch (dep.status) {
@@ -224,6 +225,15 @@ export function captureTile(state: CaptureState, deps: RuntimeDep[] | undefined)
         detail: dep?.last_error || "no changes are being captured from the source",
         tone: "bad",
       }
+    // Not green, and not red either: the user asked for this.
+    case "pipeline_paused":
+      return {
+        value: "Paused",
+        detail: "the pipeline is paused, so no changes are captured until it resumes",
+        tone: "neutral",
+      }
+    case "pipeline_stopped":
+      return { value: "Stopped", detail: "the pipeline is stopped, so no changes are being captured", tone: "neutral" }
     default:
       return { value: "—", detail: "no source-stream check has run yet", tone: "neutral" }
   }
@@ -428,15 +438,16 @@ export function tablesNeedingAttention(tables: AttentionTable[], isCdc: boolean)
       if (r === 0) return { name: t.qualified_name, reason: ["Failed", failedRows].filter(Boolean).join(" · "), tone: "bad" as Tone }
       if (r === 1) return { name: t.qualified_name, reason: failedRows, tone: "warn" as Tone }
       if (r === 2) {
+        const { label } = degradedTableLabel(t)
         const reason =
           t.mode === "batch" && (t.read_rows ?? 0) > 0
             ? (t.inserted_rows ?? 0) === 0
-              ? "Degraded · destination wrote 0 rows"
-              : `Degraded · ${formatCount(t.inserted_rows)} of ${formatCount(t.read_rows)} rows written`
-            : "Degraded"
+              ? `${label} · destination wrote 0 rows`
+              : `${label} · ${formatCount(t.inserted_rows)} of ${formatCount(t.read_rows)} rows written`
+            : label
         return { name: t.qualified_name, reason, tone: "warn" as Tone }
       }
-      const last = t.last_applied_ts ? ` · last write ${formatAge(t.last_applied_ts)}` : " · nothing written yet"
+      const last = t.last_applied_ts ? ` · last write ${formatRelativeTime(t.last_applied_ts)}` : " · nothing written yet"
       const waiting = [
         loadBehind(t) > 0 ? plural(loadBehind(t), "full-load row") : "",
         changesBehind(t) > 0 ? plural(changesBehind(t), "change") : "",
@@ -445,18 +456,6 @@ export function tablesNeedingAttention(tables: AttentionTable[], isCdc: boolean)
         .join(" and ")
       return { name: t.qualified_name, reason: `${waiting} waiting${last}`, tone: "warn" as Tone }
     })
-}
-
-/** "3 automated decisions in the last 24h, lowest confidence 62%", or null for none. */
-export function agentDecisionsLine(reasoning: OverviewPayload["agent_reasoning"]): string | null {
-  const n = reasoning?.total_decisions ?? 0
-  if (n <= 0) return null
-  const count = n >= AGENT_DECISIONS_CAP ? `At least ${AGENT_DECISIONS_CAP} automated decisions` : `${plural(n, "automated decision")}`
-  const confidences = (reasoning?.recent_decisions ?? [])
-    .map((d) => d.confidence)
-    .filter((c): c is number => typeof c === "number")
-  const lowest = confidences.length ? `, lowest confidence ${Math.round(Math.min(...confidences) * 100)}%` : ""
-  return `${count} in the last 24h${lowest}`
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +607,18 @@ function Tile(props: {
     >
       <div className="text-xs font-medium text-muted-foreground">{label}</div>
       <div className={cn("mt-1 text-lg font-semibold leading-tight", TONE_TEXT[tone])} title={state?.title || undefined}>
-        {state ? state.value : error ? "—" : "Loading…"}
+        {state ? (
+          state.value
+        ) : error ? (
+          "—"
+        ) : (
+          // Read with the tile, not announced: several tiles wait at once, and a
+          // live region in each said "Loading…" once per tile.
+          <div>
+            <span className="sr-only">Loading…</span>
+            <Skeleton aria-hidden className="mt-1 h-5 w-20" />
+          </div>
+        )}
       </div>
       {state?.detail && <div className="mt-0.5 text-xs text-muted-foreground">{state.detail}</div>}
       {error && <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">{error}</div>}
@@ -617,14 +627,7 @@ function Tile(props: {
   )
 }
 
-export function MonitoringOverviewTab({
-  pipelineId,
-  onOpenActivity,
-}: {
-  pipelineId: string
-  /** Switches the Monitoring card to its Activity sub-tab. */
-  onOpenActivity?: () => void
-}) {
+export function MonitoringOverviewTab({ pipelineId }: { pipelineId: string }) {
   const { runtime, overview, tables } = useOverviewSources(pipelineId)
   const rt = runtime.data
   const isCdc = rt?.mode === "cdc"
@@ -646,7 +649,7 @@ export function MonitoringOverviewTab({
   const usingRuntimeLag = typeof runtimeLag === "number"
   const kafkaLag = usingRuntimeLag ? runtimeLag : dataPlane?.sink_lag_messages
   const lagMeasuredAt = usingRuntimeLag ? rt?.liveness?.sink_lag_measured_at : dataPlane?.lag_measured_at
-  const capture = captureState(rt?.dependencies)
+  const capture = captureState(rt?.dependencies, rt?.phase)
   // Has anything actually counted changes for this pipeline? The summary now omits
   // its totals when nothing measured them, so `undefined` is the honest answer and
   // must not collapse into "zero changes". This is what stops Backlog rendering a
@@ -677,7 +680,7 @@ export function MonitoringOverviewTab({
   const hasRun = Boolean(rt?.execution_id)
 
   // Table-derived tiles wait for their own read; a batch pipeline with no run
-  // has nothing to read and says so instead of "Loading…".
+  // has nothing to read and says so instead of a loading skeleton.
   const tablesKnown = tables.data !== null
   const tablesError = readError(tables.error, tablesKnown)
 
@@ -699,7 +702,6 @@ export function MonitoringOverviewTab({
 
   const attention = tablesNeedingAttention(rows, isCdc)
   const tableCount = summary?.total_tables ?? tables.data?.total ?? rows.length
-  const decisions = agentDecisionsLine(overview.data?.agent_reasoning)
 
   return (
     <div className="space-y-4">
@@ -714,14 +716,14 @@ export function MonitoringOverviewTab({
             Couldn&apos;t load this pipeline&apos;s status ({runtime.error}). Retrying every 30 s.
           </div>
         ) : (
-          <div className="text-sm text-muted-foreground">Loading…</div>
+          <StatCardsSkeleton count={2} label="Loading this pipeline's status…" className="gap-3 @md:grid-cols-2" />
         )
       ) : (
         <>
           {runtime.error && (
             <p className="text-xs text-amber-700 dark:text-amber-400">{readError(runtime.error, true)}</p>
           )}
-          <div className={cn("grid grid-cols-1 gap-3 sm:grid-cols-2", isCdc && "lg:grid-cols-4")}>
+          <div className={cn("grid grid-cols-1 gap-3 @md:grid-cols-2", isCdc && "@3xl:grid-cols-4")}>
             <Tile id="freshness" label="Freshness" state={freshness} asOf={tables.at ?? runtime.at} error={tablesError} />
             {/* Capture comes FIRST of the CDC tiles: it is the upstream fact, and
                 Delivery is only interpretable once it is known. */}
@@ -756,15 +758,19 @@ export function MonitoringOverviewTab({
               <CardTitle className="text-sm font-medium">Tables needing attention</CardTitle>
             </CardHeader>
             <CardContent>
-              {!tablesKnown ? (
-                <p className="text-sm text-muted-foreground">
-                  {tablesError ?? (!isCdc && !hasRun ? "No run yet." : "Loading…")}
-                </p>
+              {!tablesKnown && !tablesError && (isCdc || hasRun) ? (
+                <RowsSkeleton rows={2} label="Loading tables…" />
+              ) : !tablesKnown ? (
+                <p className="text-sm text-muted-foreground">{tablesError ?? "No run yet."}</p>
               ) : attention.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  {isCdc
-                    ? `All ${plural(tableCount, "table")} caught up.`
-                    : `No problems in the last run's ${plural(tableCount, "table")}.`}{" "}
+                  {/* No tables is not "all caught up": a pipeline waiting for its
+                      table selection, or a run that read nothing, has none to judge. */}
+                  {tableCount === 0
+                    ? "No tables yet."
+                    : isCdc
+                      ? `All ${plural(tableCount, "table")} caught up.`
+                      : `No problems in the last run's ${plural(tableCount, "table")}.`}{" "}
                   <Link
                     href={`/pipelines/${pipelineId}?tab=table-stats`}
                     className="text-blue-600 hover:underline dark:text-blue-400"
@@ -806,25 +812,6 @@ export function MonitoringOverviewTab({
             </CardContent>
           </Card>
         </>
-      )}
-
-      {decisions && (
-        <div
-          data-testid="overview-decisions"
-          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 text-sm"
-        >
-          <span>{decisions}</span>
-          {onOpenActivity && (
-            <Button variant="outline" size="sm" onClick={onOpenActivity}>
-              View in Activity
-            </Button>
-          )}
-        </div>
-      )}
-      {!decisions && (overview.data?.agent_reasoning_error || (!overview.data && overview.error)) && (
-        <p className="text-xs text-muted-foreground">
-          Couldn&apos;t load automated decisions ({overview.data?.agent_reasoning_error ? "server error" : overview.error}).
-        </p>
       )}
     </div>
   )

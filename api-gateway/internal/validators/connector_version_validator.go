@@ -87,11 +87,13 @@ func (v *ConnectorVersionValidator) resolveConnectorDir(connectorType string) (s
 	}
 
 	for _, root := range v.connectorRoots() {
-		// Fast path (legacy flat) -- ONLY the canonicalized id (target) may be
-		// joined onto a filesystem path. The raw connectorType is never used as a
-		// path segment (it may contain "/", "\\" or ".." -> G304 traversal).
-		if st, err := os.Stat(filepath.Join(root, target, "metadata.json")); err == nil && !st.IsDir() {
-			return filepath.Join(root, target), nil
+		// Fast path (flat) -- ONLY the canonicalized id (target) may be joined onto
+		// a filesystem path. The raw connectorType is never used as a path segment
+		// (it may contain "/", "\\" or ".." -> G304 traversal).
+		for _, marker := range []string{"latest.json", "metadata.json"} {
+			if st, err := os.Stat(filepath.Join(root, target, marker)); err == nil && !st.IsDir() {
+				return filepath.Join(root, target), nil
+			}
 		}
 
 		var found string
@@ -99,20 +101,30 @@ func (v *ConnectorVersionValidator) resolveConnectorDir(connectorType string) (s
 			if err != nil {
 				return nil
 			}
-			// Skip versioned metadata
-			if strings.Contains(path, string(filepath.Separator)+"versions"+string(filepath.Separator)) {
-				if d.IsDir() && d.Name() == "versions" {
-					return filepath.SkipDir
+			if d.IsDir() {
+				if d.Name() == "versions" {
+					return filepath.SkipDir // a connector's own versions, never a connector root
 				}
 				return nil
 			}
-			if d.IsDir() || d.Name() != "metadata.json" {
+
+			// A connector folder holds latest.json and versions/<current>/metadata.json
+			// (every catalog connector, shipped or generated), or, in the legacy
+			// layout, its own metadata.json. Matching only the legacy file made every
+			// catalog connector "not found".
+			var metaPath string
+			switch d.Name() {
+			case "metadata.json":
+				metaPath = path
+			case "latest.json":
+				metaPath = currentVersionMetadataPath(filepath.Dir(path))
+			default:
 				return nil
 			}
 
 			dirAbs := filepath.Dir(path)
 
-			b, rerr := os.ReadFile(path)
+			b, rerr := os.ReadFile(metaPath)
 			if rerr != nil {
 				return nil
 			}
@@ -144,6 +156,27 @@ func (v *ConnectorVersionValidator) resolveConnectorDir(connectorType string) (s
 	}
 
 	return "", fmt.Errorf("connector '%s' not found", connectorType)
+}
+
+// currentVersionMetadataPath is versions/<current_version>/metadata.json of a
+// connector folder, read from its latest.json; "" when latest.json names no clean
+// version.
+func currentVersionMetadataPath(connectorDir string) string {
+	b, err := os.ReadFile(filepath.Join(connectorDir, "latest.json"))
+	if err != nil {
+		return ""
+	}
+	var latest struct {
+		CurrentVersion string `json:"current_version"`
+	}
+	if json.Unmarshal(b, &latest) != nil {
+		return ""
+	}
+	cv := strings.TrimSpace(latest.CurrentVersion)
+	if cv == "" || cv == "." || cv == ".." || strings.ContainsAny(cv, `/\`) {
+		return ""
+	}
+	return filepath.Join(connectorDir, "versions", cv, "metadata.json")
 }
 
 // NewConnectorVersionValidator creates a new validator

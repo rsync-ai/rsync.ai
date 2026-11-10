@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+
+	"github.com/rsync-ai/backend-orchestrator/internal/runcancel"
 )
 
 func runBatchSinkStop(t *testing.T, othersWithSameID8 int) (int, map[string]interface{}, *recordingSinks) {
@@ -95,5 +98,41 @@ func TestBatchStopSkipsWorkersWhenTheID8IsShared(t *testing.T) {
 	}
 	if w, _ := body["warnings"].([]interface{}); len(w) != 1 {
 		t.Fatalf("warnings = %v; want the shared-id8 warning", body["warnings"])
+	}
+}
+
+// Pins KI-STOP-DOES-NOT-REACH-RUNNING-TRANSFER (the executor half of a batch Stop).
+//
+// Stopping the sink worker ended the WRITE side only. The executor was still
+// exporting the source, and its healer re-ran the whole export once the first
+// attempt failed, so a stopped transfer kept reading the customer's database and
+// double-wrote the destination. The Stop must reach the run in flight — before
+// the sink is stopped, so nothing new is produced for a worker that is gone.
+func TestBatchStopCancelsTheRunningExecutor(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	unregister := runcancel.Register(stopTestPipelineID, func() { cancel(runcancel.ErrStopped) })
+	defer unregister()
+
+	code, body, _ := runBatchSinkStop(t, 0)
+	if code != http.StatusOK {
+		t.Fatalf("code=%d body=%v", code, body)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("batch Stop left the executor run for this pipeline running")
+	}
+	if n, _ := body["executor_runs_cancelled"].(float64); n != 1 {
+		t.Fatalf("executor_runs_cancelled = %v, want 1", body["executor_runs_cancelled"])
+	}
+}
+
+// Another pipeline's run is not this Stop's business.
+func TestBatchStopLeavesOtherPipelinesRunsAlone(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	unregister := runcancel.Register("11111111-2222-4333-8444-555555555555", func() { cancel(runcancel.ErrStopped) })
+	defer unregister()
+
+	runBatchSinkStop(t, 0)
+	if ctx.Err() != nil {
+		t.Fatal("stopping one pipeline cancelled another pipeline's run")
 	}
 }

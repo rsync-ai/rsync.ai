@@ -43,6 +43,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"api-gateway/internal/config"
 	rsynckafka "api-gateway/internal/kafka"
@@ -61,9 +62,11 @@ const (
 	notifyTopic   = "rsync.notifications"
 	healerResults = "rsync.healer.results"
 
-	// Dedup window: same (pipeline_id, type, action_url) within this
-	// many minutes is dropped without re-delivery. Prevents an alert
-	// storm when the healer retries the same failure mode N times.
+	// Dedup window: a repeat of the same dedup key (makeDedupKey) within
+	// this many minutes is dropped without re-delivery. Prevents an alert
+	// storm when the healer retries the same failure mode N times. A raise
+	// that says when its episode opened is dropped for the whole episode
+	// (recentDuplicate).
 	dedupWindowMinutes = 60
 )
 
@@ -119,13 +122,18 @@ func (t notifierTopics) all() []string {
 	return out
 }
 
+// newNotifierConsumerGroup is sarama.NewConsumerGroup; a test swaps it to play
+// a broker that is still starting.
+var newNotifierConsumerGroup = sarama.NewConsumerGroup
+
+var notifierDialBackoff = rsynckafka.DefaultConsumerGroupDialBackoff
+
 // Notifier wraps the sarama ConsumerGroup that reads from the
 // notification topics.
 type Notifier struct {
-	db       *sql.DB
-	consumer sarama.ConsumerGroup
-	cancel   context.CancelFunc
-	done     chan struct{}
+	db     *sql.DB
+	cancel context.CancelFunc
+	done   chan struct{}
 	// httpClient posts Slack webhooks. SSRF-guarded (safehttp), because an
 	// admin-supplied URL is otherwise a request to anywhere this pod can reach.
 	httpClient *http.Client
@@ -143,6 +151,11 @@ type Notifier struct {
 
 // Start initializes the notifier and starts consuming. The provided
 // ctx (typically appCtx) controls the consumer loop lifetime.
+//
+// It returns an error only for a Kafka security configuration this consumer
+// cannot use. Kafka not answering yet is not an error: the consumer goroutine
+// dials until it does (rsynckafka.ConnectConsumerGroup), so a gateway that
+// starts before Kafka still delivers every alert once Kafka is up.
 func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, error) {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V3_4_0_0
@@ -168,11 +181,6 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 	// reported the outage.
 	groupID := kafkaclient.Group("api-gateway-notifier")
 
-	consumer, err := sarama.NewConsumerGroup(kafkaBrokers, groupID, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("notifier: create consumer group: %w", err)
-	}
-
 	consumerCtx, cancel := context.WithCancel(ctx)
 
 	appBaseURL := appBaseURLFromEnv()
@@ -184,7 +192,6 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 
 	n := &Notifier{
 		db:                   db,
-		consumer:             consumer,
 		cancel:               cancel,
 		done:                 make(chan struct{}),
 		httpClient:           safehttp.NewClient(slackTimeout),
@@ -213,7 +220,9 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 		"consumer_group":        groupID,
 	}).Info("🔔 Starting notifier consumer")
 
-	go n.run(consumerCtx)
+	go n.run(consumerCtx, func() (sarama.ConsumerGroup, error) {
+		return newNotifierConsumerGroup(kafkaBrokers, groupID, cfg)
+	})
 	return n, nil
 }
 
@@ -250,7 +259,8 @@ func appBaseURLFromEnv() string {
 	return "http://localhost:3000"
 }
 
-// Stop gracefully shuts down the notifier consumer.
+// Stop gracefully shuts down the notifier consumer, which closes the Kafka
+// consumer group on its way out.
 func (n *Notifier) Stop() {
 	if n == nil || n.cancel == nil {
 		return // nil, or an emitter (NewEmitter) that never consumed
@@ -261,16 +271,24 @@ func (n *Notifier) Stop() {
 	case <-time.After(5 * time.Second):
 		log.Warn("notifier: timed out waiting for consumer to stop")
 	}
-	if err := n.consumer.Close(); err != nil {
-		log.WithError(err).Warn("notifier: error closing consumer")
-	}
 }
 
-func (n *Notifier) run(ctx context.Context) {
+// run dials Kafka until it answers, then consumes until ctx ends, closing the
+// consumer group if it had connected.
+func (n *Notifier) run(ctx context.Context, dial func() (sarama.ConsumerGroup, error)) {
 	defer close(n.done)
+	consumer, err := rsynckafka.ConnectConsumerGroup(ctx, "notifier", notifierDialBackoff, dial)
+	if err != nil {
+		return // ctx ended before Kafka answered
+	}
+	defer func() {
+		if err := consumer.Close(); err != nil {
+			log.WithError(err).Warn("notifier: error closing consumer")
+		}
+	}()
 	topics := n.topics.all()
 	for {
-		if err := n.consumer.Consume(ctx, topics, n); err != nil {
+		if err := consumer.Consume(ctx, topics, n); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -392,12 +410,29 @@ func (n *Notifier) handleWithRetry(ctx context.Context, msg *sarama.ConsumerMess
 // remediation, audience). When absent (legacy notifications), the consumer
 // falls back to the top-level Message field.
 type notificationPayload struct {
-	Type       string          `json:"type"`
-	PipelineID string          `json:"pipeline_id"`
+	Type       string `json:"type"`
+	PipelineID string `json:"pipeline_id"`
+	// SavedQueryID makes this an alert about a model (a data check) rather than a
+	// pipeline: it routes to the model's owner and is stored with saved_query_id, which
+	// the bell scopes through the model's workspace (migration 138).
+	SavedQueryID string `json:"saved_query_id,omitempty"`
+	// WorkflowID makes this an alert about a workflow's run: it routes to whoever the
+	// workflow runs as, and is stored in metadata (workflow_id), which the bell scopes
+	// through the workflow's workspace.
+	WorkflowID string          `json:"workflow_id,omitempty"`
 	Message    string          `json:"message"`
 	Timestamp  string          `json:"timestamp"`
 	ActionURL  string          `json:"action_url"`
 	Error      json.RawMessage `json:"error,omitempty"`
+	// OpenedAt is when the problem was first seen (RFC 3339). On a resolved notice,
+	// resolved.go uses it to pair the notice with this episode's alert only. On an
+	// alert, it makes the alert a repeat of any row stored since then, not only of
+	// one inside the dedup window (recentDuplicate): pushed once per episode.
+	OpenedAt string `json:"opened_at,omitempty"`
+	// Severity is the producer's own level ("warning", "critical"), stored as
+	// metadata raw_severity: a raise of an episode is a repeat only of rows at its
+	// level or above, so an escalation is still delivered.
+	Severity string `json:"severity,omitempty"`
 }
 
 // structuredErrorView is a minimal projection of diagnose.StructuredError
@@ -439,7 +474,7 @@ type healingResultPayload struct {
 // notification shape, and reports whether it belongs in a user's inbox at all.
 //
 // Only status="applied" is kept. The others are deliberately suppressed:
-//   - pending_approval already emits its own SCHEMA_DRIFT_DETECTED notification
+//   - pending_approval (a dropped table) already emits its own SCHEMA_DRIFT_DETECTED notification
 //     on rsync.notifications, so keeping it here double-posted every drift event
 //   - failed already emits its own failure notification
 //   - skipped is internal telemetry with nothing for a user to do
@@ -543,11 +578,57 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	// and dropped it — every time, for the entire life of that agent. Treating
 	// it as an instance alert is what makes that producer reach anyone.
 	pipelineID := strings.TrimSpace(p.PipelineID)
+	modelID := strings.TrimSpace(p.SavedQueryID)
+	workflowID := strings.TrimSpace(p.WorkflowID)
 	var (
 		recipients   []string
 		pipelineName string
+		modelName    string
+		workflowName string
 	)
-	if pipelineID == "" || isInstanceScope(pipelineID) {
+	if modelID != "" {
+		// A third shape: an alert about a model, which routes to the model's owner. The
+		// pipeline id is ignored, so the row can never read as a pipeline's alert too.
+		pipelineID = ""
+		// Stored canonical: the bell finds the model by comparing this id as text.
+		parsed, perr := uuid.Parse(modelID)
+		if perr != nil {
+			return permanent("saved_query_id %q is not a uuid", modelID)
+		}
+		modelID = parsed.String()
+		owner, name, err := n.modelOwner(ctx, modelID)
+		if err != nil {
+			return err
+		}
+		if owner == "" {
+			return nil
+		}
+		recipients = []string{owner}
+		modelName = name
+		extraParams["model"] = modelName
+	} else if workflowID != "" {
+		// A fourth: an alert about a workflow's run (workflow_run_alert.go), which
+		// routes to whoever the workflow runs as. Like a model's, it is never a
+		// pipeline's alert too.
+		pipelineID = ""
+		parsed, perr := uuid.Parse(workflowID)
+		if perr != nil {
+			return permanent("workflow_id %q is not a uuid", workflowID)
+		}
+		workflowID = parsed.String()
+		owners, name, err := n.workflowRecipients(ctx, workflowID)
+		if err != nil {
+			return err
+		}
+		if len(owners) == 0 {
+			log.WithFields(log.Fields{"topic": topic, "type": p.Type, "workflow_id": workflowID}).
+				Error("notifier: workflow alert has no run-as user, maker or active admin to deliver to; dropping")
+			return nil
+		}
+		recipients = owners
+		workflowName = name
+		extraParams["workflow"] = workflowName
+	} else if pipelineID == "" || isInstanceScope(pipelineID) {
 		pipelineID = ""
 		admins, err := n.instanceRecipients(ctx)
 		if err != nil {
@@ -651,24 +732,42 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	if se != nil {
 		dedupSubject = strings.TrimSpace(se.DedupSubject)
 	}
-	dedupKey := makeDedupKey(pipelineID, dedupIdentity, p.ActionURL, dedupSubject)
-
-	// Dedup: skip if an identical event landed within the dedup window.
-	var existingID sql.NullString
-	err := n.db.QueryRowContext(ctx, `
-		SELECT id::text FROM pipeline_notifications
-		WHERE dedup_key = $1 AND created_at > NOW() - INTERVAL '`+fmt.Sprintf("%d minutes", dedupWindowMinutes)+`'
-		ORDER BY created_at DESC LIMIT 1
-	`, dedupKey).Scan(&existingID)
-	if err == nil && existingID.Valid {
-		log.WithFields(log.Fields{
-			"dedup_key": dedupKey,
-			"existing":  existingID.String,
-		}).Debug("notifier: dedup hit, skipping")
-		return nil
+	dedupScope := pipelineID
+	if modelID != "" {
+		dedupScope = modelDedupScope(modelID)
+	} else if workflowID != "" {
+		dedupScope = workflowDedupScope(workflowID)
 	}
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("dedup lookup: %w", err)
+	dedupKey := makeDedupKey(dedupScope, dedupIdentity, p.ActionURL, dedupSubject)
+
+	// A resolved notice is not deduped by the window: resolved.go delivers it only
+	// for an alert that was pushed and stayed open, once per episode.
+	if raiseIdentity, ok := resolvedPairs[code]; ok {
+		raiseKey := makeDedupKey(dedupScope, raiseIdentity, p.ActionURL, dedupSubject)
+		due, err := n.resolvedNoticeDue(ctx, raiseKey, dedupKey, p.OpenedAt)
+		if err != nil {
+			return fmt.Errorf("resolved notice lookup: %w", err)
+		}
+		if !due {
+			return nil
+		}
+	} else {
+		// An alert that has a resolved notice dedups only back to its last one.
+		resolvedKey := ""
+		if resolvedCode, ok := resolvedCodeFor[dedupIdentity]; ok {
+			resolvedKey = makeDedupKey(dedupScope, resolvedCode, p.ActionURL, dedupSubject)
+		}
+		existingID, err := n.recentDuplicate(ctx, dedupKey, resolvedKey, p.OpenedAt, p.Severity)
+		if err != nil {
+			return fmt.Errorf("dedup lookup: %w", err)
+		}
+		if existingID != "" {
+			log.WithFields(log.Fields{
+				"dedup_key": dedupKey,
+				"existing":  existingID,
+			}).Debug("notifier: dedup hit, skipping")
+			return nil
+		}
 	}
 
 	metaMap := map[string]interface{}{
@@ -684,9 +783,26 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	if pipelineName != "" {
 		metaMap["pipeline_name"] = pipelineName
 	}
+	if modelID != "" {
+		metaMap["saved_query_id"] = modelID
+		if modelName != "" {
+			metaMap["model_name"] = modelName
+		}
+	}
+	if workflowID != "" {
+		// The bell scopes a workflow's alert through this id (handlers/notifications.go).
+		metaMap["workflow_id"] = workflowID
+		if workflowName != "" {
+			metaMap["workflow_name"] = workflowName
+		}
+	}
 	if code != "" {
 		// Kept for support ("quote this code"), never shown as the headline.
 		metaMap["error_code"] = code
+	}
+	// What the next raise of this episode ranks this row by (recentDuplicate).
+	if sev := strings.ToLower(strings.TrimSpace(p.Severity)); sev != "" {
+		metaMap["raw_severity"] = sev
 	}
 	// The category decides who is told (see planDelivery). Persisted so a
 	// 'skipped' row can say which mute skipped it.
@@ -721,15 +837,26 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	if err != nil {
 		return fmt.Errorf("begin notification insert: %w", err)
 	}
+	// saved_query_id is named only on a model alert. Such an alert can only be raised
+	// once migration 138 has made the column (with the checks it reports on), so a
+	// gateway whose 138 is still blocked keeps writing every pipeline alert.
+	modelColumn, modelValue := "", ""
+	if modelID != "" {
+		modelColumn, modelValue = ", saved_query_id", ", $11::uuid"
+	}
 	notifIDs := make([]string, len(recipients))
 	for i, recipient := range recipients {
 		notifIDs[i] = uuid.New().String()
+		args := []interface{}{notifIDs[i], pipelineArg, recipient, p.Type, severity, rendered.Title, p.Message, p.ActionURL, metaBytes, dedupKey}
+		if modelID != "" {
+			args = append(args, modelID)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO pipeline_notifications
-				(id, pipeline_id, user_id, type, severity, title, message, action_url, metadata, delivery_status, dedup_key, created_at)
+				(id, pipeline_id, user_id, type, severity, title, message, action_url, metadata, delivery_status, dedup_key, created_at`+modelColumn+`)
 			VALUES
-				($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW())
-		`, notifIDs[i], pipelineArg, recipient, p.Type, severity, rendered.Title, p.Message, p.ActionURL, metaBytes, dedupKey); err != nil {
+				($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW()`+modelValue+`)
+		`, args...); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("insert notification: %w", err)
 		}
@@ -738,10 +865,7 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		return fmt.Errorf("commit notification insert: %w", err)
 	}
 
-	// A drift notification carries interactive Approve/Reject buttons only when
-	// it maps to a specific pipeline AND the structured error is schema drift —
-	// that's the one event the inbound receiver knows how to action.
-	actionable := se != nil && se.Code == "SCHEMA_DRIFT_DETECTED" && pipelineID != ""
+	actionable := awaitsDriftDecision(se, pipelineID)
 
 	for i, recipient := range recipients {
 		// Slack is a single instance-wide webhook and the alert list is a
@@ -765,6 +889,8 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		log.WithFields(log.Fields{
 			"notification_id": notifIDs[i],
 			"pipeline_id":     pipelineID,
+			"saved_query_id":  modelID,
+			"workflow_id":     workflowID,
 			"instance_alert":  pipelineID == "",
 			"type":            p.Type,
 			"severity":        severity,
@@ -774,6 +900,80 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	}
 
 	return nil
+}
+
+// modelOwner returns the owner and name of the model an alert is about, or "" for the
+// owner when it has none to route to. A model that is gone is a permanent error: there
+// will never be an owner, and retrying would wedge the topic for nothing.
+func (n *Notifier) modelOwner(ctx context.Context, modelID string) (owner, name string, err error) {
+	var o, nm sql.NullString
+	err = n.db.QueryRowContext(ctx,
+		`SELECT created_by::text, COALESCE(name, '') FROM saved_queries WHERE id = $1`, modelID,
+	).Scan(&o, &nm)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", permanent("model %s no longer exists", modelID)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("model owner lookup: %w", err)
+	}
+	return strings.TrimSpace(o.String), strings.TrimSpace(nm.String), nil
+}
+
+// modelDedupScope keeps a model's alerts out of every pipeline's dedup window: a model
+// and a pipeline can share an id space, never a key.
+func modelDedupScope(modelID string) string { return "model:" + modelID }
+
+// workflowRecipients returns who an alert about a workflow's run goes to, and the
+// workflow's name: the user it runs as, else whoever made it, else the instance's
+// admins (both were deleted). A workflow that is gone is a permanent error, as a
+// model's is.
+func (n *Notifier) workflowRecipients(ctx context.Context, workflowID string) (recipients []string, name string, err error) {
+	var runAs, createdBy, nm sql.NullString
+	err = n.db.QueryRowContext(ctx,
+		`SELECT run_as_user_id::text, created_by::text, COALESCE(name, '') FROM workflows WHERE id = $1`, workflowID,
+	).Scan(&runAs, &createdBy, &nm)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", permanent("workflow %s no longer exists", workflowID)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("workflow owner lookup: %w", err)
+	}
+	name = strings.TrimSpace(nm.String)
+	for _, id := range []sql.NullString{runAs, createdBy} {
+		if owner := strings.TrimSpace(id.String); owner != "" {
+			return []string{owner}, name, nil
+		}
+	}
+	admins, err := n.instanceRecipients(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("instance recipient lookup: %w", err)
+	}
+	return admins, name, nil
+}
+
+// workflowDedupScope is modelDedupScope for a workflow's alerts.
+func workflowDedupScope(workflowID string) string { return "workflow:" + workflowID }
+
+// alertSubject is the label and name Slack and email give the thing an alert is about:
+// the model for a data check, the workflow for a workflow's run, the pipeline for
+// everything else. A name, falling back to the id when there is none.
+func alertSubject(p notificationPayload, r Rendered) (label, name string) {
+	if strings.TrimSpace(p.SavedQueryID) != "" {
+		if r.ModelName != "" {
+			return "Model", r.ModelName
+		}
+		return "Model", p.SavedQueryID
+	}
+	if strings.TrimSpace(p.WorkflowID) != "" {
+		if r.WorkflowName != "" {
+			return "Workflow", r.WorkflowName
+		}
+		return "Workflow", p.WorkflowID
+	}
+	if r.PipelineName != "" {
+		return "Pipeline", r.PipelineName
+	}
+	return "Pipeline", p.PipelineID
 }
 
 // instanceScopeLabel stands in for a pipeline name in copy that expects one,
@@ -935,6 +1135,15 @@ func bodyText(message, impact string) string {
 	}
 }
 
+// awaitsDriftDecision reports whether a notification gets Slack Approve/Reject
+// buttons: it maps to a specific pipeline and its code is SCHEMA_DRIFT_DETECTED, the
+// one drift code that asks for a decision (a dropped source table). A click resolves
+// to whatever change is pending on the pipeline, so buttons on a change rsync.ai already
+// handled (SCHEMA_DRIFT_HANDLED, SCHEMA_DRIFT_APPLY_FAILED) would act on something else.
+func awaitsDriftDecision(se *structuredErrorView, pipelineID string) bool {
+	return se != nil && se.Code == "SCHEMA_DRIFT_DETECTED" && pipelineID != ""
+}
+
 // slackPayload builds the Slack message body. For an actionable schema-drift
 // alert with interactivity configured it emits Block Kit with real Approve /
 // Reject buttons (action_id + value=pipeline_id) that POST back to the inbound
@@ -944,8 +1153,13 @@ func bodyText(message, impact string) string {
 // notification. Pure (no I/O) so it's unit-testable.
 func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bool) map[string]interface{} {
 	viewURL := absoluteActionURL(n.appBaseURL, p.ActionURL)
-	title := r.Title
-	body := bodyText(p.Message, r.Impact)
+	// Every piece of text is escaped for mrkdwn; the message is also scrubbed
+	// and gets whatever room the title and impact line leave under Slack's cap.
+	// The URLs are rsync.ai's own and stay as they are.
+	title := slackEscapeMax(r.Title, alertNameMax)
+	impact := slackEscape(strings.TrimSpace(r.Impact))
+	room := max(1, slackTextMax-utf8.RuneCountInString(title)-utf8.RuneCountInString(impact)-4) // "*", "*", 2× "\n"
+	body := bodyText(slackEscapeMax(alertMessage(p.Message), room), impact)
 
 	if n.interactiveApprovals && actionable {
 		return map[string]interface{}{
@@ -957,7 +1171,7 @@ func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bo
 				},
 				{
 					"type":   "section",
-					"fields": []map[string]interface{}{{"type": "mrkdwn", "text": "*Pipeline*\n" + p.PipelineID}},
+					"fields": []map[string]interface{}{{"type": "mrkdwn", "text": "*Pipeline*\n" + slackEscape(p.PipelineID)}},
 				},
 				{
 					"type": "actions",
@@ -987,10 +1201,8 @@ func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bo
 		}
 	}
 
-	pipelineLabel := r.PipelineName
-	if pipelineLabel == "" {
-		pipelineLabel = p.PipelineID
-	}
+	subjectLabel, subjectName := alertSubject(p, r)
+	subjectName = slackEscapeMax(subjectName, alertNameMax)
 
 	return map[string]interface{}{
 		"text": fmt.Sprintf("*%s*\n%s", title, body),
@@ -998,7 +1210,7 @@ func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bo
 			{
 				"color": slackColorFor(r.Severity),
 				"fields": []map[string]interface{}{
-					{"title": "Pipeline", "value": pipelineLabel, "short": true},
+					{"title": subjectLabel, "value": subjectName, "short": true},
 				},
 				"actions": []map[string]interface{}{
 					{
@@ -1030,22 +1242,29 @@ func (n *Notifier) ownerEmailAddress(ctx context.Context, userID string) (string
 // sendEmail sends one alert to one address. footer says why this address gets
 // it and where to change that, which differs for the owner and the alert list.
 func (n *Notifier) sendEmail(ctx context.Context, ch EmailChannel, to string, p notificationPayload, r Rendered, footer string) error {
-	pipelineLabel := r.PipelineName
-	if pipelineLabel == "" {
-		pipelineLabel = p.PipelineID
-	}
+	return sendSMTP(ctx, ch, to, n.alertEmail(p, r, footer))
+}
 
-	subject := fmt.Sprintf("[rsync-ai %s] %s", strings.ToUpper(r.Severity), r.Title)
-	body := fmt.Sprintf(
-		"%s\n\nPipeline: %s\n%s: %s\n\n%s\n\n--\nAutomated message from rsync-ai notifier",
-		bodyText(p.Message, r.Impact),
-		pipelineLabel,
+// alertEmail builds the email for one alert. The message is scrubbed and gets
+// whatever room the rest leaves under emailBodyMax, so the link to the full
+// error and the footer always survive. Pure (no I/O) so it's unit-testable.
+func (n *Notifier) alertEmail(p notificationPayload, r Rendered, footer string) emailMessage {
+	subjectLabel, subjectName := alertSubject(p, r)
+
+	subject := fmt.Sprintf("[rsync-ai %s] %s", strings.ToUpper(r.Severity), capRunes(r.Title, alertNameMax))
+	tail := fmt.Sprintf(
+		"\n\n%s: %s\n%s: %s\n\n%s\n\n--\nAutomated message from rsync-ai notifier",
+		subjectLabel,
+		capRunes(subjectName, alertNameMax),
 		r.ActionLabel,
 		absoluteActionURL(n.appBaseURL, p.ActionURL),
 		footer,
 	)
+	impact := strings.TrimSpace(r.Impact)
+	room := max(1, emailBodyMax-utf8.RuneCountInString(tail)-utf8.RuneCountInString(impact)-1) // "\n"
+	body := bodyText(capRunes(alertMessage(p.Message), room), impact) + tail
 
-	return sendSMTP(ctx, ch, to, emailMessage{Subject: subject, Body: body})
+	return emailMessage{Subject: subject, Body: body}
 }
 
 // classifySeverity maps event types to {info, warning, critical}.
@@ -1088,11 +1307,65 @@ func absoluteActionURL(base, actionURL string) string {
 	return base + u
 }
 
+// recentDuplicate returns the id of a notification stored under dedupKey that makes
+// this one a repeat, or "" when there is none. A repeat is a row within the dedup
+// window. When the producer sent when the episode opened (openedAt), it is also any
+// row since then — less resolvedClockSlack for a producer clock ahead of the
+// database's — at the raise's severity or above: the episode is pushed once, and an
+// escalation is not a repeat of the warning before it. A non-empty resolvedKey is the
+// key of the alert's resolved notice (resolved.go): only rows newer than the last of
+// those count, so a relapse after "no longer detected" is always delivered.
+func (n *Notifier) recentDuplicate(ctx context.Context, dedupKey, resolvedKey, openedAt, severity string) (string, error) {
+	relapse, args := "", []interface{}{dedupKey}
+	if resolvedKey != "" {
+		relapse = `
+		  AND created_at > COALESCE((SELECT MAX(created_at) FROM pipeline_notifications WHERE dedup_key = $2), '-infinity'::timestamptz)`
+		args = append(args, resolvedKey)
+	}
+	repeat := `created_at > NOW() - INTERVAL '` + fmt.Sprintf("%d minutes", dedupWindowMinutes) + `'`
+	if opened, ok := parseOpenedAt(openedAt); ok {
+		args = append(args, opened.Add(-resolvedClockSlack), severityRank(severity))
+		repeat = `(` + repeat + fmt.Sprintf(`
+		       OR (created_at > $%d::timestamptz AND %s >= $%d))`, len(args)-1, rawSeverityRankSQL, len(args))
+	}
+	var existingID sql.NullString
+	err := n.db.QueryRowContext(ctx, `
+		SELECT id::text FROM pipeline_notifications
+		WHERE dedup_key = $1 AND `+repeat+relapse+`
+		ORDER BY created_at DESC LIMIT 1
+	`, args...).Scan(&existingID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return existingID.String, nil
+}
+
+// rawSeverityRankSQL ranks a stored row by the severity its producer sent (metadata
+// raw_severity), in the order severityRank uses. A row stored before raw_severity was
+// recorded ranks lowest, so it never holds back a raise beyond the plain window.
+const rawSeverityRankSQL = `CASE metadata->>'raw_severity' WHEN 'critical' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END`
+
+// severityRank orders a producer's severity: an episode's earlier row repeats a raise
+// only at the same rank or above. Only the two levels a producer sends with opened_at
+// are ranked; anything else is 0, and is repeated by every row of its episode.
+func severityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical":
+		return 2
+	case "warning":
+		return 1
+	}
+	return 0
+}
+
 // makeDedupKey builds the idempotency key for the pre-insert window check.
 //
 // `subject` is what makes the key mean "this event" rather than "any event of this
 // class". Without it, (pipeline, code, action_url) is CONSTANT for a whole family:
-// every schema drift on a pipeline resolves to code SCHEMA_DRIFT_DETECTED and the same
+// every schema drift of one kind on a pipeline resolves to one code and the same
 // /pipelines/{id}/schema-changes deep link, so the first drift in an hour was notified
 // and every later one — a different table, a different column, a DROP after an ADD —
 // was silently swallowed. The approval row was still filed, so the drift was visible if

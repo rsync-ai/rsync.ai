@@ -357,11 +357,29 @@ func main() {
 
 	log.Info("✅ Temporal worker started")
 
+	// Workflow runs (the Workflows page) on their own queue, so a long pipeline cannot
+	// hold a workflow's alert behind it (workflows-design.md § 4.1). Four activities at
+	// a time: each send holds a gateway request for up to two minutes.
+	wr := worker.New(temporalClient, workflows.WorkflowRunsTaskQueue, worker.Options{
+		MaxConcurrentActivityExecutionSize: 4,
+		Interceptors:                       []interceptor.WorkerInterceptor{metrics.NewWorkerInterceptor()},
+	})
+	registerWorkflowRunWorker(wr)
+	if err := wr.Start(); err != nil {
+		log.Fatalf("Failed to start the workflow-runs worker: %v", err)
+	}
+	defer wr.Stop()
+
+	log.Info("✅ Workflow-runs worker started")
+
 	// Started AFTER w.Start(), so the queue already has a poller when the first tick
 	// lands. Started here at all — rather than by whoever first sets a deadline —
 	// because the sweep has to be running before anyone needs it: the models it exists
 	// to catch are the ones nothing else is firing for.
 	startModelFreshnessSweep(temporalClient)
+	// The same shape for a CDC pipeline's "run after pipeline": a window boundary
+	// passing is not an event anything emits, so a timer has to look for it.
+	startCDCTrailingEdgeSweep(temporalClient)
 
 	// No Kafka consumer here. Workflows are driven by Temporal signals sent over the
 	// Temporal API (see the Signal* constants in internal/workflows); Kafka is
@@ -381,6 +399,7 @@ func main() {
 	log.Info("🛑 Shutting down Temporal Adapter Service...")
 
 	// Graceful shutdown
+	wr.Stop()
 	w.Stop()
 	log.Info("✅ Temporal Adapter Service stopped")
 }
@@ -423,6 +442,34 @@ func startModelFreshnessSweep(temporalClient client.Client) {
 		return
 	}
 	log.Infof("✅ Model freshness sweep running (workflow_id=%s run_id=%s)", run.GetID(), run.GetRunID())
+}
+
+// startCDCTrailingEdgeSweep makes sure the singleton CDC trailing-edge sweep is running,
+// the same way and for the same reasons as startModelFreshnessSweep: USE_EXISTING, the
+// interval read here and passed as an argument, a failure logged rather than fatal.
+func startCDCTrailingEdgeSweep(temporalClient client.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	interval := 0
+	if raw := strings.TrimSpace(os.Getenv("CDC_TRAILING_EDGE_SWEEP_SECONDS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			interval = n
+		} else {
+			log.Warnf("⚠️  CDC_TRAILING_EDGE_SWEEP_SECONDS=%q is not a positive integer; using the default interval", raw)
+		}
+	}
+
+	run, err := temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:                       workflows.CDCTrailingEdgeWorkflowID,
+		TaskQueue:                adapterTaskQueue,
+		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	}, workflows.CDCTrailingEdgeWorkflow, workflows.CDCTrailingEdgeInput{IntervalSeconds: interval})
+	if err != nil {
+		log.WithError(err).Error("⚠️  could not start the CDC trailing-edge sweep; models and workflows after a CDC pipeline will not fire")
+		return
+	}
+	log.Infof("✅ CDC trailing-edge sweep running (workflow_id=%s run_id=%s)", run.GetID(), run.GetRunID())
 }
 
 func getEnv(key, defaultValue string) string {
@@ -468,7 +515,54 @@ func createKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return sarama.NewSyncProducer(security.Brokers, config)
+	return connectKafkaProducer(security.Brokers, config, kafkaStartupBudget, kafkaStartupWait, sarama.NewSyncProducer)
+}
+
+// kafkaStartupBudget started as the Temporal client's 60 s and ran out once on
+// the 2026-10-25 cold boot on two vCPUs, where Kafka took about two minutes to
+// accept connections. Three minutes outwaits that with a minute to spare. The
+// chart's TCP liveness probe is not at risk: the metrics port it checks opens
+// before this dial, and its own window is 60 s + 6 × 30 s.
+const (
+	kafkaStartupBudget = 3 * time.Minute
+	kafkaStartupWait   = 3 * time.Second
+)
+
+// connectKafkaProducer is the Temporal client's bounded startup retry, for the
+// same cold-boot race: when the VM boots, Docker restarts this container and Kafka
+// together, and this process can dial the broker before it listens. A single
+// attempt turned that refused connection into log.Fatalf and a container restart,
+// once per attempt until Kafka was up. Running out of budget still fails startup:
+// every activity is built on this producer.
+func connectKafkaProducer(brokers []string, config *sarama.Config, budget, wait time.Duration,
+	dial func([]string, *sarama.Config) (sarama.SyncProducer, error)) (sarama.SyncProducer, error) {
+	deadline := time.Now().Add(budget)
+	for attempt := 1; ; attempt++ {
+		producer, err := dial(brokers, config)
+		if err == nil {
+			return producer, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("kafka not reachable at %s after %d attempts over %s: %w",
+				strings.Join(brokers, ","), attempt, budget, err)
+		}
+		log.Warnf("⏳ Kafka not reachable yet at %s (attempt %d): %v — retrying in %s",
+			strings.Join(brokers, ","), attempt, err, wait)
+		time.Sleep(wait)
+	}
+}
+
+// registerWorkflowRunWorker puts WorkflowRunWorkflow and its steps on the workflow-runs
+// worker. A function of its own for the same reason as registerWorkflowsAndActivities.
+func registerWorkflowRunWorker(r worker.Registry) {
+	r.RegisterWorkflow(workflows.WorkflowRunWorkflow)
+	r.RegisterActivity(workflows.BeginWorkflowRunActivity)
+	r.RegisterActivity(workflows.EvaluateWorkflowRunActivity)
+	r.RegisterActivity(workflows.SendWorkflowRunActivity)
+	r.RegisterActivity(workflows.FinishWorkflowRunActivity)
+	r.RegisterActivity(workflows.GraphWorkflowRunActivity)
+	r.RegisterActivity(workflows.StepWorkflowRunActivity)
+	r.RegisterActivity(workflows.CompleteWorkflowRunActivity)
 }
 
 // registerWorkflowsAndActivities puts every workflow and activity on the worker.
@@ -484,6 +578,7 @@ func registerWorkflowsAndActivities(r worker.Registry) {
 	r.RegisterWorkflow(workflows.UpstreamFanOutWorkflow)       // One completion -> one child per downstream model
 	r.RegisterWorkflow(workflows.ModelRefreshDispatchWorkflow) // One child: deliver one completion to one model
 	r.RegisterWorkflow(workflows.ModelFreshnessWorkflow)       // Singleton durable timer: notices rebuilds that never came
+	r.RegisterWorkflow(workflows.CDCTrailingEdgeWorkflow)      // Singleton timer: fires what runs after a CDC pipeline, per window
 
 	// Register shared activities (used by all workflows)
 	r.RegisterActivity(workflows.EmitDomainEventActivity)
@@ -509,17 +604,19 @@ func registerWorkflowsAndActivities(r worker.Registry) {
 	r.RegisterActivity(workflows.ExecutorActivityV2)
 	r.RegisterActivity(workflows.CleanupPartialDataActivityV2)
 
-	// DAG + HITL activities
+	// DAG activities
 	r.RegisterActivity(workflows.ExecuteGraphNodeActivityV2)
-	r.RegisterActivity(workflows.InterpretNodeInputActivity)
 
 	// Register scheduled run activities
 	r.RegisterActivity(workflows.CheckActiveRunActivity)
+	r.RegisterActivity(workflows.CheckScheduledRunGatesActivity) // The Run button's checks, asked of the gateway
 	r.RegisterActivity(workflows.CreateScheduledExecutionActivity)
 	r.RegisterActivity(workflows.FetchPipelineRunContextActivity)
 	r.RegisterActivity(workflows.MarkExecutionFailedActivity)
 	r.RegisterActivity(workflows.RunModelActivity)
 	r.RegisterActivity(workflows.RecordModelRunFailureActivity) // Records a model run that never reported a result
+	r.RegisterActivity(workflows.ListDownstreamModelsActivity)  // The next hop: the models below a finished run
 	r.RegisterActivity(workflows.SignalModelRefreshActivity)
 	r.RegisterActivity(workflows.SweepModelFreshnessActivity)
+	r.RegisterActivity(workflows.SweepCDCTrailingEdgeActivity)
 }

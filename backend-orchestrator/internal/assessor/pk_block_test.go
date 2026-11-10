@@ -55,12 +55,15 @@ func TestInput_CDCDatabaseDestination(t *testing.T) {
 }
 
 // expectPG queues the two lookups oneTablePKCheck performs: does the table
-// exist, and does it have a PRIMARY KEY constraint.
+// exist, and does it have a PRIMARY KEY constraint. The key lookup must read
+// pg_catalog: information_schema.table_constraints hides every table the user
+// neither owns nor holds a non-SELECT privilege on, so a read-only source
+// user's keyed table read as keyless.
 func expectPG(mock sqlmock.Sqlmock, schema, table string, hasPK bool) {
 	mock.ExpectQuery("information_schema.tables").
 		WithArgs(schema, table).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectQuery("table_constraints").
+	mock.ExpectQuery(`FROM pg_catalog\.pg_constraint`).
 		WithArgs(schema, table).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(hasPK))
 }

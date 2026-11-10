@@ -31,7 +31,7 @@ import "strings"
 // "View pipeline" when the event carries an action_url.
 // Severity optionally overrides the severity inferred from the event.
 //
-// Title/Impact support {pipeline}, {source}, {table} and {column} placeholders,
+// Title/Impact support {pipeline}, {model}, {source}, {table} and {column} placeholders,
 // filled from the event; unfilled ones degrade to a neutral phrase rather than
 // rendering literal braces.
 type Entry struct {
@@ -55,18 +55,96 @@ const (
 // no StructuredError counterpart because nothing failed.
 const codeSchemaChangeApplied = "SCHEMA_CHANGE_APPLIED"
 
+// The codes a model's data checks raise (api-gateway saved_query_checks.go). Minted by
+// the gateway, so exported; they have no StructuredError counterpart either.
+const (
+	// CodeCheckBlocked: a blocking check failed or could not run, so the model's new
+	// table was not published.
+	CodeCheckBlocked = "CHECK_BLOCKED"
+	// CodeCheckWarned: a warning check failed or could not run; the new table is live.
+	CodeCheckWarned = "CHECK_WARNED"
+)
+
+// The codes the gateway raises about a stop, a wait or an unattended failure
+// (api-gateway handlers/run_notices.go). Exported for the same reason.
+const (
+	// CodePipelineRunStopped is the temporal adapter's code for a stopped batch
+	// run, raised here too when a Stop or Cancel reached no live workflow.
+	CodePipelineRunStopped = "PIPELINE_RUN_STOPPED"
+	// CodeCDCPipelineStopped: a streaming CDC pipeline was stopped by hand.
+	CodeCDCPipelineStopped = "CDC_PIPELINE_STOPPED"
+	// CodePipelineAwaitingInput: a scheduled run is waiting for someone to answer.
+	CodePipelineAwaitingInput = "PIPELINE_AWAITING_INPUT"
+	// CodeModelRunFailed: a scheduled or triggered model rebuild failed.
+	CodeModelRunFailed = "MODEL_RUN_FAILED"
+	// CodeModelSchedulePaused: a model's schedule paused itself.
+	CodeModelSchedulePaused = "MODEL_SCHEDULE_PAUSED"
+	// CodeWorkflowRunFailed: a scheduled or after-pipeline workflow run failed.
+	CodeWorkflowRunFailed = "WORKFLOW_RUN_FAILED"
+)
+
+// The "no longer detected" codes: a pushed health alert that has cleared. Only these
+// six alerts have one, because each can clear by itself (decision D2). The sentinel
+// (backend-orchestrator/internal/agents/sentinel/resolved_notice.go) and the
+// gateway's core-service watch raise them; resolved.go decides which are delivered.
+const (
+	CodeSourceStreamStalledResolved = "CDC_SOURCE_STREAM_STALLED_RESOLVED"
+	CodeCaptureStoppedResolved      = "CDC_CAPTURE_STOPPED_RESOLVED"
+	CodeConnectorDownResolved       = "CDC_CONNECTOR_DOWN_RESOLVED"
+	CodeSinkNotDrainingResolved     = "CDC_SINK_NOT_DRAINING_RESOLVED"
+	CodeWALPressureResolved         = "CDC_WAL_PRESSURE_RESOLVED"
+	CodeInfrastructureDownResolved  = "INFRASTRUCTURE_DOWN_RESOLVED"
+)
+
+// resolvedImpact is the one line every resolved notice carries. It says no more than
+// rsync.ai knows: the check is green, and whatever reacted to the alert may still need
+// a person.
+const resolvedImpact = "rsync.ai no longer sees this problem. If anything was stopped because of it, check the pipeline."
+
 // catalog maps a stable error code to its user-facing copy. Keys must match the
 // Code values in backend-orchestrator/pkg/diagnose/structured_error.go exactly.
 var catalog = map[string]Entry{
+	// ── Data checks on a model ──────────────────────────────────────────────
+	// The message names the check and what it saw; the link opens the run.
+	CodeCheckBlocked: {
+		Title:       "A data check held back {model}",
+		Impact:      "The table that was live before stays live, and the models below it were not rebuilt.",
+		ActionLabel: "View run",
+		Severity:    severityCritical,
+	},
+	CodeCheckWarned: {
+		Title:       "A data check warned on {model}",
+		Impact:      "The new table is live. Nothing below it was held back.",
+		ActionLabel: "View run",
+		Severity:    severityWarning,
+	},
+
 	// ── Schema drift ────────────────────────────────────────────────────────
 	// "Review change" is named verbatim in the drift notification BODY that the
 	// orchestrator writes (healer.schemaDriftNotificationText), because that link is
 	// the one route to /pipelines/{id}/schema-changes that always exists — there is no
 	// Schema Changes tab, and the amber drift badge renders only while something is
 	// pending. Renaming this label means updating that copy in the same change.
+	//
+	// Only a dropped source table waits for a person, and only that alert keeps
+	// SCHEMA_DRIFT_DETECTED (and with it the Slack Approve/Reject buttons). Every other
+	// change is applied or kept on its own and arrives as SCHEMA_DRIFT_HANDLED, or
+	// SCHEMA_DRIFT_APPLY_FAILED when the destination refused it.
 	"SCHEMA_DRIFT_DETECTED": {
 		Title:       "Approval needed: your source schema changed",
-		Impact:      "Your existing data keeps syncing. The change won't be applied until you approve it.",
+		Impact:      "A dropped source table waits for your decision. Nothing is dropped from the destination until you approve it.",
+		ActionLabel: "Review change",
+		Severity:    severityWarning,
+	},
+	"SCHEMA_DRIFT_HANDLED": {
+		Title:       "Your source schema changed",
+		Impact:      "No approval needed. rsync.ai handled the change and {pipeline} keeps syncing.",
+		ActionLabel: "Review change",
+		Severity:    severityInfo,
+	},
+	"SCHEMA_DRIFT_APPLY_FAILED": {
+		Title:       "A source schema change could not be applied",
+		Impact:      "The destination was left as it was. The reason is on the schema changes page.",
 		ActionLabel: "Review change",
 		Severity:    severityWarning,
 	},
@@ -277,6 +355,58 @@ var catalog = map[string]Entry{
 		ActionLabel: "View pipeline",
 		Severity:    severityCritical,
 	},
+	// The respawn rung's terminal verdict: the sink container holds no worker for the
+	// pipeline and restarting it did not bring one back.
+	"CDC_SINK_ABSENT": {
+		Title:       "Nothing is writing {pipeline}'s changes to the destination",
+		Impact:      "Changes are still being captured and held, so nothing is lost yet, but none reach the destination until the writer is started again.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	// The WAL watchdog's alert. No Severity on purpose: the watchdog raises it as a
+	// warning and again as critical when the retained WAL crosses the higher bound, and
+	// its structured error carries which.
+	"CDC_WAL_PRESSURE": {
+		Title:       "The change log kept for {pipeline} is growing on your source database",
+		Impact:      "PostgreSQL keeps every change this pipeline has not read yet on your source database's disk. Left to grow, it can fill that disk or be discarded by the database, and the changes it had not delivered would be lost.",
+		ActionLabel: "View pipeline",
+	},
+	// The WAL watchdog's alert for sources with no slot (sentinel/cdc_position_horizon.go):
+	// MySQL/MariaDB and SQL Server purge their change log on a clock, so a pipeline that
+	// is not running loses its place instead. No Severity, for the same reason as
+	// CDC_WAL_PRESSURE: raised as a warning, and again as critical close to the purge or
+	// once it has happened.
+	"CDC_POSITION_RETENTION": {
+		Title:       "{pipeline} may not be able to resume from where it stopped",
+		Impact:      "Your source database deletes its change log on a schedule, whether or not this pipeline has read it. Once the part it would resume from is gone, Start cannot resume, and the changes since are lost until the pipeline is reloaded.",
+		ActionLabel: "View pipeline",
+	},
+	// The sink-drain alarm once it has outlasted CDC_SINK_DRAIN_NOTIFY_AFTER (15 min by
+	// default): a backlog in the queue and no write committed for that long. Below the
+	// bound it is a warning on the pipeline page only.
+	"CDC_SINK_NOT_DRAINING": {
+		Title:       "Changes are not reaching the destination for {pipeline}",
+		Impact:      "Changes are still being captured and are held safely in the queue, so nothing is lost yet, but nothing is writing them and they will keep building up until the writer is running again.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	// The source-lag alarm once it has outlasted CDC_SOURCE_LAG_NOTIFY_AFTER (30 min by
+	// default) with the connector's committed position frozen. Below the bound, or while
+	// the position still moves, it is a warning on the pipeline page only.
+	"CDC_SOURCE_LAG_HIGH": {
+		Title:       "Real-time sync on {pipeline} is running behind",
+		Impact:      "New changes at the source are not being read, so they are not reaching the destination, and they keep building up on your source database until reading resumes.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	// Changes the writer consumed and set aside in its dead-letter queue instead of
+	// writing. Every lag reading is green for these: the writer moved past them.
+	"CDC_ROWS_PARKED": {
+		Title:       "Changes on {pipeline} were set aside instead of written",
+		Impact:      "These changes are not in the destination and will not arrive on their own: the pipeline has moved on past them. The pipeline's tables show which tables they belong to.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
 	"SINK_WORKER_ABSENT": {
 		Title:       "Nothing is writing this run's rows to the destination",
 		Impact:      "Rows are being read from the source and are queueing instead of landing. The run will go quiet rather than fail.",
@@ -319,13 +449,56 @@ var catalog = map[string]Entry{
 		Severity:    severityCritical,
 	},
 
+	// ── A pushed health alert has cleared (decision D2) ─────────────────────
+	// One per alert above that clears by itself. Each goes out only when its alert was
+	// pushed and stayed open for resolvedMinOpen (resolved.go), on the same channels and
+	// under the same mutes, so a blip is never announced twice.
+	CodeSourceStreamStalledResolved: {
+		Title:       "Real-time sync on {pipeline} is moving again",
+		Impact:      resolvedImpact,
+		ActionLabel: "View pipeline",
+		Severity:    severityInfo,
+	},
+	CodeCaptureStoppedResolved: {
+		Title:       "Change capture is running again on {pipeline}",
+		Impact:      resolvedImpact,
+		ActionLabel: "View pipeline",
+		Severity:    severityInfo,
+	},
+	CodeConnectorDownResolved: {
+		Title:       "Change capture has resumed on {pipeline}",
+		Impact:      resolvedImpact,
+		ActionLabel: "View pipeline",
+		Severity:    severityInfo,
+	},
+	CodeSinkNotDrainingResolved: {
+		Title:       "Changes are reaching the destination again for {pipeline}",
+		Impact:      resolvedImpact,
+		ActionLabel: "View pipeline",
+		Severity:    severityInfo,
+	},
+	CodeWALPressureResolved: {
+		Title:       "The change log kept for {pipeline} is back to a safe size",
+		Impact:      resolvedImpact,
+		ActionLabel: "View pipeline",
+		Severity:    severityInfo,
+	},
+	CodeInfrastructureDownResolved: {
+		Title:       "A core service is responding again",
+		Impact:      resolvedImpact,
+		ActionLabel: "View system health",
+		Severity:    severityInfo,
+	},
+
 	// ── Terminal run outcome ────────────────────────────────────────────────
 	// Raised by the temporal adapter's UpdatePipelineStatusActivity — the single
 	// authoritative terminal-write site, reached from a defer that fires on every
 	// workflow exit path. It is the only producer that sees a run END, as opposed
 	// to seeing one stage fail, so these two codes are what a team gets when a
 	// pipeline stops moving data. Do not add a completed/"all good" counterpart:
-	// a success alert on the same channel trains people to ignore these.
+	// a success alert on the same channel trains people to ignore these. The one
+	// exception is the six "no longer detected" notices above (decision D2): they
+	// answer an alert that was pushed and stayed open, never a run that went fine.
 	"PIPELINE_RUN_FAILED": {
 		Title: "{pipeline} stopped with an error",
 		// Deliberately does NOT promise the rest keeps running. This code is raised
@@ -342,6 +515,42 @@ var catalog = map[string]Entry{
 		Impact:      "Whatever hadn't synced yet is still waiting. Re-run when you're ready.",
 		ActionLabel: "Open pipeline",
 		Severity:    severityWarning,
+	},
+
+	// ── Stop, wait and unattended failure (api-gateway) ─────────────────────
+	// Raised by the gateway itself (handlers/run_notices.go): a stream stopped
+	// by hand, a scheduled run waiting for an answer, and a scheduled model or
+	// workflow that failed with nobody watching. The body is a fixed sentence,
+	// never the error: the link opens the page that has it.
+	CodeCDCPipelineStopped: {
+		Title:       "{pipeline} was stopped",
+		Impact:      "Changes made in the source are not delivered while it is stopped. Start it again to resume.",
+		ActionLabel: "Open pipeline",
+		Severity:    severityWarning,
+	},
+	CodePipelineAwaitingInput: {
+		Title:       "{pipeline} is waiting for your answer",
+		Impact:      "This scheduled run will not continue until someone answers its question.",
+		ActionLabel: "Open pipeline",
+		Severity:    severityWarning,
+	},
+	CodeModelRunFailed: {
+		Title:       "{model} failed to rebuild",
+		Impact:      "Its table was not rebuilt by this run. Open the model to see the error.",
+		ActionLabel: "View runs",
+		Severity:    severityCritical,
+	},
+	CodeModelSchedulePaused: {
+		Title:       "The schedule on {model} was paused",
+		Impact:      "It will not run again on its own until someone resumes the schedule.",
+		ActionLabel: "Open model",
+		Severity:    severityWarning,
+	},
+	CodeWorkflowRunFailed: {
+		Title:       "{workflow} failed",
+		Impact:      "Steps that depend on the failed one did not run. Open the workflow to see which step failed.",
+		ActionLabel: "Open workflow",
+		Severity:    severityCritical,
 	},
 
 	// ── Pre-migration assessment ────────────────────────────────────────────
@@ -396,6 +605,8 @@ var topicDefaults = map[string]Entry{
 // account". TestPlaceholderDefaultsReadAsEnglish guards this for every entry.
 var placeholderDefaults = map[string]string{
 	"pipeline": "your pipeline",
+	"model":    "your model",
+	"workflow": "your workflow",
 	"source":   "the source",
 	"table":    "the table",
 	"column":   "the new column",
@@ -417,6 +628,10 @@ type Rendered struct {
 	// pipeline has none). Carried here so Slack and email can label the alert
 	// with a name instead of a UUID.
 	PipelineName string
+	// ModelName is the same for an alert about a model (a data check).
+	ModelName string
+	// WorkflowName is the same for an alert about a workflow run.
+	WorkflowName string
 }
 
 // resolve turns a raw event into user-facing copy.
@@ -456,6 +671,8 @@ func resolve(code, eventType, topic, severity string, params map[string]string) 
 		ActionLabel:  label,
 		Severity:     severity,
 		PipelineName: strings.TrimSpace(params["pipeline"]),
+		ModelName:    strings.TrimSpace(params["model"]),
+		WorkflowName: strings.TrimSpace(params["workflow"]),
 	}
 }
 
@@ -479,7 +696,9 @@ func fallbackEntry(eventType, severity string) Entry {
 	case severityCritical:
 		impact = "Your data may not be syncing — open the pipeline to check."
 	case severityWarning:
-		impact = "Syncing continues for now. Review this when you can."
+		// Not "syncing continues": rsync.ai does not know this event, so it cannot
+		// vouch for the data (KI-ALERT-FALLBACK-COPY-OVERCLAIMS).
+		impact = "rsync.ai can't tell whether this affects syncing — open the pipeline to check."
 	}
 
 	return Entry{Title: title, Impact: impact, ActionLabel: defaultActionLabel}

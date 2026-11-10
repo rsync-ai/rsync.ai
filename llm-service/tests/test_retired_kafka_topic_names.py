@@ -5,12 +5,12 @@ the topics:
 
 - ``rsync.agent.planner.requests`` / ``.responses``: the planner's Kafka loop
   (the deleted planner/kafka_consumer.py). Every deployment ran it disabled.
-- ``rsync.conn.<name>`` and ``rsync.protected.conn.<name>``: kafka_message.py
+- ``rsync.conn.<name>`` and ``rsync.protected.conn.<name>``: the deleted kafka_message.py
   topic_name() and protected_topic_name(), called only by their own tests.
 - ``transformed.<pipeline>.<destination>``: kafka_message.py
   transformed_topic_name(), which had no caller at all.
 - ``cdc.<tenant>.<db>.<pipeline>``: the default topic_prefix that
-  CDCPipelineConfig.__post_init__ invented. The real CDC prefix is set by the
+  the deleted CDCPipelineConfig.__post_init__ invented. The real CDC prefix is set by the
   debezium connector.
 
 A builder whose topic nothing creates is how names drift from the topics that
@@ -146,32 +146,3 @@ def test_no_production_source_builds_a_retired_topic_name():
         for lineno, label, text in _offences(path.read_text(encoding="utf-8"), str(path)):
             offences.append(f"{path.relative_to(LLM_SERVICE)}:{lineno}: {label}: {text!r}")
     assert not offences, "retired Kafka topic names are being built again:\n" + "\n".join(offences)
-
-
-def test_a_cdc_pipeline_config_does_not_invent_a_topic_prefix():
-    from src.agents.planner.cdc_pipeline_model import (
-        CDCPipelineConfig,
-        DestinationConfig,
-        DestinationType,
-        SourceConfig,
-        SourceType,
-    )
-
-    config = CDCPipelineConfig(
-        pipeline_id="pipeline-001",
-        pipeline_name="p",
-        tenant_id="tenant-acme",
-        created_by="u",
-        source=SourceConfig(
-            source_type=SourceType.MYSQL,
-            connection_id="c",
-            host="h",
-            port=3306,
-            username="u",
-            password="x",
-            database="production_db",
-        ),
-        destination=DestinationConfig(destination_type=DestinationType.DATABASE, connection_id="d"),
-    )
-    assert config.topic_config.topic_prefix == ""
-    assert config.to_dict()["topic_config"]["topic_prefix"] == ""

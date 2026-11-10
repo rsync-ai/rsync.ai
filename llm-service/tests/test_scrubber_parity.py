@@ -17,7 +17,7 @@ import importlib.util
 import json
 import os
 
-from src.utils.masking import scrub_error_for_llm
+from src.utils.masking import scrub_error_for_llm, scrub_secrets_for_llm
 
 _BC_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "shared", "mcp-connectors", "base_connector.py"
@@ -141,3 +141,40 @@ def test_diagnostic_context_preserved():
     for fn in (scrub_error_for_llm, connector_scrub):
         out = fn(text)
         assert '"orders"' in out and "2026-07-17T10:00:00" in out
+
+
+# URLs. The 40-character blob rule read a long URL path as a token: a spec URL
+# in a generator error came back as `https://raw.githubusercontent.com/HubSpot/
+# HubSpot-public-api-spec-[redacted].json`, unusable to the person who pasted it.
+# And it missed what a URL does carry: credential-named query parameters
+# shorter than 40 characters and a password with an empty user name. URLs now
+# get their own rule. Its host and readable path stay, and token-shaped
+# segments and credential parameters go.
+# Bug class: a URL read as a secret, and a secret in a URL read as text.
+URL_READABLE = (
+    "https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/main/PublicApiSpecs/CRM/Contacts/Rollouts/424/v3/contacts.json",
+    "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
+    "https://api.example.com/v1/items?page=2&sort=name",
+)
+URL_CANARIES = (
+    ("redis connect failed: redis://:hunter2@cache:6379/0", "hunter2"),
+    ("GET https://maps.googleapis.com/maps/api/geocode/json?key=AIzaSyA1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvW&a=x", "AIzaSy"),
+    ("callback https://app.example.com/oauth/callback?code=4/0AY0e-g7abcDEF&state=xyz", "0AY0e-g7abcDEF"),
+    ("GET https://b.s3.amazonaws.com/o.csv?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1", "AKIAIOSFODNN7EXAMPLE"),
+    ("POST https://hooks.example.com/services/T0ABCDE12/B0ABCDE34/aB3dE5fG7hI9jK1lM3nO5pQ7 failed", "aB3dE5fG7hI9jK1lM3nO5pQ7"),
+    ("GET https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit", "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"),
+)
+
+
+def test_a_url_stays_readable_on_every_python_scrubber():
+    for url in URL_READABLE:
+        text = f"spec fetch failed: {url} returned 404"
+        for name, fn in (("masking", scrub_error_for_llm), ("connector", connector_scrub), ("egress", scrub_secrets_for_llm)):
+            assert fn(text) == text, f"{name} scrubber changed a readable URL: {fn(text)!r}"
+
+
+def test_a_secret_inside_a_url_never_survives_any_python_scrubber():
+    for text, canary in URL_CANARIES:
+        for name, fn in (("masking", scrub_error_for_llm), ("connector", connector_scrub), ("egress", scrub_secrets_for_llm)):
+            out = fn(text)
+            assert canary not in out, f"{name} leaked {canary!r} in {out!r}"

@@ -285,6 +285,24 @@ func countWorkspacePipelines(parent context.Context, database *sql.DB, workspace
 	return count, err
 }
 
+// monthlyQueriesUsed is the ONE NL→SQL query meter: this calendar month's count,
+// the number checkWorkspaceQueryOK compares against the plan's allowance. It
+// reads 0 when the stored counter is from a prior month the charge function has
+// not rolled yet.
+func monthlyQueriesUsed(parent context.Context, database *sql.DB, workspaceID string) (int64, error) {
+	if database == nil || workspaceID == "" {
+		return 0, fmt.Errorf("plan_quota: no database or workspace")
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	var used int64
+	err := database.QueryRowContext(ctx,
+		`SELECT CASE WHEN monthly_query_period = to_char(now(),'YYYY-MM')
+		             THEN monthly_query_count ELSE 0 END
+		   FROM workspaces WHERE id = $1`, workspaceID).Scan(&used)
+	return used, err
+}
+
 // planSummary is the body of GET /api/v1/usage/plan: the ACTIVE workspace's
 // plan, pipeline meter and expiry, resolved exactly as the create gate resolves
 // them. Field names match /auth/me so the plan banner can switch sources without
@@ -416,14 +434,9 @@ func checkWorkspaceQueryOK(parent context.Context, database *sql.DB, workspaceID
 	if database == nil {
 		return true, nil
 	}
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-	defer cancel()
 
-	var monthlyQueries int64
-	if err := database.QueryRowContext(ctx,
-		`SELECT CASE WHEN monthly_query_period = to_char(now(),'YYYY-MM')
-		             THEN monthly_query_count ELSE 0 END
-		   FROM workspaces WHERE id = $1`, workspaceID).Scan(&monthlyQueries); err != nil {
+	monthlyQueries, err := monthlyQueriesUsed(parent, database, workspaceID)
+	if err != nil {
 		log.WithError(err).Warnf("plan_quota: read monthly queries failed for workspace %s; allowing", workspaceID)
 		return true, nil // fail-open
 	}

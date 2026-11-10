@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"io"
 	"net"
 	"net/http"
-
-	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 	"sort"
 	"sync"
 	"time"
@@ -128,20 +127,17 @@ func (t *OffsetTracker) GetConsumerGroupOffsets(
 	return offsets, nil
 }
 
-// fetchConsumerGroupOffsets fetches offsets from Kafka
+// fetchConsumerGroupOffsets fetches offsets from Kafka. A failed read is an error:
+// offsets made up here would decide whether a consumer is caught up and its data can go.
 func (t *OffsetTracker) fetchConsumerGroupOffsets(
 	ctx context.Context,
 	consumerGroup, topic string,
 ) (*ConsumerGroupOffsets, error) {
-	// Try Kafka REST proxy first
 	offsets, err := t.fetchFromRestProxy(ctx, consumerGroup, topic)
-	if err == nil {
-		return offsets, nil
+	if err != nil {
+		return nil, fmt.Errorf("read the offsets of consumer group %s: %w", consumerGroup, err)
 	}
-
-	// Fallback: simulate offsets for testing
-	log.Printf("[OffsetTracker] REST proxy unavailable, simulating offsets for %s:%s", consumerGroup, topic)
-	return t.simulateOffsets(consumerGroup, topic), nil
+	return offsets, nil
 }
 
 // fetchFromRestProxy fetches offsets from Kafka REST proxy
@@ -203,28 +199,6 @@ func (t *OffsetTracker) fetchFromRestProxy(
 	return offsets, nil
 }
 
-// simulateOffsets creates simulated offsets for testing
-func (t *OffsetTracker) simulateOffsets(consumerGroup, topic string) *ConsumerGroupOffsets {
-	// Simulate 6 partitions with random offsets
-	offsets := &ConsumerGroupOffsets{
-		ConsumerGroup: consumerGroup,
-		Topic:         topic,
-		Offsets:       make([]PartitionOffset, 6),
-		LastCommit:    time.Now(),
-	}
-
-	for i := 0; i < 6; i++ {
-		offset := int64(1000000 + i*100000) // Simulated offset
-		offsets.Offsets[i] = PartitionOffset{
-			Partition: int32(i),
-			Offset:    offset,
-		}
-		offsets.TotalOffset += offset
-	}
-
-	return offsets
-}
-
 // GetTopicEndOffset gets the end offset for a topic
 func (t *OffsetTracker) GetTopicEndOffset(ctx context.Context, topic string) (int64, error) {
 	// Check cache
@@ -250,132 +224,84 @@ func (t *OffsetTracker) GetTopicEndOffset(ctx context.Context, topic string) (in
 	return endOffset, nil
 }
 
-// fetchTopicEndOffset fetches end offset from Kafka
+// fetchTopicEndOffset sums the end offsets of the topic's partitions. Every read must
+// succeed: a partition left out of the sum understates the topic, and a consumer
+// compared with it reads as caught up before it is.
 func (t *OffsetTracker) fetchTopicEndOffset(ctx context.Context, topic string) (int64, error) {
-	// Try Kafka REST proxy
-	url := fmt.Sprintf("http://localhost:8082/topics/%s/partitions", topic)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return 0, err
-	}
-
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		// Simulate for testing
-		return 10000000, nil // 10M messages
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 10000000, nil // Simulate
-	}
-
 	var partitions []struct {
 		Partition int32 `json:"partition"`
 		Leader    int   `json:"leader"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&partitions); err != nil {
-		return 10000000, nil
+	if err := t.getJSON(ctx, fmt.Sprintf("http://localhost:8082/topics/%s/partitions", topic), &partitions); err != nil {
+		return 0, fmt.Errorf("list the partitions of %s: %w", topic, err)
+	}
+	if len(partitions) == 0 {
+		return 0, fmt.Errorf("list the partitions of %s: the REST proxy returned none", topic)
 	}
 
-	// Sum end offsets from all partitions
 	var totalEndOffset int64
 	for _, p := range partitions {
-		offsetURL := fmt.Sprintf("http://localhost:8082/topics/%s/partitions/%d/offsets", topic, p.Partition)
-		offsetReq, _ := http.NewRequestWithContext(ctx, "GET", offsetURL, nil)
-		offsetResp, err := t.httpClient.Do(offsetReq)
-		if err != nil {
-			continue
-		}
-
 		var offsetResult struct {
 			EndOffset int64 `json:"end_offset"`
 		}
-		json.NewDecoder(offsetResp.Body).Decode(&offsetResult)
-		offsetResp.Body.Close()
-
+		url := fmt.Sprintf("http://localhost:8082/topics/%s/partitions/%d/offsets", topic, p.Partition)
+		if err := t.getJSON(ctx, url, &offsetResult); err != nil {
+			return 0, fmt.Errorf("read the end offset of %s partition %d: %w", topic, p.Partition, err)
+		}
 		totalEndOffset += offsetResult.EndOffset
 	}
-
-	if totalEndOffset == 0 {
-		return 10000000, nil // Simulate
-	}
-
 	return totalEndOffset, nil
 }
 
-// GetConsumerGroupsForTopic gets all consumer groups consuming a topic
+// GetConsumerGroupsForTopic returns the consumer groups with committed offsets on
+// topic, and none when no group consumes it. A group whose offsets cannot be read is
+// an error rather than a group left out: the caller asks whether every consumer is
+// caught up, and a consumer it never hears about cannot hold a cleanup back.
 func (t *OffsetTracker) GetConsumerGroupsForTopic(ctx context.Context, topic string) ([]string, error) {
-	// Try Kafka REST proxy
-	url := "http://localhost:8082/consumer-groups"
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return t.simulateConsumerGroups(topic), nil
-	}
-
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return t.simulateConsumerGroups(topic), nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return t.simulateConsumerGroups(topic), nil
-	}
-
 	var groups []string
-	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
-		return t.simulateConsumerGroups(topic), nil
+	if err := t.getJSON(ctx, "http://localhost:8082/consumer-groups", &groups); err != nil {
+		return nil, fmt.Errorf("list consumer groups: %w", err)
 	}
 
-	// Filter groups that consume this topic
 	var result []string
 	for _, group := range groups {
 		offsets, err := t.GetConsumerGroupOffsets(ctx, group, topic)
-		if err == nil && len(offsets.Offsets) > 0 {
+		if err != nil {
+			return nil, err
+		}
+		if len(offsets.Offsets) > 0 {
 			result = append(result, group)
 		}
 	}
-
-	if len(result) == 0 {
-		return t.simulateConsumerGroups(topic), nil
-	}
-
 	return result, nil
 }
 
-// simulateConsumerGroups is the fallback returned when the broker lookup yields
-// nothing. It is NOT test-only -- CheckAllConsumersCaughtUp and bulk_detection
-// both reach it in shipped code -- so the names have to be the ones a consumer
-// would actually join.
-//
-// The authority is groupIDForTopic in internal/agents/consumer/kafka_identity.go,
-// which mints kafkaclient.Group(ConsumerGroupPrefix + "-" + topic). Skipping the
-// qualification here would name `rsync-pipeline-<topic>` while the consumer joins
-// `rsync.rsync-pipeline-<topic>`, so a caller asking "is every consumer caught up
-// on this topic" would be answered about groups nobody has ever joined.
-//
-// It stays an approximation in one respect: this package cannot see the
-// operator's CONSUMER_GROUP_PREFIX, so it assumes the default. That is a
-// pre-existing limit of guessing group names at all -- see the Known issue --
-// but the namespace half is knowable here and is applied.
-func (t *OffsetTracker) simulateConsumerGroups(topic string) []string {
-	return []string{
-		kafkaclient.Group(fmt.Sprintf("rsync-pipeline-%s", topic)),
-		kafkaclient.Group(fmt.Sprintf("rsync-transform-%s", topic)),
+// getJSON GETs url from the Kafka REST proxy and decodes a 200 answer into out.
+func (t *OffsetTracker) getJSON(ctx context.Context, url string, out interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
 	}
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("REST proxy returned %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// CheckAllConsumersCaughtUp checks if all consumers are caught up to target offset
+// CheckAllConsumersCaughtUp checks if all consumers are caught up to target offset.
+// An error means the answer is unknown — the consumer list or a consumer's progress
+// could not be read — and the result is false; the map holds the progress that was read.
 func (t *OffsetTracker) CheckAllConsumersCaughtUp(
 	ctx context.Context,
 	topic string,
 	targetOffset int64,
 	expectedConsumers []string,
-) (bool, map[string]*ConsumerProgress) {
+) (bool, map[string]*ConsumerProgress, error) {
 	progressMap := make(map[string]*ConsumerProgress)
 
 	// Get all consumer groups if none expected
@@ -383,16 +309,20 @@ func (t *OffsetTracker) CheckAllConsumersCaughtUp(
 	if len(consumers) == 0 {
 		var err error
 		consumers, err = t.GetConsumerGroupsForTopic(ctx, topic)
-		if err != nil || len(consumers) == 0 {
-			return false, progressMap
+		if err != nil {
+			return false, progressMap, err
+		}
+		if len(consumers) == 0 {
+			return false, progressMap, nil
 		}
 	}
 
 	allCaughtUp := true
+	var errs []error
 	for _, consumer := range consumers {
 		progress, err := t.GetConsumerProgress(ctx, consumer, topic, targetOffset)
 		if err != nil {
-			log.Printf("[OffsetTracker] Error getting progress for %s: %v", consumer, err)
+			errs = append(errs, err)
 			allCaughtUp = false
 			continue
 		}
@@ -403,15 +333,16 @@ func (t *OffsetTracker) CheckAllConsumersCaughtUp(
 		}
 	}
 
-	return allCaughtUp, progressMap
+	return allCaughtUp, progressMap, errors.Join(errs...)
 }
 
-// GetBulkLoadProgress calculates overall progress for a bulk load
+// GetBulkLoadProgress calculates overall progress for a bulk load. An error means a
+// consumer's progress could not be read; the progress returned covers the ones that were.
 func (t *OffsetTracker) GetBulkLoadProgress(
 	ctx context.Context,
 	bulkLoad *BulkLoadInfo,
-) (float64, map[string]*ConsumerProgress) {
-	_, progressMap := t.CheckAllConsumersCaughtUp(
+) (float64, map[string]*ConsumerProgress, error) {
+	_, progressMap, err := t.CheckAllConsumersCaughtUp(
 		ctx,
 		bulkLoad.Topic,
 		bulkLoad.EndOffset,
@@ -419,7 +350,7 @@ func (t *OffsetTracker) GetBulkLoadProgress(
 	)
 
 	if len(progressMap) == 0 {
-		return 0, progressMap
+		return 0, progressMap, err
 	}
 
 	// Calculate average progress
@@ -428,7 +359,7 @@ func (t *OffsetTracker) GetBulkLoadProgress(
 		totalProgress += p.Progress
 	}
 
-	return totalProgress / float64(len(progressMap)), progressMap
+	return totalProgress / float64(len(progressMap)), progressMap, err
 }
 
 // Ensure imports are used

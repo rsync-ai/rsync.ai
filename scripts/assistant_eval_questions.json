@@ -1,0 +1,136 @@
+{
+  "_comment": "The 20 fixed Ask rsync.ai questions scripts/assistant_eval.py asks (docs/internal/assistant-token-design.md § 8.2). Each only reads, or drafts something the person then reviews; a call to any of write_tools fails the question (api-gateway internal/assistant/eval_questions_test.go keeps that list equal to the gateway's non-draft write tools, and every tool named here one Ask rsync.ai offers). role member runs on RSYNC_EVAL_TOKEN; role admin (the workflow and dashboard drafts, which need a workspace admin) runs on RSYNC_EVAL_ADMIN_TOKEN when it is set. must_call: each item must have a call that ended ok; an item that is a list is met by any one of its tools. draft: the tool whose call must end ok and name what it stored. {name} slots are filled from the workspace by read-only GETs; a question whose slot has nothing to fill is skipped. Change a question and the next report is no longer comparable with a baseline taken before the change.",
+  "write_tools": ["create_model", "create_silver_model", "run_model", "schedule_model", "pause_model_schedule", "resume_model_schedule", "generate_connector"],
+  "questions": [
+    {
+      "id": "q01", "topic": "workflows", "role": "admin",
+      "question": "Draft a workflow that runs every Monday at 09:00 UTC on {sql_connection}: one query that counts the rows of any one of its tables, and a message to {channel} with that count.",
+      "must_call": ["list_connections", "describe_schema", "plan_workflow"],
+      "must_not_call": ["generate_sql", "sample_rows"],
+      "draft": "plan_workflow"
+    },
+    {
+      "id": "q02", "topic": "workflows", "role": "admin",
+      "question": "Draft an alert workflow: each time the pipeline {pipeline} finishes, count the rows of one of the tables on {sql_connection}, and message {channel} only when the count is 0.",
+      "must_call": ["list_pipelines", "list_connections", "describe_schema", "plan_workflow"],
+      "must_not_call": ["generate_sql", "sample_rows"],
+      "draft": "plan_workflow"
+    },
+    {
+      "id": "q03", "topic": "workflows", "role": "admin",
+      "question": "Draft a workflow I run by hand: a query on {sql_connection} that lists up to 20 rows of one of its tables, sent to {channel} only when it returns rows.",
+      "must_call": ["list_connections", "describe_schema", "plan_workflow"],
+      "must_not_call": ["generate_sql", "sample_rows"],
+      "draft": "plan_workflow"
+    },
+    {
+      "id": "q04", "topic": "workflows", "role": "admin",
+      "question": "Propose a change to the workflow {workflow}: keep its conditions as they are, and add a last one that always sends to {channel}.",
+      "must_call": ["list_workflows", "plan_workflow_change"],
+      "must_not_call": ["plan_workflow"],
+      "draft": "plan_workflow_change"
+    },
+    {
+      "id": "q05", "topic": "dashboards", "role": "admin",
+      "question": "Draft a dashboard named Eval overview from data I can chart: a bar chart counting rows by one text column, and a scorecard of the row count.",
+      "must_call": ["list_chart_sources", "describe_chart_source", "plan_dashboard"],
+      "must_not_call": ["plan_dashboard_change"],
+      "draft": "plan_dashboard"
+    },
+    {
+      "id": "q06", "topic": "dashboards", "role": "admin",
+      "question": "Draft a dashboard with a line chart of row counts over a time column, a table of up to five columns from the same source, and a date range filter on that time column.",
+      "must_call": ["list_chart_sources", "describe_chart_source", "plan_dashboard"],
+      "must_not_call": ["plan_dashboard_change"],
+      "draft": "plan_dashboard"
+    },
+    {
+      "id": "q07", "topic": "dashboards", "role": "admin",
+      "question": "On the dashboard {dashboard_with_tiles}, propose renaming its first chart tile to Trend and making it 6 columns wide.",
+      "must_call": ["list_dashboards", "get_dashboard", "plan_dashboard_change"],
+      "must_not_call": ["plan_dashboard"],
+      "draft": "plan_dashboard_change"
+    },
+    {
+      "id": "q08", "topic": "dashboards", "role": "admin",
+      "question": "On the dashboard {dashboard_with_tiles}, propose changing its first chart tile's height to 4 rows, keeping its chart as it is.",
+      "must_call": ["list_dashboards", "get_dashboard", "plan_dashboard_change"],
+      "must_not_call": ["plan_dashboard"],
+      "draft": "plan_dashboard_change"
+    },
+    {
+      "id": "q09", "topic": "pipelines", "role": "member",
+      "question": "Why did the pipeline {failed_pipeline} fail?",
+      "must_call": ["list_pipelines", ["diagnose_run", "get_run_status", "get_pipeline_health"]],
+      "must_not_call": ["plan_pipeline"]
+    },
+    {
+      "id": "q10", "topic": "pipelines", "role": "member",
+      "question": "How has the pipeline {pipeline} been running lately? List its recent runs.",
+      "must_call": ["list_pipelines", "list_runs"],
+      "must_not_call": ["plan_pipeline"]
+    },
+    {
+      "id": "q11", "topic": "pipelines", "role": "member",
+      "question": "Propose a batch pipeline from {source_connection} to {destination_connection} that runs every day at 03:00 UTC. I will pick the tables when it first runs.",
+      "must_call": ["list_connections", "plan_pipeline"],
+      "must_not_call": [],
+      "draft": "plan_pipeline"
+    },
+    {
+      "id": "q12", "topic": "models", "role": "member",
+      "question": "What models do we have, and how did their last runs go?",
+      "must_call": ["list_models", ["list_model_runs", "get_model"]],
+      "must_not_call": ["plan_model_checks"]
+    },
+    {
+      "id": "q13", "topic": "models", "role": "member",
+      "question": "Pick any one of our models and tell me which data checks it has.",
+      "must_call": ["list_models", "list_model_checks"],
+      "must_not_call": ["plan_model_checks"]
+    },
+    {
+      "id": "q14", "topic": "models", "role": "member",
+      "question": "Draft data checks for one of our models: not_null and unique on its key column, and a row count of at least 1.",
+      "must_call": ["list_models", ["describe_schema", "get_model"], "plan_model_checks"],
+      "must_not_call": [],
+      "draft": "plan_model_checks"
+    },
+    {
+      "id": "q15", "topic": "connectors", "role": "member",
+      "question": "Which connectors can I use as a CDC source?",
+      "must_call": ["list_connectors"],
+      "must_not_call": []
+    },
+    {
+      "id": "q16", "topic": "connectors", "role": "member",
+      "question": "Which tables are on the connection {connection}?",
+      "must_call": ["list_connections", "describe_schema"],
+      "must_not_call": ["sample_rows"]
+    },
+    {
+      "id": "q17", "topic": "sql", "role": "member",
+      "question": "Write me a SQL query on {sql_connection} that counts the rows of each of two of its tables.",
+      "must_call": ["list_connections", "generate_sql"],
+      "must_not_call": ["sample_rows", "plan_workflow"]
+    },
+    {
+      "id": "q18", "topic": "sql", "role": "member",
+      "question": "Give me a query on {sql_connection} for the 10 newest rows of a table that has a timestamp column.",
+      "must_call": ["list_connections", "generate_sql"],
+      "must_not_call": ["sample_rows", "plan_workflow"]
+    },
+    {
+      "id": "q19", "topic": "general", "role": "member",
+      "question": "What failed last night?",
+      "must_call": [["list_runs", "list_pipelines"]],
+      "must_not_call": ["plan_pipeline"]
+    },
+    {
+      "id": "q20", "topic": "general", "role": "member",
+      "question": "Give me a short overview of this workspace: its connections, its pipelines and its workflows.",
+      "must_call": ["list_connections", "list_pipelines", "list_workflows"],
+      "must_not_call": ["plan_pipeline", "plan_workflow"]
+    }
+  ]
+}

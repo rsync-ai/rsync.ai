@@ -7,6 +7,55 @@ All notable changes to rsync.ai are documented in this file.
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
 
+## [Unreleased]
+
+Changes since the last release. They move under a version heading when that version
+is tagged.
+
+Everything since v0.1.8. The whole product now ships in this repository and is free to run
+for your own business under the same license, limited to one workspace per install. The AI
+connector generator is the one part that stays out.
+
+### 🏢 One workspace per install
+
+#### Changed
+- **A self-hosted install has one team workspace, and every user joins it.** The first
+  person to sign up owns it and is the install's admin. Nobody gets a personal workspace,
+  and creating another one is refused (`403 single_workspace_mode`). `RSYNC_SINGLE_WORKSPACE`
+  turns this on; the quickstart compose and the Helm chart set it to `true`.
+- **After the first user, sign-up is invite-only** until an admin picks a registration mode.
+  An invite sets the new user's role. If an admin opens sign-up, an uninvited user joins as
+  a viewer, which an admin can raise.
+- **Upgrading from v0.1.8 keeps every workspace you have.** When the first new user signs
+  up, the earliest admin's oldest team workspace becomes the install workspace; users who
+  belong to several keep the workspace switcher. The install workspace, and the user who
+  owns it, cannot be deleted.
+
+### ✨ Added
+- **Ask rsync.ai**, a docked chat that answers questions about your connections, schemas,
+  pipelines and runs, and drafts SQL for the Data Explorer. It uses your own Claude, ChatGPT
+  or Gemini key, and is told names and types, never row values.
+- **Dashboards and charts.** Chart a query, pin charts to a live dashboard, and download a
+  chart as PNG or SVG or a table as CSV.
+- **Workflows.** On a schedule, run batch pipelines and refresh models in an order you set,
+  or check a read-only query's result against a condition, and send a message to email or
+  Slack. Each run and step shows on the Runs page.
+- **Data checks on SQL models.** A failing check holds a table back on Postgres, Redshift,
+  MySQL, SQL Server and Oracle; on Snowflake, BigQuery and Databricks it warns.
+- **An MCP agent gateway** (`/api/agent/v1/mcp`). An AI client such as Claude Code or Cursor
+  works with rsync.ai through a workspace agent token you issue. The token's scopes decide
+  what it may do, and it sees the metadata its user sees, never a row value.
+
+### 🔒 LLM privacy
+
+#### Changed
+- **Ask rsync.ai and the agent gateway are on by default.** Set `RSYNC_ASSISTANT_ENABLED` or
+  `RSYNC_AGENT_GATEWAY_ENABLED` to `false` to turn either off. Without an LLM key, Ask says
+  so and nothing is sent anywhere.
+- **Sample rows never leave a self-hosted install.** The quickstart compose and the Helm
+  chart set `RSYNC_LLM_SAMPLE_ROWS_ALLOWED=false`, which api-gateway and llm-service both
+  enforce, and the setting is hidden in the UI. No row value reaches an LLM.
+
 ## [0.1.8] - 2026-10-02
 
 Everything since v0.1.7.

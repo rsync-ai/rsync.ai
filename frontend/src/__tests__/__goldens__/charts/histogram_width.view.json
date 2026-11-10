@@ -1,0 +1,54 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "histogram",
+    "description": "Count by rate",
+    "x": {
+      "field": "x",
+      "label": "rate",
+      "categories": [
+        "0.1–0.2",
+        "0.2–0.3",
+        "0.3–0.4"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "integer",
+      "title": "Count"
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Count",
+          "color": "series-1"
+        }
+      ]
+    },
+    "bins": {
+      "lo": [
+        0.1,
+        0.2,
+        0.30000000000000004
+      ],
+      "width": 0.1
+    }
+  },
+  "rows": [
+    {
+      "x": "0.1–0.2",
+      "v": 7
+    },
+    {
+      "x": "0.2–0.3",
+      "v": 19
+    },
+    {
+      "x": "0.3–0.4",
+      "v": 11
+    }
+  ],
+  "series": [],
+  "notes": []
+}

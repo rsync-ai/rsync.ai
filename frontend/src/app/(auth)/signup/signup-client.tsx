@@ -11,8 +11,10 @@ import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Mail, Loader2 } from "lucide-react"
 import { toast } from "sonner"
-import type { InviteValidation } from "@/lib/api/admin"
+import { validateInvite, type InviteValidation } from "@/lib/api/admin"
 import { safeNextPath, POST_VERIFY_NEXT_KEY } from "@/lib/auth/safe-next"
+import { claimSignedInState } from "@/lib/auth/signed-in-state"
+import { setActiveWorkspaceId } from "@/lib/workspace/active-workspace"
 import { API_GATEWAY_URL } from "@/lib/config/api"
 
 // Self-correcting base URL (see @/lib/config/api): a mis-baked localhost value
@@ -70,6 +72,10 @@ export default function SignupClient() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const inviteToken = searchParams.get("invite") || ""
+  // A team invite from the /invite/[token] landing page. The gateway claims it
+  // inside sign-up, and on a single-workspace install it is also what passes
+  // invite-only registration.
+  const workspaceInviteToken = searchParams.get("workspace_invite") || ""
   // A safe return path (e.g. set by the /invite/[token] landing page) so a new
   // user is sent back to finish what they came for. Same guard login uses:
   // only honor app-relative paths, never an absolute/external URL.
@@ -99,9 +105,8 @@ export default function SignupClient() {
   useEffect(() => {
     if (!inviteToken) return
     setInviteChecking(true)
-    fetch(`${API_URL}/api/v1/auth/invite/${inviteToken}`)
-      .then((res) => res.json())
-      .then((data: InviteValidation) => {
+    validateInvite(inviteToken)
+      .then((data) => {
         setInviteData(data)
         setInviteValid(data.valid)
         if (data.valid && data.email_hint) {
@@ -131,9 +136,11 @@ export default function SignupClient() {
     setLoading(true)
 
     try {
-      const url = inviteToken
-        ? `${API_URL}/api/v1/auth/register?invite=${encodeURIComponent(inviteToken)}`
-        : `${API_URL}/api/v1/auth/register`
+      const query = new URLSearchParams()
+      if (inviteToken) query.set("invite", inviteToken)
+      if (workspaceInviteToken) query.set("workspace_invite", workspaceInviteToken)
+      const qs = query.toString()
+      const url = `${API_URL}/api/v1/auth/register${qs ? `?${qs}` : ""}`
 
       const response = await fetch(url, {
         method: "POST",
@@ -161,11 +168,20 @@ export default function SignupClient() {
         throw new Error(data.message || data.error || "Registration failed")
       }
 
+      // Signed in from here on, verified or not: another person's /chat is not shown.
+      claimSignedInState(String(data?.user_id ?? ""))
+
+      // The workspace sign-up joined: the install workspace on a single-workspace
+      // install, or the team invite's. Open it first. When that was the invite
+      // `next` points back to, the invite is used now, so land home instead.
+      const joinedWorkspaceId = typeof data.joined_workspace_id === "string" ? data.joined_workspace_id : ""
+      if (joinedWorkspaceId) setActiveWorkspaceId(joinedWorkspaceId)
+      const safeNext = workspaceInviteToken && joinedWorkspaceId ? "/" : safeNextPath(next)
+
       if (data.email_verified === false) {
         // Email verification required — show the "check your inbox" screen. Stash a
         // safe return path so the verify-email page can send the user back here
         // (e.g. to an invite) instead of stranding them at the dashboard.
-        const safeNext = safeNextPath(next)
         if (safeNext !== "/") {
           try {
             sessionStorage.setItem(POST_VERIFY_NEXT_KEY, safeNext)
@@ -178,7 +194,7 @@ export default function SignupClient() {
         toast.success("Account created! Please verify your email to continue.")
       } else {
         toast.success("Account created successfully!")
-        router.push(safeNextPath(next))
+        router.push(safeNext)
       }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Registration failed")
@@ -339,9 +355,9 @@ export default function SignupClient() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Employee Range</Label>
+                  <Label htmlFor="employeeRange">Employee Range</Label>
                   <Select value={employeeRange} onValueChange={setEmployeeRange}>
-                    <SelectTrigger>
+                    <SelectTrigger id="employeeRange">
                       <SelectValue placeholder="Select" />
                     </SelectTrigger>
                     <SelectContent>
@@ -370,9 +386,9 @@ export default function SignupClient() {
               {/* Country + Phone */}
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-2">
-                  <Label>Country</Label>
+                  <Label htmlFor="country">Country</Label>
                   <Select value={country} onValueChange={setCountry}>
-                    <SelectTrigger>
+                    <SelectTrigger id="country">
                       <SelectValue placeholder="Select" />
                     </SelectTrigger>
                     <SelectContent>
@@ -435,7 +451,7 @@ export default function SignupClient() {
                   href="https://rsync.ai/terms"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-violet-600 hover:underline"
+                  className="text-violet-700 underline underline-offset-2 dark:text-violet-400"
                 >
                   Terms of Service
                 </a>{" "}
@@ -444,7 +460,7 @@ export default function SignupClient() {
                   href="https://rsync.ai/privacy"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-violet-600 hover:underline"
+                  className="text-violet-700 underline underline-offset-2 dark:text-violet-400"
                 >
                   Privacy Policy
                 </a>

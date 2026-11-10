@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { cleanup, render, screen, within } from "@testing-library/react"
-import ScheduledQueriesPage from "@/app/(dashboard)/explorer/schedules/page"
+import ScheduledQueriesPage from "@/app/(dashboard)/models/page"
 import { authFetch } from "@/lib/api/auth-fetch"
 
 // Seen in a browser on 2026-09-15: orders_daily, an after_upstream schedule the gateway
@@ -12,10 +12,14 @@ import { authFetch } from "@/lib/api/auth-fetch"
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/explorer/schedules",
+  usePathname: () => "/models",
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({ role: "admin", can: () => true }),
 }))
@@ -114,7 +118,7 @@ describe("schedules page: Next run for a paused after_upstream schedule", () => 
     await renderPage([paused, ACTIVE_AFTER_UPSTREAM])
 
     // The row really is on screen as paused, so the cell below is the paused one's.
-    expect(within(rowFor(paused.name)).getByText("paused")).toBeInTheDocument()
+    expect(within(rowFor(paused.name)).getByText("Paused")).toBeInTheDocument()
     expect(nextRunCell(paused.name)).not.toHaveTextContent(UPSTREAM_CLAIM)
     expect(nextRunCell(paused.name)).toHaveTextContent(/^—$/)
   })

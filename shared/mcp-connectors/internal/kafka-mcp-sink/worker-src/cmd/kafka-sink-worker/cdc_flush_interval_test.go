@@ -31,9 +31,10 @@ import (
 // CONFIG (plain json.Unmarshal), so numbers arrive as float64 exactly as they do in
 // production.
 type flushIntervalFixture struct {
-	MinSeconds int64 `json:"min_seconds"`
-	MaxSeconds int64 `json:"max_seconds"`
-	Cases      []struct {
+	MinSeconds     int64 `json:"min_seconds"`
+	MaxSeconds     int64 `json:"max_seconds"`
+	DefaultSeconds int64 `json:"default_seconds"`
+	Cases          []struct {
 		Name   string      `json:"name"`
 		Value  interface{} `json:"value"`
 		Expect interface{} `json:"expect"`
@@ -58,6 +59,13 @@ func TestObjectFlushIntervalOverride_SharedCasesWithConnector(t *testing.T) {
 	if fx.MinSeconds != minObjectFlushIntervalSeconds || fx.MaxSeconds != maxObjectFlushIntervalSeconds {
 		t.Fatalf("shared cases are for %d-%d s but the worker allows %d-%d s; update the fixture, main.go and connector.py together",
 			fx.MinSeconds, fx.MaxSeconds, minObjectFlushIntervalSeconds, maxObjectFlushIntervalSeconds)
+	}
+	// Both sides name the default in their refusal ("Clear the setting to use the N-second
+	// default"), so the connector's number must be the worker's: it was left saying 30
+	// when the worker's default moved to 240.
+	if want := time.Duration(fx.DefaultSeconds) * time.Second; want != defaultObjectFlushInterval {
+		t.Fatalf("shared cases say the default is %d s but the worker's is %v; update the fixture, main.go and connector.py together",
+			fx.DefaultSeconds, defaultObjectFlushInterval)
 	}
 	kinds := map[string]int{}
 	for _, tc := range fx.Cases {
@@ -207,7 +215,7 @@ func TestObjectFlushIntervalOverride_RefusesBadValuesWithAClearError(t *testing.
 				t.Fatalf("a refused value must not also return an interval: (%v, %v)", d, ok)
 			}
 			msg := err.Error()
-			for _, want := range []string{"max_file_interval_seconds", "whole number of seconds from 1 to 240", "30-second default"} {
+			for _, want := range []string{"max_file_interval_seconds", "whole number of seconds from 1 to 240", "240-second default"} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("error %q does not say %q", msg, want)
 				}
@@ -242,7 +250,7 @@ func objectBatcherFor(t *testing.T, destCfg map[string]interface{}, batching *CD
 		cfg.KafkaSinkWorker = &KafkaSinkWorkerConfig{CDCBatching: batching}
 	}
 	hw := newHighWaterTracker()
-	b := newCDCObjectBatcher(cfg, "gcs", &kafka.Reader{}, hw, nil, &http.Client{Transport: rt},
+	b := newCDCObjectBatcher(cfg, "gcs", newCommitGate(nil, hw), nil, &http.Client{Transport: rt},
 		&kafka.Writer{}, nil, &Metrics{}, 0, &sync.Map{}, &sync.Map{}, &sync.Map{}, &sync.Map{})
 	if b == nil {
 		t.Fatal("newCDCObjectBatcher returned nil for a gcs destination")
@@ -257,16 +265,16 @@ func TestNewCDCObjectBatcher_FlushIntervalComesFromDestinationConfig(t *testing.
 		batching *CDCBatchingConfig
 		want     time.Duration
 	}{
-		{"unset keeps the 30s default", map[string]interface{}{"bucket": "b"}, nil, 30 * time.Second},
+		{"unset keeps the 240s default", map[string]interface{}{"bucket": "b"}, nil, 240 * time.Second},
 		{"json number", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": float64(120)}, nil, 120 * time.Second},
 		{"string", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": "45"}, nil, 45 * time.Second},
-		{"orchestrator null keeps the default", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": "<nil>"}, nil, 30 * time.Second},
+		{"orchestrator null keeps the default", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": "<nil>"}, nil, 240 * time.Second},
 		{"destination setting wins over cdc_batching", map[string]interface{}{"max_file_interval_seconds": "120"}, &CDCBatchingConfig{FlushIntervalSeconds: 10}, 120 * time.Second},
 		{"cdc_batching still applies when the destination is silent", map[string]interface{}{}, &CDCBatchingConfig{FlushIntervalSeconds: 10}, 10 * time.Second},
 		{"file-roll caps do not disturb the interval", map[string]interface{}{"max_file_rows": float64(50), "max_file_interval_seconds": float64(200)}, nil, 200 * time.Second},
 		// loadConfig refuses these first; a batcher built without that check must still
 		// run on the interval it would have had, not on some other value.
-		{"invalid value keeps the 30s default", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": "abc"}, nil, 30 * time.Second},
+		{"invalid value keeps the 240s default", map[string]interface{}{"bucket": "b", "max_file_interval_seconds": "abc"}, nil, 240 * time.Second},
 		{"invalid value keeps the cdc_batching interval", map[string]interface{}{"max_file_interval_seconds": float64(0)}, &CDCBatchingConfig{FlushIntervalSeconds: 10}, 10 * time.Second},
 	}
 	for _, tc := range cases {
@@ -449,7 +457,7 @@ func TestStallWindowCoveringFlush(t *testing.T) {
 		want          time.Duration
 		mustOutlastIt bool
 	}{
-		{"default interval keeps the default 60s window", 60 * time.Second, 30 * time.Second, 60 * time.Second, true},
+		{"a 30s interval keeps the default 60s window", 60 * time.Second, 30 * time.Second, 60 * time.Second, true},
 		{"longer interval widens the window", 60 * time.Second, 120 * time.Second, 150 * time.Second, true},
 		{"longest interval", 60 * time.Second, 240 * time.Second, 270 * time.Second, true},
 		{"operator's short window is widened", 30 * time.Second, 30 * time.Second, 60 * time.Second, true},
@@ -498,7 +506,7 @@ func TestConsumerStallWindow(t *testing.T) {
 	}{
 		{"not an object-storage CDC worker: the operator's window as is", "", nil, 0, 60 * time.Second},
 		{"not an object-storage CDC worker: a set window as is", "45", nil, 0, 45 * time.Second},
-		{"30s default interval: the 60s default window", "", bDefault, 30 * time.Second, 60 * time.Second},
+		{"240s default interval widens the default window to 270s", "", bDefault, 240 * time.Second, 270 * time.Second},
 		{"120s interval widens the default window to 150s", "", b120, 120 * time.Second, 150 * time.Second},
 		{"longest interval widens it to 270s", "", bMax, 240 * time.Second, 270 * time.Second},
 		{"120s interval widens a short set window", "45", b120, 120 * time.Second, 150 * time.Second},
@@ -508,7 +516,7 @@ func TestConsumerStallWindow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("RSYNC_SINK_STALL_WATCHDOG_SECONDS", tc.env)
-			got := consumerStallWindow(tc.batcher)
+			got := consumerStallWindow(tc.batcher, nil)
 			if got != tc.want {
 				t.Fatalf("consumerStallWindow = %v, want %v", got, tc.want)
 			}

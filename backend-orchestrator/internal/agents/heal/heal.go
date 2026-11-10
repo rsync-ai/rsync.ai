@@ -3,7 +3,8 @@
 // Healer takes a Diagnosis (from Phase 3) and decides:
 //
 //	confidence >= AutoBand  → auto-execute the action
-//	confidence >= HITLBand  → ask the operator first
+//	confidence >= HITLBand  → run it only if it asks the user; otherwise
+//	                          hand the suggestion to a human
 //	confidence <  HITLBand  → escalate to a human
 //
 // The action set is closed and small — every concrete action is
@@ -20,7 +21,6 @@ package heal
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
@@ -50,15 +50,18 @@ const (
 	OutcomeNoActionDefined Outcome = "no_action_defined"
 )
 
-// HealResult is what the Healer returns. ActionExecuted == true only
-// in the auto-executed and the post-HITL-approval paths.
+// HealResult is what the Healer returns. ActionExecuted == true when an
+// executor ran: auto-executed, or a HITL-safe executor that asked the user.
 type HealResult struct {
 	Outcome        Outcome
 	Action         diagnose.Action
 	ActionExecuted bool
-	HITLPrompt     string // populated when Outcome == OutcomeHITLRequested
-	Rationale      string // copied from diagnosis for downstream display
-	Error          error  // populated when Outcome == OutcomeActionFailed
+	// HITLPrompt is the line the self-healing panel shows: what the executor
+	// asked the user (hitl_requested), or the action held back for a person
+	// (escalated from the middle band).
+	HITLPrompt string
+	Rationale  string // copied from diagnosis for downstream display
+	Error      error  // populated when Outcome == OutcomeActionFailed
 }
 
 // Executor performs one action. Implementations call out to the real
@@ -141,19 +144,24 @@ func (h *Healer) Heal(ctx context.Context, sig diagnose.Signal, dx diagnose.Diag
 		// transitions the pipeline to `waiting_for_user` with a structured
 		// blocking_reason — that IS the HITL prompt the UI surfaces.
 		//
-		// BackoffRetry is the one non-HITLSafe executor, and it DOES reach
+		// BackoffRetry and ReSnapshot are not HITLSafe, and they DO reach
 		// this branch: the orchestration rules (workflow-gone 0.8,
-		// swept-zombie 0.75 — pkg/diagnose/diagnose.go) sit in the band on
-		// purpose, because starting a pipeline run is a real side effect that
-		// nothing has authorised the healer to perform unattended. The result
-		// is a recorded recommendation the operator can act on, surfaced by
-		// the self-healing panel — not a silent no-op. Do not "fix" this by
-		// raising those confidences without deciding that autonomous runs are
-		// wanted.
+		// swept-zombie 0.75) and the lost-stream-position rules
+		// (pkg/diagnose/diagnose.go) sit in the band on purpose, because
+		// starting a run or re-reading a source is a real side effect that
+		// nothing has authorised the healer to perform unattended. Do not
+		// "fix" this by raising those confidences without deciding that
+		// autonomous runs are wanted.
+		//
+		// Nothing approves a held-back action later: no endpoint or worker
+		// calls back into the Healer once the decision is written. So it is
+		// an escalation carrying the suggestion, which the self-healing panel
+		// shows, never a hitl_requested that waits on an approval nobody can
+		// give.
 		if !exec.HITLSafe() {
-			res.Outcome = OutcomeHITLRequested
+			res.Outcome = OutcomeEscalated
 			res.HITLPrompt = fmt.Sprintf(
-				"Suggested: %s — %s (confidence %.0f%%). Approve?",
+				"Suggested: %s — %s (confidence %.0f%%). The healer does not do this on its own.",
 				dx.SuggestedAction, dx.Rationale, dx.Confidence*100,
 			)
 			return res
@@ -174,33 +182,5 @@ func (h *Healer) Heal(ctx context.Context, sig diagnose.Signal, dx diagnose.Diag
 		// Low confidence — surface to a human without taking action.
 		res.Outcome = OutcomeEscalated
 		return res
-	}
-}
-
-// ApproveHITL runs the action that a Heal call previously deferred via
-// OutcomeHITLRequested. Returns the post-action outcome.
-func (h *Healer) ApproveHITL(ctx context.Context, sig diagnose.Signal, dx diagnose.Diagnosis) HealResult {
-	exec, ok := h.executors[dx.SuggestedAction]
-	if !ok {
-		return HealResult{
-			Outcome:   OutcomeNoActionDefined,
-			Action:    dx.SuggestedAction,
-			Rationale: dx.Rationale,
-			Error:     errors.New("no executor registered for action"),
-		}
-	}
-	if err := exec.Run(ctx, sig); err != nil {
-		return HealResult{
-			Outcome:   OutcomeActionFailed,
-			Action:    dx.SuggestedAction,
-			Rationale: dx.Rationale,
-			Error:     err,
-		}
-	}
-	return HealResult{
-		Outcome:        OutcomeAutoExecuted,
-		Action:         dx.SuggestedAction,
-		ActionExecuted: true,
-		Rationale:      dx.Rationale,
 	}
 }

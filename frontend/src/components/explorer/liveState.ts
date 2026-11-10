@@ -109,7 +109,7 @@ export type LiveCell =
 export const AFTER_UPSTREAM = "after_upstream"
 
 export const ORCHESTRATION_UNAVAILABLE_REASON =
-  "Orchestration is not available to the server, so no refresh loop was asked."
+  "The server can't reach the engine that runs models, so it can't say what this one is doing."
 
 /**
  * Reads a /explorer/running body, or returns null for one this page cannot trust.
@@ -186,19 +186,21 @@ export function liveCellFor(
 
   switch (work.state) {
     case "idle":
-      return { kind: "idle", reason: work.message || "No refresh loop is open for this model." }
+      // The gateway words this by the model's upstream policy. This fallback cannot know
+      // the policy, so it says only what is true of both.
+      return { kind: "idle", reason: work.message || "Not rebuilding now. Its trigger starts the next rebuild." }
     case "running":
       if (!work.detail_available || !work.detail) {
         return {
           kind: "running_no_detail",
-          reason: work.message || "The refresh loop is running but did not say what it is doing.",
+          reason: work.message || "It is running but did not say what it is doing.",
         }
       }
       if (work.detail.phase === "rebuilding") return { kind: "rebuilding", detail: work.detail }
       if (work.detail.phase === "waiting") return { kind: "waiting", detail: work.detail }
       return {
         kind: "running_no_detail",
-        reason: `The refresh loop reported a phase this page does not recognise: "${work.detail.phase}".`,
+        reason: `It reported a step this page does not recognise: "${work.detail.phase}".`,
       }
     case "unreachable":
       // The server's message is the raw query error ("context deadline exceeded"), which
@@ -206,8 +208,8 @@ export function liveCellFor(
       return {
         kind: "unreachable",
         reason: work.message
-          ? `The refresh loop could not be asked what it is doing (${work.message}).`
-          : "The refresh loop could not be asked what it is doing.",
+          ? `The server could not ask it what it is doing (${work.message}).`
+          : "The server could not ask it what it is doing.",
       }
     case "unknown":
       return { kind: "unknown", reason: work.message || ORCHESTRATION_UNAVAILABLE_REASON }
@@ -245,11 +247,60 @@ export function formatSpan(seconds: number): string {
   return formatSpanCoarse(seconds)
 }
 
-/** Why nothing rebuilt the model, in words (saved_query_freshness.go classifyFreshnessCause). */
-export function describeFreshnessCause(cause: string): string {
+/** What the freshness wording knows of the model's schedule, when the caller has it. */
+export interface FreshnessSchedule {
+  scheduleType?: string
+  upstreams?: ScheduleUpstream[]
+  /** after_upstream only: "any" or "all" (ScheduledQuery.upstream_policy). */
+  upstreamPolicy?: string
+}
+
+/**
+ * Whether the model rebuilds only once every upstream has run. With one upstream the
+ * policy changes nothing, the rule describeUpstreamNextRun and the gateway's idle reason
+ * (saved_query_explorer_running.go WaitsForAll) both follow.
+ */
+export function waitsForAll(policy: string | undefined, upstreams: ScheduleUpstream[] | undefined): boolean {
+  return policy === "all" && (upstreams?.length ?? 0) > 1
+}
+
+/**
+ * "Orders", "Orders or Loans", "Orders, Loans or Cards", "Orders, Loans or 2 more", with
+ * "and" in place of "or" for a model that waits for all of them.
+ */
+function upstreamList(upstreams: ScheduleUpstream[], conjunction: "or" | "and" = "or"): string {
+  const names = upstreams.map((u) => u.name?.trim() || `a ${u.kind || "source"}`)
+  if (names.length <= 1) return names.join("")
+  if (names.length > 3) return `${names.slice(0, 2).join(", ")} ${conjunction} ${names.length - 2} more`
+  return `${names.slice(0, -1).join(", ")} ${conjunction} ${names[names.length - 1]}`
+}
+
+/**
+ * Why nothing rebuilt the model, in words (saved_query_freshness.go classifyFreshnessCause).
+ * "overdue" is any schedule that is on, clock or after-upstream; with the schedule the
+ * words point where to look, since an after-upstream model rebuilds only when its
+ * upstreams finish: any one of them, or on policy "all" every one.
+ */
+export function describeFreshnessCause(cause: string, schedule?: FreshnessSchedule): string {
   switch (cause) {
-    case "overdue":
-      return "its schedule is active but has not rebuilt it"
+    case "overdue": {
+      if (schedule?.scheduleType === AFTER_UPSTREAM) {
+        const ups = schedule.upstreams ?? []
+        // A fan-in on "all" is not rebuilt by any one upstream, so naming them with "or"
+        // sends the reader to check one when every one of them has to have run.
+        if (schedule.upstreamPolicy === "all" && ups.length === 0) {
+          return "it rebuilds once all its upstreams have run, and no rebuild has succeeded in time"
+        }
+        if (waitsForAll(schedule.upstreamPolicy, ups)) {
+          const both = ups.length === 2 ? "both" : "all"
+          return `it rebuilds once ${upstreamList(ups, "and")} have ${both} run, and no rebuild has succeeded in time: check when they last ran`
+        }
+        if (ups.length === 0) return "it rebuilds when one of its upstreams finishes, and no rebuild has succeeded in time"
+        const list = upstreamList(ups)
+        return `it rebuilds when ${list} finishes, and no rebuild has succeeded in time: check when ${ups.length === 1 ? list : "they"} last ran`
+      }
+      return "its schedule is on, but no scheduled rebuild has succeeded in time"
+    }
     case "no_schedule":
       return "nothing is scheduled to rebuild it"
     case "schedule_paused":

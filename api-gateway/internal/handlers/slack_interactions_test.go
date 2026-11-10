@@ -279,6 +279,7 @@ func TestSlackInteractions_HappyReject(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE schema_change_approvals")).
 		WithArgs(slackTestEmail, slackTestChange, slackTestPipeline).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectDecidedRow(mock, slackTestChange, slackTestPipeline, "add_column", "orders", "ALTER TABLE orders ADD COLUMN x int")
 
 	w := serve(h, signedSlackRequest(slackTestSecret, slack.ActionRejectSchemaChange, slackTestPipeline, "U123", slackTestNow))
 

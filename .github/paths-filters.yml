@@ -62,9 +62,6 @@ go:
   # fixture; a PR changing only the object-storage key contract must
   # run it (same for the sink and llm filters below).
   - 'shared/object_layout_golden.json'
-  # api-gateway validators/statement_class_golden_test.go reads this; the
-  # frontend filter below lists it too (the vitest copy reads it).
-  - 'shared/explorer_statement_class_golden.json'
   # Duplicate-logic goldens, each pinned from both languages:
   # security/masking_golden_test.go (gateway + orchestrator),
   # executor/postgres_family_golden_test.go and
@@ -82,16 +79,68 @@ go:
   # handlers/chat_insight_chip_prompts_golden_test.go and the frontend's
   # PipelineInsightsBar.chipPrompts.test.tsx pin the chat chips' prompts.
   - 'shared/chat_insight_chip_prompts_golden.json'
-  # handlers/, cdc/ and assessor/ local_db_host_golden_test.go pin the Go
-  # local-vs-remote DB host checks to it; the Python copies are pinned by
+  # cdc/ and assessor/ local_db_host_golden_test.go pin the orchestrator's
+  # local-vs-remote DB host checks to it (sqlexec's copy: go-shared below);
+  # the Python copies are pinned by
   # shared/mcp-connectors/tests/test_local_db_host_golden.py (llm filter).
   - 'shared/local_db_host_golden.json'
+  # The adapter's node_kind_runtime_test.go and the orchestrator's
+  # executor/node_execution_guard_test.go pin which workflow_graph node
+  # kinds run to it, and the gateway's handlers/chat_not_done_test.go the
+  # chat card that names each kind it cannot; the planner side is
+  # test_dag_planner_runnable_kinds.py (llm filter).
+  - 'shared/workflow_node_kinds_golden.json'
+  # pkg/llmscrub/scrub_golden_parity_test.go pins the error scrubber every
+  # LLM-bound string passes to it; test_scrubber_parity.py pins the
+  # Python twin (llm filter).
+  - 'shared/scrubber_golden.json'
+  # api-gateway's assistant/toolcap_test.go reads the cap on the tools
+  # one assistant step may carry; lowering it touches no Go file.
+  - 'llm-service/src/gateway/assistant_routes.py'
+  # assistant/usage_test.go decodes each Ask rsync.ai step's usage and
+  # chars keys from it; llm-service's test_assistant_step_usage_golden.py
+  # pins the route to the same file (llm filter).
+  - 'shared/assistant_step_usage_golden.json'
+  # charts/registry_test.go pins the chart types and their roles to this
+  # file, and chart-registry.test.ts pins the frontend's to it the same way
+  # (frontend filter); settings_v1_test.go and migration 147's test pin the
+  # version 1 to 2 rewrite to the second.
+  - 'shared/chart_types_golden.json'
+  - 'shared/chart_settings_v1_v2.json'
+  # handlers/workflow_chart_step_test.go pins the notes a chart cut at its
+  # type's caps writes to this file; saved-chart.test.ts pins the browser's
+  # to it the same way (frontend filter).
+  - 'shared/chart_notes_golden.json'
+  # assistant/eval_questions_test.go checks every tool the eval's
+  # questions name, and its write_tools list, against the gateway's tools.
+  - 'scripts/assistant_eval_questions.json'
+  # ...and the accuracy eval's write_tools list (TestAccuracyEvalWriteTools...).
+  - 'scripts/assistant_accuracy_questions.json'
+  # assistant/one_home_test.go reads the assistant's core rules from it: a
+  # rule pasted there that a guide or a tool already says touches no Go file.
+  - 'llm-service/prompts/assistant/step.yaml'
+  # api-gateway's agentgw/docs_test.go regenerates this page's tool
+  # reference and fails if the committed copy differs; a hand edit to
+  # the page touches no Go file.
+  - 'docs/api/agent-gateway.md'
+  # The `go` job's deadcode step runs this script against this allowlist.
+  # Adding a line to the allowlist touches no Go file, and a stale line is
+  # one of the two things the step fails on.
+  - 'scripts/check-deadcode.sh'
+  - 'scripts/deadcode-allowlist.txt'
   - '.github/workflows/ci.yml'
   # Self-protection: see the header.
   - '.github/paths-filters.yml'
 go-shared:
   - 'shared/go/**'
   - '.github/workflows/ci.yml'
+  # sqlexec's stmt/statement_class_golden_test.go pins the statement
+  # classifier to this; the frontend filter below lists it too (the vitest
+  # copy reads it).
+  - 'shared/explorer_statement_class_golden.json'
+  # sqlexec's hostguard_golden_test.go pins its local-vs-remote DB host
+  # check to this (the orchestrator's copies: the go filter above).
+  - 'shared/local_db_host_golden.json'
 # kafka-mcp-sink worker is its own Go module (NOT under shared/go,
 # so neither the `go` nor `go-shared` module list covers it). Add it
 # to the Go job on the worker module itself AND on shared/go/transforms
@@ -111,6 +160,10 @@ sink:
   - 'shared/mcp-connectors/public/storage/*/versions/*/metadata.json'
   # object_layout_test.go pins the sink's key builders to this fixture.
   - 'shared/object_layout_golden.json'
+  # unconstrained_numeric_golden_test.go pins the CDC column type of an
+  # unconstrained PostgreSQL NUMERIC to it (the llm filter's
+  # test_unconstrained_numeric_golden.py pins the batch side).
+  - 'shared/unconstrained_numeric_golden.json'
   - '.github/workflows/ci.yml'
   # Self-protection: see the header.
   - '.github/paths-filters.yml'
@@ -128,6 +181,26 @@ llm:
   - 'shared/pii_scan_contract_golden.json'
   # test_local_db_host_golden.py pins every Python DB host check to it.
   - 'shared/local_db_host_golden.json'
+  # test_unconstrained_numeric_golden.py pins canonical_to_ddl to it.
+  - 'shared/unconstrained_numeric_golden.json'
+  # test_dag_planner_runnable_kinds.py pins the DAG planner's node kinds,
+  # prompt and validator to it (the adapter and executor read it too).
+  - 'shared/workflow_node_kinds_golden.json'
+  # test_scrubber_parity.py pins scrub_error_for_llm, which the egress
+  # guard runs on every LLM-bound string, to it (Go reads it too).
+  - 'shared/scrubber_golden.json'
+  # test_assistant_step_usage_golden.py pins the assistant step route's
+  # usage and chars keys to it (the gateway's usage_test.go reads it too).
+  - 'shared/assistant_step_usage_golden.json'
+  # test_assistant_eval.py runs the Ask rsync.ai eval against a stub.
+  - 'scripts/assistant_eval.py'
+  - 'scripts/assistant_eval_questions.json'
+  # test_assistant_accuracy_eval.py runs the accuracy eval against a stub.
+  - 'scripts/assistant_accuracy_eval.py'
+  - 'scripts/assistant_accuracy_questions.json'
+  # test_assistant_step_route.py sends each topic guide through the egress
+  # guard and checks the scrubber leaves it as api-gateway wrote it.
+  - 'api-gateway/internal/agentgw/guides/**'
   # The Helm chart is here because llm-service/tests holds the chart
   # guards (test_chart_service_hostnames_resolve.py,
   # test_chart_kafka_security_env.py) -- they parse deploy/helm as
@@ -289,6 +362,15 @@ llm:
   - 'scripts/preflight-prod-config.sh'
   - 'docs/internal/public-flip-runbook.md'
   - 'scripts/flip/**'
+  # The last three non-markdown subjects the census found uncovered
+  # (2026-10-01, KI-CI-FILTER-EXCLUDES-GUARDS-OWN-SUBJECTS).
+  # test_llm_placeholder_keys.py reads the env templates an operator copies;
+  # test_public_generate_route.py reads the frontend's DISCOVERY_PROBE_PATH,
+  # which decides whether a self-hoster gets the OpenAPI upload screen. A PR
+  # touching only one of these files skipped the guard that checks it.
+  - '.env.example'
+  - '.env.staging.example'
+  - 'frontend/src/lib/api/discovery.ts'
   # NO `docs/**` and NO `*.md` here, on purpose. They were here so that guards
   # whose subject is markdown (test_doc_links_into_the_moat_are_delinked.py,
   # test_no_doc_promises_a_silent_gateway_db_failure.py, and three enrolled in
@@ -381,6 +463,20 @@ llm:
   # the single edit that re-opens the hole this guard exists to
   # close -- would have skipped llm-service-unit and reported green.
   - 'shared/go/kafkaclient/**'
+  # llm-service-unit's dead-code step runs this script against this
+  # allowlist. Adding a line to the allowlist touches no llm-service
+  # file, and a stale line is one of the two things the step fails on.
+  # (The two root scripts it reads outside llm-service are matched above.)
+  - 'scripts/check-deadcode-python.py'
+  - 'scripts/deadcode-python-allowlist.txt'
+  # test_shipped_images_carry_the_notices.py checks that each published
+  # image's Dockerfile copies THIRD_PARTY_NOTICES.md and that every compose
+  # file and script that builds one passes the `legal` context. These three
+  # of its subjects were under no pattern here; its own
+  # test_the_ci_filter_covers_every_file_this_guard_reads keeps the rest.
+  - 'frontend/Dockerfile'
+  - 'connector-deployer/Dockerfile'
+  - 'scripts/oss-deploy-smoke.sh'
   # Self-protection: see the header.
   - '.github/paths-filters.yml'
   - '.github/workflows/ci.yml'
@@ -510,8 +606,47 @@ frontend:
   # PipelineInsightsBar.chipPrompts.test.tsx pins the chat chips' prompts
   # to the api-gateway's diagnose routing the same way.
   - 'shared/chat_insight_chip_prompts_golden.json'
+  # chart-registry.test.ts and the chart golden test read the chart types
+  # and the version 2 settings the gateway's tests pin (go filter).
+  - 'shared/chart_types_golden.json'
+  - 'shared/chart_settings_v1_v2.json'
+  # saved-chart.test.ts reads the notes a chart cut at its type's caps
+  # writes, which the gateway's workflow chart step test pins (go filter).
+  - 'shared/chart_notes_golden.json'
   - 'shared/mcp-connectors/**/latest.json'
   - 'shared/mcp-connectors/**/versions/*/metadata.json'
+  # The frontend job's dead-code step runs this script against this
+  # allowlist (its knip.json is under frontend/**). Adding a line to the
+  # allowlist touches no frontend file, and a stale line is one of the
+  # two things the step fails on.
+  - 'scripts/check-deadcode-ts.mjs'
+  # The frontend job measures its build's chart chunks with this script
+  # (dashboards-design.md § 14.6); a budget change touches no frontend file.
+  - 'scripts/check-chart-bundle-size.mjs'
+  - 'scripts/deadcode-ts-allowlist.txt'
+  # Files outside frontend/ that a frontend test reads to pin the UI to them
+  # (src/__tests__/ci-filter-covers-cross-tree-reads.test.ts lists each reader
+  # and fails when one is missing here).
+  - 'api-gateway/internal/charts/settings.go'
+  - 'api-gateway/internal/handlers/activity.go'
+  - 'api-gateway/internal/handlers/activity_metrics.go'
+  - 'api-gateway/internal/handlers/saved_query_checks.go'
+  - 'api-gateway/internal/services/pipeline_policy.go'
+  - 'backend-orchestrator/internal/agents/heal/attempts.go'
+  - 'backend-orchestrator/internal/agents/heal/auto_executors.go'
+  - 'backend-orchestrator/internal/agents/heal/executors.go'
+  - 'backend-orchestrator/internal/agents/heal/verifier.go'
+  - 'backend-orchestrator/internal/agents/heal/worker.go'
+  - 'backend-orchestrator/pkg/diagnose/diagnose.go'
+  - 'backend-temporal-adapter/internal/workflows/activities.go'
+  - 'backend-temporal-adapter/internal/workflows/dag_scheduler.go'
+  - 'backend-temporal-adapter/internal/workflows/execution_plan_builder.go'
+  - 'backend-temporal-adapter/internal/workflows/nl_pipeline_v2_workflow.go'
+  - 'docs/api/agent-gateway.md'
+  - 'shared/chart_bin_labels_golden.json'
+  - 'shared/chart_number_format_golden.json'
+  - 'shared/mcp-connectors/public/namespace_filter_vectors.json'
+  - 'shared/object_layout_golden.json'
 # Everything the Kafka security matrix (kafka-security-matrix job) builds,
 # mounts or renders: the three client libraries under test, the pins its
 # Python image copies, the kafka-connect image and the compose env it is

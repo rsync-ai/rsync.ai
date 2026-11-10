@@ -32,11 +32,12 @@ import (
 // connection names (demoSourceName / demoDestinationName).
 const demoChatPrompt = "Sync sample-data to postgresql; source connection: Sample data (demo); destination connection: Demo warehouse"
 
-// fakeCatalog stands in for connector_catalog behind db.DB. It answers the one
-// query isKnownConnector sends, by name, and records every name it was asked
-// about. The order and number of those lookups are incidental (the plain reading
-// of a message runs before the "sample data" fold), so unlike sqlmock it does
-// not pin them. Any other SQL is an error the test reports: on a query error
+// fakeCatalog stands in for connector_catalog behind db.DB. It answers the
+// query isKnownConnector sends, by name, and the list of names
+// listKnownConnectors reads, and records every name it was asked about. The
+// order and number of those lookups are incidental (the plain reading of a
+// message runs before the "sample data" fold), so unlike sqlmock it does not
+// pin them. Any other SQL is an error the test reports: on a query error
 // isKnownConnector answers from its hard-coded common set, not the catalog, so a
 // stray query would let a test pass without the catalog deciding anything.
 type fakeCatalog struct {
@@ -111,6 +112,18 @@ func (c fakeCatalogConn) QueryContext(_ context.Context, query string, args []dr
 		fc.asked["<connections>"] = true
 		return &fakeConnectionRows{rows: fc.connections}, nil
 	}
+	if catalogNamesQueryRe.MatchString(query) && len(args) == 0 {
+		// listKnownConnectors: every active name, for "did you mean?".
+		fc.asked["<names>"] = true
+		if fc.broken {
+			return nil, errors.New("fake catalog: connection reset")
+		}
+		names := make([]string, 0, len(fc.active))
+		for n := range fc.active {
+			names = append(names, n)
+		}
+		return &fakeNameRows{names: names}, nil
+	}
 	if fc.otherErrs && !catalogCountQueryRe.MatchString(query) {
 		return nil, errors.New("fake catalog: not modelled")
 	}
@@ -134,6 +147,24 @@ func (c fakeCatalogConn) QueryContext(_ context.Context, query string, args []dr
 		count = 1
 	}
 	return &fakeCountRows{count: count}, nil
+}
+
+var catalogNamesQueryRe = regexp.MustCompile(`SELECT name FROM connector_catalog WHERE status = 'active'`)
+
+type fakeNameRows struct {
+	names []string
+	i     int
+}
+
+func (*fakeNameRows) Columns() []string { return []string{"name"} }
+func (*fakeNameRows) Close() error      { return nil }
+func (r *fakeNameRows) Next(dest []driver.Value) error {
+	if r.i >= len(r.names) {
+		return io.EOF
+	}
+	dest[0] = r.names[r.i]
+	r.i++
+	return nil
 }
 
 var namedConnectionsQueryRe = regexp.MustCompile(`FROM connections\s+WHERE workspace_id = \$1 AND status = 'active'`)

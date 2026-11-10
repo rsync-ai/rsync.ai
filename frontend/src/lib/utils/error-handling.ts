@@ -7,6 +7,8 @@
  * - Avoid leaking secrets (do not stringify configs)
  */
 
+import { isNetworkFailure } from "@/lib/errors/network"
+
 // ─── Structured UI error ────────────────────────────────────────────────────
 // Use AppError anywhere you need to render a structured error in the UI
 // (title as heading, message in mono, hint as actionable 💡 tip).
@@ -47,14 +49,22 @@ type ErrorContext =
 export function classifyError(err: unknown, context: ErrorContext = "general"): AppError {
   const parsed = parseApiError(err)
   const status = parsed.statusCode
-  const raw = parsed.message || "An unexpected error occurred"
+  const raw = withErrorDetails(parsed.message || "An unexpected error occurred", parsed.details)
+
+  // Callers show `hint ?? message`, so a hint guessed from the status alone
+  // replaces whatever the server said. The guesses below for a 403, 400/422 and
+  // 409 apply only when the server gave no reason of its own
+  // (KI-TOAST-HINT-HIDES-SERVER-REASON: a refused Stop read "Check that all
+  // required fields are filled in correctly"). A 401's and a 503's hints stay:
+  // those statuses mean the same thing whatever the body says.
+  const reasonGiven = _serverGaveAReason(parsed)
 
   // ── Auth ────────────────────────────────────────────────────────────────
   if (status === 401 || status === 403) {
     return {
       title: "Authentication error",
       message: raw,
-      hint: "Your session may have expired. Refresh the page to sign in again.",
+      hint: status === 401 || !reasonGiven ? "Your session may have expired. Refresh the page to sign in again." : undefined,
     }
   }
 
@@ -70,9 +80,10 @@ export function classifyError(err: unknown, context: ErrorContext = "general"): 
   // ── Validation / bad request ─────────────────────────────────────────────
   if (status === 422 || status === 400) {
     return {
-      title: "Invalid request",
+      // A refused action is named for the action: there is no form behind Stop.
+      title: context === "general" ? "Invalid request" : _titleForContext(context),
       message: raw,
-      hint: parsed.suggestion || "Check that all required fields are filled in correctly.",
+      hint: parsed.suggestion || (reasonGiven ? undefined : "Check that all required fields are filled in correctly."),
     }
   }
 
@@ -81,7 +92,7 @@ export function classifyError(err: unknown, context: ErrorContext = "general"): 
     return {
       title: "Conflict",
       message: raw,
-      hint: "This resource is still in use by other components. Remove those dependencies first.",
+      hint: parsed.suggestion || (reasonGiven ? undefined : "This resource is still in use by other components. Remove those dependencies first."),
     }
   }
 
@@ -91,7 +102,10 @@ export function classifyError(err: unknown, context: ErrorContext = "general"): 
   }
 
   // ── Network / ECONNREFUSED ───────────────────────────────────────────────
-  if (parsed.code === "NETWORK_ERROR" || raw.toLowerCase().includes("failed to fetch") || raw.toLowerCase().includes("networkerror")) {
+  // The label alone: a server's `details` can quote "failed to fetch …" from
+  // its own upstream call, and that is not the browser losing the network.
+  const label = (parsed.message || "").toLowerCase()
+  if (parsed.code === "NETWORK_ERROR" || label.includes("failed to fetch") || label.includes("networkerror")) {
     return {
       title: "Connection failed",
       message: "Could not reach the server.",
@@ -105,12 +119,52 @@ export function classifyError(err: unknown, context: ErrorContext = "general"): 
   return { title, message: raw, hint }
 }
 
-/** Build an AppError with an explicit title override (e.g. for validation messages). */
-export function makeAppError(title: string, message: string, hint?: string): AppError {
-  return { title, message, hint }
+// One reason longer than this is an upstream's raw body (Slack's, a dev
+// build's err.Error()), not a sentence; a toast shows its start.
+const MAX_REASON_CHARS = 300
+
+/**
+ * Append the reason the server gave in `details` to the label in `error`.
+ *
+ * Gateway handlers answer `{error: "<fixed label>", details: "<reason>"}` (a
+ * list for the transform save): "Invalid request" plus the field that failed
+ * binding, "Schema discovery failed" plus the connector's DNS error. A reader
+ * that keeps only `error` leaves the user nothing to fix. A reason the label
+ * already says, or one repeated, is shown once.
+ */
+export function withErrorDetails(label: string, details: unknown): string {
+  const base = (label || "").trim()
+  const seen = new Set<string>()
+  const reasons = (Array.isArray(details) ? details : [details])
+    .filter((d): d is string => typeof d === "string" && d.trim() !== "")
+    .map((d) => {
+      const reason = d.trim()
+      return reason.length > MAX_REASON_CHARS ? `${reason.slice(0, MAX_REASON_CHARS)}…` : reason
+    })
+    .filter((reason) => {
+      const key = reason.toLowerCase()
+      if (seen.has(key) || base.toLowerCase().includes(key)) return false
+      seen.add(key)
+      return true
+    })
+  if (reasons.length === 0) return base
+  if (!base) return reasons.join("; ")
+  return `${base}${/[.!?]$/.test(base) ? " " : ": "}${reasons.join("; ")}`
 }
 
 // ── Private helpers ──────────────────────────────────────────────────────────
+
+// A message that is only a status line — "Bad Request", "HTTP 400",
+// "Save failed: Conflict (HTTP 409)" (readResponseErrorMessage's last resort) —
+// names no reason, so a guessed hint is the only help there is.
+const STATUS_LINE_ONLY =
+  /^(?:[\w .-]*\bfailed:?\s*)?(?:HTTP\s*\d{3}|bad request|unprocessable (?:entity|content)|forbidden|conflict|unauthorized)?\s*(?:\(HTTP \d{3}\))?$/i
+
+function _serverGaveAReason(parsed: ParsedApiError): boolean {
+  if (parsed.details) return true
+  const msg = (parsed.message || "").trim()
+  return msg !== "" && msg !== "An unexpected error occurred" && !STATUS_LINE_ONLY.test(msg)
+}
 
 function _titleForContext(ctx: ErrorContext): string {
   const map: Record<ErrorContext, string> = {
@@ -159,6 +213,11 @@ function _hintForContext(ctx: ErrorContext, raw: string): string | undefined {
   return undefined
 }
 
+// Cloud and self-hosted run this same app, and most readers are on Cloud, where
+// nobody runs Docker: a hint leads with what any user can do, and the server
+// step is one sentence for whoever hosts rsync.ai.
+const SELF_HOSTED = "If you host rsync.ai yourself, check that its services are running."
+
 function _serviceHint(ctx: ErrorContext): string {
   if (ctx === "connector.generate" || ctx === "connector.validate") {
     return "The connector generation service may be temporarily unavailable. Try again in a moment."
@@ -166,12 +225,12 @@ function _serviceHint(ctx: ErrorContext): string {
   if (ctx.startsWith("pipeline.")) {
     return "The pipeline runner service may be temporarily unavailable. Try again shortly."
   }
-  return "A backend service is temporarily unavailable. Check that Docker and the API Gateway are running."
+  return `A backend service is temporarily unavailable. Try again in a moment. ${SELF_HOSTED}`
 }
 
 function _networkHint(ctx: ErrorContext): string {
   if (ctx.startsWith("connections.") || ctx.startsWith("connectors.") || ctx.startsWith("pipeline.")) {
-    return "Make sure Docker Desktop is running and the API Gateway is up: `docker compose up -d`"
+    return `Check your network connection and try again. ${SELF_HOSTED}`
   }
   return "Check your network connection and try again."
 }
@@ -242,7 +301,7 @@ export async function readResponseErrorMessage(res: Response, action?: string): 
     const json = safeJsonParse(trimmed)
     if (json && typeof json === "object") {
       const rec = json as Record<string, unknown>
-      const msg = String(rec["message"] || rec["error"] || rec["detail"] || "").trim()
+      const msg = withErrorDetails(String(rec["message"] || rec["error"] || rec["detail"] || ""), rec["details"])
       if (msg) return msg
       // Structured, but with nothing human-readable in it. Fall through to the
       // status line rather than dumping a JSON blob into a toast.
@@ -287,15 +346,12 @@ export function parseApiError(err: unknown): ParsedApiError {
   }
 
   // Network errors
-  if (err instanceof TypeError) {
-    const msg = err.message || ""
-    if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
-      return {
-        message: "Unable to connect to the server",
-        code: "NETWORK_ERROR",
-        suggestion: "Please check your connection and try again.",
-        raw: err,
-      }
+  if (isNetworkFailure(err)) {
+    return {
+      message: "Unable to connect to the server",
+      code: "NETWORK_ERROR",
+      suggestion: "Please check your connection and try again.",
+      raw: err,
     }
   }
 
@@ -334,7 +390,7 @@ export function parseApiError(err: unknown): ParsedApiError {
  */
 export function extractErrorMessage(err: unknown): string {
   const parsed = parseApiError(err)
-  return parsed.message || "Unknown error"
+  return withErrorDetails(parsed.message || "Unknown error", parsed.details)
 }
 
 // -----------------------------
@@ -387,7 +443,7 @@ function normalizeErrorObject(obj: Record<string, unknown>): Omit<ParsedApiError
     "An unexpected error occurred"
 
   const code = asString(obj.code) || asString(obj.error_code) || (errorIsCode ? error : undefined)
-  const details = asString(obj.details) || asString(obj.hint)
+  const details = detailsText(obj.details) || asString(obj.hint)
   const field = asString(obj.field)
   const suggestion = asString(obj.suggestion)
   const cause = asString(obj.test_error)
@@ -404,6 +460,13 @@ function normalizeFastApiDetail(detail: unknown): string | undefined {
   const loc = Array.isArray(first["loc"]) ? (first["loc"] as unknown[]).join(".") : undefined
   if (msg && loc) return `${loc}: ${msg}`
   return msg
+}
+
+// `details` is one string from most handlers and a list from the transform save.
+function detailsText(v: unknown): string | undefined {
+  if (!Array.isArray(v)) return asString(v)
+  const parts = v.map(asString).filter((p): p is string => !!p)
+  return parts.length ? parts.join("; ") : undefined
 }
 
 function asString(v: unknown): string | undefined {
@@ -442,5 +505,3 @@ function asApiRequestError(err: unknown): ParsedApiError | null {
     raw: apiErr,
   }
 }
-
-

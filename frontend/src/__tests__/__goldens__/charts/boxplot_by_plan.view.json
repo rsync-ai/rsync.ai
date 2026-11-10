@@ -1,0 +1,48 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "boxplot",
+    "description": "Order value by plan: the least, the quartiles and the greatest",
+    "x": {
+      "label": "plan",
+      "categories": [
+        "free",
+        "pro",
+        "team"
+      ]
+    },
+    "y": {
+      "label": "Order value",
+      "format": "integer"
+    },
+    "color": "series-1"
+  },
+  "rows": [
+    {
+      "x": "free",
+      "min": 10,
+      "q1": 25,
+      "median": 40,
+      "q3": 60,
+      "max": 150
+    },
+    {
+      "x": "pro",
+      "min": 60,
+      "q1": 90,
+      "median": 120,
+      "q3": 180,
+      "max": 300
+    },
+    {
+      "x": "team",
+      "min": 200,
+      "q1": 240,
+      "median": 260,
+      "q3": 320,
+      "max": 500
+    }
+  ],
+  "series": [],
+  "notes": []
+}

@@ -26,8 +26,8 @@ const CHANGE_LABELS: Record<string, string> = {
 }
 
 const CHANGE_COLORS: Record<string, string> = {
-  drop_column: "text-red-600 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
-  drop_table: "text-red-600 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
+  drop_column: "text-red-700 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
+  drop_table: "text-red-700 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
   modify_column: "text-amber-600 bg-amber-50 border-amber-200 dark:text-amber-400 dark:bg-amber-950/30 dark:border-amber-900",
   add_column: "text-emerald-600 bg-emerald-50 border-emerald-200 dark:text-emerald-400 dark:bg-emerald-950/30 dark:border-emerald-900",
   create_table: "text-emerald-600 bg-emerald-50 border-emerald-200 dark:text-emerald-400 dark:bg-emerald-950/30 dark:border-emerald-900",
@@ -38,6 +38,7 @@ const STATUS_COLORS: Record<string, string> = {
   applied: "text-emerald-700 bg-emerald-50 dark:text-emerald-400 dark:bg-emerald-950/30",
   rejected: "text-zinc-600 bg-zinc-100 dark:text-zinc-400 dark:bg-zinc-800",
   failed: "text-red-700 bg-red-50 dark:text-red-400 dark:bg-red-950/30",
+  withdrawn: "text-zinc-600 bg-zinc-100 dark:text-zinc-400 dark:bg-zinc-800",
 }
 
 /** Risks arrive as a JSON-array-as-string (e.g. `["data loss"]`); render it readable. */
@@ -69,15 +70,39 @@ function isAdvisory(c: SchemaChange): boolean {
   return (c.ddl ?? "").trimStart().startsWith("--")
 }
 
+/**
+ * A dropped source table — the one change that waits for a person. Either decision
+ * takes the table out of the pipeline; approve also drops the destination table.
+ * Mirrors isDropTableChange in api-gateway schema_evolution.go and the healer.
+ */
+function isDropTable(c: SchemaChange): boolean {
+  if (c.change_type.trim().toLowerCase() === "drop_table") return true
+  return (c.ddl ?? "").trim().toLowerCase().startsWith("drop table")
+}
+
+/** Rows the healer or the CDC sink decided on its own carry a `system:` reviewer. */
+/** What a decided dropped-table row means, per status (healer.go dropApprovedTable). */
+const DROP_TABLE_OUTCOME: Record<SchemaChange["status"], string> = {
+  pending: "",
+  rejected: "Removed from the pipeline. The destination table and its data were kept.",
+  approved: "Removed from the pipeline. Dropping the destination table now.",
+  applied: "Removed from the pipeline. The destination table was dropped.",
+  failed: "Removed from the pipeline, but the destination table was not dropped:",
+  withdrawn: "Withdrawn: the table is still in the source, so nothing was dropped and it stays in this pipeline.",
+}
+
+function isSystemHandled(c: SchemaChange): boolean {
+  return (c.reviewed_by ?? "").startsWith("system:")
+}
+
 interface Props {
   pipelineId: string
-  /** Destination connector type — disables Approve for non-relational dests. */
+  /** Destination connector type — disables Approve of column changes for non-relational dests. */
   destConnectorType?: string | null
   /**
-   * CDC pipelines have a different approval policy from batch: the sink applies a
-   * new column the moment it streams in, so nothing ever waits here. Saying so is
-   * the point — the two modes answer "who approves a schema change?" oppositely,
-   * and until now only the batch answer was visible anywhere in the product.
+   * Batch and CDC share one policy — only a dropped table waits here — but CDC adds
+   * new columns as they stream in and does not mirror type changes, which the
+   * notice says.
    */
   isCDC?: boolean
 }
@@ -115,9 +140,17 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
     try {
       if (action === "approve") {
         // Prefer what the server says it did over what we predicted it would do.
-        const dispatched = await approveSchemaChange(pipelineId, change.id)
+        const { dispatched, dropTable } = await approveSchemaChange(pipelineId, change.id)
         const manual = dispatched === null ? isManualApply(change) : !dispatched
-        if (manual) {
+        if (dropTable || isDropTable(change)) {
+          if (manual) {
+            toast.warning(
+              "Table removed from the pipeline. Its destination table was NOT dropped — drop it manually.",
+            )
+          } else {
+            toast.success("Table removed from the pipeline. Dropping its destination table now.")
+          }
+        } else if (manual) {
           toast.warning(
             "Approved — decision recorded. This DDL is NOT auto-applied; run it manually on the destination.",
           )
@@ -127,8 +160,12 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
           toast.success("Approved. Applying it to the destination now.")
         }
       } else {
-        await rejectSchemaChange(pipelineId, change.id)
-        toast.success("Change rejected.")
+        const { dropTable } = await rejectSchemaChange(pipelineId, change.id)
+        toast.success(
+          dropTable || isDropTable(change)
+            ? "Table removed from the pipeline. Its destination table is kept."
+            : "Change rejected.",
+        )
       }
       await fetchChanges()
     } catch (e) {
@@ -176,33 +213,36 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
         </div>
       )}
 
-      {/* CDC policy notice. Batch waits for a human; CDC does not for additions, and
-          it says so rather than leaving the user to infer the policy from the page.
-          Every sentence below is prod-observed behaviour, not intent: an added column
-          is applied on arrival, a dropped column/table is retained in the destination
-          and the stream keeps running, and a type change is never mirrored. The
-          retained-not-halted wording matters — a reader who assumes a drop stops the
-          stream would not go looking for the divergence this page is reporting. */}
-      {isCDC && (
-        <div className="flex items-start gap-2 rounded-md border border-sky-200 dark:border-sky-900 bg-sky-50 dark:bg-sky-950/20 px-3 py-2 text-sm text-sky-800 dark:text-sky-300">
-          <Info className="h-4 w-4 shrink-0 mt-0.5" />
-          <span>
-            This is a <strong>CDC</strong> pipeline. New source columns are added to the destination
-            automatically as they stream in — they are recorded here as <strong>applied</strong> and never wait
-            for approval. Drops and type changes are <strong>not</strong> mirrored: the destination keeps the
-            dropped column or table and its existing data, the stream keeps running, and they are listed
-            here so you can decide whether to apply them yourself.
-          </span>
-        </div>
-      )}
+      {/* The drift policy, the same for batch and CDC (healer.go routeSchemaChange):
+          only a dropped table waits for a person. A dropped column stays in the
+          destination and is no longer written (the healer's recordDriftNotice, the
+          sink's detectDroppedColumns). CDC adds new columns as they stream in and
+          does not mirror a type change — the sink does not detect one. */}
+      <div className="flex items-start gap-2 rounded-md border border-sky-200 dark:border-sky-900 bg-sky-50 dark:bg-sky-950/20 px-3 py-2 text-sm text-sky-800 dark:text-sky-300">
+        <Info className="h-4 w-4 shrink-0 mt-0.5" />
+        <span>
+          Only a <strong>dropped source table</strong> waits here for your decision. Other schema changes are
+          handled for you and listed under History: a column dropped in the source stays in the destination
+          with its existing data and is no longer written.
+          {isCDC && (
+            <>
+              {" "}
+              This is a <strong>CDC</strong> pipeline: new columns are added as they stream in, and column type
+              changes are <strong>not</strong> mirrored to the destination.
+            </>
+          )}
+        </span>
+      </div>
 
-      {/* Non-RDBMS destination notice */}
+      {/* Non-RDBMS destination notice. A dropped table is still decided here: both
+          answers take it out of the pipeline, whatever the destination is. */}
       {!destIsRDBMS && (
         <div className="flex items-start gap-2 rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/20 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
           <Ban className="h-4 w-4 shrink-0 mt-0.5" />
           <span>
-            This pipeline&apos;s destination ({destConnectorType}) is not a relational database, so schema
-            changes cannot be auto-applied. You can reject changes to clear the queue, but approval is disabled.
+            This pipeline&apos;s destination ({destConnectorType}) is not a relational database, so column
+            changes are not run against it and cannot be approved here — reject them to clear the queue. A
+            dropped table can still be approved or rejected.
           </span>
         </div>
       )}
@@ -215,16 +255,17 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
               key={c.id}
               change={c}
               destructive={DESTRUCTIVE.has(c.change_type)}
+              dropTable={isDropTable(c)}
               manualApply={isManualApply(c)}
               advisory={isAdvisory(c)}
               actioning={!!actioning[c.id]}
               acked={!!acked[c.id]}
               approveDisabled={
-                // A notice touches nothing, so a non-relational destination is no
-                // reason to block acknowledging it.
+                // A notice touches nothing, and a dropped table leaves the pipeline
+                // either way, so a non-relational destination blocks neither.
                 !!actioning[c.id] ||
-                (!destIsRDBMS && !isAdvisory(c)) ||
-                (DESTRUCTIVE.has(c.change_type) && !acked[c.id])
+                (!destIsRDBMS && !isAdvisory(c) && !isDropTable(c)) ||
+                ((DESTRUCTIVE.has(c.change_type) || isDropTable(c)) && !acked[c.id])
               }
               onAckChange={(v) => setAcked((p) => ({ ...p, [c.id]: v }))}
               onApprove={() => handleAction(c, "approve")}
@@ -240,7 +281,7 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
           <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300">You&apos;re all caught up</div>
           <div className="text-xs text-zinc-500 dark:text-zinc-400">
             {isCDC
-              ? "New columns are applied as they stream in and are listed below once they arrive; drops and type changes appear here for you to review."
+              ? "Column changes are handled as they stream in and listed below; a dropped source table appears here for your decision."
               : "No schema-drift changes are waiting for approval."}
           </div>
         </div>
@@ -264,6 +305,7 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
 function PendingCard({
   change,
   destructive,
+  dropTable,
   manualApply,
   advisory,
   actioning,
@@ -275,6 +317,8 @@ function PendingCard({
 }: {
   change: SchemaChange
   destructive: boolean
+  /** A dropped source table: both answers remove it from the pipeline. */
+  dropTable: boolean
   /** True when the healer's guard blocks auto-apply — approval is record-only. */
   manualApply: boolean
   /** True when the row carries a note rather than a statement (nothing to run). */
@@ -331,7 +375,32 @@ function PendingCard({
         )}
 
         {/* What approval actually does — honest per row (auto_applicable mirrors the healer's DROP/TRUNCATE guard) */}
-        {destructive ? (
+        {dropTable ? (
+          // The gateway takes the table out of the pipeline on either answer
+          // (schema_evolution.go removeTableFromPipeline); only approve asks the
+          // healer to drop the destination table (dropApprovedTable). A destination
+          // without a drop operation marks the row failed with the reason.
+          <div className="flex items-start gap-2 rounded-md border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/20 px-3 py-2">
+            <ShieldAlert className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
+            <div className="space-y-2">
+              <p className="text-xs text-red-700 dark:text-red-400 leading-snug">
+                This table was <strong>dropped in the source</strong>. Either answer removes it from the pipeline.{" "}
+                <strong>Approve</strong> also drops the destination table and <strong>deletes its data</strong>;{" "}
+                <strong>Reject</strong> keeps the destination table and its data. Until you decide, runs skip this
+                table.
+              </p>
+              <label className="flex items-center gap-2 text-xs font-medium text-red-700 dark:text-red-400 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={acked}
+                  onChange={(e) => onAckChange(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-red-300 text-red-600 focus:ring-red-500"
+                />
+                I understand approving deletes the destination table and its data.
+              </label>
+            </div>
+          </div>
+        ) : destructive ? (
           <div className="flex items-start gap-2 rounded-md border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/20 px-3 py-2">
             <ShieldAlert className="h-4 w-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
             <div className="space-y-2">
@@ -410,7 +479,7 @@ function PendingCard({
           className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 disabled:opacity-50"
         >
           <X className="h-3.5 w-3.5" />
-          Reject
+          {dropTable ? "Reject — keep destination table" : "Reject"}
         </button>
         <button
           type="button"
@@ -419,7 +488,13 @@ function PendingCard({
           className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Check className="h-3.5 w-3.5" />
-          {advisory ? "Acknowledge" : manualApply ? "Approve (manual apply)" : "Approve"}
+          {dropTable
+            ? "Approve — drop destination table"
+            : advisory
+              ? "Acknowledge"
+              : manualApply
+                ? "Approve (manual apply)"
+                : "Approve"}
         </button>
       </div>
     </div>
@@ -437,7 +512,18 @@ function ResolvedRow({ change }: { change: SchemaChange }) {
         <span className="text-zinc-500 dark:text-zinc-400">{label}</span>
         <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate">{change.table_name}</span>
       </div>
-      {change.status === "approved" && isManualApply(change) && (
+      {isSystemHandled(change) && change.reasoning ? (
+        // Handled without a person: the healer or the CDC sink wrote the reason for
+        // the user (healer.go fileDriftOutcome). "Approval recorded — run it
+        // manually" would be wrong here: nobody approved it, and nothing is left to run.
+        <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">{change.reasoning}</div>
+      ) : isDropTable(change) ? (
+        // Either answer took the table out of the pipeline before the row left
+        // pending (schema_evolution.go); only the destination side differs.
+        <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+          {DROP_TABLE_OUTCOME[change.status]}
+        </div>
+      ) : change.status === "approved" && isManualApply(change) && (
         <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
           {isAdvisory(change)
             ? // Telling the user to "run it manually" would be wrong here: the row

@@ -7,21 +7,25 @@ import { cn } from "@/lib/utils"
 interface ConnectorLogoProps {
   connectorType: string
   logoUrl?: string
-  size?: "sm" | "md" | "lg"
+  size?: "xs" | "sm" | "md" | "lg"
   className?: string
 }
 
 const sizeClasses = {
+  xs: "h-4 w-4 rounded",
   sm: "h-6 w-6",
   md: "h-10 w-10",
   lg: "h-14 w-14",
 }
 
 const iconSizeClasses = {
+  xs: "h-3 w-3",
   sm: "h-4 w-4",
   md: "h-6 w-6",
   lg: "h-8 w-8",
 }
+
+const IMG_PX = { xs: 16, sm: 24, md: 40, lg: 56 }
 
 // Fallback icons based on connector type
 const getFallbackIcon = (connectorType: string) => {
@@ -95,9 +99,9 @@ export function ConnectorLogo({
         <img
           src={logoUrl}
           alt={`${connectorType} logo`}
-          width={size === "lg" ? 56 : size === "md" ? 40 : 24}
-          height={size === "lg" ? 56 : size === "md" ? 40 : 24}
-          className="object-contain p-1"
+          width={IMG_PX[size]}
+          height={IMG_PX[size]}
+          className={cn("object-contain", size === "xs" ? "p-px" : "p-1")}
           onError={() => setImgError(true)}
           loading="lazy"
           decoding="async"

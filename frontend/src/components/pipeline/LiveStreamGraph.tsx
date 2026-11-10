@@ -36,7 +36,7 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { usePipelineRuntime, type PipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { formatSpanCoarse } from "@/lib/duration"
-import { cn } from "@/lib/utils"
+import { cn, formatRelativeTime } from "@/lib/utils"
 import type { ExecutionPlanStage } from "./dagTypes"
 
 export interface LiveStreamConsumerTopic {
@@ -60,7 +60,7 @@ export interface LiveStreamConsumers {
 }
 
 /** A node's status in the vocabulary the plan's stages already use. */
-type NodeStatus = "running" | "complete" | "failed" | "waiting" | "pending"
+type NodeStatus = "running" | "complete" | "failed" | "waiting" | "pending" | "paused" | "stopped"
 
 // Said in words as well as by the dot, so the state survives without colour.
 const STATUS_WORD: Record<NodeStatus, string> = {
@@ -69,6 +69,8 @@ const STATUS_WORD: Record<NodeStatus, string> = {
   failed: "Failed",
   waiting: "Waiting",
   pending: "Waiting",
+  paused: "Paused",
+  stopped: "Stopped",
 }
 
 const STATUS_DOT: Record<NodeStatus, string> = {
@@ -77,6 +79,8 @@ const STATUS_DOT: Record<NodeStatus, string> = {
   failed: "bg-red-500",
   waiting: "bg-zinc-400",
   pending: "bg-zinc-400",
+  paused: "bg-zinc-400",
+  stopped: "bg-zinc-400",
 }
 
 /**
@@ -101,6 +105,11 @@ const STATUS_DOT: Record<NodeStatus, string> = {
  *    is behind. A first load is a large backlog on a perfectly healthy sink.
  *  - Anything not measured is `waiting`, never `complete`. A node that has not
  *    been looked at must not render as a finished one.
+ *  - A paused or stopped pipeline is not probed (workers/dependency_probe.go), so
+ *    its dependency verdicts are frozen at the last running probe — usually
+ *    healthy. The phase speaks instead: Pause parks the connector, so the SOURCE
+ *    node is `paused` and the sink keeps draining; Stop also stops the sink workers
+ *    (cdc_stop.go), so every node is `stopped`, Kafka still saying what waits.
  */
 export function buildLiveStreamStages(
   runtime: PipelineRuntime | null,
@@ -112,14 +121,22 @@ export function buildLiveStreamStages(
   const debezium = deps.find((d) => d.kind === "debezium_task")
   const sink = deps.find((d) => d.kind === "kafka_sink_worker")
   const dest = deps.find((d) => d.kind === "mcp_dest")
+  const paused = runtime?.phase === "paused"
+  const stopped = runtime?.phase === "stopped"
 
   // ---- Source ----------------------------------------------------------
   let sourceStatus: NodeStatus = "waiting"
   let sourceSummary = "waiting for the first check"
-  if (debezium?.status === "healthy") {
+  if (stopped) {
+    sourceStatus = "stopped"
+    sourceSummary = "the pipeline is stopped — no changes are being captured"
+  } else if (paused) {
+    sourceStatus = "paused"
+    sourceSummary = "the pipeline is paused — no changes are captured until it resumes"
+  } else if (debezium?.status === "healthy") {
     sourceStatus = "running"
     sourceSummary = liveness?.last_event_at
-      ? `last change ${formatSpanCoarse(Math.max(0, (Date.now() - Date.parse(liveness.last_event_at)) / 1000))} ago`
+      ? `last change ${formatRelativeTime(liveness.last_event_at, { seconds: true })}`
       : "capturing"
   } else if (debezium?.status === "degraded") {
     sourceStatus = "running"
@@ -140,11 +157,15 @@ export function buildLiveStreamStages(
     kafkaStatus = lag > 0 ? "running" : "complete"
     kafkaSummary = lag > 0 ? `${lag.toLocaleString()} waiting` : "nothing waiting"
   }
+  if (stopped) kafkaStatus = "stopped"
 
   // ---- Destination -----------------------------------------------------
   let destStatus: NodeStatus = "waiting"
   let destSummary = "waiting for the first check"
-  if (liveness?.sink_stalled) {
+  if (stopped) {
+    destStatus = "stopped"
+    destSummary = "the pipeline is stopped — nothing is being written"
+  } else if (liveness?.sink_stalled) {
     destStatus = "failed"
     const forHow = liveness.sink_stalled_seconds ? ` for ${formatSpanCoarse(liveness.sink_stalled_seconds)}` : ""
     destSummary = `stalled — no progress committed${forHow}`
@@ -269,7 +290,7 @@ export function LiveStreamGraph({
           What this pipeline is doing right now. The steps below ran once, when it was set up.
         </p>
       </div>
-      <ol aria-label="Live stream" className="flex flex-col gap-4 sm:flex-row sm:gap-6">
+      <ol aria-label="Live stream" className="flex flex-col gap-4 @md:flex-row @md:gap-6">
         {stages.map((stage, i) => {
           const status = (stage.status as NodeStatus) in STATUS_WORD ? (stage.status as NodeStatus) : "waiting"
           const failed = status === "failed"
@@ -279,7 +300,7 @@ export function LiveStreamGraph({
               key={stage.id}
               data-testid={`live-node-${stage.id}`}
               data-status={status}
-              className="relative min-w-0 sm:flex-1"
+              className="relative min-w-0 @md:flex-1"
             >
               <div
                 className={cn(
@@ -310,11 +331,11 @@ export function LiveStreamGraph({
                 <>
                   <ChevronDown
                     aria-hidden="true"
-                    className="absolute -bottom-4 left-1/2 h-4 w-4 -translate-x-1/2 text-muted-foreground sm:hidden"
+                    className="absolute -bottom-4 left-1/2 h-4 w-4 -translate-x-1/2 text-muted-foreground @md:hidden"
                   />
                   <ChevronRight
                     aria-hidden="true"
-                    className="absolute -right-5 top-1/2 hidden h-4 w-4 -translate-y-1/2 text-muted-foreground sm:block"
+                    className="absolute -right-5 top-1/2 hidden h-4 w-4 -translate-y-1/2 text-muted-foreground @md:block"
                   />
                 </>
               )}

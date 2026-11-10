@@ -71,10 +71,8 @@ vi.mock("@/components/chat/PipelineAccordionView", () => ({
     </button>
   ),
 }))
-vi.mock("@/components/chat/ChatRightPanel", () => ({ ChatRightPanel: () => null }))
 vi.mock("@/components/chat/ActivePipelinesList", () => ({ ActivePipelinesList: () => null }))
 vi.mock("@/components/chat/SuggestionsReviewDialog", () => ({ SuggestionsReviewDialog: () => null }))
-vi.mock("@/components/pipeline/PipelineMonitoringPanel", () => ({ PipelineMonitoringPanel: () => null }))
 vi.mock("@/components/pipeline/PipelineConnectionSelector", () => ({
   PipelineConnectionSelector: () => null,
 }))

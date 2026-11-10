@@ -464,3 +464,16 @@ func TestObjectLayoutWiring(t *testing.T) {
 		t.Errorf("sendChunkedToKafka must put object_layout on every inline batch message")
 	}
 }
+
+func TestIsMongoSourceFamily(t *testing.T) {
+	for _, ct := range []string{"mongodb", "MongoDB", " mongo ", "mongodb-atlas", "mongodb_atlas", "mongodbatlas", "atlas"} {
+		if !isMongoSourceFamily(ct) {
+			t.Errorf("%q should be MongoDB family", ct)
+		}
+	}
+	for _, ct := range []string{"postgresql", "mysql", "sqlserver", "oracle", "minio", ""} {
+		if isMongoSourceFamily(ct) {
+			t.Errorf("%q must not be MongoDB family", ct)
+		}
+	}
+}

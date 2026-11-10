@@ -200,7 +200,7 @@ describe("ModelLineageGraph", () => {
     render(<ModelLineageGraph {...props()} />)
 
     const down = await screen.findByRole("link", { name: "orders_kpi" })
-    expect(down).toHaveAttribute("href", "/explorer/schedules/q-down?tab=graph")
+    expect(down).toHaveAttribute("href", "/models/q-down?tab=graph")
     expect(screen.getByRole("link", { name: "orders sync" })).toHaveAttribute("href", "/pipelines/pl-1")
     // The model itself is the page: it is marked, not linked.
     expect(screen.queryByRole("link", { name: "revenue_rollup" })).not.toBeInTheDocument()
@@ -208,6 +208,13 @@ describe("ModelLineageGraph", () => {
 
     expect(screen.getByRole("heading", { name: "Upstream (2)" })).toBeInTheDocument()
     expect(screen.getByRole("heading", { name: "Downstream (1)" })).toBeInTheDocument()
+    // Each heading says what the word means, right under it.
+    expect(screen.getByRole("heading", { name: "Upstream (2)" }).nextElementSibling).toHaveTextContent(
+      "Pipelines and models this one runs after.",
+    )
+    expect(screen.getByRole("heading", { name: "Downstream (1)" }).nextElementSibling).toHaveTextContent(
+      "Models that run after this one.",
+    )
     expect(screen.getByRole("status")).toHaveTextContent(/^Graph loaded: 2 upstream, 1 downstream\.$/)
     const downItem = down.closest("li")!
     expect(within(downItem).getByText("Direct downstream")).toBeInTheDocument()
@@ -678,10 +685,10 @@ describe("ModelLineageGraph", () => {
 
       clickCard(canvas, "orders_kpi")
       const panel = await screen.findByRole("dialog", { name: "orders_kpi" })
-      expect(within(panel).getByRole("link", { name: "Open model" })).toHaveAttribute("href", "/explorer/schedules/q-down?tab=graph")
+      expect(within(panel).getByRole("link", { name: "Open model" })).toHaveAttribute("href", "/models/q-down?tab=graph")
       // The newest run is picked, with how long it took and what woke it.
       expect(within(recentRuns(panel)).getByRole("button", { name: /^Succeeded in 3s/ })).toHaveAttribute("aria-pressed", "true")
-      expect(within(panel).getByText("after a model")).toBeInTheDocument()
+      expect(within(panel).getByText("After a model")).toBeInTheDocument()
 
       // The text as it was when the run started, not as it is now.
       expect(await within(panel).findByLabelText("SQL when this run started")).toHaveTextContent(/^select 1 as before_edit$/)
@@ -709,15 +716,44 @@ describe("ModelLineageGraph", () => {
       expect(runs.map((b) => b.getAttribute("aria-pressed"))).toEqual(["true", "false"])
       expect(runs[0]).toHaveAccessibleName(/^Failed in 1.2s/)
       expect(within(panel).getByText('relation "orders" does not exist')).toBeInTheDocument()
-      expect(within(panel).getByText("after a pipeline")).toBeInTheDocument()
+      expect(within(panel).getByText("After a pipeline")).toBeInTheDocument()
       expect(await within(panel).findByText("You can't open this model's SQL.")).toBeInTheDocument()
       expect(within(panel).queryByRole("button", { name: "Copy" })).not.toBeInTheDocument()
 
       await user.click(runs[1])
       expect(runs[1]).toHaveAttribute("aria-pressed", "true")
-      expect(within(panel).getByText("manual")).toBeInTheDocument()
+      expect(within(panel).getByText("Manual")).toBeInTheDocument()
       expect(within(panel).getByText("42")).toBeInTheDocument()
       expect(within(panel).queryByText('relation "orders" does not exist')).not.toBeInTheDocument()
+    })
+
+    // The panel listed a model's runs and SQL but never where it writes, so a model that
+    // reads silver tables looked like it wrote nothing. Same words as the model page.
+    it("says what the model writes, and which table a run rebuilt", async () => {
+      const target = "analytics.orders_kpi"
+      const statement = { ...ROOT, materialization: "statement" }
+      serve(
+        runRoutes({
+          "/api/v1/explorer/schedules": res(200, { schedules: [statement, { ...DOWN, target_table: target }], count: 2 }),
+          [runsUrl("q-down")]: res(200, { runs: [{ ...DOWN_RUNS[0], target_table: target }] }),
+        }),
+      )
+      const user = userEvent.setup()
+      const { container } = render(<ModelLineageGraph {...props({ rootSchedule: statement })} />)
+      const canvas = await canvasOf(container)
+      const value = (panel: HTMLElement, label: string) => within(panel).getByText(label, { selector: "dt" }).nextElementSibling
+
+      clickCard(canvas, "orders_kpi")
+      const panel = await screen.findByRole("dialog", { name: "orders_kpi" })
+      expect(value(panel, "Does")).toHaveTextContent(/^Rebuilds analytics\.orders_kpi$/)
+      expect(value(panel, "Wrote")).toHaveTextContent(/^analytics\.orders_kpi$/)
+      await user.keyboard("{Escape}")
+
+      clickCard(canvas, "revenue_rollup")
+      const root = await screen.findByRole("dialog", { name: "revenue_rollup" })
+      expect(value(root, "Does")).toHaveTextContent(/^Runs its SQL as written$/)
+      // r-2 failed: it wrote nothing.
+      expect(within(root).queryByText("Wrote", { selector: "dt" })).not.toBeInTheDocument()
     })
 
     it("opens from the list's button, retries a SQL load that failed, and gives focus back on close", async () => {

@@ -293,3 +293,115 @@ func TestTryDeployConnectorContainerReadsTheDeployOutcome(t *testing.T) {
 		})
 	}
 }
+
+// writeFakePythonConnector is writeFakeConnector plus a connector.py, and optionally a
+// requirements.txt whose install fails without the network: a fake python3 first on
+// PATH stands in for the orchestrator's interpreter, so `python3 -m venv` creates no
+// venv and the pip install that follows has no pip to run. When the stdio path is
+// taken, it starts that fake python3, which exits at once.
+func writeFakePythonConnector(t *testing.T, id, displayName string, withRequirements bool) string {
+	t.Helper()
+	tools := writeFakeConnector(t, id, displayName)
+	vdir := filepath.Join(tools, "public", "database", id, "versions", "v1.0.0")
+	files := map[string]string{"connector.py": "import sys\nsys.exit(0)\n"}
+	if withRequirements {
+		files["requirements.txt"] = "pymongo==4.6.0\n"
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(vdir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "python3"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return tools
+}
+
+// While a deploy is underway, a connector whose dependencies did not install locally
+// cannot run over stdio: the interpreter it falls back to has none of its imports, so
+// its only answer is "No module named 'X'", which batch export and import, the
+// dependency probe and the destination preflight showed as a connector error. Only
+// the callers that opt in with NoStdioWhileDeploying were spared. Every caller now gets
+// the retryable "still being set up" error in that case.
+func TestStartServerRefusesStdioWithoutDependenciesWhileDeploying(t *testing.T) {
+	const id = "zzfakedeployconn"
+	tools := writeFakePythonConnector(t, id, "Fake DB", true)
+	srv := slowToolGenerator(t)
+	t.Setenv("TOOL_GENERATOR_URL", srv.URL)
+
+	oldTimeout := deployCallTimeout
+	deployCallTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { deployCallTimeout = oldTimeout })
+
+	t.Run("StartServer without the opt-in (probe, preflight)", func(t *testing.T) {
+		sm := NewServerManager(tools)
+		t.Cleanup(func() { _ = sm.StopAll() })
+		_, err := sm.StartServer(ServerConfig{Name: id, Version: "latest", DeployWaitTimeout: 50 * time.Millisecond})
+		if !IsConnectorDeploying(err) {
+			t.Fatalf("expected *ConnectorDeployingError, got %T: %v", err, err)
+		}
+		sm.mu.RLock()
+		defer sm.mu.RUnlock()
+		if s := sm.servers[makeServerKey(id, "v1.0.0")]; s != nil {
+			t.Errorf("a %s server was registered without its dependencies", s.ConnType)
+		}
+	})
+
+	t.Run("Client.Execute (batch export and import)", func(t *testing.T) {
+		sm := NewServerManager(tools)
+		t.Cleanup(func() { _ = sm.StopAll() })
+		resp, err := NewClient(sm).Execute(ExecuteRequest{
+			Connector: id, Version: "latest", Operation: "read_records", DeployWaitTimeout: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if want := ConnectorDeployingMessage("Fake DB"); resp.Success || resp.Error != want {
+			t.Errorf("got (success=%v, error=%q), want (false, %q)", resp.Success, resp.Error, want)
+		}
+	})
+}
+
+// Controls for the test above: stdio stays the transport when the dependencies did
+// install, deploy or not, and when no deploy was possible at all (no tool-generator,
+// e.g. Docker-less Helm batch), where a failed install is reported on the stdio run as
+// before. Without these, a StartServer that refused stdio whenever a deploy was
+// underway, or whenever an install failed, would pass the test above.
+func TestStartServerKeepsStdioWhenDependenciesInstalledOrNoDeploy(t *testing.T) {
+	const id = "zzfakedeployconn"
+	oldTimeout := deployCallTimeout
+	deployCallTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { deployCallTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name             string
+		withRequirements bool
+		deployer         bool
+	}{
+		{"deploy underway, dependencies installed", false, true},
+		{"no deploy possible, dependencies failed", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools := writeFakePythonConnector(t, id, "Fake DB", tc.withRequirements)
+			t.Setenv("TOOL_GENERATOR_URL", "")
+			if tc.deployer {
+				t.Setenv("TOOL_GENERATOR_URL", slowToolGenerator(t).URL)
+			}
+			sm := NewServerManager(tools)
+			t.Cleanup(func() { _ = sm.StopAll() })
+			server, err := sm.StartServer(ServerConfig{Name: id, Version: "latest", DeployWaitTimeout: 50 * time.Millisecond})
+			if err != nil {
+				t.Fatalf("expected the stdio path, got %v", err)
+			}
+			if server.ConnType != "stdio" {
+				t.Fatalf("ConnType = %q, want stdio", server.ConnType)
+			}
+			if failed := server.DepsError != ""; failed != tc.withRequirements {
+				t.Errorf("DepsError = %q, want it set only when the install failed", server.DepsError)
+			}
+		})
+	}
+}

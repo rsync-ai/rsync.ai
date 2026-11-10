@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -608,5 +609,76 @@ func TestComputeRuntimePhase_CDCExecutorStageIsSetupUntilHandoff(t *testing.T) {
 				t.Fatalf("phase = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A liveness field the runtime declares but no code fills is always absent from the
+// response, and a client cannot tell it from "no reading": #1210 planned a "last
+// healthy" tooltip on liveness.last_healthy_at before finding that nothing ever set it.
+// This serves a CDC pipeline with every liveness source populated (an applied
+// timestamp, a backlog, a stalled sink-lag reading) and requires every key
+// RuntimeLiveness declares to be in the response, so a field with no writer fails here.
+func TestGetPipelineRuntime_ServesEveryDeclaredLivenessField(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+	mock.MatchExpectationsInOrder(false)
+
+	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
+		WithArgs(wsScopePipeline, wsScopeUser, wsScopeWS).
+		WillReturnRows(gateRoleRows("viewer"))
+	mock.ExpectQuery(`SELECT status, sync_mode, created_at, updated_at`).
+		WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "sync_mode", "created_at", "updated_at"}).
+			AddRow("running", "cdc", time.Now(), time.Now()))
+	mock.ExpectQuery(`FROM pipeline_progress`).
+		WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"execution_id", "current_stage", "message",
+			"progress_percent", "progress_current_step", "progress_total_steps",
+			"blocking_reason_type", "blocking_reason_description", "updated_at",
+		}).AddRow("55555555-5555-5555-5555-555555555555", "streaming", "Streaming pipeline active",
+			100, 8, 8, nil, nil, time.Now()))
+	mock.ExpectQuery(`MAX\(last_applied_ts\)[\s\S]*FROM pipeline_run_table_stats`).
+		WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"max", "pending"}).
+			AddRow(time.Now().Add(-10*time.Minute), int64(4213)))
+	mock.ExpectQuery(`DISTINCT ON \(d\.kind, d\.identifier\)`).
+		WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"kind", "identifier", "status", "last_checked_at", "last_healthy_at",
+			"consecutive_failures", "last_error", "details",
+		}).AddRow("source", "postgresql@v1.0.0", "healthy", time.Now(), time.Now(), 0, "", []byte("{}")))
+	mock.ExpectQuery(`FROM pipeline_sink_lag`).
+		WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"consumer_group", "total_lag", "committed_moving", "stalled", "stalled_seconds", "measured_at",
+		}).AddRow("rsync-pipeline-sink", int64(120), false, true, int64(900), time.Now()))
+
+	r := wsScopeRouterAsRole(http.MethodGet, "/pipelines/:id/runtime", GetPipelineRuntime, "viewer")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/pipelines/"+wsScopePipeline+"/runtime", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("runtime = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Liveness map[string]json.RawMessage `json:"liveness"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal runtime response: %v (body=%s)", err, w.Body.String())
+	}
+	if body.Liveness == nil {
+		t.Fatalf("no liveness block for a CDC pipeline with an applied timestamp: %s", w.Body.String())
+	}
+
+	declared := reflect.TypeOf(RuntimeLiveness{})
+	for i := 0; i < declared.NumField(); i++ {
+		key := strings.Split(declared.Field(i).Tag.Get("json"), ",")[0]
+		if _, ok := body.Liveness[key]; !ok {
+			t.Errorf("liveness.%s is declared on RuntimeLiveness but not served when every source has data: "+
+				"fill it or remove it", key)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

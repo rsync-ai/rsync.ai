@@ -29,7 +29,7 @@ func unknownSignal() Signal {
 }
 
 // newLLMServer returns an httptest server that counts requests and
-// replies with the given status + OpenAI-envelope content.
+// replies with the given status + llm-service /v1/completion content.
 func newLLMServer(t *testing.T, status int, content string, calls *int32, lastBody *string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,11 +42,7 @@ func newLLMServer(t *testing.T, status int, content string, calls *int32, lastBo
 			w.WriteHeader(status)
 			return
 		}
-		resp := map[string]interface{}{
-			"choices": []map[string]interface{}{
-				{"message": map[string]string{"content": content}},
-			},
-		}
+		resp := map[string]interface{}{"content": content, "model": "test-model"}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
@@ -57,7 +53,6 @@ func chainWith(url string) *ChainDiagnoser {
 		Rules: New(),
 		LLM: &LLMDiagnoser{
 			BaseURL:    url,
-			Model:      "test-model",
 			HTTPClient: &http.Client{},
 		},
 	}
@@ -259,10 +254,17 @@ func TestChain_PromptIsScrubbed(t *testing.T) {
 func TestLLMDiagnoser_ErrorMessageTruncated(t *testing.T) {
 	sig := unknownSignal()
 	sig.ErrorMessage = strings.Repeat("z", 5000)
-	prompt := buildLLMDiagnosePrompt(sig)
-	if len(prompt) > 2200 { // 1500-rune cap + template overhead
-		t.Errorf("prompt too long (%d chars) — error message not truncated", len(prompt))
+	msg := llmDiagnoseVariables(sig)["error_message"]
+	if len(msg) > 1600 { // 1500-rune cap + truncation marker
+		t.Errorf("error_message too long (%d chars) — not truncated", len(msg))
 	}
+}
+
+// promptOf renders the variables as one string, so a check can look for a
+// value anywhere in what is sent.
+func promptOf(sig Signal) string {
+	b, _ := json.Marshal(llmDiagnoseVariables(sig))
+	return string(b)
 }
 
 // resetDiagnoserModeLog clears the process-global sync.Once that gates
@@ -376,7 +378,7 @@ func TestPromptMetadataFieldsAreScrubbed(t *testing.T) {
 	sig.SourceType = "shopify bob@example.com"
 	sig.DestinationType = "postgresql password=hunter2"
 
-	prompt := buildLLMDiagnosePrompt(sig)
+	prompt := promptOf(sig)
 
 	for _, leak := range []string{"bob@example.com", "hunter2"} {
 		if strings.Contains(prompt, leak) {
@@ -385,5 +387,112 @@ func TestPromptMetadataFieldsAreScrubbed(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "[email-redacted]") {
 		t.Errorf("expected scrub marker [email-redacted] in prompt, got:\n%s", prompt)
+	}
+}
+
+func TestPromptSaysWhetherRowsMovedNeverHowMany(t *testing.T) {
+	// A row count describes the customer's data, so the prompt carries only
+	// whether rows were read and written. The digits below appear in no other
+	// part of the prompt, so finding one means a count was sent.
+	sig := unknownSignal()
+	sig.ErrorMessage = "benign"
+	sig.SourceRowCount = 81234
+	sig.WrittenRows = 45678
+	sig.TablesWithNoLandedRows = 3
+	sig.TablesObserved = 7
+
+	prompt := promptOf(sig)
+	for _, count := range []string{"81234", "45678", "3 of 7"} {
+		if strings.Contains(prompt, count) {
+			t.Errorf("prompt carries the count %q:\n%s", count, prompt)
+		}
+	}
+	vars := llmDiagnoseVariables(sig)
+	for _, key := range []string{"source_rows_read", "rows_written", "tables_landed_none"} {
+		if vars[key] != "yes" {
+			t.Errorf("%s: want yes, got %q", key, vars[key])
+		}
+	}
+
+	// Control: with nothing moved, each answer flips, so the values above
+	// were read from the signal and not written as constants.
+	sig.SourceRowCount, sig.WrittenRows, sig.TablesWithNoLandedRows = 0, 0, 0
+	vars = llmDiagnoseVariables(sig)
+	for _, key := range []string{"source_rows_read", "rows_written", "tables_landed_none"} {
+		if vars[key] != "no" {
+			t.Errorf("%s: want no, got %q", key, vars[key])
+		}
+	}
+}
+
+// KI-HEALER-LLM-DIAGNOSER-DEAD-ROUTE: the diagnoser POSTed an OpenAI-shaped
+// body to BaseURL+"/v1/chat/completions". llm-service has no such route, so
+// pointed at llm-service every call 404ed, and pointed at a provider it skipped
+// llm-service's egress guard. It now names a registered prompt
+// (prompts/diagnose/healer_classify.yaml) on llm-service's /v1/completion and
+// sends only that prompt's variables; the guard renders them.
+func TestLLMDiagnoser_PostsThePromptNameToLLMServiceCompletion(t *testing.T) {
+	var path string
+	var body map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"content": llmContent("network", "backoff_retry", 0.6, "flaky upstream"),
+		})
+	}))
+	defer srv.Close()
+
+	got := chainWith(srv.URL).Diagnose(unknownSignal())
+
+	if path != "/v1/completion" {
+		t.Fatalf("path: want llm-service's /v1/completion, got %q", path)
+	}
+	if body["prompt_name"] != "diagnose/healer_classify" {
+		t.Errorf("prompt_name: want diagnose/healer_classify, got %v (body %v)", body["prompt_name"], body)
+	}
+	// The prompt text lives in llm-service, where the guard renders it: the
+	// body carries no messages and picks no model.
+	for _, key := range []string{"messages", "model"} {
+		if _, ok := body[key]; ok {
+			t.Errorf("body carries %q; the guard renders the prompt and llm-service picks the model: %v", key, body)
+		}
+	}
+	vars, _ := body["variables"].(map[string]interface{})
+	for _, key := range []string{
+		"stage", "executor_status", "source_type", "destination_type",
+		"source_rows_read", "rows_written", "tables_landed_none", "error_message",
+	} {
+		if _, ok := vars[key]; !ok {
+			t.Errorf("variables lack %q: %v", key, vars)
+		}
+	}
+	if got.Category != CategoryNetwork || got.Rationale != "llm: flaky upstream" {
+		t.Errorf("want the llm-service answer read from `content`, got %+v", got)
+	}
+}
+
+func TestLLMDiagnoser_Non200ErrorNamesTheStatusNotTheBody(t *testing.T) {
+	// A failed llm-service call can answer with text that quotes the request.
+	// The error is logged, so it carries the status alone.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, "upstream echoed bob@example.com password=hunter2")
+	}))
+	defer srv.Close()
+
+	d := &LLMDiagnoser{BaseURL: srv.URL, HTTPClient: &http.Client{}}
+	_, err := d.diagnoseLLM(unknownSignal())
+	if err == nil {
+		t.Fatal("want an error for a 502")
+	}
+	for _, leak := range []string{"bob@example.com", "hunter2", "upstream echoed"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error carries the response body (%q): %v", leak, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error should name the status: %v", err)
 	}
 }

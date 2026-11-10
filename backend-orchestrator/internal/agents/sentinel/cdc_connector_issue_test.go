@@ -35,7 +35,7 @@ func TestTriggerHealerRaisesAnIssueRow(t *testing.T) {
 	// pointer, and the assertion below would not be the thing that failed.
 	s := &CDCSentinel{db: db}
 
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
 		WithArgs(
 			connectorIssueID(pid),
 			string(IssueTypeConnectorDown),
@@ -45,7 +45,7 @@ func TestTriggerHealerRaisesAnIssueRow(t *testing.T) {
 			sqlmock.AnyArg(), // description
 			sqlmock.AnyArg(), // metadata JSON
 		).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(detectedAtRow())
 
 	s.triggerHealer(context.Background(), pid, "cdc-abc12345", map[string]interface{}{
 		"state": "FAILED",

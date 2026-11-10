@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -40,6 +40,8 @@ import {
   Settings2,
   Pause,
   MinusCircle,
+  Square,
+  RotateCcw,
 } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
@@ -49,7 +51,18 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { classifyError } from "@/lib/utils/error-handling"
 import { cn, formatAbsoluteTime } from "@/lib/utils"
 import { formatDurationBetween } from "@/lib/duration"
-import { TABLE_STATUS_WAITING_FOR_DATA } from "./executionSummary"
+import { TABLE_STATUS_WAITING_FOR_DATA, degradedTableLabel } from "./executionSummary"
+import { EChartNoSSR } from "@/components/charts/EChartNoSSR"
+import { ChartCard } from "@/components/kit/ChartCard"
+import { ChartCardsSkeleton, StatCardsSkeleton } from "@/components/kit/PageSkeleton"
+import { StatCard, type StatFact } from "@/components/kit/StatCard"
+import {
+  hbarHeight,
+  tableStatusChart,
+  tableStatusRows,
+  topTablesChart,
+  topTablesRows,
+} from "./table-stats-charts"
 
 type TableStat = {
   schema_name?: string
@@ -85,6 +98,9 @@ type TableStat = {
   // Every other counter here reports what landed; this is the only one that reports
   // what did not. Always present (the API does not omit a zero).
   dlq_rows?: number
+  // Batch only: the run lost rows and put this table back to where it started,
+  // so the next run reads them again (table_stats.go rewoundSQL). Absent = no.
+  rewound?: boolean
 
   // Timestamps
   started_at?: string
@@ -99,6 +115,8 @@ export type TableStatsSummary = {
   tables_failed: number
   tables_running: number
   tables_degraded?: number
+  // Of tables_degraded, the ones the run rewound. Absent from older gateways.
+  tables_rewound?: number
   // Selected CDC tables with nothing captured or applied yet (not in tables_running).
   tables_waiting_for_data?: number
   // No longer selected. NOT in total_tables, but still in every total below:
@@ -161,7 +179,8 @@ type Props = {
   // and that grid stood in for the run (U-TS-RACE).
   executionPending?: boolean
   // The pipeline's status (the monitoring panel passes the reconciled one).
-  // "paused" relabels the tables that would otherwise read Running (#14).
+  // "paused" relabels the tables that would otherwise read Running (#14), and
+  // "stopped" (or "cancelled") the same way.
   pipelineStatus?: string
   blockingReasonType?: string
   mode?: "batch" | "cdc"
@@ -252,7 +271,7 @@ function formatTimestamp(ts?: string): string {
  * ones — this panel used to render a stopwatch ("15:26") beside the Overview's
  * "15m 26s" for the same table, which reads as two different measurements.
  */
-function formatElapsed(start?: string, end?: string): string {
+function elapsedCell(start?: string, end?: string): string {
   if (!start) return ""
   const out = formatDurationBetween(start, end)
   return out === "—" ? "" : out
@@ -280,8 +299,33 @@ function tableIdentity(table: TableStat): { schema?: string; name: string } {
 /**
  * `paused`: the pipeline is paused, so a table the stats call "running" is not
  * moving. Showing a spinner there read as "still streaming" (#14).
+ *
+ * `stopped`: the user stopped the pipeline. A table cut off mid-transfer keeps
+ * the "running" its stats row last wrote, and read as still going
+ * (KI-STOP-RACING-COMPLETION-OVERWRITTEN).
+ *
+ * `table`: a "degraded" table reads "Rewound" or "Rows not written", with its
+ * counts on hover (degradedTableLabel), never the bare "Degraded".
  */
-export function StatusBadge({ status, paused }: { status: string; paused?: boolean }) {
+export function StatusBadge({
+  status,
+  paused,
+  stopped,
+  table,
+}: {
+  status: string
+  paused?: boolean
+  stopped?: boolean
+  table?: Parameters<typeof degradedTableLabel>[0]
+}) {
+  if (stopped && status === "running") {
+    return (
+      <Badge variant="outline" className="gap-1 text-muted-foreground" title="The pipeline was stopped">
+        <Square className="h-3 w-3" />
+        Stopped
+      </Badge>
+    )
+  }
   if (paused && status === "running") {
     return (
       <Badge variant="outline" className="gap-1 text-muted-foreground" title="The pipeline is paused">
@@ -312,13 +356,20 @@ export function StatusBadge({ status, paused }: { status: string; paused?: boole
           Running
         </Badge>
       )
-    case "degraded":
+    case "degraded": {
+      const d = degradedTableLabel(table ?? {})
+      const Icon = d.label === "Rewound" ? RotateCcw : AlertTriangle
       return (
-        <Badge variant="outline" className="gap-1 border-amber-400 bg-amber-50 text-amber-700 dark:border-amber-600 dark:bg-amber-950/30 dark:text-amber-400">
-          <AlertTriangle className="h-3 w-3" />
-          Degraded
+        <Badge
+          variant="outline"
+          className="gap-1 border-amber-400 bg-amber-50 text-amber-700 dark:border-amber-600 dark:bg-amber-950/30 dark:text-amber-400"
+          title={d.title}
+        >
+          <Icon className="h-3 w-3" />
+          {d.label}
         </Badge>
       )
+    }
     case TABLE_STATUS_WAITING_FOR_DATA:
       return (
         <Badge variant="outline" className="gap-1 text-muted-foreground">
@@ -465,7 +516,7 @@ function buildColumns(
   isBatch: boolean,
   isCDC: boolean,
   hidden: ColumnGroup[],
-  opts: { paused?: boolean; snapshot?: boolean } = {},
+  opts: { paused?: boolean; stopped?: boolean; snapshot?: boolean } = {},
 ): Column[] {
   const cols: Column[] = [
     {
@@ -474,7 +525,7 @@ function buildColumns(
       sort: "status",
       cell: (t) => (
         <div className="flex flex-col gap-1">
-          <StatusBadge status={t.status} paused={opts.paused} />
+          <StatusBadge status={t.status} paused={opts.paused} stopped={opts.stopped} table={t} />
           {isChangesOnly(t) && (
             <Badge variant="outline" className="w-fit text-muted-foreground" title={CHANGES_ONLY_HELP}>
               Changes only
@@ -497,7 +548,7 @@ function buildColumns(
       header: "Elapsed",
       group: "timing",
       cellClassName: `${TIME_CELL} font-mono`,
-      cell: (t) => formatElapsed(t.started_at, t.completed_at),
+      cell: (t) => elapsedCell(t.started_at, t.completed_at),
     },
   ]
 
@@ -617,15 +668,6 @@ function SortIcon({ active, direction }: { active: boolean; direction: "ascendin
   return <ArrowDown aria-hidden className="h-3 w-3" />
 }
 
-function SummaryTile({ label, value, className }: { label: string; value: ReactNode; className?: string }) {
-  return (
-    <div>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className={cn("text-lg font-semibold tabular-nums", className)}>{value}</div>
-    </div>
-  )
-}
-
 export function TableStatisticsPanel({
   pipelineId,
   executionId,
@@ -663,6 +705,13 @@ export function TableStatisticsPanel({
     setShowLatest(false)
   }, [executionId])
   const viewedExecutionId = shownRun ?? executionId
+  // The top-ten chart's tables when the page does not hold them all: one more
+  // read of the same endpoint, sorted by rows written, ten rows. Batch only: the
+  // API sorts CDC tables by inserts, never by what the sink applied. Keyed by the
+  // run and mode it was read for, so no other run's tables are ever charted.
+  const [topTables, setTopTables] = useState<{ key: string; rows: TableStat[] } | null>(null)
+  const topSeq = useRef(0)
+  const topKey = `${viewedExecutionId ?? ""}|${mode ?? ""}`
 
   // `background` is the poll: it does not dim the grid or spin the Refresh icon,
   // and a failed poll keeps the last good rows instead of swapping them for an error.
@@ -720,6 +769,22 @@ export function TableStatisticsPanel({
       setTables(uniq)
       setTotal(nextTotal)
       setError(null)
+      if (!search && nextTotal > pageSize && data.summary?.mode === "batch") {
+        const key = topKey
+        const topRequest = ++topSeq.current
+        const topParams = new URLSearchParams(params)
+        topParams.set("sort", "inserted_rows")
+        topParams.set("limit", "10")
+        topParams.set("offset", "0")
+        // Not awaited, and a failure is not an error: until it answers, the chart
+        // shows the page's tables and says so.
+        void authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/table-stats?${topParams.toString()}`, { cache: "no-store" })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((top) => {
+            if (topRequest === topSeq.current && Array.isArray(top?.tables)) setTopTables({ key, rows: top.tables })
+          })
+          .catch(() => {})
+      }
     } catch (e: any) {
       if (seq !== requestSeq.current || background) return
       setError(String(e?.message || e || "Failed to load table stats"))
@@ -729,7 +794,7 @@ export function TableStatisticsPanel({
         setFetching(false)
       }
     }
-  }, [pipelineId, executionId, executionPending, viewedExecutionId, shownRun, showLatest, mode, search, sortBy, offset, pageSize])
+  }, [pipelineId, executionId, executionPending, viewedExecutionId, shownRun, showLatest, mode, search, sortBy, offset, pageSize, topKey])
 
   useEffect(() => {
     fetchStats()
@@ -835,29 +900,56 @@ export function TableStatisticsPanel({
   // measured 0, so they say so.
   const allTablesWaitingForData =
     !!summary && summary.total_tables > 0 && (summary.tables_waiting_for_data ?? 0) === summary.total_tables
-  const formatSummaryTotal = (num?: number | null) =>
-    allTablesWaitingForData ? NO_DATA_YET : formatNumber(num)
+  // The API's "degraded" tables, split into the ones the run rewound and the rest.
+  const tablesDegraded = Math.max(0, summary?.tables_degraded ?? 0)
+  const tablesRewound = Math.min(tablesDegraded, Math.max(0, summary?.tables_rewound ?? 0))
+  const tablesNotWritten = tablesDegraded - tablesRewound
   // Paused (CDC "paused", or a batch run paused by the user): nothing moves, so
   // nothing may read Running (#14).
   const pipelinePaused =
     normalizePipelineStatus(pipelineStatus) === "paused" ||
     (pipelineStatus === "waiting_for_user" && blockingReasonType === "paused_by_user")
+  // Stopped ("stopped", or "cancelled" in older rows and run history): the run
+  // is over, so nothing may read Running either.
+  const pipelineStopped = normalizePipelineStatus(pipelineStatus) === "cancelled"
   // Snapshot columns only when this backend reports snapshot counts at all.
   const hasSnapshotCounts =
     summary?.total_snapshot_rows !== undefined ||
     summary?.total_applied_snapshot_rows !== undefined ||
     tables.some((t) => t.snapshot_rows !== undefined || t.applied_snapshot_rows !== undefined)
 
+  const runningLabel = pipelineStopped ? "Stopped" : pipelinePaused ? "Paused" : "Running"
+  const statusChart = useMemo(() => {
+    if (!summary) return null
+    const counts = {
+      completed: summary.tables_completed,
+      running: summary.tables_running,
+      runningLabel,
+      notWritten: tablesNotWritten,
+      rewound: tablesRewound,
+      failed: summary.tables_failed,
+      waitingForData: summary.tables_waiting_for_data ?? 0,
+      removed: summary.tables_removed ?? 0,
+    } as const
+    return { settings: tableStatusChart(counts), rows: tableStatusRows(counts) }
+  }, [summary, runningLabel, tablesNotWritten, tablesRewound])
+  // The page holds every table, or the top-ten read answered for this run: the
+  // chart is the whole pipeline's top ten. Otherwise it is this page's, and says so.
+  const allOnPage = offset === 0 && total <= pageSize && !search
+  const fetchedTop = topTables?.key === topKey ? topTables.rows : null
+  const topIsPageOnly = !allOnPage && !fetchedTop
+  const topChart = useMemo(() => {
+    const rows = topTablesRows(allOnPage || !fetchedTop ? tables : fetchedTop)
+    return { rows, settings: topTablesChart(rows, resolvedMode === "cdc" ? "Rows applied" : "Rows written") }
+  }, [allOnPage, fetchedTop, tables, resolvedMode])
+
   if (loading) {
+    const label = executionPending ? "Waiting for the pipeline's run before reading its tables…" : "Loading table statistics…"
     return (
-      <Card>
-        <CardContent className="p-6">
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {executionPending ? "Waiting for the pipeline's run before reading its tables…" : "Loading table statistics…"}
-          </div>
-        </CardContent>
-      </Card>
+      <div className="space-y-4">
+        <StatCardsSkeleton count={4} label={label} className="@md:grid-cols-2 @3xl:grid-cols-4" />
+        <ChartCardsSkeleton label="Loading table charts…" />
+      </div>
     )
   }
 
@@ -891,7 +983,11 @@ export function TableStatisticsPanel({
     )
   }
 
-  const columns = buildColumns(isBatch, isCDC, prefs.hidden, { paused: pipelinePaused, snapshot: hasSnapshotCounts })
+  const columns = buildColumns(isBatch, isCDC, prefs.hidden, {
+    paused: pipelinePaused,
+    stopped: pipelineStopped,
+    snapshot: hasSnapshotCounts,
+  })
   const identities = tables.map(tableIdentity)
   const showSchema = identities.some((id) => !!id.schema)
   const columnCount = columns.length + (showSchema ? 2 : 1)
@@ -950,148 +1046,195 @@ export function TableStatisticsPanel({
     </div>
   ) : null
 
+  // The summary as KPI cards: the tables and their states, what was read and
+  // written (batch) or captured and applied (CDC), and what was dropped.
+  const statCards: ReactNode[] = []
+  if (summary) {
+    const waiting = summary.tables_waiting_for_data ?? 0
+    const removed = summary.tables_removed ?? 0
+    const tableFacts: StatFact[] = [
+      { label: "done", value: summary.tables_completed },
+      { label: runningLabel.toLowerCase(), value: summary.tables_running },
+      { label: "failed", value: summary.tables_failed, alert: true },
+    ]
+    if (tablesNotWritten > 0) tableFacts.push({ label: "rows not written", value: tablesNotWritten, alert: true })
+    if (tablesRewound > 0) tableFacts.push({ label: "rewound", value: tablesRewound })
+    if (waiting > 0) tableFacts.push({ label: "no data yet", value: waiting })
+    if (removed > 0) tableFacts.push({ label: "removed", value: removed })
+    statCards.push(
+      <StatCard
+        key="tables"
+        title="Tables"
+        icon={Database}
+        value={summary.total_tables}
+        facts={tableFacts}
+        // Not in the total, but still in every count of rows: their rows are still there.
+        hint={removed > 0 ? "Removed tables are not in this total; their rows are in the counts." : undefined}
+      />,
+    )
+    if (isBatch && (summary.total_read_rows !== undefined || summary.total_inserted_rows !== undefined)) {
+      statCards.push(
+        <StatCard key="read" title="Rows read" value={summary.total_read_rows} />,
+        <StatCard key="written" title="Rows written" value={summary.total_inserted_rows} />,
+      )
+    }
+    if (isCDC) {
+      // Every table is still waiting for its first event: say so, not a measured 0.
+      const cdcFacts = (facts: StatFact[]) =>
+        allTablesWaitingForData ? undefined : facts.filter((f) => f.value !== undefined)
+      statCards.push(
+        <StatCard
+          key="captured"
+          title="Changes captured"
+          value={allTablesWaitingForData ? NO_DATA_YET : summary.total_cdc_events}
+          facts={cdcFacts([
+            { label: "inserts", value: summary.total_inserts },
+            { label: "updates", value: summary.total_updates },
+            { label: "deletes", value: summary.total_deletes },
+            { label: "snapshot rows", value: summary.total_snapshot_rows },
+          ])}
+        />,
+        <StatCard
+          key="applied"
+          title="Changes applied"
+          value={allTablesWaitingForData ? NO_DATA_YET : summary.total_applied_cdc_events}
+          facts={cdcFacts([
+            { label: "inserts", value: summary.total_applied_inserts },
+            { label: "updates", value: summary.total_applied_updates },
+            { label: "deletes", value: summary.total_applied_deletes },
+            { label: "snapshot rows", value: summary.total_applied_snapshot_rows },
+          ])}
+        />,
+      )
+    }
+    const dropped = summary.total_dlq_rows ?? 0
+    statCards.push(
+      <StatCard
+        key="dropped"
+        title="Dropped"
+        value={summary.total_dlq_rows}
+        tone={dropped > 0 ? "bad" : "default"}
+        facts={dropped > 0 ? [{ label: "tables", value: summary.tables_with_dlq }] : undefined}
+        hint="Rows the destination rejected, parked in the dead-letter queue."
+      />,
+    )
+  }
+  // Four cards in a row; six (a mixed pipeline) in two rows of three.
+  const statGridClass = statCards.length > 4 ? "@md:grid-cols-2 @3xl:grid-cols-3" : "@md:grid-cols-2 @3xl:grid-cols-4"
+  const chartHeight = hbarHeight(Math.max(statusChart?.rows.length ?? 0, topChart.rows.length))
+
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       {runBanner}
-      {/* Summary — compact, so the per-table grid below starts near the top. */}
       {summary && (
-        <Card>
-          <CardHeader className="p-4 pb-3">
-            <CardTitle className="flex flex-wrap items-center gap-x-2 text-sm font-semibold">
-              <Database className="h-4 w-4" />
-              Summary
-              <span className="font-normal text-muted-foreground">
-                {resolvedMode === "batch" && "· Batch pipeline table migration status"}
-                {resolvedMode === "cdc" && "· CDC pipeline real-time activity by table"}
-                {resolvedMode === "mixed" && "· Mixed batch and CDC activity"}
+        <>
+          {/* What needs acting on first: failed, dropped, rewound, not written. */}
+        {/* Failed tables alert banner */}
+        {summary.tables_failed > 0 && (
+          <div className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm dark:border-red-700 dark:bg-red-950/30">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+            <div>
+              <span className="font-medium text-red-800 dark:text-red-300">
+                {summary.tables_failed} table{summary.tables_failed !== 1 ? "s" : ""} failed to sync
               </span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="p-4 pt-0">
-            {/* Failed tables alert banner */}
-            {summary.tables_failed > 0 && (
-              <div className="mb-3 flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm dark:border-red-700 dark:bg-red-950/30">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
-                <div>
-                  <span className="font-medium text-red-800 dark:text-red-300">
-                    {summary.tables_failed} table{summary.tables_failed !== 1 ? "s" : ""} failed to sync
-                  </span>
-                  <span className="ml-1 text-red-700 dark:text-red-400">
-                    — sort by Status to bring them to the top, and review connector logs.
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {/* Dropped-rows banner. Deliberately ABOVE (and visually louder than) the
-                degraded banner: a degraded table means rows are behind, this means rows
-                are GONE. Nothing else on this page reports it — every other counter is a
-                count of what landed, so a dropped row leaves captured/applied reconciling
-                perfectly with Failed at 0. */}
-            {Boolean(summary.total_dlq_rows) && (
-              <div className="mb-3 flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm dark:border-red-700 dark:bg-red-950/30">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
-                <div>
-                  <span className="font-medium text-red-800 dark:text-red-300">
-                    {formatNumber(summary.total_dlq_rows)} row
-                    {summary.total_dlq_rows !== 1 ? "s" : ""} dropped across{" "}
-                    {summary.tables_with_dlq ?? 0} table
-                    {(summary.tables_with_dlq ?? 0) !== 1 ? "s" : ""}
-                  </span>
-                  <span className="ml-1 text-red-700 dark:text-red-400">
-                    — the destination rejected these rows after every retry, so they were
-                    parked in the dead-letter queue and the stream moved on. They are not
-                    counted anywhere else on this page and will not arrive on their own.
-                    Inspect the <code>.dlq</code> topic for the rejected records and the
-                    reason.
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {/* Degraded warning banner */}
-            {Boolean(summary.tables_degraded) && (
-              <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm dark:border-amber-700 dark:bg-amber-950/30">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                <div>
-                  <span className="font-medium text-amber-800 dark:text-amber-300">
-                    {summary.tables_degraded} table{summary.tables_degraded !== 1 ? "s" : ""} degraded
-                  </span>
-                  <span className="ml-1 text-amber-700 dark:text-amber-400">
-                    — rows were read from source but not written to destination. Check destination connector logs or credentials.
-                  </span>
-                </div>
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4 lg:grid-cols-6">
-              <SummaryTile label="Total Tables" value={summary.total_tables} />
-              <SummaryTile label="Completed" value={summary.tables_completed} className="text-green-600" />
-              {pipelinePaused ? (
-                <SummaryTile label="Paused" value={summary.tables_running} className="text-muted-foreground" />
-              ) : (
-                <SummaryTile label="Running" value={summary.tables_running} className="text-blue-600" />
-              )}
-              <SummaryTile label="Degraded" value={summary.tables_degraded ?? 0} className="text-amber-600" />
-              <SummaryTile label="Failed" value={summary.tables_failed} className="text-red-600" />
-              {(summary.tables_waiting_for_data ?? 0) > 0 && (
-                <SummaryTile
-                  label={NO_DATA_YET}
-                  value={summary.tables_waiting_for_data}
-                  className="text-muted-foreground"
-                />
-              )}
-              {/* Not in Total Tables, but still in the totals: their rows are still there. */}
-              {(summary.tables_removed ?? 0) > 0 && (
-                <SummaryTile label="Removed" value={summary.tables_removed} className="text-muted-foreground" />
-              )}
-
-              {isBatch && (summary.total_read_rows !== undefined || summary.total_inserted_rows !== undefined) && (
-                <>
-                  <SummaryTile label="Total Rows Read" value={formatNumber(summary.total_read_rows)} />
-                  <SummaryTile label="Total Rows Written" value={formatNumber(summary.total_inserted_rows)} />
-                </>
-              )}
-
-              {isCDC && (
-                <>
-                  {summary.total_snapshot_rows !== undefined && (
-                    <SummaryTile label="Captured Snapshot Rows" value={formatSummaryTotal(summary.total_snapshot_rows)} />
-                  )}
-                  {summary.total_applied_snapshot_rows !== undefined && (
-                    <SummaryTile
-                      label="Applied Snapshot Rows"
-                      value={formatSummaryTotal(summary.total_applied_snapshot_rows)}
-                    />
-                  )}
-                  {summary.total_inserts !== undefined && (
-                    <SummaryTile label="Captured Inserts" value={formatSummaryTotal(summary.total_inserts)} />
-                  )}
-                  {summary.total_updates !== undefined && (
-                    <SummaryTile label="Captured Updates" value={formatSummaryTotal(summary.total_updates)} />
-                  )}
-                  {summary.total_deletes !== undefined && (
-                    <SummaryTile label="Captured Deletes" value={formatSummaryTotal(summary.total_deletes)} />
-                  )}
-                  {summary.total_applied_inserts !== undefined && (
-                    <SummaryTile label="Applied Inserts" value={formatSummaryTotal(summary.total_applied_inserts)} />
-                  )}
-                  {summary.total_applied_updates !== undefined && (
-                    <SummaryTile label="Applied Updates" value={formatSummaryTotal(summary.total_applied_updates)} />
-                  )}
-                  {summary.total_applied_deletes !== undefined && (
-                    <SummaryTile label="Applied Deletes" value={formatSummaryTotal(summary.total_applied_deletes)} />
-                  )}
-                </>
-              )}
+              <span className="ml-1 text-red-700 dark:text-red-400">
+                — sort by Status to bring them to the top, and review connector logs.
+              </span>
             </div>
-            {isCDC && (
-              <p data-testid="cdc-counter-legend" className="mt-3 text-xs text-muted-foreground">
-                {CDC_COUNTER_LEGEND}
-              </p>
-            )}
-          </CardContent>
-        </Card>
+          </div>
+        )}
+
+        {/* Dropped-rows banner. Deliberately ABOVE (and visually louder than) the
+            degraded banner: a degraded table means rows are behind, this means rows
+            are GONE. Nothing else on this page reports it — every other counter is a
+            count of what landed, so a dropped row leaves captured/applied reconciling
+            perfectly with Failed at 0. */}
+        {Boolean(summary.total_dlq_rows) && (
+          <div className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2.5 text-sm dark:border-red-700 dark:bg-red-950/30">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+            <div>
+              <span className="font-medium text-red-800 dark:text-red-300">
+                {formatNumber(summary.total_dlq_rows)} row
+                {summary.total_dlq_rows !== 1 ? "s" : ""} dropped across{" "}
+                {summary.tables_with_dlq ?? 0} table
+                {(summary.tables_with_dlq ?? 0) !== 1 ? "s" : ""}
+              </span>
+              <span className="ml-1 text-red-700 dark:text-red-400">
+                — the destination rejected these rows after every retry, so they were
+                parked in the dead-letter queue and the stream moved on. They are not
+                counted anywhere else on this page and will not arrive on their own.
+                Inspect the <code>.dlq</code> topic for the rejected records and the
+                reason.
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Rewound banner: the run lost rows and put these tables back to where
+            it started, so the next run reads them again. */}
+        {tablesRewound > 0 && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm dark:border-amber-700 dark:bg-amber-950/30">
+            <RotateCcw className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <div>
+              <span className="font-medium text-amber-800 dark:text-amber-300">
+                {tablesRewound} table{tablesRewound !== 1 ? "s" : ""} rewound
+              </span>
+              <span className="ml-1 text-amber-700 dark:text-amber-400">
+                — the destination lost rows, so the run put these tables back to where it
+                started. The next run reads those rows again.
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Rows-not-written banner: the rest of the tables the API calls "degraded". */}
+        {tablesNotWritten > 0 && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm dark:border-amber-700 dark:bg-amber-950/30">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <div>
+              <span className="font-medium text-amber-800 dark:text-amber-300">
+                {tablesNotWritten} table{tablesNotWritten !== 1 ? "s" : ""} with rows not written
+              </span>
+              <span className="ml-1 text-amber-700 dark:text-amber-400">
+                — rows were read from source but not written to destination. Check destination connector logs or credentials.
+              </span>
+            </div>
+          </div>
+        )}
+
+          <div className={cn("grid gap-4", statGridClass)}>{statCards}</div>
+          {isCDC && (
+            <p data-testid="cdc-counter-legend" className="text-xs text-muted-foreground">
+              {CDC_COUNTER_LEGEND}
+            </p>
+          )}
+
+          <div className="grid gap-4 @3xl:grid-cols-2">
+            <ChartCard
+              title="Tables by status"
+              description={summary.tables_removed ? "Removed tables are no longer selected; their rows are still at the destination." : "How many tables are in each state."}
+              empty={statusChart && statusChart.rows.length === 0 ? "No tables yet" : undefined}
+              emptyIcon={Database}
+            >
+              {statusChart && (
+                <EChartNoSSR settings={statusChart.settings} rows={statusChart.rows} height={chartHeight} />
+              )}
+            </ChartCard>
+            <ChartCard
+              title={resolvedMode === "cdc" ? "Top 10 tables by rows applied" : "Top 10 tables by rows written"}
+              description={[
+                topIsPageOnly ? "Of the tables on this page." : null,
+                isCDC ? "A CDC table counts its snapshot rows and the changes the sink applied." : null,
+              ]
+                .filter(Boolean)
+                .join(" ") || "The tables that wrote the most rows in this run."}
+              empty={topChart.rows.length === 0 ? "Nothing written yet" : undefined}
+              emptyIcon={Database}
+            >
+              <EChartNoSSR settings={topChart.settings} rows={topChart.rows} height={chartHeight} />
+            </ChartCard>
+          </div>
+        </>
       )}
 
       {/* Table List */}

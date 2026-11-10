@@ -239,6 +239,7 @@ func ModelRefreshWorkflow(ctx workflow.Context, input ModelRefreshInput) error {
 			UpstreamRunID: latest.UpstreamRunID,
 			ExecutionID:   latest.ExecutionID,
 			Coalesced:     len(batch),
+			NextHop:       ModelNextHopCaller,
 		}
 		// Workflow time: the failure record below is deduped on it, so it has to be the
 		// same instant on every replay and every delivery.
@@ -275,6 +276,9 @@ func ModelRefreshWorkflow(ctx workflow.Context, input ModelRefreshInput) error {
 				logger.Warn("❌ model refresh failed",
 					"saved_query_id", input.SavedQueryID, "error", result.Error)
 			}
+			// Before the loop takes the next batch or continues as new, so the hop below
+			// this run is in this history whatever the loop does next.
+			startModelNextHop(ctx, runInput, result)
 		}
 		done++
 		phase = ModelRefreshPhaseWaiting

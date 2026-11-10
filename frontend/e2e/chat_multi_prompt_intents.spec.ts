@@ -10,7 +10,7 @@ test.describe("Chat: multiple prompts in one session", () => {
   })
 
   async function sendChat(page: any, msg: string) {
-    const input = page.getByPlaceholder("Describe what data you want to move…")
+    const input = page.getByRole("textbox", { name: "Message" })
     await expect(input).toBeVisible()
     await input.fill(msg)
     await page.keyboard.press("Enter")

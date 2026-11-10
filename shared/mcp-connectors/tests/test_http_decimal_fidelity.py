@@ -261,9 +261,10 @@ fastapi_encoders = pytest.importorskip(
 # Every value here must be one float64 genuinely cannot represent -- i.e. needing more
 # than ~17 significant digits. That is a narrower set than it looks: 0.123456789012 and
 # -0.000000000123456 both survive a float round-trip untouched, so using them here would
-# make the control assert something false. (They are still corrupted end-to-end, but by
-# the destination's NUMERIC(38,9) scale, which is a separate defect -- see
-# KI-CONNECTOR-UNCONSTRAINED-NUMERIC-ROUNDS-AT-9DP.) Three shapes that do overflow a
+# make the control assert something false. (From an unconstrained PostgreSQL NUMERIC
+# they used to be corrupted end-to-end by the destination's NUMERIC(38,9) scale, a
+# separate defect, since resolved -- see test_unconstrained_numeric_golden.py and the
+# resolved KI-CONNECTOR-UNCONSTRAINED-NUMERIC-ROUNDS-AT-9DP.) Three shapes that do overflow a
 # float: sub-1 precision, large-magnitude precision, and a value whose float collapses
 # to a completely different rendering.
 LOSSY_VALUES = [

@@ -72,6 +72,34 @@ func ScheduledPipelineRunWorkflow(ctx workflow.Context, input ScheduledRunInput)
 		return nil // Successful skip (not an error)
 	}
 
+	// Step 1b: the Run button's checks (billing, draft, a Reload into an API).
+	// A refusal is a skip, like an overlap; the schedule's page says why
+	// (blocked_reason). A gateway that cannot answer lets the tick run, as each
+	// gate does on a read error.
+	if workflow.GetVersion(ctx, scheduledRunGatesVersion, workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		gateCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			StartToCloseTimeout: 15 * time.Second,
+			RetryPolicy: &temporal.RetryPolicy{
+				InitialInterval:    time.Second,
+				BackoffCoefficient: 2.0,
+				MaximumInterval:    5 * time.Second,
+				MaximumAttempts:    3,
+			},
+		})
+		var gate ScheduledRunGate
+		if err := workflow.ExecuteActivity(gateCtx, CheckScheduledRunGatesActivity, input.PipelineID).Get(ctx, &gate); err != nil {
+			logger.Warn("Could not check the run gates; running the scheduled tick",
+				"pipeline_id", input.PipelineID, "error", err)
+		} else if !gate.Allowed {
+			logger.Warn("⏭️  Skipping scheduled execution (the Run button would refuse it)",
+				"pipeline_id", input.PipelineID,
+				"schedule_id", input.ScheduleID,
+				"reason", gate.Reason,
+				"message", gate.Message)
+			return nil
+		}
+	}
+
 	// Step 2: Create execution record (deterministic + idempotent)
 	var executionID string
 	err = workflow.ExecuteActivity(ctx, CreateScheduledExecutionActivity, input).Get(ctx, &executionID)
@@ -220,6 +248,27 @@ func CheckActiveRunActivity(ctx context.Context, pipelineID string) (bool, error
 	}
 
 	return isActive, nil
+}
+
+// scheduledRunGatesVersion marks the wrapper asking CheckScheduledRunGatesActivity
+// before it writes an execution; a wrapper started before it replays without.
+const scheduledRunGatesVersion = "scheduled-run-gates"
+
+// ScheduledRunGate is the gateway's answer to "may this tick start a run?".
+type ScheduledRunGate struct {
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// CheckScheduledRunGatesActivity asks the gateway for the Run button's checks on
+// this pipeline: the billing gates as its creator, the draft gate and a Reload
+// into an app's API (POST /api/v1/internal/pipelines/:id/scheduled-run/check).
+func CheckScheduledRunGatesActivity(ctx context.Context, pipelineID string) (ScheduledRunGate, error) {
+	var out ScheduledRunGate
+	err := callWorkflowRunEndpoint(ctx, "/api/v1/internal/pipelines/"+pipelineID+"/scheduled-run/check",
+		map[string]any{}, 10*time.Second, &out)
+	return out, err
 }
 
 // CreateScheduledExecutionActivity creates a deterministic execution record

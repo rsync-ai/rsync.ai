@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import {
   Dialog,
   DialogContent,
@@ -16,6 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Loader2,
@@ -29,19 +30,36 @@ import {
   ChevronDown,
   ChevronRight,
   Settings2,
+  Plus,
+  Trash2,
 } from "lucide-react"
 import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "sonner"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { metadataErrorMessage } from "@/lib/api/connections"
 import {
   generateSuggestions,
   type SuggestionsResponse,
-  type PIIColumnSuggestion,
   type TransformSuggestion,
-  type OptimizationSuggestion,
 } from "@/lib/api/suggestions"
-import { TRANSFORM_TYPE_BLURBS, transformTypeLabel } from "@/lib/transform-display"
+import { describeTransform, TRANSFORM_TYPE_BLURBS, transformTypeLabel } from "@/lib/transform-display"
+import { SUPPORTED_OPERATION_LIST, TRANSFORM_OPERATIONS } from "@/components/transforms/transformOperations"
+import { TransformRuleFields, type TableColumns } from "@/components/transforms/TransformRuleFields"
+import {
+  isSupportedOperation,
+  toEngineTransform,
+  type TransformOperation,
+} from "@/lib/pipeline/transformOps"
+import {
+  describeRuleTypeLimit,
+  loadPipelineTransformPlan,
+  operationRuns,
+  ruleTypeRuns,
+  savePipelineTransformPlan,
+  stableStringify,
+  type PlanRule,
+} from "@/lib/pipeline/transformPlan"
 
 export interface TableMetadata {
   name: string
@@ -73,10 +91,12 @@ interface SuggestionsReviewDialogProps {
   // awaits it so it can show a spinner and stay open on failure.
   onClose: () => void | Promise<void>
   pipelineId: string
-  executionId?: string
   sourceConnectionId: string
   selectedTables: string[]
-  onApplyContinue: (transforms: TransformSuggestion[]) => Promise<void>
+  // Resumes the parked pipeline. The plan is already saved by then: the dialog
+  // writes it to transform_definitions itself, and that table is the only copy the
+  // run reads, so the resume carries just how many rules this step added.
+  onApplyContinue: (saved: { count: number }) => Promise<void>
   // If the parent already fetched schema (pre-fetch on table selection), pass it here
   // to skip the schema fetch step and jump straight to LLM suggestions.
   prefetchedSchema?: TableMetadata[]
@@ -227,11 +247,85 @@ function transformColumn(t: TransformSuggestion): string {
   return typeof c === "string" && c ? c : t.summary || t.type
 }
 
+/**
+ * A plan rule in the engine's vocabulary, for display, preview and duplicate
+ * checks. A rule added here or in the Transforms tab's editor is stored under the
+ * builder's name (`mask`, `rename`) and an AI suggestion under the engine's
+ * (`mask_pii`, `rename_columns`); both normalise to the same engine rule
+ * (shared/go/transforms/validate.go normalizeType), so they are compared here.
+ */
+function engineView(rule: PlanRule): { type: string; config: Record<string, unknown> } {
+  const op = rule.operation
+  if (isSupportedOperation(op)) {
+    // Forced enabled: toEngineTransform drops a disabled rule, and a disabled saved
+    // rule still has to be shown and compared.
+    const t = toEngineTransform({ ...rule, operation: op, enabled: true })
+    if (t) return { type: String(t.type), config: (t.config || {}) as Record<string, unknown> }
+  }
+  return { type: op, config: rule.config || {} }
+}
+
+/** Two rules with the same key do the same thing; saving both would apply it twice. */
+function planKey(rule: PlanRule): string {
+  const v = engineView(rule)
+  return `${rule.enabled ? 1 : 0}|${v.type}|${stableStringify(v.config)}`
+}
+
+/**
+ * The operator's choices over the suggestions, as one comparable value: equal to
+ * the value taken when the suggestions loaded means nothing was changed. Ticking a
+ * box and ticking it back is no change.
+ */
+function selectionKey(
+  enabledPII: Record<string, boolean>,
+  piiActions: Record<string, string>,
+  piiHashFunctions: Record<string, string>,
+  enabledTransforms: Record<number, boolean>,
+  editedConfigs: Record<number, Record<string, unknown>>
+): string {
+  return stableStringify({ enabledPII, piiActions, piiHashFunctions, enabledTransforms, editedConfigs })
+}
+
+// A rule added in this step only has to name what the engine needs to run it. The
+// one exception: "Drop Row" needs no default value.
+function missingRequiredField(op: TransformOperation, config: Record<string, unknown>): string | null {
+  for (const field of TRANSFORM_OPERATIONS[op].fields) {
+    if (!field.required) continue
+    if (op === "null_handle" && field.name === "default_value" && config.action === "skip") continue
+    const v = config[field.name]
+    if (v === undefined || v === null || String(v).trim() === "") return field.label
+  }
+  return null
+}
+
+/**
+ * The selected tables and their columns, named the way the operator picked them.
+ * That name becomes a rule's `config.table`, and the engine matches it on either
+ * the qualified or the bare table name (validate.go tableMatches), so it holds on
+ * both the batch path and the CDC path.
+ */
+function tablesWithColumns(schema: TableMetadata[], selectedTables: string[]): TableColumns[] {
+  const all = schema.map((t) => {
+    const qualified = t.schema ? `${t.schema}.${t.name}` : t.name
+    const picked = selectedTables.find(
+      (s) => s.toLowerCase() === qualified.toLowerCase() || s.toLowerCase() === t.name.toLowerCase()
+    )
+    return {
+      picked: Boolean(picked),
+      table: picked || qualified,
+      columns: (t.columns || []).map((c) => c.name).filter(Boolean),
+    }
+  })
+  // A schema the parent pre-fetched can hold more than the picked tables; offer
+  // only those. If none match by name, the schema is all there is to go on.
+  const chosen = all.filter((t) => t.picked)
+  return (chosen.length > 0 ? chosen : all).map(({ table, columns }) => ({ table, columns }))
+}
+
 export function SuggestionsReviewDialog({
   isOpen,
   onClose,
   pipelineId,
-  executionId,
   sourceConnectionId,
   selectedTables,
   onApplyContinue,
@@ -242,6 +336,10 @@ export function SuggestionsReviewDialog({
   const [loadStep, setLoadStep] = useState<"schema" | "suggestions">("schema")
   const [retryCount, setRetryCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  // A failed save or resume. Kept apart from `error`, which is the suggestions
+  // load failing and replaces the whole dialog body: this one must leave the
+  // operator's plan on screen so they can retry it.
+  const [actionError, setActionError] = useState<string | null>(null)
   const [suggestions, setSuggestions] = useState<SuggestionsResponse | null>(null)
   const [schema, setSchema] = useState<TableMetadata[]>(prefetchedSchema ?? [])
   
@@ -275,6 +373,32 @@ export function SuggestionsReviewDialog({
   // single resume: whichever fires first sets it, and the other aborts — preventing
   // two conflicting resume signals (transforms vs. skip) racing to the backend.
   const committedRef = useRef(false)
+  // The suggestion choices as they loaded, so a close can tell whether the
+  // operator changed any (selectionKey). null until the suggestions load.
+  const [loadedSelection, setLoadedSelection] = useState<string | null>(null)
+  // Escape, the backdrop or X over unsaved work: ask before it is thrown away.
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
+  const keepEditingRef = useRef<HTMLButtonElement>(null)
+  const discardQuestionId = useId()
+
+  // What the pipeline already has. Saving is a REPLACE (transformPlan.ts), so the
+  // dialog must know these before it writes anything: a table-selection step on a
+  // pipeline that already has transforms (a re-discovery) would otherwise delete
+  // them. null = not loaded yet, or the load failed.
+  const [existingRules, setExistingRules] = useState<PlanRule[] | null>(null)
+  const [existingError, setExistingError] = useState<string | null>(null)
+  const [existingAttempt, setExistingAttempt] = useState(0)
+  // The only rule types the pipeline can run (consumer_rule_types, sent for a
+  // MongoDB CDC pipeline); null = any type can. Only those are offered: the save
+  // refuses any other, and every other rule it was sent with.
+  const [ruleTypeLimit, setRuleTypeLimit] = useState<string[] | null>(null)
+
+  // Rules the operator adds in this step, with the Transforms tab's rule fields.
+  const [customRules, setCustomRules] = useState<PlanRule[]>([])
+  const [draftOp, setDraftOp] = useState<TransformOperation | "">("")
+  const [draftConfig, setDraftConfig] = useState<Record<string, any>>({})
+  const [draftError, setDraftError] = useState<string | null>(null)
+  const [editingCustom, setEditingCustom] = useState<string | null>(null)
 
   // Transform-tab view state. Cards default to COLLAPSED so a long list (e.g.
   // 37 json_flatten suggestions) reads as a few grouped rows, not a wall of
@@ -292,6 +416,7 @@ export function SuggestionsReviewDialog({
     const list = suggestions?.transforms || []
     for (let i = 0; i < list.length; i++) {
       const t = list[i]
+      if (!ruleTypeRuns(ruleTypeLimit, t.type || "")) continue
       const key = t.type || "other"
       if (!byType[key]) {
         byType[key] = []
@@ -300,7 +425,21 @@ export function SuggestionsReviewDialog({
       byType[key].push({ transform: t, idx: i })
     }
     return order.map((type) => ({ type, items: byType[type] }))
-  }, [suggestions])
+  }, [suggestions, ruleTypeLimit])
+
+  // The suggestions this pipeline cannot run: not listed, not saved, and named.
+  const leftOutTransforms = useMemo(
+    () => (suggestions?.transforms || []).filter((t) => !ruleTypeRuns(ruleTypeLimit, t.type || "")),
+    [suggestions, ruleTypeLimit]
+  )
+  const offeredTransformCount = (suggestions?.transforms?.length || 0) - leftOutTransforms.length
+  const ruleTypeNote = ruleTypeLimit
+    ? describeRuleTypeLimit(ruleTypeLimit, {
+        count: leftOutTransforms.length,
+        noun: "suggestion",
+        types: [...new Set(leftOutTransforms.map((t) => t.type || "other"))],
+      })
+    : null
 
   function normalizeValue(v: unknown): string {
     if (v == null) return ""
@@ -409,6 +548,17 @@ export function SuggestionsReviewDialog({
       setPreviewOpen(false)
       setPreviewData(null)
       setClosing(false)
+      setActionError(null)
+      setExistingRules(null)
+      setExistingError(null)
+      setRuleTypeLimit(null)
+      setCustomRules([])
+      setDraftOp("")
+      setDraftConfig({})
+      setDraftError(null)
+      setEditingCustom(null)
+      setLoadedSelection(null)
+      setConfirmDiscard(false)
       committedRef.current = false
       return
     }
@@ -429,7 +579,9 @@ export function SuggestionsReviewDialog({
             )}&include_columns=true`,
             { cache: "no-store" }
           )
-          if (!schemaRes.ok) throw new Error("Failed to fetch schema")
+          // "Schema discovery failed" names nothing; `details` carries the
+          // connector's own reason (a DNS or auth error).
+          if (!schemaRes.ok) throw new Error(await metadataErrorMessage(schemaRes))
           const schemaData = await schemaRes.json()
           tables = schemaData.tables || []
           setSchema(tables)
@@ -479,6 +631,7 @@ export function SuggestionsReviewDialog({
           transformEnabled[i] = true
         }
         setEnabledTransforms(transformEnabled)
+        setLoadedSelection(selectionKey(piiEnabled, piiActs, {}, transformEnabled, {}))
       } catch (err: any) {
         setError(err?.message || "Failed to generate suggestions")
       } finally {
@@ -489,6 +642,29 @@ export function SuggestionsReviewDialog({
     void fetchAndGenerate()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, sourceConnectionId, selectedTables, retryCount])
+
+  // Load the pipeline's saved transforms, which the save below has to keep.
+  useEffect(() => {
+    if (!isOpen) return
+    if (!pipelineId) {
+      setExistingRules([])
+      return
+    }
+    let cancelled = false
+    setExistingError(null)
+    void loadPipelineTransformPlan(pipelineId).then((res) => {
+      if (cancelled) return
+      if (res.ok) {
+        setExistingRules(res.data)
+        setRuleTypeLimit(res.consumerRuleTypes)
+      } else setExistingError(res.error)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen, pipelineId, existingAttempt])
+
+  const tableColumns = useMemo(() => tablesWithColumns(schema, selectedTables), [schema, selectedTables])
 
   const buildActiveTransforms = useCallback((): TransformSuggestion[] => {
     const transforms: TransformSuggestion[] = []
@@ -526,7 +702,7 @@ export function SuggestionsReviewDialog({
     // checkbox and per-row toggle, so a never-touched suggestion that shows as
     // CHECKED is also persisted (not silently dropped).
     for (let i = 0; i < (suggestions.transforms || []).length; i++) {
-      if (enabledTransforms[i] ?? true) {
+      if ((enabledTransforms[i] ?? true) && ruleTypeRuns(ruleTypeLimit, suggestions.transforms[i].type || "")) {
         const base = suggestions.transforms[i]
         const edits = editedConfigs[i]
         if (edits && Object.keys(edits).length > 0) {
@@ -538,13 +714,72 @@ export function SuggestionsReviewDialog({
     }
 
     return transforms
-  }, [suggestions, enabledPII, enabledTransforms, piiActions, editedConfigs, piiHashFunctions])
+  }, [suggestions, enabledPII, enabledTransforms, piiActions, editedConfigs, piiHashFunctions, ruleTypeLimit])
+
+  /**
+   * The plan this step saves: the pipeline's saved rules first, unchanged, then
+   * the checked suggestions, then the rules added here. Every new rule runs on
+   * both the batch and the CDC path ("both"), because a CDC pipeline's initial
+   * load can take either. A rule already in the plan is not added twice — a
+   * second mask would hash the hash.
+   */
+  const planRules = useMemo((): PlanRule[] => {
+    const seen = new Set<string>()
+    const out: PlanRule[] = []
+    const push = (r: PlanRule) => {
+      const k = planKey(r)
+      if (seen.has(k)) return
+      seen.add(k)
+      out.push({ ...r, order: out.length })
+    }
+    // Saved rules go in exactly as stored — even a duplicate pair — so nothing
+    // already saved is dropped by a re-save, and addedCount stays exact.
+    for (const r of existingRules ?? []) {
+      seen.add(planKey(r))
+      out.push({ ...r, order: out.length })
+    }
+    for (const t of buildActiveTransforms()) {
+      push({ id: "", order: 0, type: "both", operation: t.type, enabled: true, config: { ...(t.config || {}) } })
+    }
+    for (const r of customRules) push(r)
+    return out
+  }, [existingRules, buildActiveTransforms, customRules])
+
+  const existingCount = existingRules?.length ?? 0
+  const addedCount = planRules.length - existingCount
+
+  const addCustomRule = () => {
+    if (!draftOp) return
+    const missing = missingRequiredField(draftOp, draftConfig)
+    if (missing) {
+      setDraftError(`${missing} is required.`)
+      return
+    }
+    const rule: PlanRule = {
+      id: crypto.randomUUID(),
+      order: 0,
+      type: "both",
+      operation: draftOp,
+      enabled: true,
+      config: { ...draftConfig },
+      description: TRANSFORM_OPERATIONS[draftOp].description,
+    }
+    if (planRules.some((r) => planKey(r) === planKey(rule))) {
+      setDraftError("Already in the plan.")
+      return
+    }
+    setCustomRules((prev) => [...prev, rule])
+    setDraftOp("")
+    setDraftConfig({})
+    setDraftError(null)
+  }
 
   const handlePreview = useCallback(
     async (table: string) => {
       if (!sourceConnectionId || !table) return
 
-      const activeTransforms = buildActiveTransforms()
+      // The whole plan as the run will apply it, saved rules included.
+      const activeTransforms = planRules.filter((r) => r.enabled).map(engineView)
       if (activeTransforms.length === 0) {
         // Nothing meaningful to show — tell user to enable at least one transform.
         setPreviewTable(table)
@@ -605,62 +840,36 @@ export function SuggestionsReviewDialog({
         setPreviewLoading(false)
       }
     },
-    [sourceConnectionId, buildActiveTransforms]
+    [sourceConnectionId, planRules]
   )
 
   const handleApply = useCallback(async () => {
     // A resume (apply or a raced-in skip) already owns this node — don't start.
     if (committedRef.current) return
     setSubmitting(true)
-    setError(null)
+    setActionError(null)
 
     try {
-      const transforms = buildActiveTransforms()
-
-      // Persist transforms to pipeline for audit/future edits
-      if (transforms.length > 0 && pipelineId) {
-        const saveRes = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/transforms/pipeline/${pipelineId}`, {
-          method: "POST",
-          // Bound the save so a stalled socket can't pin the "Applying…" spinner
-          // forever — the catch surfaces the error and reopens the actions.
-          timeoutMs: 30000,
-          // Persist EACH transform as both a producer and a consumer row.
-          // The modal has no access to pipeline mode (batch/CDC/hybrid): the
-          // batch executor reads transform_type='producer'; the CDC sink reads
-          // transform_type='consumer'. Emitting both guarantees the transform
-          // runs regardless of mode (and covers hybrid). SavePipelineTransforms
-          // is DELETE-then-INSERT, so re-apply is idempotent.
-          body: JSON.stringify({
-            transforms: transforms.flatMap((t, idx) => {
-              const transform_config = {
-                operation: t.type,
-                ...t.config,
-              }
-              return [
-                {
-                  id: crypto.randomUUID(),
-                  pipeline_id: pipelineId,
-                  transform_type: "producer",
-                  transform_order: idx * 2,
-                  transform_config,
-                  enabled: true,
-                },
-                {
-                  id: crypto.randomUUID(),
-                  pipeline_id: pipelineId,
-                  transform_type: "consumer",
-                  transform_order: idx * 2 + 1,
-                  transform_config,
-                  enabled: true,
-                },
-              ]
-            }),
-          }),
-        })
-        if (!saveRes.ok) {
-          const body = await saveRes.json().catch(() => ({}))
-          throw new Error(body?.error || `Failed to save transforms (HTTP ${saveRes.status})`)
+      // Nothing new means nothing to write: the saved rules are already stored,
+      // and re-writing them would only re-mint their ids.
+      if (addedCount > 0) {
+        // A rule edited after "Add to plan" can have lost a required field.
+        for (const r of customRules) {
+          const missing = missingRequiredField(r.operation as TransformOperation, r.config)
+          if (missing) {
+            throw new Error(
+              `Transforms not saved: ${TRANSFORM_OPERATIONS[r.operation as TransformOperation].name} needs ${missing}.`
+            )
+          }
         }
+        if (!pipelineId) throw new Error("Transforms not saved: this step has no pipeline to save them to.")
+        // The button is disabled until the saved rules are known; this guards a
+        // click that lands in between. A save without them would delete them.
+        if (existingRules === null) throw new Error("Transforms not saved: the pipeline's saved transforms have not loaded.")
+        // The shared save the Transforms tab's editor uses: one producer row and one
+        // consumer row per rule, bounded by a timeout.
+        const saved = await savePipelineTransformPlan(pipelineId, planRules)
+        if (!saved.ok) throw new Error(`Transforms not saved: ${saved.error}`)
       }
 
       // If a Skip raced in while the save POST was in flight, it has already claimed
@@ -668,27 +877,32 @@ export function SuggestionsReviewDialog({
       if (committedRef.current) return
       committedRef.current = true
 
-      if (transforms.length > 0 && pipelineId) {
-        // The CDC sink caches consumer transforms for up to 30s, so changes to a
-        // pipeline that is already running propagate within that window.
-        toast.success("Transforms saved. Changes propagate to running pipelines within 30 seconds.")
-      }
+      // onApplyContinue already closes this dialog (unmounts it) once the resume
+      // signal is sent, so we do NOT also call onClose() here — onClose is the SKIP
+      // handler, and calling it fired a spurious second (skip) resume on top of the
+      // apply.
+      await onApplyContinue({ count: addedCount })
 
-      // Resume pipeline with transforms in metadata. onApplyContinue already
-      // closes this dialog (unmounts it) once the resume signal is sent, so we do
-      // NOT also call onClose() here — onClose is the SKIP handler, and calling it
-      // fired a spurious second (skip) resume on top of the apply.
-      await onApplyContinue(transforms)
+      // Only after the resume went through (a failed one reports in the dialog),
+      // and with its own duration so it doesn't outlive the step it describes.
+      // The CDC sink caches consumer transforms for up to 30s, so changes to a
+      // pipeline that is already running propagate within that window.
+      if (addedCount > 0) {
+        toast.success("Transforms saved. Changes propagate to running pipelines within 30 seconds.", {
+          duration: 5000,
+        })
+      }
     } catch (err: any) {
       // Release the claim so the user can retry from the still-open modal.
       committedRef.current = false
-      setError(err?.message || "Failed to apply transforms")
+      setActionError(err?.message || "Failed to apply transforms")
     } finally {
       setSubmitting(false)
     }
-  }, [buildActiveTransforms, onApplyContinue, pipelineId])
+  }, [addedCount, customRules, existingRules, onApplyContinue, pipelineId, planRules])
 
-  // Single entry point for skip / backdrop / escape / X. Awaits the parent's async
+  // The Skip resume: the Skip button, and "Discard and start" in the question
+  // that Escape, the backdrop and X raise over unsaved work. Awaits the parent's async
   // resume so it can (a) show a "Skipping…" spinner while it runs, and (b) stay open
   // with the user's selection intact if the resume fails. `setSubmitting(false)` keeps
   // Skip a real escape hatch even if an Apply is mid-flight — the user must always be
@@ -699,7 +913,7 @@ export function SuggestionsReviewDialog({
     if (closing || committedRef.current) return
     committedRef.current = true
     setSubmitting(false)
-    setError(null)
+    setActionError(null)
     setClosing(true)
     try {
       await onClose()
@@ -708,9 +922,41 @@ export function SuggestionsReviewDialog({
       // Resume failed — release the claim, reopen the actions, and surface the error.
       committedRef.current = false
       setClosing(false)
-      setError(err?.message || "Failed to skip suggestions")
+      setActionError(err?.message || "Failed to skip suggestions")
     }
   }, [closing, onClose])
+
+  // What Escape, the backdrop and X would throw away. Suggestions as they loaded
+  // are not the operator's work, so closing over them stays one step.
+  const hasUnsavedWork =
+    !loading &&
+    !error &&
+    (customRules.length > 0 ||
+      draftOp !== "" ||
+      (loadedSelection !== null &&
+        selectionKey(enabledPII, piiActions, piiHashFunctions, enabledTransforms, editedConfigs) !== loadedSelection))
+
+  // Escape and X (an outside click never closes this dialog). Only the Skip
+  // button skips without asking: these also fire by accident, and closing
+  // starts the pipeline without the rules set up here
+  // (KI-TRANSFORM-STEP-CLOSE-DISCARDS-RULES).
+  const requestDismiss = useCallback(() => {
+    if (closing || committedRef.current) return
+    // A second Escape backs out of the question rather than answering it.
+    if (confirmDiscard) {
+      setConfirmDiscard(false)
+      return
+    }
+    if (hasUnsavedWork) {
+      setConfirmDiscard(true)
+      return
+    }
+    void requestClose()
+  }, [closing, confirmDiscard, hasUnsavedWork, requestClose])
+
+  useEffect(() => {
+    if (confirmDiscard) keepEditingRef.current?.focus()
+  }, [confirmDiscard])
 
   // ---- Transform group helpers (operate on original indices) ----
   // Tri-state group checkbox: true if all enabled, false if none, "indeterminate" otherwise.
@@ -740,24 +986,22 @@ export function SuggestionsReviewDialog({
     })
   }
 
-  const totalSuggestions =
-    (suggestions?.pii_columns?.length || 0) + (suggestions?.transforms?.length || 0)
-  const activeSuggestions =
-    Object.values(enabledPII).filter(Boolean).length +
-    Object.values(enabledTransforms).filter(Boolean).length
+  // Saving with the saved rules unknown would delete them (a REPLACE), so a plan
+  // that adds anything waits for them.
+  const saveBlocked = addedCount > 0 && existingRules === null
 
   return (
     <>
-      <Dialog open={isOpen} onOpenChange={(open) => { if (!open) void requestClose() }}>
+      <Dialog open={isOpen} onOpenChange={(open) => { if (!open) requestDismiss() }} closeOnOutsideClick={false}>
         <DialogContent className="w-[95vw] max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Sparkles className="h-5 w-5 text-violet-600" />
-              AI Suggestions &amp; Transforms
+              Transforms
             </DialogTitle>
             <DialogDescription>
-              Review and customize AI-suggested transforms before continuing. Selected PII rules and
-              transforms are applied to your data during pipeline execution; optimizations are advice only.
+              Keep the AI suggestions you want and add your own rules. Every rule runs on the initial
+              load and on every change after it. Optimizations are advice only.
             </DialogDescription>
           </DialogHeader>
 
@@ -831,8 +1075,8 @@ export function SuggestionsReviewDialog({
                       // onApplyContinue already dismisses this dialog. Do NOT also
                       // call onClose() — that's the SKIP handler and would fire a
                       // spurious second resume on top of the continue.
-                      await onApplyContinue([])
-                    } catch (e) {
+                      await onApplyContinue({ count: 0 })
+                    } catch {
                       // Reset so the user can retry or cancel.
                       setSubmitting(false)
                     }
@@ -858,8 +1102,11 @@ export function SuggestionsReviewDialog({
             <>
               <div className="flex items-center justify-between px-1 py-2">
                 <div className="text-sm text-zinc-600 dark:text-zinc-400">
-                  <span className="font-medium text-foreground">{activeSuggestions}</span> of{" "}
-                  {totalSuggestions} suggestions will be applied
+                  <span className="font-medium text-foreground">{planRules.length}</span>{" "}
+                  {planRules.length === 1 ? "transform" : "transforms"} in the plan
+                  {existingCount > 0 && (
+                    <span className="text-muted-foreground"> ({existingCount} already saved)</span>
+                  )}
                   {selectedTables.length > 0 && (
                     <span className="text-muted-foreground">
                       {" "}
@@ -908,18 +1155,26 @@ export function SuggestionsReviewDialog({
                 tab headers and the Skip/Apply footer fixed while the list scrolls.
               */}
               <Tabs defaultValue="pii" className="flex-1 min-h-0 flex flex-col w-full">
-                <TabsList className="grid w-full grid-cols-3 shrink-0">
+                <TabsList className="grid w-full grid-cols-2 sm:grid-cols-5 h-auto shrink-0">
                     <TabsTrigger value="pii">
                       <Shield className="h-4 w-4 mr-2" />
                       PII ({suggestions?.pii_columns?.length || 0})
                     </TabsTrigger>
                     <TabsTrigger value="transforms">
                       <Zap className="h-4 w-4 mr-2" />
-                      Transforms ({suggestions?.transforms?.length || 0})
+                      Transforms ({offeredTransformCount})
+                    </TabsTrigger>
+                    <TabsTrigger value="custom">
+                      <Plus className="h-4 w-4 mr-2" />
+                      Add a transform
                     </TabsTrigger>
                     <TabsTrigger value="optimizations">
                       <Sparkles className="h-4 w-4 mr-2" />
                       Optimizations ({suggestions?.optimizations?.length || 0})
+                    </TabsTrigger>
+                    <TabsTrigger value="plan">
+                      <CheckCircle2 className="h-4 w-4 mr-2" />
+                      Plan ({planRules.length})
                     </TabsTrigger>
                   </TabsList>
 
@@ -1015,7 +1270,7 @@ export function SuggestionsReviewDialog({
                                       title="Hash algorithm"
                                     >
                                       <option value="sha256">SHA-256 (recommended)</option>
-                                      <option value="hmac_sha256">HMAC-SHA256 (keyed)</option>
+                                      <option value="hmac_sha256" title="Needs RSYNC_PII_HASH_SALT on the server; without it the rule is refused">HMAC-SHA256 (needs server key)</option>
                                       <option value="md5">MD5 (legacy)</option>
                                     </select>
                                   )}
@@ -1031,17 +1286,20 @@ export function SuggestionsReviewDialog({
                   </TabsContent>
 
                   <TabsContent value="transforms" className="space-y-3 mt-4">
-                    {(suggestions?.transforms || []).length > 0 && (
+                    {ruleTypeNote && (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">{ruleTypeNote}</p>
+                    )}
+                    {offeredTransformCount > 0 && (
                       <div className="flex items-start gap-2 rounded-md border border-teal-200 dark:border-teal-900/60 bg-teal-50 dark:bg-teal-950/30 px-3 py-2.5">
                         <Sparkles className="h-4 w-4 text-teal-600 dark:text-teal-400 mt-0.5 shrink-0" />
                         <p className="text-xs text-teal-800 dark:text-teal-200">
                           We auto-selected{" "}
-                          <span className="font-medium">{(suggestions?.transforms || []).length} transforms</span>{" "}
+                          <span className="font-medium">{offeredTransformCount} transforms</span>{" "}
                           from your schema. These are safe defaults — uncheck anything you don&apos;t want, then continue.
                         </p>
                       </div>
                     )}
-                    {(suggestions?.transforms || []).length === 0 ? (
+                    {offeredTransformCount === 0 ? (
                       <Card>
                         <CardContent className="pt-6">
                           <div className="text-sm text-zinc-600 dark:text-zinc-400 text-center">
@@ -1192,6 +1450,128 @@ export function SuggestionsReviewDialog({
                     )}
                   </TabsContent>
 
+                  <TabsContent value="custom" className="space-y-4 mt-4">
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      A rule added here joins the plan. Like every rule, it runs on the initial load and on
+                      every change after it.
+                    </p>
+                    {ruleTypeLimit && (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">{describeRuleTypeLimit(ruleTypeLimit)}</p>
+                    )}
+                    <Card>
+                      <CardContent className="pt-4 space-y-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="custom-transform-operation">Operation</Label>
+                          <Select
+                            value={draftOp || undefined}
+                            onValueChange={(v) => {
+                              setDraftOp(v as TransformOperation)
+                              setDraftConfig({})
+                              setDraftError(null)
+                            }}
+                          >
+                            <SelectTrigger id="custom-transform-operation" aria-label="Operation">
+                              <SelectValue placeholder="Pick an operation" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {SUPPORTED_OPERATION_LIST.filter((op) => operationRuns(ruleTypeLimit, op)).map((op) => (
+                                <SelectItem key={op} value={op}>
+                                  {TRANSFORM_OPERATIONS[op].name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {draftOp && (
+                            <p className="text-xs text-muted-foreground">
+                              {TRANSFORM_OPERATIONS[draftOp].description}
+                            </p>
+                          )}
+                        </div>
+                        {draftOp && (
+                          <TransformRuleFields
+                            operation={draftOp}
+                            config={draftConfig}
+                            onChange={(next) => {
+                              setDraftConfig(next)
+                              setDraftError(null)
+                            }}
+                            schema={tableColumns}
+                          />
+                        )}
+                        {draftError && (
+                          <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+                            {draftError}
+                          </p>
+                        )}
+                        <div className="flex justify-end">
+                          <Button size="sm" onClick={addCustomRule} disabled={!draftOp}>
+                            <Plus className="h-4 w-4 mr-2" />
+                            Add to plan
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+
+                    {customRules.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="text-sm font-medium">Added here ({customRules.length})</div>
+                        {customRules.map((rule) => {
+                          const op = rule.operation as TransformOperation
+                          const name = TRANSFORM_OPERATIONS[op]?.name ?? rule.operation
+                          const view = engineView(rule)
+                          const d = describeTransform(view.type, view.config)
+                          const editing = editingCustom === rule.id
+                          return (
+                            <Card key={rule.id}>
+                              <CardContent className="pt-3 pb-3 space-y-3">
+                                <div className="flex items-center gap-2">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="text-sm font-medium">{name}</div>
+                                    <div className="text-xs text-muted-foreground truncate">
+                                      {d.primary}
+                                      {d.secondary ? ` ${d.secondary}` : ""}
+                                    </div>
+                                  </div>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => setEditingCustom(editing ? null : rule.id)}
+                                    aria-expanded={editing}
+                                  >
+                                    {editing ? "Done" : "Edit"}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    aria-label={`Remove ${name}`}
+                                    onClick={() => {
+                                      setCustomRules((prev) => prev.filter((r) => r.id !== rule.id))
+                                      if (editing) setEditingCustom(null)
+                                    }}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                                {editing && (
+                                  <TransformRuleFields
+                                    operation={op}
+                                    config={rule.config}
+                                    onChange={(next) =>
+                                      setCustomRules((prev) =>
+                                        prev.map((r) => (r.id === rule.id ? { ...r, config: next } : r))
+                                      )
+                                    }
+                                    schema={tableColumns}
+                                  />
+                                )}
+                              </CardContent>
+                            </Card>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </TabsContent>
+
                   <TabsContent value="optimizations" className="space-y-3 mt-4">
                     {(suggestions?.optimizations || []).length === 0 ? (
                       <Card>
@@ -1204,7 +1584,7 @@ export function SuggestionsReviewDialog({
                     ) : (
                       <>
                       <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                        Advice only: Apply &amp; Continue does not change any of these.
+                        Advice only: Save &amp; continue does not change any of these.
                       </p>
                       {(suggestions?.optimizations || []).map((opt, idx) => (
                         <Card key={idx} className="border-blue-200 dark:border-blue-800">
@@ -1228,15 +1608,120 @@ export function SuggestionsReviewDialog({
                       </>
                     )}
                   </TabsContent>
+
+                  <TabsContent value="plan" className="space-y-3 mt-4">
+                    <div data-testid="transform-plan" className="space-y-2">
+                      {planRules.length === 0 ? (
+                        <Card>
+                          <CardContent className="pt-6">
+                            <div className="text-sm text-zinc-600 dark:text-zinc-400 text-center">
+                              No transforms — data is copied as-is
+                            </div>
+                          </CardContent>
+                        </Card>
+                      ) : (
+                        planRules.map((rule, idx) => {
+                          const view = engineView(rule)
+                          const d = describeTransform(view.type, view.config)
+                          const table = typeof rule.config?.table === "string" ? rule.config.table : ""
+                          return (
+                            <div
+                              key={`${idx}-${planKey(rule)}`}
+                              className="flex items-start gap-3 rounded-md border border-zinc-200 dark:border-zinc-800 px-3 py-2"
+                            >
+                              <span className="text-xs text-muted-foreground tabular-nums mt-0.5">{idx + 1}.</span>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-sm font-medium">{transformTypeLabel(view.type)}</span>
+                                  {idx < existingCount && <Badge variant="secondary">saved</Badge>}
+                                  {table && <Badge variant="outline">{table}</Badge>}
+                                  {/* A legacy rule stored on one side only. The Transform
+                                      Builder offers "Run on both"; this step never converts it. */}
+                                  {rule.type === "producer" && <Badge variant="outline">Batch only</Badge>}
+                                  {rule.type === "consumer" && <Badge variant="outline">CDC only</Badge>}
+                                </div>
+                                <div className="text-xs text-muted-foreground truncate">
+                                  {d.primary}
+                                  {d.secondary ? ` ${d.secondary}` : ""}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })
+                      )}
+                    </div>
+                  </TabsContent>
                 </div>
               </Tabs>
 
-              {error && (
-                <div className="px-1 py-2 text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
-                  {error}
+              <p className="px-1 pt-2 text-xs text-zinc-500 dark:text-zinc-400">
+                You can change these later in the pipeline&apos;s Transforms tab; changes apply to data moved after the save.
+              </p>
+
+              {existingError && (
+                <div
+                  role="alert"
+                  className="px-3 py-2 text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md flex items-center gap-3"
+                >
+                  <span className="flex-1">
+                    Couldn&apos;t load this pipeline&apos;s saved transforms: {existingError}. Saving new ones now
+                    could delete them, so Save stays off until they load.
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setExistingError(null)
+                      setExistingAttempt((n) => n + 1)
+                    }}
+                  >
+                    Retry
+                  </Button>
                 </div>
               )}
 
+              {actionError && (
+                <div
+                  role="alert"
+                  className="px-3 py-2 text-sm text-red-700 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md"
+                >
+                  {actionError}
+                </div>
+              )}
+
+              {confirmDiscard ? (
+                <div
+                  role="group"
+                  aria-labelledby={discardQuestionId}
+                  className="flex flex-col gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="text-sm">
+                    <p id={discardQuestionId} className="font-medium text-amber-900 dark:text-amber-100">
+                      {addedCount > 0
+                        ? `Discard ${addedCount} ${addedCount === 1 ? "rule" : "rules"} and start without ${addedCount === 1 ? "it" : "them"}?`
+                        : "Discard your changes and start without new transforms?"}
+                    </p>
+                    <p className="text-amber-800 dark:text-amber-200">
+                      Nothing from this step is saved
+                      {draftOp ? ", including the rule not yet added to the plan" : ""}.
+                    </p>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Button ref={keepEditingRef} variant="outline" onClick={() => setConfirmDiscard(false)}>
+                      Keep editing
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        setConfirmDiscard(false)
+                        void requestClose()
+                      }}
+                    >
+                      Discard and start
+                    </Button>
+                  </div>
+                </div>
+              ) : (
               <DialogFooter className="gap-2">
                 <Button
                   variant="outline"
@@ -1250,21 +1735,25 @@ export function SuggestionsReviewDialog({
                       <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                       Skipping…
                     </>
+                  ) : existingCount > 0 ? (
+                    // Skipping adds nothing; the rules already saved keep running.
+                    "Skip — add nothing"
                   ) : (
-                    "Skip suggestions"
+                    "Skip — no transforms"
                   )}
                 </Button>
-                <Button onClick={handleApply} disabled={submitting || closing || loading}>
+                <Button onClick={handleApply} disabled={submitting || closing || loading || saveBlocked}>
                   {submitting ? (
                     <>
                       <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Applying...
+                      Saving…
                     </>
                   ) : (
-                    <>Apply &amp; Continue ({activeSuggestions})</>
+                    <>Save &amp; continue ({planRules.length})</>
                   )}
                 </Button>
               </DialogFooter>
+              )}
             </>
           )}
         </DialogContent>

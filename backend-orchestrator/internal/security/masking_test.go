@@ -40,27 +40,3 @@ func TestEnforcedKeysUnaffectedByPIIAddition(t *testing.T) {
 		}
 	}
 }
-
-// TestMaskMapDoesNotMutateInput pins the log-only invariant: masking returns a
-// copy and never alters the caller's data (pipeline payloads must be untouched).
-func TestMaskMapDoesNotMutateInput(t *testing.T) {
-	in := map[string]interface{}{
-		"host":     "db.internal",
-		"password": "supersecret",
-		"email":    "user@example.com",
-	}
-	masked := MaskMap(in)
-
-	if in["password"] != "supersecret" || in["email"] != "user@example.com" {
-		t.Fatalf("MaskMap mutated its input: %+v", in)
-	}
-	if masked["password"] != MaskedValue {
-		t.Errorf("expected password masked, got %v", masked["password"])
-	}
-	if masked["email"] != MaskedValue {
-		t.Errorf("expected email masked, got %v", masked["email"])
-	}
-	if masked["host"] != "db.internal" {
-		t.Errorf("expected host preserved, got %v", masked["host"])
-	}
-}

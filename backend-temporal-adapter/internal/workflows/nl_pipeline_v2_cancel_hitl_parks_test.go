@@ -47,6 +47,10 @@ type hitlParkScenario struct {
 	wantCalls []string
 	// executorCalls is how many times the executor must have been dispatched.
 	executorCalls int
+	// legacyBefore, when set, is the version change that removed this park: it is
+	// reached only by runs recorded before it, so the scenario pins it to
+	// DefaultVersion.
+	legacyBefore string
 }
 
 type hitlParkHarness struct {
@@ -207,6 +211,9 @@ func runHITLPark(t *testing.T, sc hitlParkScenario, setup func(env *testsuite.Te
 	} {
 		env.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})
 	}
+	if sc.legacyBefore != "" {
+		env.OnGetVersion(sc.legacyBefore, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	}
 	if setup != nil {
 		setup(env, h)
 	}
@@ -349,13 +356,14 @@ var hitlParkScenarios = []hitlParkScenario{
 		executorCalls: 1,
 	},
 	{
-		name:          "schema change approval",
+		name:          "schema change approval, recorded before schema-approval-fails-fast",
 		input:         fastRerunParkInput,
 		executor:      executorFails("schema drift detected on orders"),
 		park:          "executor/approval",
 		waitingFor:    "the schema change to be approved",
 		wantCalls:     []string{"ExecutorNativeActivity", "PlanSchemaDriftRepairActivity"},
 		executorCalls: 1,
+		legacyBefore:  schemaApprovalFailsFastVersion,
 	},
 }
 

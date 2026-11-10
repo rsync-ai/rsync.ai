@@ -4,7 +4,6 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
-  Loader2,
   RefreshCw,
   ArrowDown,
   ChevronDown,
@@ -15,7 +14,7 @@ import {
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { withoutPassedOverStages } from "@/lib/pipeline/stageDefinitions"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { LinearTimeline } from "./DAGVisualization"
+import { LinearTimeline } from "./LinearTimeline"
 import type { ExecutionPlan, ExecutionPlanStage } from "./dagTypes"
 import { DAGVisualizationV2 } from "./DAGVisualizationV2"
 import { StageDetailPanel } from "./StageDetailPanel"
@@ -24,6 +23,11 @@ import { PipelineCopilotDock } from "./PipelineCopilotDock"
 import { SchemaEvolutionPanel } from "./SchemaEvolutionPanel"
 import { LiveStreamGraph } from "./LiveStreamGraph"
 import { displayConnectorName } from "@/lib/connector-display"
+import { formatDuration } from "@/lib/duration"
+import { cn } from "@/lib/utils"
+import { StatCard } from "@/components/kit/StatCard"
+import { StatCardsSkeleton } from "@/components/kit/PageSkeleton"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
   normalizeStrategyMode,
   type DataLoadingStrategy,
@@ -139,6 +143,10 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   // The pipeline's real sync mode. The plan's own `mode` is the planner's guess and
   // is often absent, and the old `|| "batch"` fallback labelled CDC pipelines batch.
   const [pipelineMode, setPipelineMode] = useState<StrategyMode | null>(null)
+  // Whether the pipeline request that answers the mode has come back, either way.
+  // The plan from /state lands first and its mode is "batch" even for a stream,
+  // so anything shaped by the mode drew as batch for a moment and then vanished.
+  const [modeSettled, setModeSettled] = useState(false)
   const summaryMode: StrategyMode | null =
     pipelineMode ?? (executionPlan?.mode ? normalizeStrategyMode(executionPlan.mode) : null)
 
@@ -211,13 +219,15 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
         didInitConnectorOverridesRef.current = true
         const pipelineRes = await authFetch(API_ENDPOINTS.PIPELINES.GET(pipelineId), { cache: "no-store" }).catch(() => null)
         const overrides: { source?: string; destination?: string } = {}
+        const p = pipelineRes?.ok ? ((await pipelineRes.json().catch(() => null)) as PipelineSummary | null) : null
+        if (p?.name) setPipelineName(p.name)
+        const strategy = p?.data_loading_strategy
+        if (strategy?.mode || strategy?.effective_sync_mode) {
+          setPipelineMode(normalizeStrategyMode(strategy.mode || strategy.effective_sync_mode))
+        }
+        // Settled even when the request failed: the plan's mode is then all there is.
+        setModeSettled(true)
         if (pipelineRes?.ok) {
-          const p = (await pipelineRes.json().catch(() => null)) as PipelineSummary | null
-          if (p?.name) setPipelineName(p.name)
-          const strategy = p?.data_loading_strategy
-          if (strategy?.mode || strategy?.effective_sync_mode) {
-            setPipelineMode(normalizeStrategyMode(strategy.mode || strategy.effective_sync_mode))
-          }
           const srcId = (p?.source_connection_id || "").trim()
           const dstId = (p?.destination_connection_id || "").trim()
           const connFetches: Array<Promise<Response | null>> = []
@@ -503,6 +513,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   const hasStages = displayStages.length > 0
 
   const isStream = summaryMode === "cdc"
+  const showEstimate = !isStream && !!executionPlan?.estimated_time
   const setupFailed = displayStages.some((st) => st.status === "failed")
 
   // A failed setup opens itself. That is the "my pipeline hangs" case, and this
@@ -523,7 +534,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   // Determine actual view mode
   const actualViewMode = useMemo(() => {
     if (viewMode === "auto") {
-      // Default to Graph whenever we have 2+ stages (deps may be synthesized in DAGVisualization).
+      // Default to Graph whenever we have 2+ stages (deps may be synthesized in DAGVisualizationV2).
       return displayStages.length > 1 ? "dag" : "timeline"
     }
     return viewMode
@@ -558,7 +569,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
 
   return (
     <div className="space-y-6" onWheelCapture={markUserInteraction} onScrollCapture={markUserInteraction} onTouchStartCapture={markUserInteraction}>
-      {hasStages && (!isStream || setupOpen) && (
+      {hasStages && modeSettled && (!isStream || setupOpen) && (
         <PipelineCopilotDock
           pipelineId={pipelineId}
           pipelineName={pipelineName}
@@ -593,7 +604,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {hasStages && !isStream && viewSwitch}
+          {hasStages && modeSettled && !isStream && viewSwitch}
           <Button variant="outline" size="sm" onClick={() => fetchExecutionPlan({ background: false })} disabled={initialLoading || refreshing}>
             <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
             Refresh
@@ -609,8 +620,9 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       )}
 
       {initialLoading ? (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-8 w-8 animate-spin text-violet-600" />
+        <div className="space-y-4">
+          <StatCardsSkeleton count={3} label="Loading steps…" className="@md:grid-cols-3" />
+          <Skeleton className="h-[240px] w-full rounded-lg" />
         </div>
       ) : error && !executionPlan ? (
         <div className="flex flex-col items-center justify-center py-12">
@@ -624,6 +636,20 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
         </div>
       ) : (
         <div className="space-y-4">
+          {/* Mode, step count and run-time estimate, above the graph: as a
+              footer under a 540 px canvas they sat below the fold. Steps counts
+              the steps drawn, not the plan's stored node_count: the tab drops
+              passed-over stages and synthesises source/destination nodes, so
+              the planner's count disagreed with the picture. A stream has no
+              end, so a CDC pipeline has no run-time estimate. With no mode
+              named anywhere there is no Mode card: an empty one reads
+              "could not be loaded". */}
+          <div className={cn("grid gap-4", summaryMode && showEstimate ? "@md:grid-cols-3" : "@md:grid-cols-2")}>
+            {summaryMode && <StatCard title="Mode" value={summaryMode === "cdc" ? "CDC" : "Batch"} />}
+            <StatCard title="Steps" value={displayStages.length} />
+            {showEstimate && <StatCard title="Estimated time" value={`~${formatDuration((executionPlan.estimated_time ?? 0) * 1000)}`} />}
+          </div>
+
           {/* Schema evolution — pending DDL approvals from healer agent */}
           <SchemaEvolutionPanel pipelineId={pipelineId} />
 
@@ -683,7 +709,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
               graph when its nodes are first measured, and a graph that mounted
               hidden fitted itself to a 0×0 pane — tiny, at the left edge. */}
           {(!isStream || setupOpen) && (
-            <div className="flex flex-col lg:flex-row gap-4">
+            <div className="flex flex-col @3xl:flex-row gap-4">
               <div className="flex-1 min-w-0">
                 {actualViewMode === "dag" ? (
                   <DAGVisualizationV2
@@ -710,31 +736,6 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
             </div>
           )}
 
-          {/* Summary */}
-          <div className="flex items-center gap-4 pt-4 border-t text-sm text-zinc-600 dark:text-zinc-400">
-            {summaryMode && (
-              <span>
-                Mode: <span className="font-medium">{summaryMode === "cdc" ? "CDC" : "Batch"}</span>
-              </span>
-            )}
-            {/* A stream has no end, so a run-time estimate means nothing for CDC. */}
-            {summaryMode !== "cdc" && executionPlan.estimated_time ? (
-              <span>
-                Est. Time:{" "}
-                <span className="font-medium">
-                  {executionPlan.estimated_time < 60
-                    ? "<1min"
-                    : `${Math.round(executionPlan.estimated_time / 60)}min`}
-                </span>
-              </span>
-            ) : null}
-            {/* The steps drawn above, not the plan's stored node_count: the tab
-                drops passed-over stages and synthesises source/destination
-                nodes, so the planner's count disagreed with the picture. */}
-            <span data-testid="steps-count">
-              Steps: <span className="font-medium">{displayStages.length}</span>
-            </span>
-          </div>
         </div>
       )}
     </div>

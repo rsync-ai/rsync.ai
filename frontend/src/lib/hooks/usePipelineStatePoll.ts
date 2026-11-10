@@ -29,6 +29,9 @@ export const SETTLED_POLL_MS = 30_000
 // Paused or idle: a schedule or another tab moves these on more often than a
 // finished run, and 30 s left the page trailing the database (item 35).
 export const PAUSED_POLL_MS = 10_000
+// The next read is scheduled when this one answers, so a read that never
+// answers would freeze the status for good (KI-BATCH-UI-STALE-AFTER-RUN).
+export const STATE_REQUEST_TIMEOUT_MS = 10_000
 
 /**
  * How long to wait before the next read. A finished run is read every 30 s, a
@@ -123,6 +126,7 @@ function startPoller(pipelineId: string): Poller {
       const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
         cache: "no-store",
         signal: ac.signal,
+        timeoutMs: STATE_REQUEST_TIMEOUT_MS,
       })
       if (!res.ok) {
         if (res.status === 404) notFound = true

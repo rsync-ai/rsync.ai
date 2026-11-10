@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	log "github.com/sirupsen/logrus"
@@ -114,14 +115,20 @@ func (s *CDCSentinel) surfaceCaptureDown(ctx context.Context) {
 	}
 	_ = rows.Close()
 
+	now := time.Now()
 	for _, d := range deps {
 		issueID := captureStoppedIssueID(d.pipelineID)
 		if !captureIsDown(d) {
-			// Only a probe that stopped reading unhealthy clears it; the resolver is a
-			// DELETE by this pipeline's own id, so it cannot touch another class.
-			s.resolveLagIssue(ctx, issueID, d.pipelineID)
+			// Only a probe that stopped reading unhealthy clears it, and only once the
+			// stream has moved since: a connector retrying a lost resume position probes
+			// healthy too. The resolver is a DELETE by this pipeline's own id, so it
+			// cannot touch another class.
+			if s.captureProvenMoving(d.connector) {
+				s.resolveLagIssue(ctx, issueID, d.pipelineID)
+			}
 			continue
 		}
+		s.noteCaptureDown(d.connector, now)
 		// The fixed text avoids every phrase the diagnoser's CDC-provisioning rule matches
 		// ("debezium", "replication slot", "change stream", …), which is checked ahead of
 		// the transient-network rule: naming Debezium here would escalate every outage,

@@ -163,8 +163,7 @@ func keylessBatcher(t *testing.T, destType string, destCfg map[string]interface{
 		destType:     destType,
 		destCfg:      destCfg,
 		params:       cdcBatchingParams{maxEvents: 1000, maxRetries: 0, backoff: time.Millisecond},
-		reader:       reader,
-		hw:           newHighWaterTracker(),
+		gate:         newCommitGate(reader.CommitMessages, newHighWaterTracker()),
 		httpClient:   &http.Client{Transport: dest},
 		ddl:          &DDLSupport{Enabled: false, resolved: true},
 		eventsWriter: &kafka.Writer{},
@@ -199,7 +198,7 @@ var keylessWritePaths = []struct {
 		}
 		for key, batch := range b.batches {
 			delete(b.batches, key)
-			b.flushBatchPerRow(context.Background(), key, batch, "test", errors.New("batch write failed"))
+			b.flushBatchPerRow(context.Background(), key, batch, "test", errors.New("batch write failed"), nil)
 		}
 	}},
 	{"single event (batching off)", func(t *testing.T, destType string, destCfg map[string]interface{}, dest http.RoundTripper, sms []*SinkMessage, msgs []kafka.Message) {
@@ -222,7 +221,7 @@ func singleEvents(t *testing.T, destType string, destCfg map[string]interface{},
 	cfg := &WorkerConfig{PipelineID: ackFKPipelineID, SinkMode: "cdc", DestinationConnector: destType, DestinationConfig: destCfg}
 	c := newCDCTestCounters()
 	for i := range msgs {
-		if _, err := processCDCEvent(context.Background(), newHighWaterTracker(), nil, &http.Client{Transport: dest}, cfg,
+		if _, err := processCDCEvent(context.Background(), newCommitGate(nil, newHighWaterTracker()), nil, &http.Client{Transport: dest}, cfg,
 			&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msgs[i], sms[i], c.metrics,
 			c.inserts, c.updates, c.deletes, &sync.Map{}, time.Minute); err != nil {
 			t.Fatalf("processCDCEvent offset %d: %v", msgs[i].Offset, err)

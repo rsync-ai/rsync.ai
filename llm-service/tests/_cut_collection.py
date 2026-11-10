@@ -280,3 +280,26 @@ def skip_if_cut(*rel_paths):
             + ", ".join(missing),
             allow_module_level=True,
         )
+
+
+def removed_by_the_cut(rel_path):
+    """True when ``oss-strip-list.txt`` removes ``rel_path`` and it is gone.
+
+    ``rel_path`` is relative to ``llm-service/``. For a census that names a file
+    the cut strips -- a prompt under ``prompts/tool_generator``, a call site in
+    ``src/agents/tool_generator/agents`` -- so the census can skip that one entry
+    on the public tree and still check every other. In the private repo the file
+    exists and this is False, so nothing is skipped here.
+    """
+    rel = rel_path.replace("/", os.sep)
+    if os.path.exists(os.path.join(_LLM_SERVICE, rel)):
+        return False
+    with open(STRIP_LIST, encoding="utf-8") as handle:
+        for raw in handle:
+            entry = raw.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            entry = entry.replace("/", os.sep)
+            if rel == entry or rel.startswith(entry + os.sep):
+                return True
+    return False

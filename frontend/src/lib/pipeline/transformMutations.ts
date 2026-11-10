@@ -13,13 +13,11 @@
  * therefore fans out over every id the logical transform carries and reports a
  * partial failure as a failure.
  *
- * WHY DISABLING A MASK IS GUARDED. `enabled` is not decorative. The Mongo CDC
- * fail-closed check in backend-orchestrator/internal/agents/executor/
- * nl_transforms_gate.go:584 loads masks `WHERE ... enabled = TRUE`, and
- * :530 folds the aliases `mask` and `mask_pii` together. So turning a mask off
- * removes it both from runtime application AND from the check that would have
- * refused the run — the next execution copies those columns to the destination
- * in the clear. That is a decision worth a typed confirmation, not a toggle.
+ * WHY DISABLING A MASK IS GUARDED. `enabled` is not decorative: only enabled
+ * rows are applied at run time, so turning a mask off means the next execution
+ * copies those columns to the destination in the clear. Nothing downstream
+ * notices — the run succeeds either way. That is a decision worth a typed
+ * confirmation, not a toggle.
  */
 
 import { authFetch } from "@/lib/api/auth-fetch"
@@ -38,7 +36,8 @@ export function idsOf(ids: TransformIds): string[] {
 
 /**
  * Operations whose whole purpose is to keep values out of the destination.
- * Exactly the aliases the NL gate folds at nl_transforms_gate.go — the frontend
+ * Exactly the aliases the shared engine folds to mask_pii (normalizeType in
+ * shared/go/transforms/validate.go) — the frontend
  * normalizes to `mask_pii`, but a row written directly through the API can
  * still carry a short form, so all three are listed. `hash` is one of them: the
  * Hash Column card is mask_pii with mask_type=hash, and a rule this set does

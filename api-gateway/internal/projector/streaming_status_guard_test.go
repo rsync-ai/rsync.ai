@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"testing"
 
@@ -38,7 +39,28 @@ func (s statusArg) Match(v driver.Value) bool {
 // upsert may be issued — sqlmock fails an unexpected Exec, which projectEvent returns);
 // otherwise the upsert must be issued with that status. expectSyncModeUpdate is set when
 // the event is an executor event mentioning "streaming", which also backfills sync_mode.
+// An event from another execution is checked for being superseded; here it never is
+// (superseded_run_guard_test.go covers the other answers).
 func projectAgainstRow(t *testing.T, existingStatus, existingExec string, event map[string]interface{}, expectSyncModeUpdate bool, wantStatus string) {
+	t.Helper()
+	check := noSupersedeCheck
+	if eventExec, _ := event["execution_id"].(string); eventExec != existingExec {
+		check = notSuperseded
+	}
+	projectOverRow(t, existingStatus, existingExec, event, expectSyncModeUpdate, check, wantStatus)
+}
+
+// supersedeCheck is what the superseded-run query answers for the event's execution.
+type supersedeCheck int
+
+const (
+	noSupersedeCheck    supersedeCheck = iota // the query must not be issued
+	notSuperseded                             // issued, answers false
+	isSuperseded                              // issued, answers true
+	supersedeCheckFails                       // issued, errors
+)
+
+func projectOverRow(t *testing.T, existingStatus, existingExec string, event map[string]interface{}, expectSyncModeUpdate bool, check supersedeCheck, wantStatus string) {
 	t.Helper()
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -57,6 +79,15 @@ func projectAgainstRow(t *testing.T, existingStatus, existingExec string, event 
 		WithArgs(guardPipelineID).
 		WillReturnRows(sqlmock.NewRows([]string{"version", "status", "execution_id"}).
 			AddRow(7, existingStatus, existingExec))
+	if check != noSupersedeCheck {
+		eventExec, _ := event["execution_id"].(string)
+		q := mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).WithArgs(eventExec)
+		if check == supersedeCheckFails {
+			q.WillReturnError(errors.New("connection reset"))
+		} else {
+			q.WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(check == isSuperseded))
+		}
+	}
 	if wantStatus != "" {
 		args := make([]driver.Value, 22)
 		for i := range args {

@@ -23,7 +23,6 @@ from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from enum import Enum
 
 from .container_names import parse_versioned_container_name, strip_stack_affixes
 
@@ -71,15 +70,6 @@ except ImportError:
     logger.warning("Docker SDK not available - container operations will be skipped")
 
 
-class BuildStatus(str, Enum):
-    """Docker build status"""
-    PENDING = "pending"
-    BUILDING = "building"
-    PUSHING = "pushing"
-    SUCCESS = "success"
-    FAILED = "failed"
-
-
 @dataclass
 class DockerBuildResult:
     """Result of a Docker build operation"""
@@ -106,6 +96,17 @@ class DockerBuildResult:
         if self.registry_url:
             return f"{self.registry_url}/{self.image_name}:{self.image_tag}"
         return f"{self.image_name}:{self.image_tag}"
+
+
+class ContainerRemovalError(RuntimeError):
+    """A container that may still exist could not be stopped and removed. The
+    message names the container and the cause's type only: the cause can carry a
+    host path or a daemon address, so it stays in the log."""
+
+    def __init__(self, container_name: str, cause: BaseException):
+        super().__init__(f"could not remove container {container_name} ({type(cause).__name__})")
+        self.container_name = container_name
+        self.cause = cause
 
 
 class DockerBuilder:
@@ -223,12 +224,7 @@ class DockerBuilder:
                 return left
 
         return core
-        try:
-            self.client.ping()
-            return True
-        except Exception:
-            return self._init_docker_client()
-    
+
     async def build(
         self,
         connector_dir: Path,
@@ -950,6 +946,40 @@ class DockerBuilder:
         except Exception:
             return False
 
+    async def remove_container_if_present(self, container_name: str) -> None:
+        """Stop and remove a container; one that does not exist is success.
+
+        Unlike remove_container (a bool, False for a missing container on the
+        Docker-SDK path), this raises ContainerRemovalError when the container
+        may still be there: the deployer refused or failed, or the daemon could
+        not be asked. Callers that must not go on with a live container — an
+        overwrite, a delete — use this."""
+        if self.use_deployer:
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, lambda: self.deployer.undeploy(container_name))
+            except Exception as e:
+                raise ContainerRemovalError(container_name, e) from e
+            return
+        if not self.client:
+            raise ContainerRemovalError(container_name, RuntimeError("no Docker client"))
+        try:
+            container = self.client.containers.get(container_name)
+        except docker.errors.NotFound:
+            return
+        except Exception as e:
+            raise ContainerRemovalError(container_name, e) from e
+        try:
+            container.stop(timeout=10)
+        except Exception:
+            pass  # remove(force=True) below kills it
+        try:
+            container.remove(force=True)
+        except docker.errors.NotFound:
+            return
+        except Exception as e:
+            raise ContainerRemovalError(container_name, e) from e
+
     def list_managed_container_names(self) -> List[str]:
         """Return the names of all containers the Docker daemon knows about.
 
@@ -1005,75 +1035,3 @@ class DockerBuilder:
         # Fallback: return a random high port
         import random
         return random.randint(9000, 9999)
-    
-    async def verify_image(self, image_name: str) -> bool:
-        """Verify image can start and respond to health check using Docker SDK"""
-        if not self.client:
-            return False
-        
-        logger.info(f"🔍 Verifying image: {image_name}")
-        
-        container_name = f"mcp-verify-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
-        try:
-            # Start container
-            container = self.client.containers.run(
-                image_name,
-                name=container_name,
-                detach=True,
-            )
-            
-            # Wait a moment
-            await asyncio.sleep(2)
-            
-            # Check if running
-            container.reload()
-            is_running = container.status == 'running'
-            
-            return is_running
-            
-        except Exception as e:
-            logger.error(f"Verification failed: {e}")
-            return False
-            
-        finally:
-            # Cleanup
-            try:
-                container = self.client.containers.get(container_name)
-                container.remove(force=True)
-            except Exception:
-                pass
-    
-    def list_mcp_containers(self) -> List[Dict[str, Any]]:
-        """List all MCP-managed containers"""
-        if not self.client:
-            return []
-        
-        try:
-            containers = self.client.containers.list(
-                all=True,
-                filters={"label": "mcp.managed=true"}
-            )
-            
-            result = []
-            for c in containers:
-                result.append({
-                    "id": c.short_id,
-                    "name": c.name,
-                    "status": c.status,
-                    "image": c.image.tags[0] if c.image.tags else "unknown",
-                    "ports": c.ports,
-                })
-            
-            return result
-        except Exception:
-            return []
-    
-    def build_sync(
-        self,
-        connector_dir: Path,
-        name: str,
-        version: str = "latest",
-    ) -> DockerBuildResult:
-        """Synchronous build wrapper"""
-        return asyncio.run(self.build(connector_dir, name, version))

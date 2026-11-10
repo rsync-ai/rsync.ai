@@ -46,6 +46,14 @@ except ImportError:  # pragma: no cover - dev/test path
         os.path.dirname(__file__), "..", "..", "..", "..")))
     from canonical_types import canonicalize_type, canonical_to_ddl
 
+# Stable batch paging for SQL sources (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS),
+# shipped into the image via `COPY --from=shared sql_paging.py` (see
+# Dockerfile). Without it an export fails loudly instead of paging unstably.
+try:
+    import sql_paging  # type: ignore
+except Exception:  # pragma: no cover
+    sql_paging = None  # type: ignore
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -411,6 +419,37 @@ def _group_rows_by_shape(data, columns):
         else:
             groups.append((sig, [row]))
     return [(list(sig), rows) for sig, rows in groups]
+
+
+# Leading whitespace and -- / /* */ comments, skipped before classifying a
+# statement by its first keyword.
+_ORACLE_LEADING_NOISE_RE = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*", re.S)
+_ORACLE_PLSQL_RE = re.compile(r"(?:BEGIN|DECLARE)\b", re.I)
+_ORACLE_DML_RE = re.compile(r"(?:INSERT|UPDATE|DELETE|MERGE)\b", re.I)
+
+
+def _oracle_statement_kind(sql: str) -> str:
+    """``plsql`` (an anonymous BEGIN/DECLARE block), ``dml``, or ``other``."""
+    body = sql[_ORACLE_LEADING_NOISE_RE.match(sql).end():]
+    if _ORACLE_PLSQL_RE.match(body):
+        return "plsql"
+    if _ORACLE_DML_RE.match(body):
+        return "dml"
+    return "other"
+
+
+def _oracle_single_statement(sql: str) -> str:
+    """The text oracledb is sent for one statement.
+
+    A plain SQL statement loses ONE trailing ``;`` — oracledb rejects it with
+    ORA-00911. An anonymous PL/SQL block keeps its final ``END;``: that
+    semicolon is block syntax, and stripping it raises PLS-00103."""
+    sql = (sql or "").strip()
+    if _oracle_statement_kind(sql) == "plsql":
+        return sql
+    if sql.endswith(";"):
+        sql = sql[:-1].rstrip()
+    return sql
 
 
 class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
@@ -2604,6 +2643,12 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     "type": "destination",
                     "description": "Drop destination table (used by run_mode=reload to rebuild schema from scratch)"
                 },
+                {
+                    "name": "execute",
+                    "method": "oracle_execute",
+                    "type": "destination",
+                    "description": "Run exactly one SQL statement or PL/SQL block verbatim (models DDL/DML); returns rows_affected"
+                },
             ],
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -4163,180 +4208,6 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
             raw = raw[len(prefix) :]
         return raw
 
-    def _get_primary_key_column(self, cursor, table: str) -> Optional[str]:
-        """
-        Best-effort: return the first PRIMARY KEY column name for keyset pagination.
-        Works across common relational DBs; falls back to None.
-        """
-        module = (self.driver_pattern.get("module", "") or "").lower()
-        table_parts = self._split_qualified_table(table)
-        schema = table_parts.get("schema")
-        tbl = table_parts.get("table")
-        if not tbl:
-            return None
-
-        try:
-            # MySQL
-            if "mysql" in module:
-                safe_tbl = self._safe_column_identifier(tbl)
-                if not safe_tbl:
-                    return None
-                fq = f'`{safe_tbl}`'
-                if schema:
-                    safe_schema = self._safe_column_identifier(schema)
-                    if not safe_schema:
-                        return None
-                    fq = f'`{safe_schema}`.`{safe_tbl}`'
-                cursor.execute(f"SHOW KEYS FROM {fq} WHERE Key_name = 'PRIMARY'")
-                rows = cursor.fetchall() or []
-                if rows and isinstance(rows[0], dict):
-                    rows_sorted = sorted(rows, key=lambda r: int(r.get("Seq_in_index") or 9999))
-                    pk = rows_sorted[0].get("Column_name")
-                    return self._safe_column_identifier(pk)
-                if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 5:
-                    pk = rows[0][4]
-                    return self._safe_column_identifier(str(pk))
-                return None
-
-            # PostgreSQL (psycopg2)
-            if module == "psycopg2":
-                # Default schema is public if not provided
-                schema_val = schema or "public"
-                cursor.execute(
-                    """
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                      ON tc.constraint_name = kcu.constraint_name
-                     AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY'
-                      AND tc.table_schema = %s
-                      AND tc.table_name = %s
-                    ORDER BY kcu.ordinal_position
-                    LIMIT 1
-                    """,
-                    (schema_val, tbl),
-                )
-                r = cursor.fetchone()
-                if isinstance(r, dict):
-                    return self._safe_column_identifier(r.get("column_name"))
-                if isinstance(r, (list, tuple)) and len(r) >= 1:
-                    return self._safe_column_identifier(str(r[0]))
-                return None
-
-            # SQLite
-            if "sqlite" in module:
-                cursor.execute(f"PRAGMA table_info({tbl})")
-                rows = cursor.fetchall() or []
-                # Row shape: cid, name, type, notnull, dflt_value, pk
-                for row in rows:
-                    if isinstance(row, dict):
-                        if int(row.get("pk") or 0) == 1:
-                            return self._safe_column_identifier(row.get("name"))
-                    elif isinstance(row, (list, tuple)) and len(row) >= 6:
-                        if int(row[5] or 0) == 1:
-                            return self._safe_column_identifier(str(row[1]))
-                return None
-
-            # SQL Server (pyodbc): first PK column via sys catalogs. Qmark
-            # paramstyle; schema defaults to dbo when the table is unqualified.
-            if "pyodbc" in module:
-                schema_val = schema or "dbo"
-                cursor.execute(
-                    "SELECT c.name "
-                    "FROM sys.key_constraints kc "
-                    "JOIN sys.index_columns ic ON kc.parent_object_id = ic.object_id "
-                    "  AND kc.unique_index_id = ic.index_id "
-                    "JOIN sys.columns c ON ic.object_id = c.object_id "
-                    "  AND ic.column_id = c.column_id "
-                    "JOIN sys.tables t ON kc.parent_object_id = t.object_id "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    "WHERE kc.type = 'PK' AND s.name = ? AND t.name = ? "
-                    "ORDER BY ic.key_ordinal",
-                    (schema_val, tbl),
-                )
-                r = cursor.fetchone()
-                if not r:
-                    return None
-                # pyodbc.Row is neither dict nor list/tuple, but supports r[0].
-                val = r.get("name") if isinstance(r, dict) else r[0]
-                return self._safe_column_identifier(str(val)) if val is not None else None
-
-            # Oracle (oracledb): first PK column via the data-dictionary. :N
-            # binds; own-schema (user_*) when unqualified, owner-qualified
-            # (all_*) otherwise. Table names default to Oracle's uppercase fold.
-            if "oracledb" in module:
-                if schema:
-                    cursor.execute(
-                        "SELECT cc.column_name "
-                        "FROM all_constraints c "
-                        "JOIN all_cons_columns cc ON c.owner = cc.owner "
-                        "  AND c.constraint_name = cc.constraint_name "
-                        "WHERE c.constraint_type = 'P' AND c.owner = :1 "
-                        "  AND c.table_name = :2 ORDER BY cc.position",
-                        (schema, tbl.upper() if tbl.islower() else tbl),
-                    )
-                else:
-                    cursor.execute(
-                        "SELECT cc.column_name "
-                        "FROM user_constraints c "
-                        "JOIN user_cons_columns cc "
-                        "  ON c.constraint_name = cc.constraint_name "
-                        "WHERE c.constraint_type = 'P' AND c.table_name = :1 "
-                        "ORDER BY cc.position",
-                        (tbl.upper() if tbl.islower() else tbl,),
-                    )
-                r = cursor.fetchone()
-                if not r:
-                    return None
-                val = r[0] if isinstance(r, (list, tuple)) else r
-                return self._safe_column_identifier(str(val)) if val is not None else None
-        except Exception:
-            return None
-
-    def _is_invisible_column(self, cursor, table: str, column: str) -> bool:
-        """MySQL 8: report whether ``column`` is INVISIBLE (omitted from
-        ``SELECT *``). A table whose ONLY primary key is an invisible generated
-        key (GIPK — e.g. ``my_row_id``, auto-added to a CTAS table that has no
-        PK when ``sql_generate_invisible_primary_key=ON``) is found by
-        ``SHOW KEYS`` (so ``_get_primary_key_column`` returns it) but the column
-        is excluded from ``SELECT *``. The keyset cursor value then can't be read
-        back from the returned rows, ``next_cursor`` stays None, and pagination
-        silently truncates to the first page. Detecting invisibility lets
-        ``export`` project the column explicitly so the cursor advances.
-
-        Best-effort: returns False on any error (caller keeps existing behavior).
-        Only meaningful for MySQL — other dialects have no invisible columns.
-        """
-        module = (self.driver_pattern.get("module", "") or "").lower()
-        if "mysql" not in module:
-            return False
-        table_parts = self._split_qualified_table(table)
-        schema = table_parts.get("schema")
-        tbl = table_parts.get("table")
-        if not tbl or not column:
-            return False
-        try:
-            # information_schema.COLUMNS lists invisible columns (unlike
-            # SELECT *). COALESCE falls back to the connection's current DB when
-            # the table reference is unqualified.
-            cursor.execute(
-                "SELECT EXTRA FROM information_schema.COLUMNS "
-                "WHERE TABLE_SCHEMA = COALESCE(%s, DATABASE()) "
-                "AND TABLE_NAME = %s AND COLUMN_NAME = %s",
-                (schema, tbl, column),
-            )
-            rows = cursor.fetchall() or []
-            if not rows:
-                return False
-            first = rows[0]
-            extra = first.get("EXTRA") if isinstance(first, dict) else (first[0] if len(first) else "")
-            return "INVISIBLE" in str(extra or "").upper()
-        except Exception:
-            return False
-
-        return None
-
     # ------------------------------------------------------------------
     # Incremental sync helpers (T2-6 — see INCREMENTAL.md). Mirrors the
     # PG connector's helpers; behavior must stay byte-identical so a
@@ -4368,6 +4239,107 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
             s = raw.strip()
             return s if s else None
         return None
+
+    # BEGIN watermark snapshot block
+    # KI-DB-BATCH-PAGING-CAN-SKIP-ROWS cause 3, INCREMENTAL.md §2. Kept
+    # identical in connector_database.py.j2 and the PostgreSQL, MySQL, Oracle
+    # and SQL Server connectors (test_db_watermark_snapshot.py checks it).
+    #
+    # A sweep pages by key, so a row the cursor has already passed can be
+    # updated below a later page's max(updated_at) and fall outside the next
+    # sweep's `updated_at > since`. The sweep's watermark is therefore
+    # max(updated_at) read once before its first page: every row updated
+    # after that read is above it, whatever its key. When that value is
+    # within a few seconds of the database clock it is held back to
+    # `now - lag`, so a transaction that stamped its row earlier but commits
+    # after the read still lands above the next `since`. Rows inside the lag
+    # are read twice (at-least-once); a commit later than the lag is missed.
+    _DEFAULT_INCREMENTAL_LAG_SECONDS = 5.0
+
+    @classmethod
+    def _incremental_lag_seconds(cls, config, params) -> float:
+        """`incremental_lag_seconds` from the export params, then the
+        connection config; the default when neither holds a number."""
+        for source in (params or {}, config or {}):
+            raw = source.get("incremental_lag_seconds") if isinstance(source, dict) else None
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                continue
+        return cls._DEFAULT_INCREMENTAL_LAG_SECONDS
+
+    @staticmethod
+    def _hold_back_watermark(value, utc_now, local_now, lag_seconds):
+        """`now - lag` when ``value`` is within ``lag_seconds`` of the database
+        clock, else ``value``. An aware value is compared with UTC, a naive
+        one with the session's local clock; anything else is returned as is."""
+        from datetime import datetime, timedelta, timezone
+        if not isinstance(value, datetime) or not lag_seconds:
+            return value
+        now = utc_now if value.tzinfo is not None else local_now
+        if not isinstance(now, datetime):
+            return value
+        if value.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if (now.tzinfo is None) != (value.tzinfo is None):
+            return value
+        lag = timedelta(seconds=lag_seconds)
+        if now - lag < value <= now + lag:
+            held = now - lag
+            return held.astimezone(value.tzinfo) if value.tzinfo is not None else held
+        return value
+
+    def _watermark_snapshot(self, conn, cursor, dialect, safe_table, field, since, lag_seconds):
+        """(column, value) for the sweep's watermark, read before its first
+        page; None when the table has no such column or the read fails, and
+        the export then reports its page max as before. The paging dialect
+        supplies the bind style and the clocks, so an engine sharing a
+        driver with another (Redshift over psycopg2) reads its own way."""
+        try:
+            cursor.execute(f"SELECT * FROM {safe_table} WHERE 1 = 0")
+            description = list(cursor.description or [])
+            columns = [d[0] for d in description]
+            try:
+                cursor.fetchall()
+            except Exception:
+                pass
+            column = next((c for c in columns if str(c).lower() == field.lower()), None)
+            if column is None:
+                return None
+            binder = sql_paging.Binder(dialect.paramstyle)
+            ident = dialect.ident(column)
+            clocks = f", {dialect.clocks}" if dialect.clocks else ""
+            query = f"SELECT MAX({ident}) AS wm_max{clocks} FROM {safe_table}"
+            if since:
+                # As the column's type where the engine compares no other
+                # (Athena); unchanged elsewhere.
+                typed = sql_paging.since_value(dialect, since, description[columns.index(column)])
+                query += f" WHERE {ident} > {binder.add(typed)}"
+            bound = binder.params()
+            if bound is None:
+                cursor.execute(query)
+            else:
+                cursor.execute(query, bound)
+            row = cursor.fetchone()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        if row is None:
+            return None
+        values = list(row.values()) if isinstance(row, dict) else list(row)
+        value = values[0] if values else None
+        if value is None:
+            return (column, since) if since else None
+        utc_now = values[1] if len(values) > 1 else None
+        local_now = values[2] if len(values) > 2 else None
+        held = self._hold_back_watermark(value, utc_now, local_now, lag_seconds)
+        return (column, held.isoformat() if hasattr(held, "isoformat") else str(held))
+    # END watermark snapshot block
 
     @staticmethod
     def _max_field_value(rows: List, field: str) -> Optional[str]:
@@ -4419,6 +4391,18 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
             offset = int(offset)
         except (TypeError, ValueError):
             offset = 0
+
+        # Verbatim query mode: one page of a caller-supplied SELECT (the
+        # models feature reads the catalog this way). No table is needed.
+        raw_query = ""
+        for key in ("query", "sql"):
+            v = (params or {}).get(key)
+            if isinstance(v, str) and v.strip():
+                raw_query = v
+                break
+        if raw_query:
+            return self._export_query(config, raw_query, limit)
+
         use_keyset = bool((params or {}).get("use_keyset_paging") or (params or {}).get("use_cursor_paging"))
         cursor_value = (params or {}).get("cursor")
         cursor_column = (params or {}).get("cursor_column") or (params or {}).get("primary_key")
@@ -4463,44 +4447,32 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
             cursor = self._get_cursor(conn)
 
             module = (self.driver_pattern.get("module", "") or "").lower()
-            # Prefer keyset paging when requested or when cursor provided.
-            pk = self._safe_column_identifier(str(cursor_column)) if cursor_column else None
-            if (use_keyset or cursor_value is not None) and not pk:
-                pk = self._get_primary_key_column(cursor, table)
-
-            # GIPK fix: a MySQL table whose only PK is an INVISIBLE generated key
-            # (my_row_id) is found by SHOW KEYS (so pk is set) but excluded from
-            # `SELECT *`, so the keyset cursor value can't be read back and
-            # pagination silently truncates to the first page. Detect the
-            # invisible PK so we project it explicitly below and advance the
-            # cursor. No-op for visible PKs and non-MySQL dialects.
-            pk_is_invisible = self._is_invisible_column(cursor, table, pk) if pk else False
-
-            # Choose placeholder style for parameterized queries.
-            # pyodbc (SQL Server) and sqlite3 use qmark paramstyle ("?");
-            # mysql-connector / psycopg2 use pyformat ("%s"); oracledb uses
-            # numbered positional binds (":1", ":2", ...) built via _ph() below.
-            is_sqlserver = "pyodbc" in module
-            is_oracle = "oracledb" in module
-            placeholder = "%s"
-            if "sqlite" in module or is_sqlserver:
-                placeholder = "?"
-
-            # Choose identifier quoting per driver. SQL Server accepts
-            # double-quoted identifiers with QUOTED_IDENTIFIER ON (ODBC default);
-            # Oracle uses double quotes (case-preserving).
-            quote = "`" if "mysql" in module else "\""
+            # Paging order, bind style and page SQL per driver come from the
+            # shared sql_paging module (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS): a
+            # named cursor_column, else the whole primary or unique key, else
+            # the row's physical locator, else ORDER BY every column. A driver
+            # it does not know pages as exports always did.
+            if sql_paging is None:
+                return {"success": False, "error": "sql_paging.py is missing from this connector image; rebuild it"}
+            dialect = sql_paging.dialect_for(module, self.driver_pattern.get("name"))
+            quote = dialect.quote
 
             safe_table = self._safe_qualified_table(table, quote)
             if not safe_table:
                 return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
 
-            # Incremental sync: compose WHERE clause (T2-6). Two DIFFERENT
-            # fields, deliberately kept apart — `inc_field_safe` drives the
-            # WHERE filter and only exists once we have a `since` to compare
-            # against; `watermark_field` drives the watermark we REPORT and
-            # must be populated on the very first run too, or the contract
-            # can never bootstrap. See PG connector for full rationale.
+            # Incremental sync: compose the WHERE clause (INCREMENTAL.md §5).
+            # Two DIFFERENT fields, deliberately kept apart:
+            #   * `inc_field_safe` / `inc_bind_value` drive the WHERE filter,
+            #     and only exist once we have a `since` to compare against.
+            #   * `watermark_field` drives the stats.watermark we REPORT, and
+            #     must be populated on the very first run too.
+            # Collapsing the two deadlocks the contract: the executor only
+            # sends `since` once a watermark is in the checkpoint, and the
+            # connector would only emit a watermark once `since` arrived — so
+            # neither side can go first and every run silently degrades to
+            # keyset-by-PK (append-only), which never propagates an UPDATE to
+            # an already-synced row.
             inc_field_safe = None
             inc_bind_value = None
             watermark_field = self._safe_column_identifier(incremental_field)
@@ -4508,131 +4480,43 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 inc_field_safe = watermark_field
                 inc_bind_value = normalized_since
 
-            where_parts = []
-            bind_values = []
-
-            def _ph():
-                # Oracle needs :N positional binds; the count is the current
-                # length before appending the next value (so first -> :1).
-                return f":{len(bind_values) + 1}" if is_oracle else placeholder
+            # A sweep's watermark is max(<field>) read before its first page,
+            # not the pages' own max (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS; the
+            # watermark snapshot block above).
+            snapshot = None
+            if watermark_field and (cursor_value is None or cursor_value == "") and not offset:
+                snapshot = self._watermark_snapshot(
+                    conn, cursor, dialect, safe_table, watermark_field,
+                    inc_bind_value, self._incremental_lag_seconds(config, params),
+                )
 
             # `cursor` is this run's PAGING position and always narrows with
-            # AND. The delta predicate decides which rows this run cares
-            # about at all, and its two halves are OR'ed:
+            # AND. The delta predicate decides which rows this run cares about
+            # at all, and its two halves are OR'ed:
             #
-            #     WHERE pk > <page cursor>
-            #       AND ( updated_at > <watermark> OR pk > <last run's pk> )
+            #     WHERE key > <page cursor>
+            #       AND ( updated_at > <watermark> OR key > <last run's key> )
             #
-            # Timestamp alone would drop every INSERT whose incremental
-            # column is NULL or hand-maintained; AND-ing the halves (the
-            # behavior this replaces) dropped every UPDATE to an
-            # already-synced row, since an updated row keeps its old PK.
-            # Each bind is appended as its placeholder is minted, so the
-            # Oracle :N numbering stays in lockstep with the emitted SQL.
-            if pk and cursor_value is not None and cursor_value != "":
-                where_parts.append(f"{quote}{pk}{quote} > {_ph()}")
-                bind_values.append(cursor_value)
-
-            delta_parts = []
-            if inc_field_safe is not None and inc_bind_value is not None:
-                delta_parts.append(f"{quote}{inc_field_safe}{quote} > {_ph()}")
-                bind_values.append(inc_bind_value)
-            if pk and since_cursor is not None and since_cursor != "":
-                delta_parts.append(f"{quote}{pk}{quote} > {_ph()}")
-                bind_values.append(since_cursor)
-            if delta_parts:
-                where_parts.append("(" + " OR ".join(delta_parts) + ")")
-
-            where_clause = ""
-            if where_parts:
-                where_clause = " WHERE " + " AND ".join(where_parts)
-
-            if pk:
-                # Project the keyset PK explicitly when it is INVISIBLE so it
-                # survives `SELECT *` and yields a usable next_cursor (GIPK fix).
-                # An invisible column is never part of `*`, so this never
-                # duplicates a column; visible PKs keep plain `SELECT *`.
-                projection = f"*, {quote}{pk}{quote}" if pk_is_invisible else "*"
-                if is_sqlserver:
-                    # SQL Server has no LIMIT; a keyset page is ORDER BY pk + TOP.
-                    query = f"SELECT TOP ({int(limit)}) {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote}"
-                elif is_oracle:
-                    # Oracle (12c+): ORDER BY pk + FETCH FIRST N ROWS ONLY.
-                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} FETCH FIRST {int(limit)} ROWS ONLY"
-                else:
-                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} LIMIT {limit}"
-                if bind_values:
-                    cursor.execute(query, tuple(bind_values))
-                else:
-                    # pyodbc treats execute(sql, None) as ONE None parameter
-                    # ("0 markers, 1 supplied"); mysql/psycopg2 treat it as no
-                    # params. Omit the arg entirely when there are no binds.
-                    cursor.execute(query)
-            else:
-                if is_sqlserver:
-                    # SQL Server: OFFSET/FETCH requires an ORDER BY; use a stable
-                    # no-op ordering so unkeyed offset paging is still valid SQL.
-                    query = f"SELECT * FROM {safe_table}{where_clause} ORDER BY (SELECT NULL) OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
-                elif is_oracle:
-                    # Oracle (12c+): OFFSET n ROWS FETCH NEXT m ROWS ONLY.
-                    query = f"SELECT * FROM {safe_table}{where_clause} OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
-                else:
-                    query = f"SELECT * FROM {safe_table}{where_clause} LIMIT {limit} OFFSET {offset}"
-                if bind_values:
-                    cursor.execute(query, tuple(bind_values))
-                else:
-                    # pyodbc treats execute(sql, None) as ONE None parameter
-                    # ("0 markers, 1 supplied"); mysql/psycopg2 treat it as no
-                    # params. Omit the arg entirely when there are no binds.
-                    cursor.execute(query)
-
-            # Convert rows to dicts
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
-
-            if rows and isinstance(rows[0], dict):
-                data = rows
-            else:
-                data = [dict(zip(columns, row)) for row in rows]
-
+            # Timestamp alone would drop every INSERT whose incremental column
+            # is NULL or hand-maintained; AND-ing the halves drops every UPDATE
+            # to an already-synced row, since an updated row keeps its old key
+            # and can never satisfy `key > last_key`. Only the OR catches both.
+            #
+            # read_page plans, queries and finishes the page: next_cursor /
+            # paging_mode / cursor_column(s) for the executor, with a projected
+            # hidden key or row locator stripped from the rows. A warehouse
+            # (Snowflake, Databricks) pins a sweep's pages to one snapshot
+            # (KI-WAREHOUSE-BATCH-PAGING-UNORDERED).
+            data, columns, paging = sql_paging.read_page(
+                conn, cursor, dialect, table, safe_table, limit=limit, offset=offset,
+                cursor_value=cursor_value, nominated=cursor_column,
+                stable=bool(use_keyset or cursor_value is not None or cursor_column),
+                since_cursor=since_cursor, inc_field=inc_field_safe, inc_value=inc_bind_value,
+            )
             cursor.close()
-            # Include next_cursor for keyset pagination if we can.
-            next_cursor = None
-            if pk and data:
-                last = data[-1]
-                if isinstance(last, dict):
-                    next_cursor = last.get(pk)
-                else:
-                    try:
-                        idx = columns.index(pk)
-                        next_cursor = last[idx]
-                    except Exception:
-                        next_cursor = None
-
-            # GIPK fix: when we explicitly projected an INVISIBLE keyset PK,
-            # (1) emit next_cursor as a STRING so a BIGINT id beyond 2**53
-            #     round-trips through the orchestrator's JSON hop without
-            #     float64 precision loss (which would skip rows = a NEW silent
-            #     drop), and
-            # (2) strip the injected PK from every row + the columns list so the
-            #     invisible column never reaches the destination — schema
-            #     discovery intentionally reports such tables as keyless (routed
-            #     to the content-hash surrogate), and leaking my_row_id would
-            #     break that contract / add an unexpected column.
-            # next_cursor is read ABOVE (from data[-1]) before this strip runs.
-            if pk_is_invisible:
-                if next_cursor is not None:
-                    next_cursor = str(next_cursor)
-                for r in data:
-                    if isinstance(r, dict):
-                        r.pop(pk, None)
-                columns = [c for c in columns if c != pk]
 
             result = self.finalize_export_result(data, prepared, columns)
-            if next_cursor is not None:
-                result["next_cursor"] = next_cursor
-                result["paging_mode"] = "keyset"
-                result["cursor_column"] = pk
+            result.update(paging)
 
             # Incremental watermark (T2-6) — see PG connector for
             # full rationale on edge cases. Emitted whenever the incremental
@@ -4662,6 +4546,14 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
                         "value": max_val,
                     }
                     result["max_watermark"] = max_val
+            if snapshot is not None:
+                result.setdefault("stats", {})
+                result["stats"]["watermark"] = {
+                    "field": snapshot[0],
+                    "value": snapshot[1],
+                    "snapshot": True,
+                }
+                result["max_watermark"] = snapshot[1]
             return result
             
         except Exception as e:
@@ -4673,6 +4565,89 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 except:
                     pass
     
+    def _export_query(self, config: Dict, raw_query: str, limit: int) -> Dict:
+        """Run a verbatim query and return at most ``limit`` rows as one page.
+
+        Row keys are the driver's column names exactly as it reports them —
+        Oracle folds unquoted identifiers to UPPERCASE, so ``SELECT table_name``
+        comes back keyed ``TABLE_NAME``."""
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn)
+            cursor.execute(_oracle_single_statement(raw_query))
+            rows = cursor.fetchmany(limit) or []
+            columns = [d[0] for d in (cursor.description or [])]
+            data = [dict(r) if isinstance(r, dict) else dict(zip(columns, r)) for r in rows]
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if not columns and data:
+            columns = list(data[0].keys())
+        # A verbatim query is one page; a full one may have been cut short.
+        return {
+            "success": True,
+            "data": data,
+            "columns": columns,
+            "total_records": len(data),
+            "paging_mode": "query",
+            "has_more": False,
+            "next_cursor": None,
+            "truncated": len(data) == limit,
+        }
+
+    def execute(self, params: Dict = None) -> Dict[str, Any]:
+        """Run exactly ONE statement verbatim — the models feature's DDL/DML.
+
+        ``timeout_seconds`` becomes ``Connection.call_timeout`` (ms per
+        round-trip): when it fires oracledb breaks the call on the server and
+        raises DPI-1067. An anonymous PL/SQL block keeps its ``END;``; plain
+        SQL loses one trailing ``;`` (see ``_oracle_single_statement``).
+        Never retried — DDL is not idempotent. DML (and a block, which may
+        hold DML) is committed; DDL auto-commits. ``rows_affected`` is the
+        cursor's rowcount for DML, else None."""
+        params = params or {}
+        sql = ""
+        for key in ("query", "sql", "statement"):
+            v = params.get(key)
+            if isinstance(v, str) and v.strip():
+                sql = v
+                break
+        if not sql:
+            return {"success": False, "error": "Missing 'query' (or 'sql'/'statement') parameter"}
+        statement = _oracle_single_statement(sql)
+        kind = _oracle_statement_kind(statement)
+        timeout = params.get("timeout_seconds")
+        try:
+            timeout = int(timeout) if not isinstance(timeout, bool) else 0
+        except (TypeError, ValueError):
+            timeout = 0
+        config = self._get_config(params)
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            if timeout > 0:
+                conn.call_timeout = timeout * 1000
+            cursor = conn.cursor()
+            cursor.execute(statement)
+            rowcount = getattr(cursor, "rowcount", None) if kind == "dml" else None
+            conn.commit()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        rows_affected = rowcount if isinstance(rowcount, int) and rowcount >= 0 else None
+        return {"success": True, "executed": True, "rows_affected": rows_affected}
+
     def _export_nosql(self, conn, config: Dict, collection: str, limit: int, offset: int, prepared: Dict) -> Dict:
         """Export from NoSQL database"""
         if "mongo" in self.driver_pattern.get("module", ""):
@@ -4867,8 +4842,8 @@ def create_http_app():
         runtime_version = f"v{runtime_version}"
 
     app = FastAPI(
-        title="MySQL MCP Connector",
-        description="Connector for MySQL relational database.",
+        title="Oracle MCP Connector",
+        description="Connector for Oracle Database (python-oracledb, thin mode).",
         version=runtime_version or "1.0.0"
     )
     
@@ -4900,7 +4875,7 @@ def create_http_app():
             # Run the synchronous DB call in a thread pool so concurrent
             # requests from multiple pipelines don't block each other on the
             # asyncio event loop. A fresh OracleMCPServer instance is created
-            # per call because mysql.connector connections are not thread-safe.
+            # per call because DB-API connections are not thread-safe.
             def _handle():
                 s = OracleMCPServer()
                 return s.handle_request(req_data)
@@ -4925,7 +4900,7 @@ def create_http_app():
                 method = getattr(server, method_name)
                 return method(params)
             
-            prefixed = f"mysql_{method_name}"
+            prefixed = f"oracle_{method_name}"
             if hasattr(server, prefixed):
                 method = getattr(server, prefixed)
                 return method(params)
@@ -4951,6 +4926,11 @@ def create_http_app():
     @app.post("/discover_schema")
     async def api_discover_schema(params: Optional[dict] = None):
         return server.discover_schema(params or {})
+
+    @app.post("/execute")
+    async def api_execute(params: Optional[dict] = None):
+        import asyncio
+        return await asyncio.to_thread(server.execute, params or {})
     
     return app
 
@@ -4966,7 +4946,7 @@ if __name__ == "__main__":
         # HTTP mode for Docker
         import uvicorn
         app = create_http_app()
-        logger.info(f"🚀 Starting MySQL MCP Server in HTTP mode on port {port}")
+        logger.info(f"🚀 Starting Oracle MCP Server in HTTP mode on port {port}")
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         # Stdio mode for local/CLI usage

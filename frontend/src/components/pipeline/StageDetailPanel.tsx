@@ -8,7 +8,7 @@ import { Progress } from "@/components/ui/progress"
 import { ConnectorLogo } from "@/components/connectors/ConnectorLogo"
 import { getConnectorLogoUrl } from "@/lib/api/mcp-connectors"
 import { formatDateTime, cn } from "@/lib/utils"
-import { formatDuration } from "./dagHelpers"
+import { formatDuration } from "@/lib/duration"
 import type { ExecutionPlanStage } from "./dagTypes"
 import { detectDurationAnomaly, stageDurationMs } from "./dagHelpers"
 
@@ -110,7 +110,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
   )
 
   return (
-    <div className="w-full lg:w-[380px] shrink-0 lg:sticky lg:top-4 lg:self-start rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 flex flex-col max-h-[calc(100vh-6rem)] lg:max-h-[calc(100vh-2rem)] overflow-hidden">
+    <div className="w-full @3xl:w-[380px] shrink-0 @3xl:sticky @3xl:top-20 @3xl:self-start rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 flex flex-col max-h-[calc(100dvh-6rem)] overflow-hidden">
       {/* Header */}
       <div className="flex items-start justify-between gap-3 p-4 border-b border-zinc-200 dark:border-zinc-800">
         <div className="flex items-start gap-3 min-w-0">

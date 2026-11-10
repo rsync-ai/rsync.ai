@@ -1,13 +1,13 @@
 /**
- * Monitoring → Overview: tiles, the tables-needing-attention list, the one-line
- * agent summary, and the 30 s refresh that pauses while the browser tab is hidden.
+ * Monitoring → Overview: tiles, the tables-needing-attention list, and the 30 s
+ * refresh that pauses while the browser tab is hidden.
  *
  * Three independent reads (runtime, monitoring overview, table stats); a failed
  * one keeps its last good numbers and says so, it never blanks the tile.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
 const authFetch = vi.fn()
@@ -18,11 +18,12 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 import {
   MonitoringOverviewTab,
   OVERVIEW_POLL_MS,
-  agentDecisionsLine,
+  captureState,
   deliveryTile,
   tablesNeedingAttention,
   type AttentionTable,
 } from "@/components/pipeline/MonitoringOverviewTab"
+import type { RuntimeDep } from "@/lib/hooks/usePipelineRuntime"
 
 type Reply = { status?: number; body?: unknown } | "network"
 
@@ -53,7 +54,6 @@ const batchRuntime = (phase = "completed", executionId: string | null = "exec-1"
 const overview = (extra: Record<string, unknown> = {}) => ({
   body: {
     pipeline_id: "p1",
-    agent_reasoning: { total_decisions: 0, recent_decisions: [] },
     data_plane: { sink_lag_messages: 0, lag_measured_at: ago(60_000) },
     links: {},
     ...extra,
@@ -188,23 +188,9 @@ describe("tablesNeedingAttention", () => {
       false
     )
     expect(items.map((i) => [i.name, i.reason])).toEqual([
-      ["b.none", "Degraded · destination wrote 0 rows"],
-      ["b.some", "Degraded · 20 of 50 rows written"],
+      ["b.none", "Rows not written · destination wrote 0 rows"],
+      ["b.some", "Rows not written · 20 of 50 rows written"],
     ])
-  })
-})
-
-describe("agentDecisionsLine", () => {
-  it("is null with no decisions", () => {
-    expect(agentDecisionsLine({ total_decisions: 0 })).toBeNull()
-    expect(agentDecisionsLine(undefined)).toBeNull()
-  })
-
-  it("names the lowest confidence and says 'at least' at the query's 20-row cap", () => {
-    expect(agentDecisionsLine({ total_decisions: 3, recent_decisions: [{ confidence: 0.9 }, { confidence: 0.62 }, {}] })).toBe(
-      "3 automated decisions in the last 24h, lowest confidence 62%"
-    )
-    expect(agentDecisionsLine({ total_decisions: 20 })).toBe("At least 20 automated decisions in the last 24h")
   })
 })
 
@@ -269,6 +255,21 @@ describe("MonitoringOverviewTab (CDC)", () => {
     const link = await screen.findByRole("link", { name: /Table statistics/ })
     expect(link).toHaveAttribute("href", "/pipelines/p1?tab=table-stats")
     expect(screen.getByText(/All 3 tables caught up/)).toBeInTheDocument()
+  })
+
+  it("says there are no tables yet rather than 'All 0 tables caught up'", async () => {
+    replies.tables = tableStats([])
+    render(<MonitoringOverviewTab pipelineId="p1" />)
+    await screen.findByRole("link", { name: /Table statistics/ })
+    expect(screen.getByText(/No tables yet\./)).toBeInTheDocument()
+    expect(screen.queryByText(/caught up/)).toBeNull()
+
+    cleanup()
+    replies.runtime = batchRuntime()
+    render(<MonitoringOverviewTab pipelineId="p1" />)
+    await screen.findByRole("link", { name: /Table statistics/ })
+    expect(screen.getByText(/No tables yet\./)).toBeInTheDocument()
+    expect(screen.queryByText(/last run's 0 tables/)).toBeNull()
   })
 
   it("lists at most five tables needing attention, then '+N more'", async () => {
@@ -423,28 +424,20 @@ describe("MonitoringOverviewTab on another pipeline", () => {
     authFetch.mockImplementation(() => new Promise((resolve) => (answerP2 = resolve)))
     rerender(<MonitoringOverviewTab pipelineId="p2" />)
     expect(screen.queryByText("7 changes")).toBeNull()
-    expect(screen.getByText("Loading…")).toBeInTheDocument()
+    expect(screen.getByRole("status")).toHaveTextContent("Loading this pipeline's status…")
     expect(calls("/pipelines/p2/runtime")).toHaveLength(1)
     answerP2({ ok: false, status: 404, json: async () => ({}) })
   })
 })
 
-describe("MonitoringOverviewTab agent line", () => {
-  it("is hidden when there were no automated decisions", async () => {
-    render(<MonitoringOverviewTab pipelineId="p1" onOpenActivity={() => {}} />)
-    await screen.findByText(/All 3 tables caught up/)
-    expect(screen.queryByTestId("overview-decisions")).toBeNull()
-    expect(screen.queryByRole("button", { name: "View in Activity" })).toBeNull()
-  })
-
-  it("summarises decisions in one line and opens Activity", async () => {
-    replies.overview = overview({ agent_reasoning: { total_decisions: 2, recent_decisions: [{ confidence: 0.8 }, { confidence: 0.55 }] } })
-    const onOpenActivity = vi.fn()
-    render(<MonitoringOverviewTab pipelineId="p1" onOpenActivity={onOpenActivity} />)
-    const line = await screen.findByTestId("overview-decisions")
-    expect(line).toHaveTextContent("2 automated decisions in the last 24h, lowest confidence 55%")
-    fireEvent.click(within(line).getByRole("button", { name: "View in Activity" }))
-    expect(onOpenActivity).toHaveBeenCalledTimes(1)
+describe("MonitoringOverviewTab while the tables load", () => {
+  it("announces one loading status, not one per waiting tile", async () => {
+    const answer = authFetch.getMockImplementation()!
+    authFetch.mockImplementation((url: string) => (url.includes("/table-stats") ? new Promise(() => {}) : answer(url)))
+    render(<MonitoringOverviewTab pipelineId="p1" />)
+    await waitFor(() => expect(tile("freshness")).toHaveTextContent("Loading…"))
+    expect(tile("errors")).toHaveTextContent("Loading…")
+    expect(screen.getAllByRole("status").map((s) => s.textContent)).toEqual(["Loading tables…"])
   })
 })
 
@@ -591,6 +584,50 @@ describe("MonitoringOverviewTab: zero is not automatically health", () => {
     const kafka = await screen.findByTestId("overview-tile-delivery")
     expect(within(kafka).getByText(/Couldn't load/)).toBeInTheDocument()
     expect(within(kafka).queryByText("Caught up")).toBeNull()
+  })
+
+  // The dependency probe sweeps running pipelines only (workers/dependency_probe.go),
+  // so a paused or stopped pipeline's debezium_task verdict is whatever the last
+  // running probe saw — usually healthy. The KYC pipeline on prod read a green
+  // "Capturing" while it was stopped.
+  it("does not say 'Capturing' for a stopped pipeline whose last probe read healthy", async () => {
+    const rt = cdcRuntimeWith({ sink_lag_messages: 0, sink_lag_measured_at: ago(20_000) }, [debezium("healthy")])
+    replies.runtime = { body: { ...rt.body, phase: "stopped", health: "degraded" } }
+    render(<MonitoringOverviewTab pipelineId="p1" />)
+
+    const capture = await screen.findByTestId("overview-tile-capture")
+    expect(within(capture).getByText("Stopped")).toBeInTheDocument()
+    expect(within(capture).getByText("the pipeline is stopped, so no changes are being captured")).toBeInTheDocument()
+    // Stopped on purpose is not a fault: not green, and not red either.
+    expect(capture).toHaveAttribute("data-tone", "neutral")
+    expect(within(capture).queryByText("Capturing")).toBeNull()
+  })
+
+  it("says 'Paused' for a paused pipeline whose last probe read healthy", async () => {
+    const rt = cdcRuntimeWith({ sink_lag_messages: 0, sink_lag_measured_at: ago(20_000) }, [debezium("healthy")])
+    replies.runtime = { body: { ...rt.body, phase: "paused", health: "degraded" } }
+    render(<MonitoringOverviewTab pipelineId="p1" />)
+
+    const capture = await screen.findByTestId("overview-tile-capture")
+    expect(within(capture).getByText("Paused")).toBeInTheDocument()
+    expect(
+      within(capture).getByText("the pipeline is paused, so no changes are captured until it resumes")
+    ).toBeInTheDocument()
+    expect(capture).toHaveAttribute("data-tone", "neutral")
+  })
+
+  it("lets the phase speak over a frozen verdict, and only for a pipeline that is not running", () => {
+    const healthy = [debezium("healthy")] as RuntimeDep[]
+    const dead = [debezium("unhealthy", "connection refused")] as RuntimeDep[]
+    expect(captureState(healthy, "stopped")).toBe("pipeline_stopped")
+    expect(captureState(healthy, "paused")).toBe("pipeline_paused")
+    // Not probed after the stop either, so an unhealthy row is just as frozen.
+    expect(captureState(dead, "stopped")).toBe("pipeline_stopped")
+    // A running pipeline keeps the probe's live verdict.
+    expect(captureState(healthy, "streaming")).toBe("capturing")
+    expect(captureState(dead, "streaming")).toBe("stopped")
+    expect(captureState(dead, "failed")).toBe("stopped")
+    expect(captureState(healthy, undefined)).toBe("capturing")
   })
 
   it("does not call a batch pipeline's capture stopped (it has no source stream)", async () => {

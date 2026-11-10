@@ -23,7 +23,6 @@ const nextStepsGatedSentence = "Set up an LLM first: add a provider key to .env,
 // The shape llm-service's rules fallback (_mock_next_steps) returns with 200
 // when no LLM is set up and row_count > 10.
 const nextStepsRulesBody = `{"suggestions":[` +
-	`{"action_type":"metabase","title":"Create Dashboard","description":"Visualize these results","confidence":0.9,"required_inputs":["dashboard_name"],"cta":"Create Dashboard"},` +
 	`{"action_type":"download_csv","title":"Download CSV","description":"Export 42 rows to CSV","confidence":0.8,"required_inputs":[],"cta":"Download"},` +
 	`{"action_type":"slack","title":"Share to Slack","description":"Send results to a channel","confidence":0.6,"required_inputs":["channel"],"cta":"Share"}]}`
 
@@ -208,7 +207,7 @@ func TestNextStepsForwardsTheRulesFallback(t *testing.T) {
 				t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
 			}
 			got := nextStepsActionTypes(t, w)
-			want := []string{"metabase", "download_csv", "slack"}
+			want := []string{"download_csv", "slack"}
 			if strings.Join(got, ",") != strings.Join(want, ",") {
 				t.Fatalf("suggestions = %v, want %v", got, want)
 			}
@@ -228,8 +227,8 @@ func TestNextStepsKeepsDefaultSuggestionsWhenTheAnswerIsUnusable(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 with default suggestions (%s)", w.Code, w.Body.String())
 		}
-		if got := nextStepsActionTypes(t, w); strings.Join(got, ",") != "metabase,download_csv" {
-			t.Fatalf("suggestions = %v, want the two defaults", got)
+		if got := nextStepsActionTypes(t, w); strings.Join(got, ",") != "download_csv" {
+			t.Fatalf("suggestions = %v, want the one default", got)
 		}
 	})
 	t.Run("200 not json", func(t *testing.T) {
@@ -240,8 +239,54 @@ func TestNextStepsKeepsDefaultSuggestionsWhenTheAnswerIsUnusable(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 with the default suggestion (%s)", w.Code, w.Body.String())
 		}
-		if got := nextStepsActionTypes(t, w); strings.Join(got, ",") != "metabase" {
+		if got := nextStepsActionTypes(t, w); strings.Join(got, ",") != "download_csv" {
 			t.Fatalf("suggestions = %v, want the one default", got)
 		}
 	})
+}
+
+// llm-service hides the query's literals behind placeholders before the model
+// sees the SQL, and it can only find them with the query's dialect: with none,
+// it withholds the whole query. The gateway used to drop the dialect, so every
+// next-steps prompt said "(withheld: …)" instead of the query.
+func TestNextStepsForwardsTheSQLDialect(t *testing.T) {
+	for _, tc := range []struct{ sent, want string }{
+		{"mysql", "mysql"},
+		{"", ""},
+	} {
+		var got map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(nextStepsRulesBody))
+		}))
+		gin.SetMode(gin.TestMode)
+		t.Setenv("LLM_SERVICE_URL", srv.URL)
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			// No database in this test, so the connection lookup finds nothing
+			// and the client's dialect stands.
+			"connection_id":  "conn-1",
+			"dialect":        tc.sent,
+			"question":       "orders per day",
+			"sql":            "SELECT day FROM orders WHERE status = 'paid'",
+			"result_profile": map[string]interface{}{"row_count": 42},
+		})
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Set("user_id", "u1")
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/explorer/nl/next-steps", bytes.NewReader(reqBody))
+		c.Request.Header.Set("Content-Type", "application/json")
+		GetExplorerNextSteps(c)
+		srv.Close()
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("dialect %q: status %d (%s)", tc.sent, w.Code, w.Body.String())
+		}
+		if got == nil {
+			t.Fatalf("dialect %q: llm-service was not called", tc.sent)
+		}
+		if d, _ := got["dialect"].(string); d != tc.want {
+			t.Errorf("dialect %q: llm-service got dialect %q, want %q", tc.sent, d, tc.want)
+		}
+	}
 }

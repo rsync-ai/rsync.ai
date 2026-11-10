@@ -43,9 +43,10 @@ RUN pip install --no-cache-dir -r requirements-oss.txt
 COPY src/__init__.py ./src/__init__.py
 COPY src/agents/__init__.py ./src/agents/__init__.py
 COPY src/agents/tool_generator/__init__.py ./src/agents/tool_generator/__init__.py
-# On-disk connector-path helpers (stdlib only).
+# On-disk connector-path helpers and the API-spec size limit (stdlib only).
 COPY src/utils/__init__.py ./src/utils/__init__.py
 COPY src/utils/connector_paths.py ./src/utils/connector_paths.py
+COPY src/utils/spec_limits.py ./src/utils/spec_limits.py
 # The moat-free connector-lifecycle package: /v1/deploy handler + docker build/start service.
 COPY src/agents/tool_generator/deployment/ ./src/agents/tool_generator/deployment/
 # The deterministic renderer behind POST /v1/generate: an OpenAPI or Swagger document in,
@@ -66,6 +67,10 @@ COPY src/lifecycle/ ./src/lifecycle/
 # src/agents/tool_generator/{discovery_routes.py,service.py,field_templates.py},
 # src/gateway/, src/agents/planner/ and prompts/ are INTENTIONALLY NOT copied. Do not add
 # a blanket `COPY src/ ./src/` here.
+
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 RUN chown -R appuser:appuser /app
 

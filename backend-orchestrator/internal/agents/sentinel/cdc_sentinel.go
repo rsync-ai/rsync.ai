@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -66,9 +67,18 @@ const (
 	// warning alert (no action). 512 MB.
 	DefaultWALWarnBytes int64 = 512 * 1024 * 1024
 	// CRITICAL tier: a slot retaining more than this much WAL is dangerous (the
-	// source can run out of disk). 2 GB. For a stopped/deleted pipeline the slot
-	// is auto-dropped; for a running/paused pipeline it escalates as critical.
+	// source can run out of disk). 2 GB. A stopped pipeline is started (a paused one
+	// resumed) so it drains its slot, which is kept; only a deleted pipeline's slot is
+	// dropped, as an orphan.
 	DefaultWALCriticalBytes int64 = 2 * 1024 * 1024 * 1024
+
+	// --- Position horizon (sources that purge their change log on a clock) ---
+	// WARN tier: a stopped MySQL/MariaDB or SQL Server pipeline whose stored position the
+	// source may purge within this long raises a warning alert.
+	DefaultPositionHorizonWarn = 24 * time.Hour
+	// CRITICAL tier: within this long, the pipeline is started (resumed) so it reads past
+	// its position before the purge.
+	DefaultPositionHorizonCritical = 6 * time.Hour
 
 	// --- Restart-attempt cap (FINDING-04) ---
 	// A connector restart can only fix a *transient* fault. A permanently-FAILED
@@ -85,6 +95,15 @@ const (
 	// Rolling window after which a connector's restart-attempt count resets to zero, so a
 	// connector that fails transiently every few weeks isn't permanently considered dead.
 	ConnectorRestartWindow = 24 * time.Hour
+	// How long a restarted connector must stay RUNNING before its restart attempts are
+	// forgotten. RUNNING right after a restart proves nothing: every source we deploy
+	// retries a failing task inside RUNNING for errors.max.retries x
+	// retriable.restart.connector.wait.ms (30 x 10s, about 5 min, debezium connector.py)
+	// before the task reaches FAILED again. Forgetting the attempts on the first RUNNING
+	// poll reset the cap on every cycle, so a MongoDB connector whose resume token had
+	// left the oplog was restarted every 6 min with "attempt 1 of 3", forever. 30 min
+	// outlasts several of those retry budgets.
+	ConnectorRestartStableAfter = 30 * time.Minute
 )
 
 // These restart-policy bounds are overridable via env for operators running very large
@@ -117,10 +136,27 @@ func connectorRestartCooldown() time.Duration {
 	return ConnectorRestartCooldown
 }
 
+func connectorRestartStableAfter() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("CDC_SENTINEL_RESTART_STABLE_AFTER")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return ConnectorRestartStableAfter
+}
+
 func kafkaConnectURLFromEnv() string {
 	v := strings.TrimSpace(os.Getenv("KAFKA_CONNECT_URL"))
 	if v == "" {
 		return "http://kafka-connect:8083"
+	}
+	return v
+}
+
+func apiGatewayInternalURLFromEnv() string {
+	v := strings.TrimRight(strings.TrimSpace(os.Getenv("API_GATEWAY_INTERNAL_URL")), "/")
+	if v == "" {
+		return "http://api-gateway:8080"
 	}
 	return v
 }
@@ -143,6 +179,7 @@ type connRestartState struct {
 	firstAttempt time.Time // start of the current window
 	lastAttempt  time.Time // last restart attempt (for cooldown spacing)
 	escalated    bool      // terminal escalation already sent (dedup)
+	runningSince time.Time // first RUNNING poll since the connector last FAILED; zero while failing
 }
 
 // CDCSentinel monitors the health of active Debezium connectors
@@ -155,9 +192,10 @@ type CDCSentinel struct {
 	workerID     string
 	connectURL   string
 	pollInterval time.Duration
-	// mu guards restartState, sinkRestartState, sinkRespawnState, sinkProgress, sinkDrain, startedAt,
-	// and mcpManager — all touched from more than one of the Sentinel's background goroutines
-	// (monitoringLoop + sourceLagLoop + walWatchdogLoop) and, for mcpManager, from the startup
+	// mu guards restartState, sinkRestartState, sinkRespawnState, sinkProgress, sinkDrain, rowsParked,
+	// sourceFreshness, sourceLag, startedAt, and mcpManager — all touched from more than one of the
+	// Sentinel's background goroutines (monitoringLoop + sourceLagLoop + walWatchdogLoop) and, for
+	// mcpManager, from the startup
 	// goroutine via SetMCPManager. Without it, concurrent map iteration+write is a Go runtime
 	// fatal that crashes the whole orchestrator (SENT-C).
 	mu sync.Mutex
@@ -178,11 +216,24 @@ type CDCSentinel struct {
 	// Per-pipeline committed Kafka position from the previous tick, so the sink-lag alarm can
 	// tell a sink working through a backlog from one that has stopped (cdc_sink_drain.go).
 	sinkDrain map[string]sinkDrainState
+	// Per-pipeline count of parked (dead-lettered) CDC rows the rows-parked alarm last
+	// reported, so it alerts on new parked rows only (cdc_rows_parked.go).
+	rowsParked map[string]int64
 	// Per-connector committed SOURCE position from the previous tick, so the freshness alarm
 	// can tell a connector that Connect calls RUNNING but which has stopped advancing through
 	// the source's change stream (cdc_source_freshness.go). Keyed by connector name, because
 	// the position belongs to the Kafka Connect connector rather than to the pipeline.
 	sourceFreshness map[string]sourceFreshnessState
+	// Per-pipeline clock of how long SOURCE-side lag has been over its threshold and the
+	// committed position frozen, so sustained lag can escalate to a notification
+	// (cdc_source_lag.go).
+	sourceLag map[string]sourceLagState
+	// sourceLagNow is the source-lag alarm's clock; nil means time.Now. It exists so tests
+	// can let half an hour pass between two readings without rewinding the clock's starts.
+	sourceLagNow func() time.Time
+	// heartbeatEndOffset reads a heartbeat topic's end offset for the freshness alarm; nil
+	// means kafkaManager.TopicEndOffset. It exists so tests can count heartbeats without Kafka.
+	heartbeatEndOffset func(topic string) (int64, bool, error)
 	// startedAt anchors the respawn rung's startup grace window, so we don't race the CDC
 	// executor's own start_sink while the stack is still coming up.
 	startedAt time.Time
@@ -196,6 +247,19 @@ type CDCSentinel struct {
 	walWarnBytes        int64
 	walCriticalBytes    int64
 	walAutoAct          bool
+	// apiGatewayURL is where the watchdog asks for a stopped pipeline to be started: the
+	// internal run route, the same one the healer's backoff retry uses.
+	apiGatewayURL string
+	// walOpenSource opens a source PostgreSQL for the watchdog; nil means openSourcePG.
+	// It exists so tests can measure a slot without a real source.
+	walOpenSource func(ctx context.Context, connectionID string) (*sql.DB, error)
+
+	// --- Position horizon config (cdc_position_horizon.go) ---
+	horizonWarn     time.Duration
+	horizonCritical time.Duration
+	// horizonMeasure reads a source's purge clock for a stored offset; nil means
+	// measurePositionHorizon. It exists so tests can measure without a real source.
+	horizonMeasure func(ctx context.Context, family, connectionID string, offset map[string]interface{}) (cdc.PositionHorizon, error)
 }
 
 func NewCDCSentinel(db *sql.DB, kafkaManager *kafka.Manager) *CDCSentinel {
@@ -216,11 +280,15 @@ func NewCDCSentinel(db *sql.DB, kafkaManager *kafka.Manager) *CDCSentinel {
 		sinkRespawnState: make(map[string]*connRestartState),
 		sinkProgress:     make(map[string]sql.NullTime),
 		sinkDrain:        make(map[string]sinkDrainState),
+		rowsParked:       make(map[string]int64),
 
 		walWatchdogInterval: walDurationFromEnv("CDC_WAL_WATCHDOG_INTERVAL", DefaultWALWatchdogInterval),
 		walWarnBytes:        walBytesFromEnv("CDC_WAL_WARN_BYTES", DefaultWALWarnBytes),
 		walCriticalBytes:    walBytesFromEnv("CDC_WAL_CRITICAL_BYTES", DefaultWALCriticalBytes),
 		walAutoAct:          walBoolFromEnv("CDC_WAL_WATCHDOG_AUTOACT", true),
+		apiGatewayURL:       apiGatewayInternalURLFromEnv(),
+		horizonWarn:         walDurationFromEnv("CDC_POSITION_HORIZON_WARN", DefaultPositionHorizonWarn),
+		horizonCritical:     walDurationFromEnv("CDC_POSITION_HORIZON_CRITICAL", DefaultPositionHorizonCritical),
 	}
 }
 
@@ -369,6 +437,10 @@ func (s *CDCSentinel) checkActivePipelines(ctx context.Context) {
 	// seen dead. This must not sit behind getDebeziumStatus, whose early return on an
 	// unreachable Connect is exactly the dead-worker case it exists for
 	// (KI-DEBEZIUM-WORKER-DEATH-NOT-SURFACED).
+	//
+	// Every check below reads running pipelines only, so first close the running-only
+	// alerts of pipelines that stopped: nothing else would ever clear them.
+	s.closeAlertsOfStoppedPipelines(ctx)
 	s.surfaceCaptureDown(ctx)
 
 	status, err := s.getDebeziumStatus(ctx)
@@ -395,21 +467,32 @@ func (s *CDCSentinel) checkActivePipelines(ctx context.Context) {
 			}
 			s.handleFailedConnector(ctx, pipelineID, connName, connState)
 		} else if stateStr == "RUNNING" {
-			// Connector is healthy again — clear any restart-attempt bookkeeping so a
-			// future failure starts from a clean slate (FINDING-04).
-			s.clearRestartState(connName)
+			// Forget the restart attempts only once the connector has stayed RUNNING past
+			// its own retry budget, so a future failure starts from a clean slate
+			// (FINDING-04) but a restart that is about to fail again still counts.
+			s.noteConnectorRunning(connName, time.Now())
 			// RUNNING is Connect's opinion, not evidence. Debezium retries a permanent
 			// error on a loop without ever leaving RUNNING, so this branch is exactly
 			// where a dead pipeline hides (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL).
 			// Ask the committed source position whether it is actually moving.
 			if pipelineID != "" {
 				s.checkSourceFreshness(ctx, pipelineID, connName, connState)
+				// RUNNING ends the FAILED verdict, and only that one: a stall is the
+				// freshness alarm's to clear. Without this the terminal connector-down
+				// issue had no way out at all. It waits for the position to move after
+				// the failure, because the restart that follows a lost resume position
+				// is RUNNING too (captureProvenMoving).
+				if s.captureProvenMoving(connName) {
+					s.resolveLagIssue(ctx, connectorIssueID(pipelineID), pipelineID)
+				}
 			}
 		}
 	}
 
 	// Prune restart bookkeeping for connectors that no longer appear in Connect (deleted
-	// or reaped) so the maps can't grow unbounded.
+	// or reaped) so the maps can't grow unbounded. A paused or stopped connector is still
+	// listed, so its freshness entry is kept; the observation gap it leaves is what
+	// restarts its stall clock on resume (decideSourceFreshnessAlarm).
 	s.pruneRestartState(seenConnectors)
 	s.forgetSourceFreshness(seenConnectors)
 }
@@ -443,6 +526,7 @@ func (s *CDCSentinel) pipelineInInitialSnapshot(ctx context.Context, pipelineID 
 func (s *CDCSentinel) handleFailedConnector(ctx context.Context, pipelineID, connName string, connState interface{}) {
 	now := time.Now()
 	inSnapshot := s.pipelineInInitialSnapshot(ctx, pipelineID)
+	s.noteCaptureDown(connName, now)
 
 	s.mu.Lock()
 	st := s.restartState[connName]
@@ -456,6 +540,9 @@ func (s *CDCSentinel) handleFailedConnector(ctx context.Context, pipelineID, con
 		st.firstAttempt = now
 		st.escalated = false
 	}
+	// A failure ends any healthy streak: the RUNNING that followed the last restart was
+	// the connector's own retry loop, not a recovery.
+	st.runningSince = time.Time{}
 	attempts := st.attempts
 	lastAttempt := st.lastAttempt
 	alreadyEscalated := st.escalated
@@ -520,8 +607,9 @@ func (s *CDCSentinel) handleFailedConnector(ctx context.Context, pipelineID, con
 
 	// Attempt a direct restart via the Kafka Connect REST API. A successful HTTP response
 	// only means the restart was ACCEPTED, not that the connector recovered — recovery is
-	// confirmed only when a later poll observes state=RUNNING (which clears the state). So
-	// we never treat the restart response itself as "recovered"; the cap above bounds it.
+	// confirmed only when later polls observe state=RUNNING for connectorRestartStableAfter
+	// (which clears the state). So we never treat the restart response itself as
+	// "recovered"; the cap above bounds it.
 	if accepted := s.restartConnector(ctx, connName); accepted {
 		log.WithFields(log.Fields{
 			"connector":   connName,
@@ -540,11 +628,31 @@ func (s *CDCSentinel) handleFailedConnector(ctx context.Context, pipelineID, con
 	s.triggerHealer(ctx, pipelineID, connName, connState)
 }
 
-// clearRestartState drops restart bookkeeping for a connector that is healthy again.
-func (s *CDCSentinel) clearRestartState(connName string) {
+// noteConnectorRunning records one RUNNING poll and drops the connector's restart
+// bookkeeping once it has stayed RUNNING for connectorRestartStableAfter.
+func (s *CDCSentinel) noteConnectorRunning(connName string, now time.Time) {
 	s.mu.Lock()
-	delete(s.restartState, connName)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	st := s.restartState[connName]
+	if st == nil {
+		return
+	}
+	next, recovered := connectorRecovered(*st, now, connectorRestartStableAfter())
+	if recovered {
+		delete(s.restartState, connName)
+		return
+	}
+	*st = next
+}
+
+// connectorRecovered is the pure half of noteConnectorRunning: it starts the healthy
+// streak on the first RUNNING poll and reports recovery once the streak has lasted
+// stableAfter. A connector that fails again before then keeps every attempt it used.
+func connectorRecovered(st connRestartState, now time.Time, stableAfter time.Duration) (connRestartState, bool) {
+	if st.runningSince.IsZero() {
+		st.runningSince = now
+	}
+	return st, now.Sub(st.runningSince) >= stableAfter
 }
 
 // pruneRestartState removes bookkeeping for connectors no longer reported by Connect.
@@ -858,6 +966,23 @@ func (s *CDCSentinel) sourceLagLoop() {
 //     earlier version did — meant the MySQL lag check never actually ran.
 func (s *CDCSentinel) checkSourceDBLag(ctx context.Context) {
 	defer recoverTick("source_lag")
+	// Every running CDC pipeline gets exactly one sink check per tick: the source-lag
+	// branches below check the pipelines they find, and the catch-all at the end checks
+	// everything they did not. Once, because the drain clock reads one committed position
+	// per tick, and a pipeline with two slot rows would otherwise be observed twice.
+	checked := make(map[string]bool)
+	checkSink := func(pipelineID, pipelineName, dbType string) {
+		if checked[pipelineID] {
+			return
+		}
+		checked[pipelineID] = true
+		s.checkSinkConsumerLag(ctx, pipelineID, pipelineName, dbType)
+	}
+	// The pipelines the source-lag branches find running. Every other pipeline's lag clock is
+	// dropped at the end of the tick (pruneSourceLag), unless a discovery query failed: a
+	// failed query says nothing about which pipelines stopped.
+	lagRunning := make(map[string]bool)
+	lagDiscovered := true
 	// PostgreSQL — slot-based discovery via cdc_resources.
 	pgRows, err := s.db.QueryContext(ctx, `
 		SELECT p.id, p.name, cr.connection_id, cr.resource_name
@@ -869,6 +994,7 @@ func (s *CDCSentinel) checkSourceDBLag(ctx context.Context) {
 		  AND cr.resource_type = 'replication_slot'
 	`)
 	if err != nil {
+		lagDiscovered = false
 		log.WithError(err).Debug("🛡️ sourceLagLoop: failed to query PG slot resources")
 	} else {
 		for pgRows.Next() {
@@ -876,26 +1002,35 @@ func (s *CDCSentinel) checkSourceDBLag(ctx context.Context) {
 			if err := pgRows.Scan(&pipelineID, &pipelineName, &connID, &slotName); err != nil {
 				continue
 			}
+			lagRunning[pipelineID] = true
 			s.checkPGSlotLag(ctx, pipelineID, pipelineName, connID, slotName)
 			// Also assert the SINK is draining Kafka. checkPGSlotLag only proves
 			// Debezium is consuming the WAL; a dead/wedged sink leaves the slot
 			// current while nothing lands at the destination (the "green but dead"
 			// gap). Raises the distinct cdc-sink-lag-* issue.
-			s.checkSinkConsumerLag(ctx, pipelineID, pipelineName, "postgresql")
+			checkSink(pipelineID, pipelineName, "postgresql")
+		}
+		if pgRows.Err() != nil {
+			lagDiscovered = false
 		}
 		pgRows.Close()
 	}
 
-	// MySQL — connection-based discovery (no cdc_resource to rely on).
+	// MySQL and MariaDB — connection-based discovery (no cdc_resource to rely on). MariaDB
+	// is captured by the same Debezium MySQL connector (the debezium connector.py maps
+	// mariadb to mysql), so its offset carries the same binlog file/pos and
+	// checkMySQLBinlogLag measures it the same way; left out of this filter, a MariaDB
+	// source's lag was never measured.
 	myRows, err := s.db.QueryContext(ctx, `
 		SELECT p.id, p.name, p.source_connection_id
 		FROM pipelines p
 		JOIN connections c ON c.id = p.source_connection_id
 		WHERE p.status = 'running'
 		  AND (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL)
-		  AND c.connector_type ILIKE 'mysql%'
+		  AND (c.connector_type ILIKE 'mysql%' OR c.connector_type ILIKE 'mariadb%')
 	`)
 	if err != nil {
+		lagDiscovered = false
 		log.WithError(err).Debug("🛡️ sourceLagLoop: failed to query MySQL CDC pipelines")
 	} else {
 		for myRows.Next() {
@@ -903,58 +1038,60 @@ func (s *CDCSentinel) checkSourceDBLag(ctx context.Context) {
 			if err := myRows.Scan(&pipelineID, &pipelineName, &connID); err != nil {
 				continue
 			}
+			lagRunning[pipelineID] = true
 			s.checkMySQLBinlogLag(ctx, pipelineID, pipelineName, connID)
 			// Always-on sink-drain check (distinct cdc-sink-lag-* issue). The MySQL
 			// binlog path only falls back to a consumer-lag proxy when the binlog offset
 			// is unreadable, so a dead sink with a readable binlog offset went unnoticed.
-			s.checkSinkConsumerLag(ctx, pipelineID, pipelineName, "mysql")
+			checkSink(pipelineID, pipelineName, "mysql")
+		}
+		if myRows.Err() != nil {
+			lagDiscovered = false
 		}
 		myRows.Close()
 	}
+	if lagDiscovered {
+		s.pruneSourceLag(lagRunning)
+	}
 
-	// Other CDC families (oracle/sqlserver/mongodb) — connection-based discovery. They have no
-	// dedicated source-lag probe (checkPGSlotLag/checkMySQLBinlogLag are PG/MySQL-specific), but
-	// their change events reach the destination through the SAME shared sink worker (consumer
-	// group sink-<short8>), so they are equally exposed to the "green but dead sink" wedge that
-	// checkSinkConsumerLag detects — and, when armed, that maybeAutoRestartSink recovers. Without
-	// this pass only PG and MySQL sinks were ever checked. Family-agnostic: dbType is a label only.
-	for _, tgt := range s.discoverOtherFamilyCDCSinks(ctx) {
-		s.checkSinkConsumerLag(ctx, tgt.pipelineID, tgt.pipelineName, tgt.dbType)
+	// Every other running CDC pipeline. Oracle, SQL Server and MongoDB have no source-lag
+	// probe, but their changes reach the destination through the SAME shared sink worker
+	// (consumer group sink-<short8>), so they are equally exposed to the "green but dead sink"
+	// wedge that checkSinkConsumerLag detects. A list of families here was the bug this
+	// replaced: it left out MariaDB (connector_type 'mariadb' matches none of the branches),
+	// and a Postgres pipeline whose slot row is missing or not 'active' fell through both
+	// branches -- in each case changes could stop reaching the destination with no alarm.
+	// Family-agnostic: dbType is a label only.
+	for _, tgt := range s.discoverCDCSinkTargets(ctx) {
+		checkSink(tgt.pipelineID, tgt.pipelineName, tgt.dbType)
 	}
 }
 
-// cdcSinkTarget identifies a running CDC pipeline that needs the family-agnostic sink-drain
-// check but has no dedicated source-lag probe (oracle/sqlserver/mongodb). dbType is a display
-// label only — the sink check and auto-restart rung key on the pipeline id and mode='cdc'.
+// cdcSinkTarget identifies a running CDC pipeline for the family-agnostic sink-drain check.
+// dbType is a display label only — the sink check and auto-restart rung key on the pipeline
+// id and mode='cdc'.
 type cdcSinkTarget struct {
 	pipelineID   string
 	pipelineName string
 	dbType       string
 }
 
-// discoverOtherFamilyCDCSinks returns the running CDC pipelines whose SOURCE connector family is
-// oracle, SQL Server, or MongoDB. PostgreSQL (discovered via cdc_resources) and MySQL (via the
-// source connection) already run checkSinkConsumerLag inline from their source-lag branches in
-// checkSourceDBLag; these three families have no source-lag probe, so without this discovery
-// their sinks were never checked for the "green but dead sink" wedge (nor auto-restarted). The
-// discovery is connection-based (like MySQL) because oracle/sqlserver/mongodb record no
-// PostgreSQL-style server-side resource in cdc_resources. connector_type is normalized purely for
-// the log/issue label; the sink-drain check itself is source-family-agnostic.
-func (s *CDCSentinel) discoverOtherFamilyCDCSinks(ctx context.Context) []cdcSinkTarget {
+// discoverCDCSinkTargets returns EVERY running CDC pipeline, whatever its source. The caller
+// skips the ones its source-lag branches already checked; this is the net under them, so it
+// deliberately names no family -- a family list is how MariaDB was missed. LEFT JOIN, so a
+// pipeline whose source connection row is gone is still checked (its label is "unknown"):
+// its changes can still be stuck in Kafka. connector_type is normalized purely for the
+// log/issue label; the sink-drain check itself is source-family-agnostic.
+func (s *CDCSentinel) discoverCDCSinkTargets(ctx context.Context) []cdcSinkTarget {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.id, p.name, c.connector_type
+		SELECT p.id, p.name, COALESCE(c.connector_type, '')
 		FROM pipelines p
-		JOIN connections c ON c.id = p.source_connection_id
+		LEFT JOIN connections c ON c.id = p.source_connection_id
 		WHERE p.status = 'running'
 		  AND (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL)
-		  AND (   c.connector_type ILIKE 'oracle%'
-		       OR c.connector_type ILIKE 'sqlserver%'
-		       OR c.connector_type ILIKE 'mssql%'
-		       OR c.connector_type ILIKE 'mongodb%'
-		       OR c.connector_type ILIKE 'mongo%')
 	`)
 	if err != nil {
-		log.WithError(err).Debug("🛡️ sourceLagLoop: failed to query other-family CDC pipelines")
+		log.WithError(err).Debug("🛡️ sourceLagLoop: failed to query CDC pipelines for the sink check")
 		return nil
 	}
 	defer rows.Close()
@@ -965,10 +1102,14 @@ func (s *CDCSentinel) discoverOtherFamilyCDCSinks(ctx context.Context) []cdcSink
 		if err := rows.Scan(&pipelineID, &pipelineName, &connectorType); err != nil {
 			continue
 		}
+		dbType := cdc.NormalizeDBType(connectorType)
+		if dbType == "" {
+			dbType = "unknown"
+		}
 		targets = append(targets, cdcSinkTarget{
 			pipelineID:   pipelineID,
 			pipelineName: pipelineName,
-			dbType:       cdc.NormalizeDBType(connectorType),
+			dbType:       dbType,
 		})
 	}
 	return targets
@@ -1012,9 +1153,12 @@ func (s *CDCSentinel) checkPGSlotLag(ctx context.Context, pipelineID, pipelineNa
 	defer srcDB.Close()
 
 	var lagBytes int64
+	// confirmed_flush_lsn is the connector's committed position: the sustained-lag alarm
+	// escalates only while it stays frozen (cdc_source_lag.go).
+	var confirmedFlush sql.NullString
 	err = srcDB.QueryRowContext(ctx,
-		`SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)
-		 FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&lagBytes)
+		`SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0), confirmed_flush_lsn::text
+		 FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&lagBytes, &confirmedFlush)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
 			"pipeline_id": pipelineID,
@@ -1031,12 +1175,20 @@ func (s *CDCSentinel) checkPGSlotLag(ctx context.Context, pipelineID, pipelineNa
 	}).Debug("🛡️ PG replication slot lag")
 
 	if lagBytes > walBytesFromEnv("CDC_PG_SLOT_LAG_BYTES", PGSlotLagAlertBytes) {
+		// Same connector name the executor registers (cdc-<short8>, executor.go).
+		connectorCfg, _ := s.fetchSourceConfig(ctx, "cdc-"+utils.SafeID8(pipelineID))
 		s.emitSourceLagAlert(ctx, pipelineID, pipelineName, "postgresql",
 			fmt.Sprintf("Replication slot lag is %.1f MB (slot: %s) — source changes are not being consumed fast enough", lagMB, slotName),
 			map[string]interface{}{
 				"lag_bytes": lagBytes,
 				"lag_mb":    lagMB,
 				"slot_name": slotName,
+			},
+			sourceLagProbe{
+				sourceSide: true,
+				position:   confirmedFlush.String,
+				heartbeats: s.heartbeatsWritten(connectorCfg),
+				slot:       slotName,
 			})
 	} else {
 		s.resolveSourceLagAlert(ctx, pipelineID, "postgresql")
@@ -1069,6 +1221,7 @@ func (s *CDCSentinel) checkMySQLBinlogLag(ctx context.Context, pipelineID, pipel
 			}).Debug("🛡️ MySQL source binlog lag")
 
 			if lagBytes > walBytesFromEnv("CDC_MYSQL_BINLOG_LAG_BYTES", MySQLBinlogLagAlertBytes) {
+				connectorCfg, _ := s.fetchSourceConfig(ctx, connectorName)
 				s.emitSourceLagAlert(ctx, pipelineID, pipelineName, "mysql",
 					fmt.Sprintf("Source binlog lag is %.1f MB (connector: %s) — source changes are not being captured fast enough", lagMB, connectorName),
 					map[string]interface{}{
@@ -1079,6 +1232,11 @@ func (s *CDCSentinel) checkMySQLBinlogLag(ctx context.Context, pipelineID, pipel
 						"committed_pos":  committed.Pos,
 						"current_file":   current.File,
 						"current_pos":    current.Pos,
+					},
+					sourceLagProbe{
+						sourceSide: true,
+						position:   fmt.Sprintf("%s:%d", committed.File, committed.Pos),
+						heartbeats: s.heartbeatsWritten(connectorCfg),
 					})
 			} else {
 				s.resolveSourceLagAlert(ctx, pipelineID, "mysql")
@@ -1189,21 +1347,16 @@ func (s *CDCSentinel) checkMySQLConsumerLagProxy(ctx context.Context, pipelineID
 				"total_lag":      totalLag,
 				"consumer_group": consumerGroup,
 				"topics":         lagMap,
-			})
+			},
+			// The sink's Kafka backlog, not the source's log: never escalates.
+			sourceLagProbe{})
 	} else {
 		s.resolveSourceLagAlert(ctx, pipelineID, "mysql")
 	}
 }
 
-// sinkConsumerGroup is the DERIVED fallback name, kept as a thin alias so the existing
-// call sites and tests in this package keep reading naturally. The single definition of
-// the "sink-" prefix now lives in handlers.
-func sinkConsumerGroup(pipelineID string) string {
-	return handlers.DerivedSinkConsumerGroup(pipelineID)
-}
-
 // resolveSinkConsumerGroup returns the consumer group the sink ACTUALLY registered,
-// falling back to the derived name above.
+// falling back to the derived name, handlers.DerivedSinkConsumerGroup.
 //
 // The derived name is only correct for the default CDC shape. The executor picks the
 // group from the pipeline's mode (executor.go, "Distinct consumer group per phase"):
@@ -1212,7 +1365,7 @@ func sinkConsumerGroup(pipelineID string) string {
 //	batch-backfill topic               sink-<pid8>-batch
 //	cdc_mode streaming_only | never    sink-<pid8>-<eid8>
 //
-// For the last two, sinkConsumerGroup() names a group that has never existed. The lag
+// For the last two, the derived name is a group that has never existed. The lag
 // probe then gets an error or an empty map from a non-existent group — which it treats
 // as "can't tell, skip this tick" — so a streaming_only pipeline whose sink is dead
 // looks exactly like one whose sink is perfectly healthy, forever. That is the same
@@ -1232,8 +1385,14 @@ func (s *CDCSentinel) resolveSinkConsumerGroup(ctx context.Context, pipelineID s
 	return handlers.ResolveSinkConsumerGroup(ctx, s.db, pipelineID)
 }
 
+// sourceLagIssueID keys the source-side lag issue: the WAL/binlog the slot or connector
+// has not yet read.
+func sourceLagIssueID(pipelineID string) string {
+	return fmt.Sprintf("cdc-lag-%s", pipelineID)
+}
+
 // sinkLagIssueID keys the sink-drain lag issue. Deliberately distinct from the
-// source-lag issue ("cdc-lag-%s") so the two concerns never resolve/overwrite each
+// source-lag issue (sourceLagIssueID) so the two concerns never resolve/overwrite each
 // other — a healthy source slot must not clear a dead-sink alarm.
 func sinkLagIssueID(pipelineID string) string {
 	return fmt.Sprintf("cdc-sink-lag-%s", pipelineID)
@@ -1268,6 +1427,16 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 	// cdc_sink_respawn.go for why it needs no feature flag.
 	s.ensureSinkWorkerPresent(ctx, pipelineID, pipelineName, dbType)
 
+	// Rows the sink set aside instead of writing. Also above the kafkaManager guard: it
+	// reads only the control DB, and a parked row is not in the destination whatever
+	// Kafka's offsets say -- the sink commits it, so it is invisible to the drain check
+	// below by design (cdc_rows_parked.go).
+	s.checkRowsParked(ctx, pipelineID, pipelineName, dbType)
+
+	// The auto-restart rung's terminal escalation closes once the sink applies again. Also
+	// control-DB only, and outside the rung's flag (cdc_sink_autorestart.go).
+	s.resolveSinkWedged(ctx, pipelineID)
+
 	if s.kafkaManager == nil {
 		return
 	}
@@ -1291,10 +1460,15 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 		totalLag += topicLag
 	}
 
+	// The auto-restart rung keeps its 1000-event threshold: restarting a sink is an action,
+	// and it already needs two more signals before it takes one (cdc_sink_autorestart.go).
 	lagging := totalLag > walBytesFromEnv("CDC_SINK_KAFKA_LAG_ALERT", SinkKafkaLagAlert)
-	// A backlog alone is not a stuck sink: a first load puts one far above the threshold on
-	// a healthy sink. Alarm only when the sink has also stopped committing (cdc_sink_drain.go).
-	stalled, stalledFor, moving := s.observeSinkDrain(pipelineID, drain.Committed, lagging, time.Now())
+	// The alarm counts from ONE waiting change, not from the threshold: a sink stuck on a
+	// few hundred changes is as stuck as one stuck on a million (cdc_sink_drain.go says why
+	// lag > 0 cannot fire on a healthy sink). A backlog alone is still not a stuck sink -- a
+	// first load puts a huge one on a healthy sink -- so the alarm also needs the committed
+	// position to have stopped moving.
+	stalled, stalledFor, moving := s.observeSinkDrain(pipelineID, drain.Committed, totalLag > 0, time.Now())
 
 	// Persist the reading before deciding what to do with it. This tick is the only
 	// place in the product that reads the authoritative broker-side drain on a
@@ -1322,7 +1496,11 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 	}).Debug("🛡️ CDC sink consumer lag")
 
 	if stalled {
-		s.emitLagIssue(ctx, issueID, "sink_lag", pipelineID, pipelineName, dbType,
+		// A warning on the pipeline page first; pushed to the owner as CDC_SINK_NOT_DRAINING
+		// once it has lasted DefaultSinkDrainNotifyAfter. Same issue id either way, so the
+		// page shows one alert that escalates.
+		severity, alertType := sinkDrainAlert(stalledFor, sinkDrainNotifyAfter())
+		s.emitCDCIssue(ctx, issueID, IssueTypeHighLag, severity, alertType, pipelineID, pipelineName, dbType,
 			fmt.Sprintf("CDC sink is not draining Kafka: consumer lag is %d events and the sink has not committed any progress for %s (group: %s) — change events are captured but NOT reaching the destination (the sink worker may be dead, wedged, or stuck retrying a batch)", totalLag, stalledFor.Round(time.Second), consumerGroup),
 			map[string]interface{}{
 				"total_lag":           totalLag,
@@ -1345,8 +1523,35 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 
 // emitSourceLagAlert writes a SOURCE-side lag alert (Debezium not keeping up with the
 // source WAL/binlog) to sentinel_active_issues and emits a domain event.
-func (s *CDCSentinel) emitSourceLagAlert(ctx context.Context, pipelineID, pipelineName, dbType, description string, metadata map[string]interface{}) {
-	s.emitLagIssue(ctx, fmt.Sprintf("cdc-lag-%s", pipelineID), "source_lag", pipelineID, pipelineName, dbType, description, metadata)
+//
+// It is a warning on the pipeline page until the lag has lasted, with the committed position
+// frozen, for CDC_SOURCE_LAG_NOTIFY_AFTER; then the same row becomes a critical
+// source_lag_sustained, which is pushed to the pipeline's owner (cdc_source_lag.go). A probe
+// that is not source-side never starts the clock. Each stall is pushed as its own episode,
+// opened when it turned critical (sourceLagCriticalSince).
+func (s *CDCSentinel) emitSourceLagAlert(ctx context.Context, pipelineID, pipelineName, dbType, description string, metadata map[string]interface{}, probe sourceLagProbe) {
+	severity, alertType := IssueSeverityWarning, "source_lag"
+	var openedAt time.Time
+	if probe.sourceSide {
+		clock := s.sourceLagNow
+		if clock == nil {
+			clock = time.Now
+		}
+		now, notifyAfter := clock(), sourceLagNotifyAfter()
+		overFor, frozenFor, silentFor := s.observeSourceLag(pipelineID, probe, now)
+		metadata["lagging_for_seconds"] = int64(overFor.Seconds())
+		metadata["frozen_for_seconds"] = int64(frozenFor.Seconds())
+		metadata["heartbeat_silent_for_seconds"] = int64(silentFor.Seconds())
+		severity, alertType = sourceLagAlert(overFor, frozenFor, silentFor, notifyAfter, probe.sourceSide)
+		if severity == IssueSeverityCritical && s.sourceLagSuppressed(ctx, pipelineID, probe.slot) {
+			severity, alertType = IssueSeverityWarning, "source_lag"
+		}
+		if severity == IssueSeverityCritical {
+			openedAt = sourceLagCriticalSince(now, overFor, frozenFor, silentFor, notifyAfter)
+		}
+	}
+	s.emitCDCIssueOpenedAt(ctx, sourceLagIssueID(pipelineID), IssueTypeHighLag, severity,
+		alertType, pipelineID, pipelineName, dbType, description, metadata, openedAt)
 }
 
 // emitLagIssue upserts a CDC lag issue into sentinel_active_issues and emits a
@@ -1372,9 +1577,27 @@ func (s *CDCSentinel) emitCDCIssue(
 	alertType, pipelineID, pipelineName, dbType, description string,
 	metadata map[string]interface{},
 ) {
+	s.emitCDCIssueOpenedAt(ctx, issueID, issueType, severity,
+		alertType, pipelineID, pipelineName, dbType, description, metadata, time.Time{})
+}
+
+// emitCDCIssueOpenedAt is emitCDCIssue for an alert that knows when its episode opened
+// better than its row does (sourceLagCriticalSince). The zero time means the row's
+// detected_at.
+func (s *CDCSentinel) emitCDCIssueOpenedAt(
+	ctx context.Context,
+	issueID string,
+	issueType IssueType,
+	severity IssueSeverity,
+	alertType, pipelineID, pipelineName, dbType, description string,
+	metadata map[string]interface{},
+	openedAt time.Time,
+) {
 	metaJSON, _ := json.Marshal(metadata)
 
-	_, err := s.db.ExecContext(ctx, `
+	// detected_at is when this episode opened: NOW() on insert, kept on conflict.
+	var detectedAt time.Time
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO sentinel_active_issues (
 			id, type, severity, component_id, component_type,
 			description, detected_at, occurrence_count, last_occurrence, metadata
@@ -1385,14 +1608,22 @@ func (s *CDCSentinel) emitCDCIssue(
 			severity         = EXCLUDED.severity,
 			description      = EXCLUDED.description,
 			metadata         = EXCLUDED.metadata
+		RETURNING detected_at
 	`, issueID, string(issueType), string(severity),
-		pipelineID, string(ComponentTypeCDCPipeline), description, metaJSON)
+		pipelineID, string(ComponentTypeCDCPipeline), description, metaJSON).Scan(&detectedAt)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
 			"pipeline_id": pipelineID,
 			"issue_id":    issueID,
 		}).Warn("🛡️ Failed to persist CDC issue")
 	}
+
+	// Tell the pipeline's owner, if this is one they need to act on. The domain
+	// event below only reaches somebody already looking at the UI.
+	if openedAt.IsZero() {
+		openedAt = detectedAt
+	}
+	publishSentinelAlert(s.kafkaManager, issueType, severity, alertType, pipelineID, description, metadata, openedAt)
 
 	// A nil manager is the unit-test shape (and the pre-wiring startup window);
 	// the row above is the durable half, so there is nothing to fail here.
@@ -1430,10 +1661,6 @@ func (s *CDCSentinel) emitCDCIssue(
 		"trace_id": pipelineID,
 	})
 
-	// ...and tell the pipeline's owner, if this is one they need to act on.
-	// The domain event above only reaches somebody already looking at the UI.
-	publishSentinelAlert(s.kafkaManager, issueType, severity, alertType, pipelineID, description, metadata)
-
 	log.WithFields(log.Fields{
 		"pipeline_id": pipelineID,
 		"db_type":     dbType,
@@ -1444,16 +1671,42 @@ func (s *CDCSentinel) emitCDCIssue(
 // resolveSourceLagAlert removes the SOURCE-side lag issue from sentinel_active_issues
 // once source lag is back to normal.
 func (s *CDCSentinel) resolveSourceLagAlert(ctx context.Context, pipelineID, dbType string) {
-	s.resolveLagIssue(ctx, fmt.Sprintf("cdc-lag-%s", pipelineID), pipelineID)
+	s.forgetSourceLag(pipelineID)
+	s.resolveLagIssue(ctx, sourceLagIssueID(pipelineID), pipelineID)
 }
 
 // resolveLagIssue deletes a specific lag issue by id (source_lag or sink_lag) once it
 // is back to normal. Keyed by issueID so resolving one concern never clears the other.
+//
+// An alert on the D2 allowlist (resolvedKindForIssue) is followed by a resolved notice
+// when this delete is what closed it: the row it removed says how severe the alert was
+// and when the episode opened. A delete that finds no row announces nothing, so a tick
+// that re-checks a healthy pipeline never does.
 func (s *CDCSentinel) resolveLagIssue(ctx context.Context, issueID, pipelineID string) {
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM sentinel_active_issues WHERE id = $1`, issueID)
+	kind, announced := resolvedKindForIssue(issueID, pipelineID)
+	if !announced {
+		_, err := s.db.ExecContext(ctx,
+			`DELETE FROM sentinel_active_issues WHERE id = $1`, issueID)
+		if err != nil {
+			log.WithError(err).WithField("pipeline_id", pipelineID).Debug("🛡️ resolveLagIssue: delete failed (may not exist)")
+		}
+		return
+	}
+
+	var severity string
+	var openedAt time.Time
+	err := s.db.QueryRowContext(ctx,
+		`DELETE FROM sentinel_active_issues WHERE id = $1 RETURNING severity, detected_at`, issueID).
+		Scan(&severity, &openedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return // nothing was open
+	}
 	if err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).Debug("🛡️ resolveLagIssue: delete failed (may not exist)")
+		return
 	}
+	if kind.onlyCritical && IssueSeverity(severity) != IssueSeverityCritical {
+		return // never pushed, so there is nothing to retract
+	}
+	publishResolved(s.kafkaManager, pipelineID, kind, pipelineID, notificationActionURL(pipelineID), "", "", openedAt)
 }
-

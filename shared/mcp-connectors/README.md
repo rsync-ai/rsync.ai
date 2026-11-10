@@ -95,9 +95,11 @@ then checks that the required files exist, that `metadata.json` carries the requ
 fields and declares the core operations, that the connector class subclasses
 `BaseMCPConnector`, and that its methods return the documented response shapes.
 
-Three connectors — `debezium`, `minio` and `sample-data` — are standalone MCP servers
+Four connectors — `debezium`, `minio`, `nse-india` and `sample-data` — are standalone MCP servers
 rather than `BaseMCPConnector` subclasses. The validator says so explicitly and reports
-their class and method-surface checks as *skipped*, not passed.
+their class and method-surface checks as *skipped*, not passed. `nse-india` and `sample-data`
+have both run modes too, but their stdio mode takes only `tools/call` requests, the shape the
+orchestrator sends when it starts a connector as a subprocess.
 
 The deeper conformance suites live in `tests/` and run in CI:
 
@@ -168,10 +170,11 @@ run. Do not spin a new version for a bug fix, and do not create root copies. A n
 version by hand is only for a change the maintainers decide is major, and it has to
 move in lockstep: `versions/<v>/`, `latest.json`, and `docker-compose.mcp.yml`.
 
-Regenerating a REST or GraphQL connector with the tool generator is different: it
-always writes a **new** version (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...)
-and points `latest.json` at it, so a regeneration never overwrites a version that
-carries hand fixes.
+Regenerating a REST or GraphQL connector with the tool generator is different: by
+default it writes a **new** version (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...)
+and points `latest.json` at it, so a default regeneration never overwrites a version that
+carries hand fixes. Only the user's explicit overwrite rewrites the current version in
+place and removes its container.
 
 Four connectors are hand-curated (`postgresql`, `mysql`, `shopify-admin-graphql`,
 `google-sheets`). **A fix to one of those must also be applied to its Jinja template**

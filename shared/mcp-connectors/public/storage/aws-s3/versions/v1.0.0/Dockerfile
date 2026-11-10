@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/shared/mcp-connectors
 
 # Copy entire build context (safe: per-connector version directory is small).
-# This makes optional directories (like oauth/) work without Dockerfile conditionals.
+# This makes optional files work without Dockerfile conditionals.
 COPY . /app/
 
 # Pull the shared rsync_protocol/ package from the single canonical source
@@ -48,9 +48,6 @@ RUN if [ -f /app/base_connector.py ]; then \
     # This lets us fix auth/normalization/pagination once in the shared library and have it apply \
     # across all connectors without regenerating each connector's Python code. \
     rm -f /app/base_connector.py; \
-    fi && \
-    if [ -d /app/oauth ]; then \
-      mkdir -p /app/shared/mcp-connectors/oauth && cp -r /app/oauth/* /app/shared/mcp-connectors/oauth/; \
     fi
 
 # Add shared connectors to Python path

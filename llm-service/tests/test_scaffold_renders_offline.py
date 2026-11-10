@@ -62,8 +62,8 @@ _TOOL_GENERATOR_DIR = os.path.dirname(_SCAFFOLD_DIR)
 _SRC_DIR = os.path.dirname(os.path.dirname(_TOOL_GENERATOR_DIR))
 
 # Directories inside the generation package that reach an LLM, directly or by
-# way of a package `__init__`. `utils/__init__.py` eagerly imports
-# `llm_consensus`, which imports `openai`, so the whole package is a barrier.
+# way of a package `__init__`. `utils` stays on the list although nothing in
+# it imports a model SDK today: the scaffold has no reason to reach into it.
 _LLM_BEARING_SUBTREES = ("agents", "config", "utils")
 
 # Top-level distributions that only exist to talk to a model.
@@ -333,7 +333,7 @@ def test_a_multi_resource_document_renders_every_resource():
 
 
 # --------------------------------------------------------------------------- #
-# write_artifacts: the two guards it borrows from save_to_directory
+# write_artifacts: an invalid or empty build is never written
 # --------------------------------------------------------------------------- #
 
 class _FakeGenerated:
@@ -347,7 +347,6 @@ class _FakeGenerated:
 
 
 def test_an_invalid_connector_is_never_written(tmp_path):
-    """`save_to_directory` refuses these; the CLI does not call it, so it must too."""
     with pytest.raises(OpenAPIConversionError) as excinfo:
         write_artifacts(_FakeGenerated(is_valid=False, errors=["bad thing"]), {}, str(tmp_path / "out"))
     assert "bad thing" in str(excinfo.value)
@@ -472,7 +471,7 @@ def _strip_generation_stamp(text: str) -> str:
     """Drop the one line per artifact that carries the wall-clock time.
 
     `builder.py` stamps `datetime.now().isoformat()` into every artifact it
-    renders (`generator/builder.py:392`), so the scaffolder's output is
+    renders (`generator/builder.py:279`), so the scaffolder's output is
     reproducible in every respect EXCEPT this line. The exemption is anchored to
     the exact three spellings the templates use so it cannot quietly widen into
     "ignore anything that differs".

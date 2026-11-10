@@ -11,7 +11,29 @@ import (
 //
 // v1.1.0 — code detection is anchored to statement position instead of a bare
 // substring, and the phone rule no longer matches timestamps. See looksLikeSQL.
-const RedactionPolicyVersion = "v1.1.0"
+//
+// v1.2.0 — a field its producer declares SQL (DeclaredSQLKeys) is redacted by
+// rule: every literal value masked, the statement kept. See maskSQLLiterals.
+const RedactionPolicyVersion = "v1.2.0"
+
+// DeclaredSQLKeys are the payload keys whose value is SQL by contract, so the
+// redactor never has to guess. The producers today: the adapter's
+// PIPELINE_WAITING approval card (`proposed_ddl`, and `repair_plan.ddl` from
+// SchemaRepairPlan, nl_pipeline_v2_workflow.go) and the healer's `ddl_applied`
+// (healer.go). `sql` is the name for any new one. A producer that puts SQL in
+// an event field names the field from this list; SQL inside free text (an
+// error message quoting its query) still falls to the looksLikeSQL backstop.
+var DeclaredSQLKeys = []string{"sql", "ddl", "proposed_ddl", "ddl_applied"}
+
+func isDeclaredSQLKey(key string) bool {
+	k := strings.ToLower(key)
+	for _, d := range DeclaredSQLKeys {
+		if k == d {
+			return true
+		}
+	}
+	return false
+}
 
 // RedactAny recursively masks sensitive values inside arbitrarily nested JSON-like structures.
 // It is safe to use on untrusted event payloads before logging, broadcasting over websockets,
@@ -50,6 +72,10 @@ func RedactMap(m map[string]interface{}) map[string]interface{} {
 	for k, v := range m {
 		if isSensitiveKey(k) {
 			out[k] = MaskedValue
+			continue
+		}
+		if isDeclaredSQLKey(k) {
+			out[k] = redactDeclaredSQL(v)
 			continue
 		}
 		out[k] = RedactAny(v)
@@ -144,6 +170,58 @@ func looksLikePython(s string) bool {
 	return pythonStatementRe.MatchString(s)
 }
 
+// redactDeclaredSQL redacts a value its producer declared SQL: a statement, or a
+// list of them (proposed_ddl is a []string). Anything else is not SQL and gets
+// the ordinary treatment.
+func redactDeclaredSQL(v interface{}) interface{} {
+	switch t := v.(type) {
+	case string:
+		return maskSQLLiterals(t)
+	case []interface{}:
+		out := make([]interface{}, 0, len(t))
+		for _, item := range t {
+			out = append(out, redactDeclaredSQL(item))
+		}
+		return out
+	default:
+		return RedactAny(v)
+	}
+}
+
+// Everything in a statement that can hold a value rather than a name, in the
+// order a scanner meets them:
+//
+//   - a single-quoted literal, prefixes (E'x', X'ff', N'x') included, to the end of
+//     the string if it never closes — a truncated statement must not leak its tail;
+//   - a dollar-quoted literal ($$…$$, $tag$…$tag$);
+//   - a comment, to the end of the line or the closing */.
+//
+// Double quotes are identifiers in standard SQL, and the producers' DDL quotes
+// every schema, table and column name with them, so they are kept. So are bare
+// numbers: in DDL they are type modifiers (varchar(255), numeric(38,9)).
+var sqlValueRe = regexp.MustCompile(`'(?:[^'\\]|\\[\s\S]?)*(?:'|$)` +
+	`|\$(?:[A-Za-z_]\w*)?\$[\s\S]*?(?:\$(?:[A-Za-z_]\w*)?\$|$)` +
+	`|--[^\n]*` +
+	`|/\*[\s\S]*?(?:\*/|$)`)
+
+// maskSQLLiterals keeps a statement readable and removes every value in it, so
+// a declared query never carries data or a credential into the event store.
+func maskSQLLiterals(sql string) string {
+	return sqlValueRe.ReplaceAllStringFunc(sql, func(m string) string {
+		switch {
+		case strings.HasPrefix(m, "'"):
+			return "'" + MaskedValue + "'"
+		case strings.HasPrefix(m, "--"):
+			return "-- " + MaskedValue
+		case strings.HasPrefix(m, "/*"):
+			return "/* " + MaskedValue + " */"
+		default: // dollar-quoted: keep the opening tag as the delimiter
+			tag := m[:strings.Index(m[1:], "$")+2]
+			return tag + MaskedValue + tag
+		}
+	})
+}
+
 // redactSQL masks sensitive parts of SQL queries
 // Safe fallback: if unsure, return masked placeholder
 func redactSQL(sql string) string {
@@ -156,7 +234,7 @@ func redactSQL(sql string) string {
 		strings.Contains(lower, "api_key") {
 		return "[SQL query redacted - contains sensitive patterns]"
 	}
-	
+
 	// Otherwise, return as-is (basic queries are safe)
 	return sql
 }
@@ -173,7 +251,7 @@ func redactPython(code string) string {
 		strings.Contains(lower, "credentials") {
 		return "[Python code redacted - contains sensitive patterns]"
 	}
-	
+
 	// Otherwise, return as-is
 	return code
 }
@@ -220,5 +298,3 @@ func redactPII(s string) string {
 
 	return s
 }
-
-

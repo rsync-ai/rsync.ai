@@ -106,14 +106,6 @@ export interface AgentResponse {
   agent?: string  // Which agent responded (intent, discovery, planner, etc.)
 }
 
-export interface ChatMessage {
-  id: string
-  role: "user" | "assistant"
-  content: string
-  timestamp: string
-  agentResponse?: AgentResponse  // Parsed structured response
-}
-
 export interface SendChatRequest {
   message: string
   context?: {

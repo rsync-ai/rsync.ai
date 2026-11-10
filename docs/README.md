@@ -15,6 +15,7 @@ rsync.ai is a self-hosted, source-available AI data platform for batch pipelines
 | **Deploy to production** | [Self-hosting](deployment/self-hosting.md) (Docker Compose) · [Kubernetes](deployment/kubernetes.md) (EKS/GKE/AKS) |
 | **Understand a single service in depth** | [Services HLD/LLD](services/INDEX.md) |
 | **Query data / use the Data Explorer** | [Data Explorer](explorer/README.md) |
+| **Chart data, build a dashboard** | [Charts and dashboards](explorer/charts-and-dashboards.md) |
 | **Contribute (setup, PR process, style)** | [CONTRIBUTING.md](../CONTRIBUTING.md) |
 
 > Root-level canonical docs: [ARCHITECTURE.md](../ARCHITECTURE.md) (design + rationale) · [CONTRIBUTING.md](../CONTRIBUTING.md) (setup, PR process, style).
@@ -41,6 +42,7 @@ rsync.ai is a self-hosted, source-available AI data platform for batch pipelines
 | [System overview](architecture/overview.md) | Component diagram + data-flow sequence diagrams |
 | [Kafka topics](architecture/kafka-topics.md) | Topic naming, partitioning, message contracts |
 | [Services (HLD/LLD)](services/INDEX.md) | Per-service high-level and low-level design |
+| [What rsync.ai sends to an LLM](security/llm-egress.md) | Every model call, every prompt and what each may carry -- generated from the egress guard |
 
 ---
 
@@ -53,7 +55,6 @@ rsync.ai is a self-hosted, source-available AI data platform for batch pipelines
 | [Base interface](connectors/base-interface.md) | Standard connector tool interface spec |
 | [Add a CDC database type](connectors/add-cdc-database.md) | Checklist for adding a new database to Debezium CDC |
 | [CDC exactly-once offsets](connectors/cdc-exactly-once-offsets.md) | Per-destination (Tier A/B/C) offset-tracking guide — replaces Redis dedup |
-| [Optimization](connectors/optimization.md) | Schema-discovery + throughput tuning |
 | [Parameter normalization](connectors/parameter-normalization.md) | Schema/param normalization rules |
 
 > Before fixing a hand-curated connector, read the [connector developer guide](connectors/developer-guide.md): a fix must be propagated to the Jinja template + regenerated.
@@ -64,8 +65,9 @@ rsync.ai is a self-hosted, source-available AI data platform for batch pipelines
 
 | | |
 |---|---|
-| [Data Explorer overview](explorer/README.md) | **Start here** — the whole feature: running SQL, NL→SQL, schema intelligence, HITL resolution, export/share, Metabase, data protection, and every route |
+| [Data Explorer overview](explorer/README.md) | **Start here** — the whole feature: running SQL, NL→SQL, schema intelligence, HITL resolution, export/share, data protection, and every route |
 | [Saved queries, models & schedules](explorer/saved-queries-and-models.md) | Deep dive on the largest subsystem — materialization modes, the run authorization path, cron/interval/after-pipeline triggers, version control, and the approval gate on scheduled SQL |
+| [Charts and dashboards](explorer/charts-and-dashboards.md) | Charts on a model or saved query, dashboards with filters, the tile badges, who can do what, and drafting one with Ask rsync.ai |
 
 > `validators.ValidateExplorerStatement` is a security boundary — it is what stops stacked SQL running under a schedule creator's authority. See [§3](explorer/saved-queries-and-models.md#3-authorization--the-part-to-change-carefully) before touching either run path.
 

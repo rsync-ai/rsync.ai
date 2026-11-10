@@ -1,21 +1,22 @@
 import { test as setup, expect } from '@playwright/test'
 import path from 'node:path'
 import fs from 'node:fs'
+import { A11Y_API_URL } from './a11y-backend'
 
 /**
  * Logs in once and persists the resulting cookie/localStorage state to disk
  * so authenticated specs can load it via `storageState`.
  *
- * Skips (without failing the run) when no backend is reachable — that way
- * the PR-blocking CI lane stays green; the test only exercises authenticated
- * flows when an api-gateway is actually available (locally or in a future
- * docker-compose-backed workflow).
+ * Fails when the backend cannot be reached. It used to skip, and a skipped
+ * login meant every authenticated page went unchecked while the run read
+ * green. The config starts a stub backend unless E2E_API_URL names a real one
+ * (a11y-backend.ts), so there is always something to log in to.
  *
  * Credentials are read from env so this same fixture works against any
- * environment. Defaults match the seeded dev user.
+ * environment. Defaults match the seeded dev user; the stub takes any.
  */
 
-const API_URL = process.env.E2E_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001'
+const API_URL = A11Y_API_URL
 const EMAIL = process.env.E2E_USER_EMAIL || 'default@rsync-ai.local'
 const PASSWORD = process.env.E2E_USER_PASSWORD || 'password123'
 
@@ -24,14 +25,11 @@ export const AUTH_STATE_PATH = path.join(__dirname, '..', '..', '.auth', 'user.j
 setup('authenticate test user', async ({ request, page }) => {
   // Probe backend before attempting the real login. We never want a missing
   // backend to look like an auth failure in the report.
-  let reachable = false
-  try {
-    const probe = await request.get(`${API_URL}/health`, { timeout: 3_000 })
-    reachable = probe.ok()
-  } catch {
-    reachable = false
-  }
-  setup.skip(!reachable, `Skipping authenticated suite — backend at ${API_URL} not reachable`)
+  const probe = await request.get(`${API_URL}/health`, { timeout: 3_000 }).catch((e: Error) => e)
+  expect(
+    probe instanceof Error ? false : probe.ok(),
+    `backend at ${API_URL} not reachable: ${probe instanceof Error ? probe.message : probe.status()}`,
+  ).toBeTruthy()
 
   const loginResponse = await request.post(`${API_URL}/api/v1/auth/login`, {
     data: { email: EMAIL, password: PASSWORD },

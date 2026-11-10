@@ -22,11 +22,10 @@ on:
   # its filter, a schedule run would diff only main's LAST commit: the event has
   # no `before`, so dorny falls back to it.)
   workflow_dispatch:
-  # Nightly trigger for the non-blocking a11y suite. It used to run on
-  # every PR purely to upload a report (continue-on-error, known-unfixed
-  # violations), adding a full Playwright build+browser run to the PR
-  # critical path for zero gating value. Moved off PRs onto a nightly
-  # cron so violations are still tracked without slowing every push.
+  # Nightly trigger for the a11y suite (frontend-a11y). It used to run on every
+  # PR purely to upload a report (continue-on-error, known-unfixed violations),
+  # adding a full Playwright build+browser run to the PR critical path. It now
+  # fails on a violation, but still runs nightly, not per push.
   schedule:
     # 09:00 UTC. The hour was chosen to be off-peak on the self-hosted Macs
     # this workflow ran on; on hosted runners nothing makes one hour cheaper.
@@ -121,6 +120,10 @@ jobs:
     name: Go
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
+    env:
+      # The sink worker's live-broker container; per run, so parallel runs on one
+      # runner cannot collide on the name.
+      SINK_KAFKA: sink-live-kafka-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Change detection, inlined -- see "Why there is no `changes` job" above.
@@ -170,6 +173,41 @@ jobs:
           # that step was removed with the module cache and the citation
           # outlived it, describing a saving no run has made since.)
           cache: false
+      # A real broker for the sink worker's live tests. They skip without
+      # SINK_LIVE_KAFKA_BROKER (liveKafkaBroker, kafka_security_test.go), and CI
+      # never set it, so all five skipped on every run -- which is how four of
+      # them failed from #797 on with nobody seeing it. Same image as the Kafka
+      # security matrix. The tests create their own topics. Plaintext, bound to
+      # 127.0.0.1 only, and on a free port: the listener has to advertise the
+      # host port the client dials, so the port is picked before the start.
+      - name: Live Kafka broker for the sink worker's tests
+        if: env.RUN == '1' && (steps.filter.outputs.sink == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          port=$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+          docker run -d --rm --name "$SINK_KAFKA" -p "127.0.0.1:$port:9092" \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:$port" \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            apache/kafka:3.7.0 >/dev/null
+          for _ in $(seq 1 90); do
+            if docker logs "$SINK_KAFKA" 2>&1 | grep -q 'Kafka Server started'; then
+              echo "SINK_LIVE_KAFKA_BROKER=127.0.0.1:$port" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$SINK_KAFKA" 2>&1 | tail -50
+          echo "::error title=Live Kafka broker::the broker did not start within 90 s"
+          exit 1
       # NO GitHub actions/cache for the Go caches -- and unlike most notes in
       # this file, this one does NOT simply carry over the runner move.
       #
@@ -209,6 +247,16 @@ jobs:
       #   the sink worker set at startup. Same reason: `replace` builds it but
       #   never runs memlimit_test.go, whose real-runtime case is the only check
       #   that the soft limit actually reaches the Go runtime.
+      # - shared/go/workflowdef: a workflow's definition, its checks and the
+      #   rules that pick the next step, which api-gateway stores and checks
+      #   and the temporal-adapter runs. Same reason: `replace` never runs
+      #   its validator and rule tests.
+      # - shared/go/sqlexec: every customer statement's engine (Postgres, MySQL,
+      #   SQL Server, Databricks, the delegated connectors), its statement
+      #   classifier and preview masking -- moved out of api-gateway for
+      #   query-service (docs/internal/query-service-design.md § 9, Q0). Same
+      #   reason: `replace` never runs its read-only, write-refusal and
+      #   classifier tests.
       # - the kafka-mcp-sink worker is its own module outside both lists above,
       #   so its data-critical unit tests (table normalization, namespace
       #   routing, CDC/batch message parsing, DLQ handling) otherwise never
@@ -241,7 +289,7 @@ jobs:
             modules="$modules api-gateway backend-orchestrator backend-temporal-adapter connector-deployer"
           fi
           if [ "$SHARED" = true ]; then
-            modules="$modules shared/go/correlation shared/go/crypto shared/go/transforms shared/go/naming shared/go/pgdriver shared/go/kafkaclient shared/go/memlimit"
+            modules="$modules shared/go/correlation shared/go/crypto shared/go/transforms shared/go/naming shared/go/pgdriver shared/go/kafkaclient shared/go/memlimit shared/go/workflowdef shared/go/sqlexec"
           fi
           if [ "$SINK" = true ]; then
             modules="$modules shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
@@ -249,8 +297,12 @@ jobs:
           failed=""
           for m in $modules; do
             tc=$(awk '$1 == "toolchain" { print $2; exit }' "$m/go.mod")
+            # The sink's live-broker tests take ~2.5 min on their own (the stall
+            # watchdog's trials), so that module gets 10.
+            to=5m
+            case "$m" in *kafka-mcp-sink*) to=10m ;; esac
             echo "::group::go test $m (${tc:-$(go env GOVERSION)})"
-            if ! (cd "$m" && GOTOOLCHAIN="${tc:-local}" go test -timeout 5m ./...); then
+            if ! (cd "$m" && GOTOOLCHAIN="${tc:-local}" go test -timeout "$to" ./...); then
               failed="$failed $m"
             fi
             echo "::endgroup::"
@@ -259,6 +311,19 @@ jobs:
             echo "::error title=go test failed::$failed"
             exit 1
           fi
+      # A step in this job, not a job of its own: the runner queue, not the
+      # ~10 s this takes, is what delays a merge, and this job has already
+      # checked out the repo and warmed the four modules' build cache. Runs
+      # when the service modules are tested (SERVICES above) -- deadcode reads
+      # all four as one workspace, so a change to any of them can make a
+      # function in another unreachable. Why the allowlist exists and how its
+      # stale-line direction doubles as the control: the script's header.
+      - name: No unreachable Go functions (deadcode)
+        if: env.RUN == '1' && (steps.filter.outputs.go == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: scripts/check-deadcode.sh
+      - name: Remove the sink worker's live Kafka broker
+        if: env.RUN == '1' && (always())
+        run: docker rm -fv "$SINK_KAFKA" >/dev/null 2>&1 || true
 
   llm-service-unit:
     name: llm-service unit tests
@@ -466,6 +531,8 @@ jobs:
         # tests" on 4 workers. Installed here, not in "Install dependencies", for the
         # same reason as the drivers -- a venv cache HIT skips that step.
         run: pip install pymongo 'setuptools<81' 'pytest-xdist>=3.8'
+      # No Python dead-code step: that check measures reach from entrypoints
+      # this tree does not ship, so it runs in the repository that has them.
       # Eight cases across six suites are `skipif(shutil.which("helm") is None)`.
       # They render the chart: the documented `helm install` blocks, the four
       # cloud overlays, the external-Postgres TLS wiring, the docker-host
@@ -609,7 +676,6 @@ jobs:
             --ignore=src/agents/tool_generator/tests/test_session_handoff_phase_13a.py
             --ignore=src/agents/tool_generator/tests/test_discovery_phase_0a.py
             --ignore=src/agents/tool_generator/tests/test_probe_pipeline_phase_4.py
-            --ignore=src/agents/tool_generator/tests/test_vendor_registry_phase_0b.py
             --ignore=src/agents/tool_generator/tests/test_oauth_provider_linkage.py
           "
 
@@ -980,7 +1046,7 @@ jobs:
             echo '::notice title=Frontend skipped::no path this job filters on changed'
             echo '`Frontend` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: env.RUN == '1'
         with:
           # MUST equal the major in frontend/Dockerfile (node:26-alpine in all
@@ -1049,6 +1115,18 @@ jobs:
         if: env.RUN == '1'
         working-directory: frontend
         run: npm test
+      # The TypeScript twin of the go job's deadcode step, in this job for the
+      # same reason: the runner queue, not the time knip takes, is what delays a
+      # merge, and this job already ran `npm ci` (knip loads the Next.js and
+      # Vitest plugins from frontend/node_modules). The script runs its pinned
+      # knip through npx, so package.json and the lockfile do not change. Unused
+      # imports, variables and props are the other half of the guard: ESLint's
+      # no-unused-vars is an error, failed by the lint step below. Why the
+      # allowlist exists and how its stale-line direction doubles as the
+      # control: the script's header.
+      - name: No unused frontend code (knip)
+        if: env.RUN == '1'
+        run: node scripts/check-deadcode-ts.mjs
       # CI SPEEDUP: cache Next.js incremental build output (.next/cache).
       # Next.js 13+ persists per-page/per-chunk RSC and webpack caches here.
       # On a PR that only touches a few files this cuts the build from ~4-6
@@ -1118,6 +1196,14 @@ jobs:
           LINT_PID=$!
           npm run build
           wait $LINT_PID
+      # The chart code a browser downloads stays within its gzip budget
+      # (dashboards-design.md § 14.6), measured on the build above, so it is a
+      # step here and not a job of its own. Why, and what it counts as a chart
+      # chunk: the script's header.
+      - name: Chart chunks within their size budget
+        if: env.RUN == '1'
+        working-directory: frontend
+        run: node ../scripts/check-chart-bundle-size.mjs
       # Keep this build's .next/cache for the next job on this runner: only
       # after a successful build, and through a temp dir + rename so the kept
       # copy is never a partial one. Capped at 2 GB -- past that it is dropped,
@@ -1175,37 +1261,26 @@ jobs:
   frontend-a11y:
     name: Frontend a11y (axe-core)
     needs: frontend
-    # Nightly / manual only — NOT on PRs, and it MEASURES LESS THAN IT LOOKS.
+    # Nightly / manual only, and BLOCKING: a serious or critical axe violation
+    # on any page it visits turns it red.
     #
-    # This job brings up only the Next frontend (playwright.a11y.config.ts
-    # `webServer` = `PORT=3100 npm run start`). It starts NO api-gateway, so
-    # e2e/fixtures/auth.setup.ts fails its `${API_URL}/health` probe and calls
-    # `setup.skip(...)`, and e2e/a11y/authenticated_pages.spec.ts then self-skips
-    # all four authenticated routes on the missing `.auth/user.json`. A skip is
-    # indistinguishable from a pass in the report. What actually gets measured
-    # here is the two PUBLIC route specs (login, signup). And if anything else
-    # on the runner happens to serve :5001, the authenticated project runs
-    # after all — nondeterministic either way.
+    # playwright.a11y.config.ts starts two servers: the Next frontend
+    # (`PORT=3100 npm run start`) and e2e/fixtures/a11y-api-stub.mjs, a stand-in
+    # api-gateway that logs in and answers the signed-in pages' reads with an
+    # empty workspace. So e2e/fixtures/auth.setup.ts always has a backend, and
+    # the five authenticated routes are measured on every run, contrast
+    # included. It used to start no backend: setup skipped, the authenticated
+    # specs skipped with it, and a skip read as a pass. Setup now FAILS on an
+    # unreachable backend, and frontend/src/__tests__/a11y-gate-is-real.test.ts
+    # (run by the `frontend` job) fails if a skip comes back, or a
+    # `continue-on-error` anywhere but the report upload.
     #
-    # The PR-lane guard for the authenticated pages is therefore a jsdom+axe unit
-    # test, frontend/src/__tests__/authenticated-pages-a11y.test.tsx, which the
-    # `frontend` job's `npm test` runs on every frontend PR. It applies the same
-    # blocking bar (zero serious/critical under wcag2a/2aa/21a/21aa) to
-    # /settings, /connections and the collapsed Sidebar, but it covers name/role/
-    # label rules ONLY — jsdom has no layout or paint, so `color-contrast` is
-    # disabled there and can only be measured by this job.
-    #
-    # Two prerequisites before this can become a blocking PR gate — do NOT flip
-    # the `if:` or drop either `continue-on-error` until both are met:
-    #   (a) the job must stand up an api-gateway (or set E2E_API_URL at a
-    #       reachable one) so the authenticated project runs deterministically
-    #       instead of depending on what the runner happens to serve;
-    #   (b) the remaining runtime violations on /dashboard and /pipelines — not
-    #       yet enumerated, most likely `color-contrast` — must be read out of
-    #       the playwright-a11y-report artifact and fixed.
+    # The PR-lane guard for the authenticated pages is still the jsdom+axe unit
+    # test, frontend/src/__tests__/authenticated-pages-a11y.test.tsx: name/role/
+    # label rules on every frontend PR. jsdom has no layout or paint, so
+    # `color-contrast` is measured only here.
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Change detection, inlined -- see "Why there is no `changes` job" above.
@@ -1229,7 +1304,7 @@ jobs:
             echo '::notice title=Frontend a11y (axe-core) skipped::no path this job filters on changed'
             echo '`Frontend a11y (axe-core)` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: env.RUN == '1'
         with:
           # Kept in lockstep with the frontend job above — the two share one
@@ -1297,27 +1372,35 @@ jobs:
         if: env.RUN == '1' && (steps.pw-cache.outputs.cache-hit != 'true')
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+      # The stub api-gateway gets a free port rather than its default 5199: the
+      # runners are shared Macs, and a port some other job holds would fail the
+      # suite for a reason that has nothing to do with accessibility.
+      - name: Pick a port for the stub api-gateway
+        if: env.RUN == '1'
+        run: |
+          port=$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close() })')
+          echo "A11Y_STUB_PORT=$port" >> "$GITHUB_ENV"
       - name: Run axe-core a11y suite
         if: env.RUN == '1'
+        id: a11y
         working-directory: frontend
-        # Without an api-gateway on :5001 the four authenticated specs SKIP
-        # (see the job-level comment above) — so a green result here is not
-        # evidence that /dashboard, /connections, /pipelines or /settings are
-        # clean; it usually means they were never visited. The step-level
-        # `continue-on-error: true`, together with the job-level flag, keeps
-        # the check reporting green while still uploading the report.
-        # Both flags stay until the authenticated project runs deterministically
-        # AND the remaining /dashboard + /pipelines violations are enumerated
-        # and fixed; removing them now would turn the nightly red for
-        # violations nobody has listed yet.
-        continue-on-error: true
-        env:
-          NEXT_PUBLIC_API_URL: http://localhost:5001
-          NEXT_PUBLIC_WS_URL: ws://localhost:5001/ws
+        # Playwright starts the stub and `next start` and stops both when the run
+        # ends, pass or fail. The prebuilt app reaches the stub through
+        # PUBLIC_URL, which the config sets and which outranks the URL baked in
+        # at build time.
         run: npm run test:a11y
       - name: Upload report on failure
-        if: env.RUN == '1' && (always())
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        # Only when the suite failed. This step said "on failure" but ran on
+        # every run, so while the account artifact quota was full (see
+        # KI-SECURITY-SARIF-HAS-NOWHERE-TO-LAND) a CLEAN suite still ended in a
+        # red X from this upload. `failure()` is what lets it run after the
+        # suite step failed; `outcome` narrows that to the suite itself.
+        if: env.RUN == '1' && (failure() && steps.a11y.outcome == 'failure')
+        # Soft, and only this step: a full artifact quota must not be what turns
+        # the job red (test_no_job_depends_on_the_artifact_quota.py). The suite
+        # step above stays hard, which a11y-gate-is-real.test.ts holds.
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-a11y-report
           path: frontend/playwright-a11y-report

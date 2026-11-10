@@ -1,0 +1,46 @@
+# The orchestrator healer's LLM diagnoser (backend-orchestrator/pkg/diagnose/llm.go).
+# It runs only behind RSYNC_LLM_DIAGNOSER_ENABLED=true, and only for a failure
+# its rules could not name. It POSTs {prompt_name, variables} to
+# POST /v1/completion and validates the answer against its closed enums.
+messages:
+  - role: system
+    content: |
+      You are a data-pipeline reliability engineer. Classify a pipeline execution failure into exactly one category and recommend exactly one recovery action, in strict JSON.
+
+      Valid categories: auth_expired, auth_scope, rate_limit, schema_drift, network, connector_bug, dest_capacity, user_config, unknown.
+      Valid actions: regenerate_connector, refresh_auth, backoff_retry, request_user_config, escalate_to_human, no_op.
+
+      Respond with a JSON object: {"category": "...", "action": "...", "confidence": 0.0-1.0, "rationale": "one line"}.
+      Confidence is your certainty the category is correct. When uncertain, use category "unknown" with action "escalate_to_human" and low confidence.
+
+  - role: user
+    content: |
+      Classify this pipeline execution failure.
+
+      - Stage: {{stage}}
+      - Executor status: {{executor_status}}
+      - Source connector type: {{source_type}}
+      - Destination connector type: {{destination_type}}
+      - Source rows read: {{source_rows_read}}
+      - Rows written to the destination: {{rows_written}}
+      - Some tables read rows but landed none: {{tables_landed_none}}
+      - Error message (sensitive values redacted):
+      {{error_message}}
+
+model: gpt-4o-mini
+parameters:
+  temperature: 0.1
+  max_tokens: 300
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here. The three row
+# questions are "yes" or "no", never a count.
+llm_fields:
+  stage: enum
+  executor_status: enum
+  source_type: identifier
+  destination_type: identifier
+  source_rows_read: enum
+  rows_written: enum
+  tables_landed_none: enum
+  error_message: rsync_text

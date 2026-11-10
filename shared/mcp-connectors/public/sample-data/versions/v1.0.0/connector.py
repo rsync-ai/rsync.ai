@@ -20,14 +20,17 @@ Implements the minimal SOURCE contract the orchestrator batch executor calls
   sample-data_export            -> {success, data, columns, row_count, has_more}
   sample-data_get_capabilities  -> {success, capabilities}
 
-Cloned from the internal MinIO connector's self-contained stdlib HTTP/JSON-RPC
-skeleton (no base_connector, no third-party deps).
+Cloned from the internal MinIO connector's self-contained stdlib JSON-RPC
+skeleton (no base_connector, no third-party deps): HTTP on /mcp in the image
+(MCP_HTTP_MODE=true), one request per line on stdin/stdout when the orchestrator
+starts it as a subprocess.
 """
 
 import json
 import os
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 CONNECTOR_TYPE = "sample-data"
 CONNECTOR_VERSION = "1.0.0"
@@ -111,7 +114,7 @@ TABLES: Dict[str, Dict[str, Any]] = {
             {"name": "customer_id", "type": "integer", "nullable": False},
             {"name": "product_id", "type": "integer", "nullable": False},
             {"name": "quantity", "type": "integer", "nullable": False},
-            {"name": "total_amount", "type": "numeric", "nullable": False},
+            {"name": "total_amount", "type": "decimal", "nullable": False},
             {"name": "status", "type": "string", "nullable": False},
             {"name": "order_date", "type": "date", "nullable": False},
         ],
@@ -123,7 +126,7 @@ TABLES: Dict[str, Dict[str, Any]] = {
             {"name": "product_id", "type": "integer", "nullable": False},
             {"name": "name", "type": "string", "nullable": False},
             {"name": "category", "type": "string", "nullable": True},
-            {"name": "price", "type": "numeric", "nullable": False},
+            {"name": "price", "type": "decimal", "nullable": False},
             {"name": "in_stock", "type": "boolean", "nullable": False},
             {"name": "created_at", "type": "date", "nullable": True},
         ],
@@ -220,7 +223,8 @@ class SampleDataMCPServer:
 
 
 # --------------------------------------------------------------------------
-# stdlib HTTP / JSON-RPC transport (cloned from the internal MinIO connector).
+# stdlib JSON-RPC transport (cloned from the internal MinIO connector): HTTP or
+# stdin/stdout.
 # --------------------------------------------------------------------------
 
 def _jsonrpc_error(req_id: Any, code: int, message: str) -> Dict[str, Any]:
@@ -231,11 +235,9 @@ def _jsonrpc_result(req_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def serve_http() -> None:
+def _dispatch() -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
     server = SampleDataMCPServer()
-    port = int(os.getenv("MCP_PORT") or os.getenv("PORT") or "8000")
-    prefix = CONNECTOR_TYPE + "_"
-    dispatch = {
+    return {
         "test_connection": server.test_connection,
         "validate_config": server.validate_config,
         "discover_schema": server.discover_schema,
@@ -243,6 +245,45 @@ def serve_http() -> None:
         "get_capabilities": server.get_capabilities,
         "health": lambda _args: {"success": True, "status": "ok"},
     }
+
+
+def handle_request(dispatch: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]], req: Any) -> Dict[str, Any]:
+    """Answer one parsed JSON-RPC request. Never raises: both transports send
+    whatever this returns."""
+    if not isinstance(req, dict):
+        return _jsonrpc_error(None, -32600, "invalid request")
+    req_id = req.get("id")
+    if req.get("jsonrpc") != "2.0":
+        return _jsonrpc_error(req_id, -32600, "invalid request")
+    if req.get("method") != "tools/call":
+        return _jsonrpc_error(req_id, -32601, "method not found")
+
+    params = req.get("params") or {}
+    if not isinstance(params, dict):
+        return _jsonrpc_error(req_id, -32602, "params must be an object")
+    tool = params.get("name") or ""
+    args = params.get("arguments") or {}
+    if not isinstance(tool, str) or not tool:
+        return _jsonrpc_error(req_id, -32602, "missing tool name")
+    if not isinstance(args, dict):
+        return _jsonrpc_error(req_id, -32602, "arguments must be an object")
+    prefix = CONNECTOR_TYPE + "_"
+    if not tool.startswith(prefix):
+        return _jsonrpc_error(req_id, -32601, "tool not found")
+
+    fn = dispatch.get(tool[len(prefix):].strip())
+    if fn is None:
+        return _jsonrpc_error(req_id, -32601, "tool not found")
+    try:
+        res = fn(args)
+    except Exception as e:  # never crash the server on a bad request
+        res = {"success": False, "error": str(e)}
+    return _jsonrpc_result(req_id, res)
+
+
+def serve_http() -> None:
+    dispatch = _dispatch()
+    port = int(os.getenv("MCP_PORT") or os.getenv("PORT") or "8000")
 
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, status: int, obj: Dict[str, Any]) -> None:
@@ -271,38 +312,7 @@ def serve_http() -> None:
             except Exception:
                 self._send_json(200, _jsonrpc_error(None, -32700, "parse error"))
                 return
-
-            req_id = req.get("id")
-            if req.get("jsonrpc") != "2.0":
-                self._send_json(200, _jsonrpc_error(req_id, -32600, "invalid request"))
-                return
-            if req.get("method") != "tools/call":
-                self._send_json(200, _jsonrpc_error(req_id, -32601, "method not found"))
-                return
-
-            params = req.get("params") or {}
-            tool = params.get("name") or ""
-            args = params.get("arguments") or {}
-            if not isinstance(tool, str) or not tool:
-                self._send_json(200, _jsonrpc_error(req_id, -32602, "missing tool name"))
-                return
-            if not isinstance(args, dict):
-                self._send_json(200, _jsonrpc_error(req_id, -32602, "arguments must be an object"))
-                return
-            if not tool.startswith(prefix):
-                self._send_json(200, _jsonrpc_error(req_id, -32601, "tool not found"))
-                return
-
-            op = tool[len(prefix):].strip()
-            fn = dispatch.get(op)
-            if fn is None:
-                self._send_json(200, _jsonrpc_error(req_id, -32601, "tool not found"))
-                return
-            try:
-                res = fn(args)
-            except Exception as e:  # never crash the server on a bad request
-                res = {"success": False, "error": str(e)}
-            self._send_json(200, _jsonrpc_result(req_id, res))
+            self._send_json(200, handle_request(dispatch, req))
 
         def log_message(self, format: str, *args):  # noqa: A002
             return
@@ -311,5 +321,29 @@ def serve_http() -> None:
     httpd.serve_forever()
 
 
+def serve_stdio() -> None:
+    """One JSON-RPC request per line on stdin, one JSON line back on stdout:
+    how the orchestrator runs the connector when it starts it as a subprocess
+    (server_manager.go sets MCP_HTTP_MODE=false). Nothing else goes to stdout."""
+    dispatch = _dispatch()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            resp = _jsonrpc_error(None, -32700, "parse error")
+        else:
+            resp = handle_request(dispatch, req)
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    serve_http()
+    # The image sets MCP_HTTP_MODE=true and DOCKER_CONTAINER; the orchestrator's
+    # subprocess fallback strips both and sets MCP_HTTP_MODE=false.
+    if os.getenv("MCP_HTTP_MODE", "false").lower() == "true" or os.getenv("DOCKER_CONTAINER"):
+        serve_http()
+    else:
+        serve_stdio()

@@ -1,0 +1,62 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "donut",
+    "description": "Customers by plan",
+    "slices": {
+      "field": "s",
+      "label": "plan",
+      "values": [
+        {
+          "key": "s0",
+          "label": "Team",
+          "color": "series-3"
+        },
+        {
+          "key": "s1",
+          "label": "Free",
+          "color": "series-2"
+        },
+        {
+          "key": "s2",
+          "label": "Enterprise",
+          "color": "series-1"
+        }
+      ]
+    },
+    "value": {
+      "field": "v",
+      "label": "Customers",
+      "format": "integer"
+    }
+  },
+  "rows": [
+    {
+      "s": "s0",
+      "v": 410
+    },
+    {
+      "s": "s1",
+      "v": 260
+    },
+    {
+      "s": "s2",
+      "v": 85
+    }
+  ],
+  "series": [
+    {
+      "value": "Team",
+      "color": "series-3"
+    },
+    {
+      "value": "Free",
+      "color": "series-2"
+    },
+    {
+      "value": "Enterprise",
+      "color": "series-1"
+    }
+  ],
+  "notes": []
+}

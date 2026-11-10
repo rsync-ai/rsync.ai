@@ -5,9 +5,9 @@
  * `X` from lucide-react on line 4 and never rendered it, and
  * `ExecutionDetailDialog` reserved `pr-8` on its title for a button that did not
  * exist — two independent traces of a close affordance that was intended and
- * lost. Escape and backdrop-click did work, so every dialog was *closable*; none
- * was *discoverably* closable, which is the defect a user reports as "there is
- * no X".
+ * lost. Escape did work, so every dialog was *closable*; none was
+ * *discoverably* closable, which is the defect a user reports as "there is no
+ * X". (A click outside never closed one either: `dialog-outside-click.test.tsx`.)
  *
  * The affordance is pinned on the shared primitive rather than on one dialog,
  * because all 23 call sites inherit the gap from this single component. For the
@@ -18,12 +18,13 @@
  * named above is history, not current code.)
  */
 
-import { describe, it, expect, vi } from "vitest"
-import { render, screen } from "@testing-library/react"
+import { describe, it, expect, vi, beforeAll } from "vitest"
+import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import "@testing-library/jest-dom"
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 function open(onOpenChange = vi.fn()) {
   render(
@@ -103,5 +104,90 @@ describe("every dialog offers a visible way out", () => {
       </Dialog>,
     )
     expect(screen.queryByRole("button", { name: /close/i })).not.toBeInTheDocument()
+  })
+})
+
+// KI-TRANSFORM-STEP-CLOSE-DISCARDS-RULES: the dialog closed on every Escape on the
+// page, including one an open dropdown inside it had already handled, and one
+// meant for a second dialog opened over it. Closing a dialog can be an action
+// (the pipeline Transforms step's close is Skip), so an Escape aimed at a layer
+// on top must close that layer only.
+describe("Escape closes only the layer it was aimed at", () => {
+  beforeAll(() => {
+    window.ResizeObserver ||= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver
+  })
+
+  it("closes the dialog when nothing is open on top of it", async () => {
+    const onOpenChange = open()
+
+    await userEvent.keyboard("{Escape}")
+
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it("leaves the dialog open when the Escape closed a dropdown inside it", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const onOpenChange = vi.fn()
+    render(
+      <Dialog open onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogTitle>Add a transform</DialogTitle>
+          <Select>
+            <SelectTrigger aria-label="Column">
+              <SelectValue placeholder="Pick a column" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="amount">amount</SelectItem>
+            </SelectContent>
+          </Select>
+        </DialogContent>
+      </Dialog>,
+    )
+    await user.click(screen.getByRole("combobox", { name: "Column" }))
+    await screen.findByRole("listbox")
+
+    await user.keyboard("{Escape}")
+
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull())
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it("closes only the dialog opened last when two are open", async () => {
+    const under = vi.fn()
+    const over = vi.fn()
+    // An inline handler, as most call sites pass: a new function every render.
+    const tree = (overOpen: boolean) => (
+      <>
+        <Dialog open onOpenChange={(o) => under(o)}>
+          <DialogContent>
+            <DialogTitle>Transforms</DialogTitle>
+          </DialogContent>
+        </Dialog>
+        <Dialog open={overOpen} onOpenChange={over}>
+          <DialogContent>
+            <DialogTitle>Preview</DialogTitle>
+          </DialogContent>
+        </Dialog>
+      </>
+    )
+    const { rerender } = render(tree(false))
+    rerender(tree(true))
+    // The dialog underneath re-renders while the other is open (the step's state
+    // changes under a preview); that must not lift it back on top.
+    rerender(tree(true))
+
+    await userEvent.keyboard("{Escape}")
+
+    expect(over).toHaveBeenCalledWith(false)
+    expect(under).not.toHaveBeenCalled()
+
+    // Once the one on top is gone, Escape belongs to the one under it again.
+    rerender(tree(false))
+    await userEvent.keyboard("{Escape}")
+    expect(under).toHaveBeenCalledWith(false)
   })
 })

@@ -15,8 +15,8 @@ describe("resolveWorkspaceSwitchTarget", () => {
       resolveWorkspaceSwitchTarget("/pipelines/2cb685ed-4cf7-445b-9f77-071794d25423"),
     ).toEqual({ href: "/pipelines", label: "pipelines" })
     expect(resolveWorkspaceSwitchTarget("/executions/abc-123")).toEqual({
-      href: "/executions",
-      label: "executions",
+      href: "/runs",
+      label: "runs",
     })
     expect(resolveWorkspaceSwitchTarget("/connections/abc-123")).toEqual({
       href: "/connections",
@@ -38,6 +38,7 @@ describe("resolveWorkspaceSwitchTarget", () => {
     // to itself would flash a pointless toast.
     expect(resolveWorkspaceSwitchTarget("/pipelines")).toBeNull()
     expect(resolveWorkspaceSwitchTarget("/executions")).toBeNull()
+    expect(resolveWorkspaceSwitchTarget("/runs")).toBeNull()
     expect(resolveWorkspaceSwitchTarget("/connections")).toBeNull()
   })
 

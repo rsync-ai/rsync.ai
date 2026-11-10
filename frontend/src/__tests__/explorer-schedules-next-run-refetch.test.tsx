@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import ScheduledQueriesPage from "@/app/(dashboard)/explorer/schedules/page"
+import ScheduledQueriesPage from "@/app/(dashboard)/models/page"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 // The bug: the schedules page fetched once, so when a row's next_run_at passed it said
 // "due now" and kept saying it — the server already knew the following run, but nothing
@@ -15,10 +15,14 @@ import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/explorer/schedules",
+  usePathname: () => "/models",
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({ role: "admin", can: () => true }),
 }))
@@ -175,7 +179,7 @@ describe("schedules page: refetch when a next run comes due", () => {
     expect(scheduleFetches()).toBe(2)
     // Not replaced by an error the user never asked for.
     expect(screen.getByText(NAME)).toBeInTheDocument()
-    expect(screen.queryByText(/could not load scheduled queries/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/could not load models/i)).not.toBeInTheDocument()
 
     // And the failure did not end the refetching: the row is still overdue, so the
     // page asks again (after as long as it has been overdue, ~6s here) instead of
@@ -183,5 +187,40 @@ describe("schedules page: refetch when a next run comes due", () => {
     await advance(8 * SECOND)
     expect(scheduleFetches()).toBe(3)
     await waitFor(() => expect(nextRunCell()).toHaveTextContent("in 28m"))
+  })
+
+  // The timed refetch is for next-run times. It must not pull every saved query and its
+  // SQL again, and a Manual model that got a schedule meanwhile must not show twice.
+  it("does not re-read the saved list, and a model scheduled meanwhile is one row", async () => {
+    const SAVED = "/api/v1/explorer/saved"
+    const second = { ...clockSchedule(NOW + 64 * MINUTE), schedule_id: "sch-q-2", saved_query_id: "q-2", name: "late_model" }
+    let n = 0
+    ;(authFetch as Mock).mockImplementation(async (url: string) => {
+      if (url === SAVED) {
+        return res(200, {
+          saved_queries: [
+            { id: "q-2", name: "late_model", connection_id: "c-1", materialization: "table", created_by: "u-1", created_at: "2026-08-01T00:00:00Z", schedule_status: "" },
+          ],
+          count: 1,
+        })
+      }
+      if (url !== SCHEDULES) return res(404, {})
+      n++
+      const first = clockSchedule(NOW + 1 * MINUTE + 30 * SECOND)
+      return n === 1
+        ? res(200, { schedules: [first], count: 1 })
+        : res(200, { schedules: [clockSchedule(NOW + 30 * MINUTE + 30 * SECOND), second], count: 2 })
+    })
+    render(<ScheduledQueriesPage />)
+    await screen.findByText(NAME)
+    expect(within(screen.getByText("late_model").closest("tr")!).getByText("Manual")).toBeInTheDocument()
+    const savedFetches = () => (authFetch as Mock).mock.calls.filter(([url]) => url === SAVED).length
+    expect(savedFetches()).toBe(1)
+
+    await advance(1 * MINUTE + 36 * SECOND)
+    expect(scheduleFetches()).toBe(2)
+    expect(savedFetches()).toBe(1)
+    await waitFor(() => expect(screen.getAllByText("late_model")).toHaveLength(1))
+    expect(within(screen.getByRole("table")).queryByText("Manual")).not.toBeInTheDocument()
   })
 })

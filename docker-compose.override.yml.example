@@ -8,12 +8,10 @@ services:
       # Frontend dev origin(s) allowed by CORS. Add your own non-3000 worktree
       # port, e.g.: http://localhost:3000,http://localhost:<your-dev-port>
       - RSYNC_CORS_ORIGINS=http://localhost:3000
-  # Expose tool-generator to the host for the discovery UI flow (browser hits
-  # localhost:5010 directly via NEXT_PUBLIC_TOOL_GENERATOR_URL).
-  # Production routes via the api-gateway proxy; this is dev-only convenience.
+  # Expose tool-generator to the host for the Playwright specs' /health
+  # checks (frontend/e2e/*.spec.ts, server-side requests). The browser never
+  # calls it: the UI goes through the api-gateway's /api/v1/tool-generator
+  # proxy, and the service allows no browser origin.
   tool-generator:
     ports:
       - "127.0.0.1:5010:5010"
-    environment:
-      # Allow CORS from your frontend dev origin(s) for /v1/discover etc.
-      - TG_ALLOWED_ORIGINS=http://localhost:3000

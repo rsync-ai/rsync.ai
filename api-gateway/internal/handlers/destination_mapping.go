@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rsync-ai/shared/naming"
+	"github.com/rsync-ai/shared/sqlexec"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -357,6 +358,10 @@ type namespaceProbe struct {
 func (p namespaceProbe) isCollision() bool {
 	return len(p.CollidingTables) > 0 && strings.TrimSpace(p.OwnerPipelineID) != ""
 }
+
+// namespaceCollisionProbe is probeNamespaceCollision, swappable so a test can stand
+// in for the live destination.
+var namespaceCollisionProbe = probeNamespaceCollision
 
 // probeNamespaceCollision reports whether the candidate namespace already holds
 // tables this pipeline would write AND those tables belong to another pipeline.
@@ -740,7 +745,7 @@ func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID
 		return chosen, nil
 	}
 
-	probe, err := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, chosen, pipelineID, selectedTables, destTables)
+	probe, err := namespaceCollisionProbe(ctx, database, workspaceID, destConnID, destType, chosen, pipelineID, selectedTables, destTables)
 	if err != nil {
 		log.WithContext(ctx).WithError(err).WithFields(map[string]interface{}{
 			"pipeline_id": pipelineID,
@@ -766,7 +771,7 @@ func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID
 		prefixed = ""
 	}
 	if prefixed != "" {
-		probe2, err2 := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, prefixed, pipelineID, selectedTables, destTables)
+		probe2, err2 := namespaceCollisionProbe(ctx, database, workspaceID, destConnID, destType, prefixed, pipelineID, selectedTables, destTables)
 		if err2 != nil {
 			log.WithContext(ctx).WithError(err2).WithFields(map[string]interface{}{
 				"pipeline_id": pipelineID,
@@ -1015,12 +1020,12 @@ func relationalDSN(connectorType string, config map[string]interface{}) (driverN
 	switch strings.ToLower(strings.TrimSpace(connectorType)) {
 	case "mysql", "mariadb":
 		portInt := configPortInt(config["port"], 3306)
-		tlsMode := resolveMySQLTLSMode(config, host)
+		tlsMode := sqlexec.ResolveMySQLTLSMode(config, host)
 		return "mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=8s&tls=%s",
 			user, password, host, portInt, dbName, tlsMode), nil
 	case "postgresql", "postgres", "pg":
 		portInt := configPortInt(config["port"], 5432)
-		sslMode := resolvePostgresSSLMode(config, host)
+		sslMode := sqlexec.ResolvePostgresSSLMode(config, host)
 		return "postgres", fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=8",
 			host, portInt, user, password, dbName, sslMode), nil
 	default:

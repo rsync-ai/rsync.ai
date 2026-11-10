@@ -15,10 +15,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"api-gateway/internal/chat"
 	"api-gateway/internal/db"
+	"api-gateway/internal/services"
 	"api-gateway/internal/telemetry"
 
 	"github.com/gin-gonic/gin"
@@ -650,20 +652,65 @@ var nlTableStopWords = map[string]bool{
 	"target": true, "from": true, "to": true, "into": true, "in": true, "of": true,
 	"and": true, "or": true, "my": true, "your": true, "our": true, "their": true,
 	"its": true, "it": true, "other": true, "another": true, "next": true, "first": true,
+	// Objects of a sync verb that name no table ("copy everything from …").
+	"everything": true, "both": true, "table": true, "tables": true, "collection": true,
+	"collections": true, "database": true,
+	"databases": true, "db": true, "schema": true, "schemas": true, "dataset": true,
+	"rows": true, "records": true, "them": true, "stuff": true, "changes": true,
+	// Filler and verbs that can sit right before "table" ("also table x", "sync table x").
+	"also": true, "just": true, "only": true, "please": true, "yes": true, "no": true,
+	"copy": true, "move": true, "sync": true, "replicate": true, "load": true,
+	"migrate": true, "transfer": true, "stream": true, "ingest": true, "bring": true,
+	"pull": true, "send": true, "export": true,
+	// Sync modes that sit between the verb and "from" ("stream cdc from pg"). The
+	// gateway stores a chat CDC request as "Stream CDC from <src> to <dst>. …", so
+	// without these the pause card said "Couldn't find `cdc`" (prod a6ca2103).
+	"cdc": true, "streaming": true, "realtime": true, "real-time": true, "live": true,
+	"incremental": true, "incrementally": true, "continuous": true, "continuously": true,
+	"updates": true,
+}
+
+// nlTablePrepositions end a list of names: "table customers, to postgres" names
+// only customers.
+var nlTablePrepositions = map[string]bool{
+	"from": true, "to": true, "into": true, "in": true, "on": true, "for": true,
+	"with": true, "at": true, "via": true, "using": true,
 }
 
 // nlTableBeforeRe captures the identifier immediately before a SINGULAR "table"
-// (e.g. "the customers table" → "customers"). Anchored on the word boundary after
-// "table" so it never fires on the plural "tables".
-var nlTableBeforeRe = regexp.MustCompile(`([a-z_][a-z0-9_.-]*)\s+table\b`)
+// or "collection" (e.g. "the customers table" → "customers"). Anchored on the word
+// boundary after the noun so it never fires on the plural.
+var nlTableBeforeRe = regexp.MustCompile(`([a-z_][a-z0-9_.-]*)\s+(?:table|collection)\b`)
 
-// nlTableAfterRe captures the identifier right after "table " (e.g. "table customers").
-var nlTableAfterRe = regexp.MustCompile("\\btable\\s+[\"'`]?([a-z_][a-z0-9_.-]*)")
+// A list of table names as a request spells it: "orders", "the orders",
+// "orders, customers and payments", "orders & customers", quoted or schema-
+// qualified. nlTableListSep is the separator between two names. A document store
+// calls a table a collection, so every shape reads either noun (nlTableNoun).
+const (
+	nlTableNoun      = `(?:tables?|collections?)`
+	nlTablesNoun     = `(?:tables|collections)`
+	nlTableNameQuote = "[\"'`]?"
+	nlTableListItem  = `(?:the\s+)?` + nlTableNameQuote + `[a-z_][a-z0-9_.-]*` + nlTableNameQuote
+	nlTableListSep   = `(?:\s*,\s*(?:and\s+|&\s*)?|\s+and\s+|\s*&\s*)`
+	nlTableList      = `(` + nlTableListItem + `(?:` + nlTableListSep + nlTableListItem + `)*)`
+)
 
-// nlPluralTablesRe detects a plural "tables" mention — a signal of multi-table
-// intent that we deliberately leave to the table-selection HITL rather than
-// half-parsing.
-var nlPluralTablesRe = regexp.MustCompile(`\btables\b`)
+var (
+	nlTableListSepRe = regexp.MustCompile(nlTableListSep)
+	nlTableNameRe    = regexp.MustCompile(`^[a-z_][a-z0-9_.-]*$`)
+
+	// nlVerbTableListRe: the names are the object of a sync verb, up to "from"
+	// ("move orders and customers from pg to bq", "copy only orders tables from …").
+	nlVerbTableListRe = regexp.MustCompile(`\b(?:copy|move|sync|replicate|load|migrate|transfer|stream|ingest|bring|pull|send|export)\s+(?:only\s+|just\s+)?` +
+		nlTableList + `\s+(?:` + nlTableNoun + `\s+)?from\b`)
+	// nlListTablesRe: names followed by "tables" ("the users and orders tables").
+	// One name before "tables" is usually an engine ("mysql tables"), so this
+	// shape needs two or more.
+	nlListTablesRe = regexp.MustCompile(`(?:^|[\s(:])` + nlTableList + `\s+` + nlTablesNoun + `\b`)
+	// nlTablesListRe: "table customers", "tables orders, customers", "tables: a, b",
+	// "collection customers".
+	nlTablesListRe = regexp.MustCompile(`\b` + nlTableNoun + `(?:\s*:\s*|\s+)` + nlTableList)
+)
 
 // destNamespaceTokenRe is the explicit token the chat Confirm card sends when the
 // user types a destination database/schema on it ("Yes sync_mode=cdc
@@ -709,42 +756,76 @@ func confirmationNamespaceFields(data map[string]interface{}, sourceType, destTy
 	return data
 }
 
-// parseTableIntent extracts an explicitly-named SINGLE source table from a chat NL
-// message so a one-turn create can skip the table-selection HITL (KI-NLCHAT-
-// TABLENAME-IGNORED). Conservative by design: it only fires on the singular
-// "<name> table" / "table <name>" shape, drops stop-words, and returns nil the
-// moment the phrasing looks multi-table ("all tables", "the users and orders
-// tables"). A returned name is NOT trusted directly — createAndRunPipeline
-// validates it against the source's cached schema and drops anything unresolved or
-// ambiguous back to the HITL, so a connector/connection token that slips through
-// here never auto-selects a wrong table. Mirrors parseMaskingIntent (re-run on the
-// original request at confirmation time). Returns nil when no table is named.
-func parseTableIntent(message string) []string {
-	lc := strings.ToLower(message)
-	// Multi-table intent ("all tables", "…and orders tables") → let the HITL
-	// handle it rather than half-parsing a single name.
-	if nlPluralTablesRe.MatchString(lc) {
-		return nil
+// cleanTableToken trims the quotes and punctuation around one parsed name and
+// returns "" for anything that is not a table-name-shaped identifier.
+func cleanTableToken(tok string) string {
+	tok = strings.TrimSpace(tok)
+	tok = strings.TrimSpace(strings.TrimPrefix(tok, "the "))
+	tok = strings.Trim(tok, " \t.:;,'\"()`")
+	// A lone dot or a dot-only artifact from the identifier class is not a name.
+	if strings.Trim(tok, ".") == "" || !nlTableNameRe.MatchString(tok) {
+		return ""
 	}
-	seen := map[string]bool{}
+	return tok
+}
+
+// tableListItems splits one matched list into its names. The list ends at the
+// first preposition ("customers, to postgres" → customers). A list holding a stop
+// word ("orders and everything") names no clean set of tables, so it yields nil
+// and the table-selection step asks instead.
+func tableListItems(list string) []string {
 	var out []string
-	add := func(tok string) {
-		tok = strings.Trim(tok, " \t.:;,'\"()`")
-		if tok == "" || nlTableStopWords[tok] || seen[tok] {
-			return
+	for _, raw := range nlTableListSepRe.Split(list, -1) {
+		tok := cleanTableToken(raw)
+		if nlTablePrepositions[tok] {
+			break
 		}
-		// Reject a lone dot / trailing-dot artifact from the identifier class.
-		if strings.Trim(tok, ".") == "" {
-			return
+		if tok == "" || nlTableStopWords[tok] {
+			return nil
 		}
-		seen[tok] = true
 		out = append(out, tok)
 	}
-	for _, m := range nlTableBeforeRe.FindAllStringSubmatch(lc, -1) {
-		add(m[1])
+	return out
+}
+
+// parseTableIntent extracts the source tables a chat NL message names, one or a
+// list, so a one-turn create can skip the table-selection HITL (KI-NLCHAT-
+// TABLENAME-IGNORED, KI-NLCHAT-TABLE-LIST-IGNORED). It reads four shapes: the
+// object of a sync verb up to "from" ("move orders and customers from pg"), two
+// or more names before "tables", names after "table"/"tables:", and the singular
+// "<name> table" — each with "collection(s)" read the same as "table(s)". Phrasings that name no table ("all tables", "the database",
+// "everything") return nil. A returned name is NOT trusted directly —
+// createAndRunPipeline validates every name against the source's cached schema
+// and pre-selects only when all of them resolve, so a connector or connection
+// token that slips through here never auto-selects a wrong table. Mirrors
+// parseMaskingIntent (re-run on the original request at confirmation time).
+func parseTableIntent(message string) []string {
+	lc := strings.ToLower(message)
+	seen := map[string]bool{}
+	var out []string
+	add := func(names []string) {
+		for _, n := range names {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
 	}
-	for _, m := range nlTableAfterRe.FindAllStringSubmatch(lc, -1) {
-		add(m[1])
+	for _, m := range nlVerbTableListRe.FindAllStringSubmatch(lc, -1) {
+		add(tableListItems(m[1]))
+	}
+	for _, m := range nlListTablesRe.FindAllStringSubmatch(lc, -1) {
+		if items := tableListItems(m[1]); len(items) >= 2 {
+			add(items)
+		}
+	}
+	for _, m := range nlTablesListRe.FindAllStringSubmatch(lc, -1) {
+		add(tableListItems(m[1]))
+	}
+	for _, m := range nlTableBeforeRe.FindAllStringSubmatch(lc, -1) {
+		if tok := cleanTableToken(m[1]); tok != "" && !nlTableStopWords[tok] {
+			add([]string{tok})
+		}
 	}
 	if len(out) == 0 {
 		return nil
@@ -824,11 +905,12 @@ func (h *ChatHandler) SendMessageNLPipeline(c *gin.Context) {
 
 	// Load or create conversation context
 	ctx := c.Request.Context()
-	conv, err := h.getOrCreateConversation(ctx, userIDStr, sessionID)
+	conv, err := h.getOrCreateConversation(ctx, userIDStr, activeWorkspaceID(c), sessionID)
 	if err != nil {
 		log.WithError(err).Warn("Failed to load conversation context")
 		// Continue with fresh context
 		conv = chat.NewConversationContext(userIDStr, sessionID)
+		conv.WorkspaceID = activeWorkspaceID(c)
 	}
 
 	// Update message count
@@ -974,7 +1056,7 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 	// the next step from the connector_missing response, so users can launch
 	// generation without leaving the chat. The actual generation runs async
 	// against tool-generator (1–3 min); we ack immediately.
-	if reply, handled := h.maybeHandleGenerateCommand(ctx, message, traceID); handled {
+	if reply, handled := h.maybeHandleGenerateCommand(ctx, chatActor(c), message, traceID); handled {
 		conv.SetState(chat.StateIdle)
 		conv.SetPendingIntent(nil)
 		return reply
@@ -1300,7 +1382,7 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 		sourceSupportsCDC := connectorSupportsCDC(intent.SourceType)
 		sourceSupportsIncrementalBatch := connectorSupportsIncrementalBatch(intent.SourceType)
 		return ChatMessageResponse{
-			Message:   fmt.Sprintf("I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(intent.SourceType), getFriendlyName(intent.DestinationType)),
+			Message:   fmt.Sprintf("I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(intent.SourceType), getFriendlyName(intent.DestinationType)) + namedTablesCardLine(pendingIntent) + notDoneCardLine(pendingIntent),
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
@@ -1873,6 +1955,7 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(req)
 
 	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
@@ -1983,7 +2066,7 @@ func (h *ChatHandler) handleSlotFilling(ctx context.Context, c *gin.Context, con
 		sourceSupportsCDC := connectorSupportsCDC(pendingIntent.SourceType)
 		sourceSupportsIncrementalBatch := connectorSupportsIncrementalBatch(pendingIntent.SourceType)
 		return ChatMessageResponse{
-			Message:   fmt.Sprintf("Perfect! I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(pendingIntent.SourceType), getFriendlyName(pendingIntent.DestinationType)),
+			Message:   fmt.Sprintf("Perfect! I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(pendingIntent.SourceType), getFriendlyName(pendingIntent.DestinationType)) + namedTablesCardLine(pendingIntent) + notDoneCardLine(pendingIntent),
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
@@ -2073,13 +2156,14 @@ func (h *ChatHandler) handleRoleClarification(ctx context.Context, c *gin.Contex
 			SyncMode:        "auto",
 			SourceType:      conn,
 			DestinationType: otherID,
+			Tables:          pendingIntent.Tables,
 			OriginalRequest: pendingIntent.OriginalRequest,
 		}
 		conv.SetPendingIntent(pi)
 		conv.SetState(chat.StateAwaitingConfirmation)
 		supportedSyncModes := supportedSyncModesForSource(conn)
 		return ChatMessageResponse{
-			Message:   fmt.Sprintf("I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(conn), getFriendlyName(otherID)),
+			Message:   fmt.Sprintf("I understood: **%s → %s**. Create and run this pipeline?", getFriendlyName(conn), getFriendlyName(otherID)) + namedTablesCardLine(pi) + notDoneCardLine(pi),
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
@@ -2318,15 +2402,13 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 			TypeConvert: parseTypeConvertIntent(pendingIntent.OriginalRequest) || parseTypeConvertIntent(message),
 		}
 
-		// Parse an explicitly-named source table (KI-NLCHAT-TABLENAME-IGNORED) from
-		// the original request ∪ the confirmation message (mirrors masking above) so
-		// a one-turn create can skip the table-selection HITL. The name is validated
-		// against the source's cached schema inside createAndRunPipeline; anything
-		// unresolved/ambiguous is dropped back to the HITL — never auto-selected.
-		namedTables := parseTableIntent(pendingIntent.OriginalRequest)
-		if mt := parseTableIntent(message); len(mt) > 0 {
-			namedTables = mergeUniqueColumns(namedTables, mt)
-		}
+		// The source tables the user named (KI-NLCHAT-TABLENAME-IGNORED, KI-NLCHAT-
+		// TABLE-LIST-IGNORED): the classifier's tables ∪ the original request ∪ the
+		// confirmation message (mirrors masking above), so a one-turn create can skip
+		// the table-selection HITL. Every name is validated against the source's
+		// cached schema inside createAndRunPipeline; unless all of them resolve,
+		// nothing is pre-selected and the HITL asks — never a wrong or partial set.
+		namedTables := confirmationNamedTables(pendingIntent, message)
 
 		// The destination namespace the user named: typed on the Confirm card (sent
 		// as a destination_namespace= token) or said in the original request.
@@ -2420,7 +2502,7 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 		if pi := conv.GetPendingIntent(); pi != nil && pi.SourceType != "" && pi.DestinationType != "" {
 			if h.tryEditPendingConnector(conv, pi, parseMsg) {
 				return ChatMessageResponse{
-					Message:   fmt.Sprintf("Updated: **%s → %s**. Create and run this pipeline?", getFriendlyName(pi.SourceType), getFriendlyName(pi.DestinationType)),
+					Message:   fmt.Sprintf("Updated: **%s → %s**. Create and run this pipeline?", getFriendlyName(pi.SourceType), getFriendlyName(pi.DestinationType)) + namedTablesCardLine(pi) + notDoneCardLine(pi),
 					Type:      "confirmation",
 					TraceID:   traceID,
 					Timestamp: time.Now().Format(time.RFC3339),
@@ -2503,13 +2585,16 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 	}
 }
 
-// getOrCreateConversation retrieves or creates a conversation context
-func (h *ChatHandler) getOrCreateConversation(ctx context.Context, userID, conversationID string) (*chat.ConversationContext, error) {
+// getOrCreateConversation retrieves or creates a conversation context, scoped to
+// the active workspace.
+func (h *ChatHandler) getOrCreateConversation(ctx context.Context, userID, workspaceID, conversationID string) (*chat.ConversationContext, error) {
 	if h.conversationCache == nil {
 		// No cache - return new context
-		return chat.NewConversationContext(userID, conversationID), nil
+		conv := chat.NewConversationContext(userID, conversationID)
+		conv.WorkspaceID = workspaceID
+		return conv, nil
 	}
-	return h.conversationCache.GetOrCreate(ctx, userID, conversationID)
+	return h.conversationCache.GetOrCreate(ctx, userID, workspaceID, conversationID)
 }
 
 // saveConversation persists the conversation context
@@ -2548,7 +2633,6 @@ func (h *ChatHandler) connectorTypeForConnectionName(wsID, direction, name strin
 	return connectorType
 }
 
-// isKnownConnector checks if a connector exists in the catalog
 // commonConnectors answers isKnownConnector when connector_catalog cannot: no DB,
 // or the catalog query failed.
 var commonConnectors = map[string]bool{
@@ -2561,8 +2645,14 @@ var commonConnectors = map[string]bool{
 	"sample-data": true,
 }
 
+// isKnownConnector reports whether the planner may use a connector: one with an
+// active connector_catalog row, or one the connector catalog page lists
+// (listedConnectorNames).
 func (h *ChatHandler) isKnownConnector(connectorName string) bool {
 	normalized := chat.NormalizeConnectorName(connectorName)
+	if listedConnectorNames()[normalized] {
+		return true
+	}
 	database := db.GetDB()
 	if database == nil {
 		return commonConnectors[normalized]
@@ -2583,9 +2673,28 @@ func (h *ChatHandler) isKnownConnector(connectorName string) bool {
 	return count > 0
 }
 
-// listKnownConnectors returns all active connector names from the catalog.
-// Falls back to the hardcoded common set when the DB is unavailable.
+// listKnownConnectors returns every name isKnownConnector accepts that it can
+// enumerate: the active catalog names, or the hardcoded common set when the DB is
+// unavailable, plus the listed connectors.
 func (h *ChatHandler) listKnownConnectors() []string {
+	names := h.catalogConnectorNames()
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		seen[n] = true
+	}
+	listed := listedConnectorNames()
+	extra := make([]string, 0, len(listed))
+	for n := range listed {
+		if !seen[n] {
+			extra = append(extra, n)
+		}
+	}
+	// Map order is random; a fuzzy match takes the first of equally close names.
+	sort.Strings(extra)
+	return append(names, extra...)
+}
+
+func (h *ChatHandler) catalogConnectorNames() []string {
 	database := db.GetDB()
 	if database != nil {
 		rows, err := database.Query(`SELECT name FROM connector_catalog WHERE status = 'active'`)
@@ -2610,6 +2719,65 @@ func (h *ChatHandler) listKnownConnectors() []string {
 		"cassandra", "shopify-admin-graphql", "sample-data",
 	}
 }
+
+// listedConnectorNames is the id of every connector the connector catalog page
+// lists (ListMCPConnectors with include_internal off), in the planner's name
+// space. It reads the page's own cached scan of the public connectors directory
+// and applies the page's rules: internal and dev-only connectors are left out,
+// and the id is metadata id, then connector_type, then the directory name.
+//
+// A generated connector is a directory and nothing else: only migrations write
+// connector_catalog, so without this the planner refused every connector the
+// generator made, and every shipped one a migration never seeded
+// (docs/internal/ask-rsync-and-mcp-roadmap.md § 3).
+func listedConnectorNames() map[string]bool {
+	root := GetMCPPublicConnectorsPath()
+	idx := getConnectorIndex(root)
+
+	listedNamesMu.Lock()
+	defer listedNamesMu.Unlock()
+	if listedNamesCache.root == root && listedNamesCache.builtAt.Equal(idx.builtAt) {
+		return listedNamesCache.names
+	}
+	names := make(map[string]bool, len(idx.scanned))
+	for _, sc := range idx.scanned {
+		var m struct {
+			ID            string `json:"id"`
+			ConnectorType string `json:"connector_type"`
+			Internal      bool   `json:"internal"`
+		}
+		if json.Unmarshal(sc.Metadata, &m) != nil || m.Internal {
+			continue
+		}
+		id := canonicalizeConnectorID(m.ID)
+		if id == "" {
+			id = canonicalizeConnectorID(m.ConnectorType)
+		}
+		if id == "" {
+			id = canonicalizeConnectorID(sc.DirName)
+		}
+		if id == "" || isDevOnlyConnector(id) {
+			continue
+		}
+		names[chat.NormalizeConnectorName(id)] = true
+	}
+	listedNamesCache = listedNamesEntry{root: root, builtAt: idx.builtAt, names: names}
+	return names
+}
+
+// listedNamesCache holds listedConnectorNames' result for one build of the
+// connector index, so the planner does not re-parse every metadata.json for
+// each word it asks about.
+type listedNamesEntry struct {
+	root    string
+	builtAt time.Time
+	names   map[string]bool
+}
+
+var (
+	listedNamesMu    sync.Mutex
+	listedNamesCache listedNamesEntry
+)
 
 // fuzzyMatchKnownConnector returns the closest known connector within edit distance 2
 // (distance 1 for short inputs ≤4 chars). Returns "", false if nothing is close enough.
@@ -2661,6 +2829,7 @@ func (h *ChatHandler) callSlotFillingLLM(ctx context.Context, conv *chat.Convers
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(req)
 
 	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
@@ -2814,6 +2983,7 @@ func (h *ChatHandler) parseIntent(ctx context.Context, message string) (*Intent,
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(req)
 	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2919,6 +3089,11 @@ var connectorIdentityAliases = map[string]string{
 	"snowflakewarehouse":  "snowflake",
 }
 
+// ConnectorKey is the canonical key of a connector name as a user or a
+// connection record spells it: "Google Cloud Storage", "gcs" and
+// "google_cloud_storage" share one key, so do "aws-s3" and "Amazon S3".
+func ConnectorKey(connectorType string) string { return connectorKeyForConnResolution(connectorType) }
+
 func connectorKeyForConnResolution(connectorType string) string {
 	normalized := strings.ToLower(strings.TrimSpace(connectorType))
 	normalized = strings.ReplaceAll(normalized, " ", "")
@@ -3004,10 +3179,11 @@ var reGenerateCommand = regexp.MustCompile(`(?i)^\s*(?:generate|create|build|mak
 
 // maybeHandleGenerateCommand inspects the user message for an explicit
 // connector-generation command. Returns (reply, true) when handled. The
-// generation request is dispatched asynchronously so the chat stays
-// responsive — generation takes 1–3 minutes and we don't want to hold the
-// HTTP connection that long.
-func (h *ChatHandler) maybeHandleGenerateCommand(ctx context.Context, message, traceID string) (ChatMessageResponse, bool) {
+// generation runs in the background through the same core as an agent's
+// generate_connector (startConnectorGeneration), so it meets the same role
+// rule, hourly limit, built-in-name guard and one-run-per-name rule, and the
+// reply carries the run's id.
+func (h *ChatHandler) maybeHandleGenerateCommand(ctx context.Context, actor services.Actor, message, traceID string) (ChatMessageResponse, bool) {
 	msg := strings.TrimSpace(message)
 	m := reGenerateCommand.FindStringSubmatch(msg)
 	if len(m) != 2 {
@@ -3017,100 +3193,42 @@ func (h *ChatHandler) maybeHandleGenerateCommand(ctx context.Context, message, t
 	if rawName == "" {
 		return ChatMessageResponse{}, false
 	}
+	reply := func(typ, text string, data map[string]interface{}) ChatMessageResponse {
+		return ChatMessageResponse{Message: text, Type: typ, TraceID: traceID, Timestamp: time.Now().Format(time.RFC3339), Data: data}
+	}
 	// Refuse if the requested name maps to something we already have — the
 	// user likely meant the existing connector. We check both the strict
 	// versioned-on-disk path AND the looser "is in our catalog" check used
 	// by the rest of the chat handler, so common connectors (mysql,
 	// postgresql, etc.) that aren't yet versioned-on-disk still short-circuit.
+	// Answered before the role check, so "already available" answers everyone.
 	apiName := normalizeConnectorName(rawName)
 	if mcpConnectorIsVersioned(apiName) || h.isKnownConnector(apiName) {
-		return ChatMessageResponse{
-			Message:   fmt.Sprintf("`%s` is already available. Try **\"sync %s to <destination>\"** to use it.", apiName, apiName),
-			Type:      "text",
-			TraceID:   traceID,
-			Timestamp: time.Now().Format(time.RFC3339),
-		}, true
+		return reply("text", fmt.Sprintf("`%s` is already available. Try **\"sync %s to <destination>\"** to use it.", apiName, apiName), nil), true
 	}
 	if !isKebabCaseConnectorID(apiName) {
-		return ChatMessageResponse{
-			Message:   fmt.Sprintf("I couldn't normalize `%s` to a valid connector id. Use lowercase kebab-case like `acme-crm` or `hubspot`.", rawName),
-			Type:      "error",
-			TraceID:   traceID,
-			Timestamp: time.Now().Format(time.RFC3339),
-		}, true
+		return reply("error", fmt.Sprintf("I couldn't normalize `%s` to a valid connector id. Use lowercase kebab-case like `acme-crm` or `hubspot`.", rawName), nil), true
 	}
 
-	// Dispatch to tool-generator asynchronously so chat stays responsive.
-	// We log but don't block on the result; the user can retry the original
-	// pipeline command (e.g. "sync acme-crm to bigquery") once generation
-	// completes — by then the connector will be in our catalog.
-	go h.dispatchConnectorGeneration(apiName, traceID)
-
-	return ChatMessageResponse{
-		Message: fmt.Sprintf(
-			"🤖 Started generating the **%s** connector. This usually takes 1–3 minutes — I'll add it to the catalog when it's ready.\n\n"+
-				"Once it's done, retry your original request (e.g. **\"sync %s to bigquery\"**). You can also watch progress at /admin → Connectors.",
-			apiName, apiName,
-		),
-		Type:      "connector_generation_started",
-		TraceID:   traceID,
-		Timestamp: time.Now().Format(time.RFC3339),
-		Data: map[string]interface{}{
-			"connector_name": apiName,
-			"status":         "generation_started",
-			"eta_minutes":    "1-3",
-		},
-	}, true
-}
-
-// dispatchConnectorGeneration POSTs to the tool-generator service in the
-// background. Errors are logged but never surface to the caller — the chat
-// reply has already been sent. The user retries their original pipeline
-// command once they get the "connector ready" signal (or after a few minutes).
-func (h *ChatHandler) dispatchConnectorGeneration(apiName, traceID string) {
-	toolGenURL := strings.TrimRight(strings.TrimSpace(os.Getenv("TOOL_GENERATOR_URL")), "/")
-	if toolGenURL == "" {
-		toolGenURL = "http://tool-generator:5010"
-	}
-	body, _ := json.Marshal(map[string]interface{}{
-		"api_name":       apiName,
-		"description":    fmt.Sprintf("User-requested connector for %s", apiName),
-		"save_artifacts": true,
-		"enable_chaos":   true,
-	})
-	// Use a long timeout — tool-generator can take a couple of minutes.
-	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodPost, toolGenURL+"/v1/generate", bytes.NewReader(body))
+	run, err := startConnectorGeneration(withLLMWorkspace(ctx, actor.WorkspaceID), generationCaller{actor: actor}, GenerationInput{Name: apiName})
 	if err != nil {
-		log.WithError(err).Errorf("chat: failed to build tool-generator request for %s", apiName)
-		return
+		var refusal *GenerationRefusal
+		if errors.As(err, &refusal) {
+			return reply("error", refusal.Message, map[string]interface{}{"connector_name": apiName, "code": refusal.Code}), true
+		}
+		log.WithError(err).Errorf("chat: could not start generating %s", apiName)
+		return reply("error", "I could not start generating that connector. Try again in a minute.", nil), true
 	}
-	req.Header.Set("Content-Type", "application/json")
-	// SEC-H-03: authenticate this outbound generate call with the shared
-	// internal-service secret when configured. tool-generator gates /v1/generate
-	// on X-Internal-Secret (env INTERNAL_SERVICE_SECRET; compose sets it on
-	// api-gateway in prod). No-op when unset. Mirrors connector_generator.go
-	// GenerateConnector and orchestrator server_manager.go — without it the chat
-	// "generate <name>" command would 401 upstream once the secret is set.
-	if secret := strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_SECRET")); secret != "" {
-		req.Header.Set("X-Internal-Secret", secret)
-	}
-	if traceID != "" {
-		req.Header.Set("X-Trace-Id", traceID)
-	}
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.WithError(err).Errorf("chat: tool-generator unreachable for %s", apiName)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		log.Errorf("chat: tool-generator returned %d for %s", resp.StatusCode, apiName)
-		return
-	}
-	log.Infof("✅ chat-initiated connector generation completed for %s (status=%d)", apiName, resp.StatusCode)
+	return reply("connector_generation_started", fmt.Sprintf(
+		"🤖 Started generating the **%s** connector. This usually takes 1–3 minutes — it is added to the catalog when it's ready.\n\n"+
+			"Once it's done, retry your original request (e.g. **\"sync %s to bigquery\"**).",
+		apiName, apiName,
+	), map[string]interface{}{
+		"connector_name": apiName,
+		"run_id":         run.ID,
+		"status":         "generation_started",
+		"eta_minutes":    "1-3",
+	}), true
 }
 
 // errAmbiguousConnection signals that multiple active connections match a
@@ -3386,10 +3504,51 @@ func normalizePersistedPipelineModes(syncMode, cdcMode, cdcInitialLoad string) (
 	return syncMode, cdcMode, cdcInitialLoad
 }
 
-// createAndRunPipeline creates a pipeline and starts the Temporal workflow
-// V2: Simplified - no pre-parsing, just passes user message to workflow
+// pipelineOrigin is who is creating a pipeline through createAndRunPipelineAs:
+// the chat, or a person creating one from a plan Ask rsync.ai or an agent
+// proposed (pipeline_plans.go).
+type pipelineOrigin struct {
+	actor services.Actor
+	// name is the new pipeline's name; empty names it as chat does
+	// (chatPipelineName).
+	name string
+	// description is the new pipeline's description.
+	description string
+	// refuse turns a services.Authorize refusal into the error returned; what
+	// says what the role cannot do ("create pipelines").
+	refuse func(err error, what string) error
+	// audit is added to the create_pipeline audit row's details.
+	audit map[string]interface{}
+}
+
+// createAndRunPipeline creates a pipeline from chat and starts the Temporal
+// workflow (createAndRunPipelineAs).
 func (h *ChatHandler) createAndRunPipeline(
 	c *gin.Context,
+	request, userID, traceID string,
+	sourceConnectionID, destinationConnectionID string,
+	syncMode string,
+	cdcMode string,
+	cdcInitialLoad string,
+	nlTransforms nlTransformSpec,
+	scheduleOnly bool,
+	namedTables []string,
+	requestedNamespace string,
+) (string, string, string, error) {
+	origin := pipelineOrigin{
+		actor:       chatActor(c),
+		description: fmt.Sprintf("Created from chat: %s", request),
+		refuse:      chatRefusal,
+	}
+	return createAndRunPipelineAs(c, origin, request, userID, traceID, sourceConnectionID, destinationConnectionID,
+		syncMode, cdcMode, cdcInitialLoad, nlTransforms, scheduleOnly, namedTables, requestedNamespace)
+}
+
+// createAndRunPipelineAs creates a pipeline and starts the Temporal workflow
+// V2: Simplified - no pre-parsing, just passes user message to workflow
+func createAndRunPipelineAs(
+	c *gin.Context,
+	origin pipelineOrigin,
 	request, userID, traceID string,
 	sourceConnectionID, destinationConnectionID string,
 	syncMode string,
@@ -3405,9 +3564,25 @@ func (h *ChatHandler) createAndRunPipeline(
 	// explanation when auto-suffix kicked in because the bare namespace
 	// was already owned by another pipeline. The chat handler appends
 	// this note to the "Pipeline started!" message so the user knows
-	// their data is landing in `shopify_7150` instead of `shopify`.
+	// their data is landing in `shopify_7150` instead of `shopify`. When the
+	// request named tables, the note also says which were pre-selected or why
+	// the table-selection step still asks (namedTablesNote).
 	// Design: Option B from .design/destination-namespace.md (transparency,
 	// no blocking HITL); Option C will add a real interactive prompt.
+
+	// Workspace role (KI-CHAT-SKIPS-WORKSPACE-ROLE): the same table REST asks, so
+	// a viewer cannot create or run from chat what the UI refuses them. First,
+	// before any read or write.
+	actor := origin.actor
+	if err := services.Authorize(actor, services.ActionPipelineCreate); err != nil {
+		return "", "", "", origin.refuse(err, "create pipelines")
+	}
+	if !scheduleOnly {
+		if err := services.Authorize(actor, services.ActionPipelineRun); err != nil {
+			return "", "", "", origin.refuse(err, "run pipelines")
+		}
+	}
+
 	database := db.GetDB()
 	if database == nil {
 		return "", "", "", fmt.Errorf("database not connected")
@@ -3441,9 +3616,12 @@ func (h *ChatHandler) createAndRunPipeline(
 
 	// Create pipeline
 	createReq := CreatePipelineRequest{
-		Name:        chatPipelineName(time.Now(), c.GetString(clientTimezoneCtxKey)),
-		Description: fmt.Sprintf("Created from chat: %s", request),
+		Name:        origin.name,
+		Description: origin.description,
 		Request:     request,
+	}
+	if createReq.Name == "" {
+		createReq.Name = chatPipelineName(time.Now(), c.GetString(clientTimezoneCtxKey))
 	}
 
 	// Create pipeline in DB
@@ -3473,6 +3651,22 @@ func (h *ChatHandler) createAndRunPipeline(
 	// A batch pipeline never persists CDC options (see normalizePersistedPipelineModes).
 	syncMode, cdcMode, cdcInitialLoad = normalizePersistedPipelineModes(syncMode, cdcMode, cdcInitialLoad)
 
+	// The preflight REST CreatePipeline runs (connector installed on disk for
+	// each side). Chat skipped it and created pipelines that failed at run time.
+	// It sees the modes the INSERT below persists. A HITL answer is surfaced as
+	// the chat reply.
+	if syncMode != "" {
+		createReq.SyncMode = &syncMode
+	}
+	if cdcMode != "" {
+		createReq.CDCMode = &cdcMode
+	}
+	if hitl, err := runPipelinePreflight(database, workspaceID, &createReq, &sourceConnectionID, &destinationConnectionID); err != nil {
+		return "", "", "", fmt.Errorf("pipeline preflight failed: %w", err)
+	} else if hitl != nil {
+		return "", "", "", fmt.Errorf("%s", hitl.Message)
+	}
+
 	// Note: created_by must never be NULL to ensure proper event visibility
 	// resolveUserID always returns a non-empty string with dev fallback
 	_, err := database.Exec(`
@@ -3495,6 +3689,20 @@ func (h *ChatHandler) createAndRunPipeline(
 		"pipeline_id": pipelineID,
 		"name":        createReq.Name,
 	}).Info("✅ Created pipeline from chat")
+
+	// The same audit action REST CreatePipeline writes, so a chat create is not
+	// the one create that leaves no trail. Metadata only: no request text.
+	auditDetails := map[string]interface{}{
+		"name":                      createReq.Name,
+		"source_connection_id":      sourceConnectionID,
+		"destination_connection_id": destinationConnectionID,
+		"sync_mode":                 syncMode,
+		"channel":                   string(actor.Channel),
+	}
+	for k, v := range origin.audit {
+		auditDetails[k] = v
+	}
+	logAudit(c, "create_pipeline", "pipeline", pipelineID, auditDetails)
 
 	// Persist the NL-requested transform intent (masking / type conversion) onto
 	// pipelines.config.nl_transforms. The orchestrator's planNLTransforms gate reads
@@ -3525,33 +3733,32 @@ func (h *ChatHandler) createAndRunPipeline(
 
 	// KI-NLCHAT-TABLENAME-IGNORED: pre-select an explicitly-named source table so a
 	// one-turn NL create skips the table-selection HITL — but ONLY when the name
-	// resolves UNAMBIGUOUSLY against the source's cached schema. A cold cache, an
-	// unknown name, or a name that is ambiguous across schemas is left to the HITL
-	// (never auto-select a wrong table). Persisted to config.selected_tables (read
-	// by the scheduled-run workflow) and threaded into the immediate workflow input
-	// below. Best-effort: a validation/persist miss simply defers to the HITL — this
-	// is a convenience, not a safety control, so it never fails pipeline creation.
+	// resolves UNAMBIGUOUSLY against the source's table list: the schema cache, or,
+	// when that is cold, a live read of the source (preselectDiscover). An unreadable
+	// source, an unknown name, or a name that is ambiguous across schemas is left to
+	// the HITL (never auto-select a wrong table). Persisted to config.selected_tables
+	// (read by the scheduled-run workflow) and threaded into the immediate workflow
+	// input below. Best-effort: a validation/persist miss simply defers to the HITL —
+	// this is a convenience, not a safety control, so it never fails pipeline creation.
 	var qualifiedTables []string
+	var tablesNote string
 	if len(namedTables) > 0 && sourceConnectionID != "" {
 		qualified, missing, ambiguous, ok := validateAndQualifySelectedTablesFromCache(
 			c.Request.Context(), sourceConnectionID, namedTables)
+		if !ok {
+			qualified, missing, ambiguous, ok = qualifyNamedTablesFromSource(
+				c.Request.Context(), workspaceID, sourceConnectionID, userID, namedTables)
+		}
 		if shouldPreselectNamedTables(qualified, missing, ambiguous, ok) {
-			if raw, mErr := json.Marshal(qualified); mErr == nil {
-				if _, uErr := database.Exec(`
-					UPDATE pipelines
-					SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{selected_tables}', $2::jsonb, true),
-					    updated_at = NOW()
-					WHERE id = $1
-				`, pipelineID, string(raw)); uErr != nil {
-					log.WithError(uErr).WithField("pipeline_id", pipelineID).
-						Warn("[chat_nl_pipeline] failed to persist selected_tables (best-effort → HITL)")
-				} else {
-					qualifiedTables = qualified
-					log.WithFields(log.Fields{
-						"pipeline_id":     pipelineID,
-						"selected_tables": qualifiedTables,
-					}).Info("📝 Pre-selected NL-named source table(s)")
-				}
+			if uErr := persistPreselectedTables(database, pipelineID, qualified, !scheduleOnly); uErr != nil {
+				log.WithError(uErr).WithField("pipeline_id", pipelineID).
+					Warn("[chat_nl_pipeline] failed to persist selected_tables (best-effort → HITL)")
+			} else {
+				qualifiedTables = qualified
+				log.WithFields(log.Fields{
+					"pipeline_id":     pipelineID,
+					"selected_tables": qualifiedTables,
+				}).Info("📝 Pre-selected NL-named source table(s)")
 			}
 		} else {
 			log.WithFields(log.Fields{
@@ -3559,9 +3766,11 @@ func (h *ChatHandler) createAndRunPipeline(
 				"requested":    namedTables,
 				"missing":      missing,
 				"ambiguous_ct": len(ambiguous),
-				"cache_warm":   ok,
+				"tables_read":  ok,
 			}).Info("[chat_nl_pipeline] NL-named table(s) not unambiguously resolved — deferring to table-selection HITL")
 		}
+		// Built from what was persisted, so a failed write never reads as pre-selected.
+		tablesNote = namedTablesNote(namedTables, qualifiedTables, missing, ambiguous, ok)
 	}
 
 	// Round-4 destination-namespace assignment: mirror the CreatePipeline
@@ -3603,6 +3812,13 @@ func (h *ChatHandler) createAndRunPipeline(
 				defaultNamespace, destinationNamespace,
 			)
 		}
+	}
+	// The reply's note also says what happened to the tables the user named.
+	if tablesNote != "" {
+		if namespaceNote != "" {
+			namespaceNote += "\n\n"
+		}
+		namespaceNote += tablesNote
 	}
 
 	// Schedule-only (NL "every day at 2am" on a batch pipeline): create the
@@ -3812,4 +4028,296 @@ func (h *ChatHandler) rewriteNamedConnections(wsID, message string) string {
 			Info("chat: read saved connection names as their connector types")
 	}
 	return out
+}
+
+// confirmationNamedTables is every table the conversation named by the time the
+// user confirms: the tables the intent classifier extracted (they used to be
+// dropped here), the ones the original request spells out, and any the
+// confirmation message adds. Wildcards and filler the classifier returns ("*",
+// "all") are dropped, so they reach the table-selection step instead.
+func confirmationNamedTables(pending *chat.PendingIntent, message string) []string {
+	var names []string
+	if pending != nil {
+		for _, t := range pending.Tables {
+			if tok := cleanTableToken(strings.ToLower(t)); tok != "" && !nlTableStopWords[tok] {
+				names = mergeUniqueColumns(names, []string{tok})
+			}
+		}
+		names = mergeUniqueColumns(names, parseTableIntent(pending.OriginalRequest))
+	}
+	names = mergeUniqueColumns(names, parseTableIntent(message))
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// namedTablesCardLine is the Confirm card's line listing the tables the request
+// named, so the user sees them before saying yes. Empty when none were named.
+func namedTablesCardLine(pending *chat.PendingIntent) string {
+	names := confirmationNamedTables(pending, "")
+	if len(names) == 0 {
+		return ""
+	}
+	return "\n\nTables you named: " + backtickList(names) + ". I'll check them against the source when you confirm."
+}
+
+// notifyIntentRe matches a request to be told about a run: "notify me",
+// "email me", "alert me if it fails", "let me know", "send a (slack)
+// notification", "notifications via slack". A bare noun ("the alerts table",
+// "the email column", "sync slack messages") is not one.
+var notifyIntentRe = regexp.MustCompile(`\b(?:(?:notify|alert|email|e-mail|ping|message|slack)\s+(?:me|us)\b|notify\b|let\s+(?:me|us)\s+know\b|send\s+(?:me\s+|us\s+)?(?:an?\s+)?(?:slack\s+|email\s+|e-mail\s+)?(?:notification|alert|message|email|e-mail)s?\b|(?:notifications?|alerts?)\s+(?:via|on|through|by)\s+(?:slack|e-?mail)\b)`)
+
+// notifyChannelRe finds the channel a notification request names.
+var notifyChannelRe = regexp.MustCompile(`\b(slack|e-?mail)\b`)
+
+// notificationRequest reports whether the request asks to be notified about the
+// run, and the channel it names ("Slack", "email", or "" when it names none).
+// The channel is read from the request's wording from the ask onward, so a
+// Slack SOURCE ("sync slack messages to s3, then email me") is not the channel.
+func notificationRequest(request string) (channel string, asked bool) {
+	msg := strings.ToLower(request)
+	loc := notifyIntentRe.FindStringIndex(msg)
+	if loc == nil {
+		return "", false
+	}
+	if m := notifyChannelRe.FindStringSubmatch(msg[loc[0]:]); m != nil {
+		if m[1] == "slack" {
+			return "Slack", true
+		}
+		return "email", true
+	}
+	return "", true
+}
+
+// apiCallIntentRe matches a request to call out over HTTP as a step: "call our
+// webhook", "hit https://…", "post the results to an endpoint". The verb is
+// required, so a table or column named for one ("the webhooks table",
+// "endpoint_url") is not one.
+var apiCallIntentRe = regexp.MustCompile(`\b(?:call|hit|trigger|invoke|ping|(?:post|send)\s+(?:(?:it|them|the\s+\w+|results?)\s+)?to)\s+(?:(?:an?|the|our|my|this|that)\s+)?(?:[\w-]+\s+)?(?:(?:webhook|endpoint|url)\b|https?://)`)
+
+// llmIntentRe matches a request to run a model over the data: "using an LLM to
+// tag", "sentiment analysis", "AI-generated summaries". A verb that SQL can do
+// too ("categorize orders by amount", "summarize by day") is not one, and
+// neither is a table, a column or the product's own name.
+var llmIntentRe = regexp.MustCompile(`\b(?:(?:use|using|with|via|through|run|ask)\s+(?:an?\s+|the\s+)?(?:ai|llm|gpt[\w.-]*|chatgpt|claude|openai|gemini|language\s+model)\b|(?:ai|llm|gpt)[-\s](?:generated|powered|based|written)\b|sentiment\s+analysis|(?:analy[sz]e|score|detect)\s+(?:the\s+)?sentiment)`)
+
+// conditionIntentRe matches a step that should run only when a check passes:
+// "only if the table has new rows", "unless they are empty", "if the load
+// fails, …". A row filter ("only rows where …") is not one.
+var conditionIntentRe = regexp.MustCompile(`\b(?:only\s+(?:if|when)|unless|if\s+(?:(?:it|this|that)\s+(?:fails|succeeds|errors)|there\s+(?:is|are)|the\s+\w+(?:\s+\w+)?\s+(?:fails|succeeds|errors|is|are|has|have|exists|contains)))\b`)
+
+// clauseBreakRe splits a request into the clauses a condition is read within.
+var clauseBreakRe = regexp.MustCompile(`[.,;!?]|\b(?:then|and)\b`)
+
+// conditionRequest reports whether the request makes a step conditional. A
+// condition on a notification ("alert me only if it fails", "if the load fails,
+// email me") is not counted: the notification is named on its own, and alerts
+// on failure are what Admin → Notifications sends.
+func conditionRequest(msg string) bool {
+	breaks := clauseBreakRe.FindAllStringIndex(msg, -1)
+	for _, loc := range conditionIntentRe.FindAllStringIndex(msg, -1) {
+		start, end, next := 0, len(msg), len(msg)
+		for i, b := range breaks {
+			if b[1] <= loc[0] {
+				start = b[1]
+				continue
+			}
+			if b[0] >= loc[1] {
+				end = b[0]
+				if i+1 < len(breaks) {
+					next = breaks[i+1][0]
+				}
+				break
+			}
+		}
+		// A condition that opens its clause ("if X fails, …") governs the next one.
+		if strings.TrimSpace(msg[start:loc[0]]) == "" {
+			end = next
+		}
+		if !notifyIntentRe.MatchString(msg[start:end]) {
+			return true
+		}
+	}
+	return false
+}
+
+// notIncludedStep is a step a request can ask for that a pipeline cannot run.
+// There is one per not_runnable kind in shared/workflow_node_kinds_golden.json,
+// and chat_not_done_test.go fails when a kind is added there without one here.
+type notIncludedStep struct {
+	kind string
+	// asked reports whether the lowercased request asks for the step and, if so,
+	// how the card names it.
+	asked func(msg string) (what string, ok bool)
+	why   string
+}
+
+var notIncludedSteps = []notIncludedStep{
+	{
+		kind: "notification",
+		asked: func(msg string) (string, bool) {
+			channel, asked := notificationRequest(msg)
+			if channel != "" {
+				return "the " + channel + " notification you asked for", asked
+			}
+			return "the notification you asked for", asked
+		},
+		why: "a pipeline can't send its own notifications yet. " +
+			"Alerts when any pipeline fails can go to Slack or email: set them up under Admin → Notifications.",
+	},
+	{
+		kind: "api_call",
+		asked: func(msg string) (string, bool) {
+			return "the webhook call you asked for", apiCallIntentRe.MatchString(msg)
+		},
+		why: "a pipeline can't call a webhook or an endpoint as one of its steps.",
+	},
+	{
+		kind:  "llm",
+		asked: func(msg string) (string, bool) { return "the AI step you asked for", llmIntentRe.MatchString(msg) },
+		why:   "a pipeline doesn't send your data to an AI model.",
+	},
+	{
+		kind:  "condition",
+		asked: func(msg string) (string, bool) { return "the condition you asked for", conditionRequest(msg) },
+		why:   "a pipeline runs the same steps on every run; it can't skip or branch on a check.",
+	},
+}
+
+// notDoneCardLine is the Confirm card's line naming each step the request asked
+// for that the pipeline will not do, so the user knows before saying yes.
+// Empty when the request asked for nothing the pipeline leaves out.
+func notDoneCardLine(pending *chat.PendingIntent) string {
+	if pending == nil {
+		return ""
+	}
+	msg := strings.ToLower(pending.OriginalRequest)
+	var lines []string
+	for _, s := range notIncludedSteps {
+		if what, ok := s.asked(msg); ok {
+			lines = append(lines, what+" — "+s.why)
+		}
+	}
+	switch len(lines) {
+	case 0:
+		return ""
+	case 1:
+		return "\n\nNot included: " + lines[0]
+	}
+	return "\n\nNot included:\n- " + strings.Join(lines, "\n- ")
+}
+
+// backtickList renders names as `a`, `b` for a chat reply.
+func backtickList(names []string) string {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = "`" + n + "`"
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// preselectDiscoverTimeout caps the live table-list read a chat create makes
+// when the schema cache is cold. Past it the create goes on without a
+// pre-select and the table-selection step asks instead.
+const preselectDiscoverTimeout = 15 * time.Second
+
+// preselectDiscover reads a source's table list live, for a chat create whose
+// schema cache is cold. It loads the connection in the caller's workspace only
+// and sends the same discover-schema request the table picker sends. It returns
+// names and schemas only and writes nothing to the schema cache, whose envelope
+// other readers depend on. A variable so tests can stand in for the orchestrator.
+var preselectDiscover = func(ctx context.Context, workspaceID, connectionID, userID string) ([]schemaTableRef, error) {
+	var connectorType string
+	config, err := decryptedConnectionConfig(db.DB, workspaceID, connectionID, &connectorType)
+	if err != nil {
+		return nil, err
+	}
+	tables, err := fetchSourceTables(ctx, connectionID, connectorType, config, userID)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]schemaTableRef, 0, len(tables))
+	for _, t := range tables {
+		refs = append(refs, schemaTableRef{Name: t.Name, Schema: t.Schema})
+	}
+	return refs, nil
+}
+
+// qualifyNamedTablesFromSource is the cold-cache path of the pre-select: it
+// matches the named tables against a live read of the source. ok is false when
+// the source could not be read, or listed no tables, in time.
+func qualifyNamedTablesFromSource(ctx context.Context, workspaceID, connectionID, userID string, names []string) (qualified, missing []string, ambiguous map[string][]string, ok bool) {
+	ctx, cancel := context.WithTimeout(ctx, preselectDiscoverTimeout)
+	defer cancel()
+	known, err := preselectDiscover(ctx, workspaceID, connectionID, userID)
+	if err != nil || len(known) == 0 {
+		log.WithError(err).WithFields(log.Fields{
+			"connection_id": connectionID,
+			"tables":        len(known),
+		}).Info("[chat_nl_pipeline] could not read the source's tables to check the named ones")
+		return nil, nil, nil, false
+	}
+	qualified, missing, ambiguous = qualifyNamedTables(known, names)
+	return qualified, missing, ambiguous, true
+}
+
+// namedTablesNote tells the user what happened to the tables they named: which
+// were pre-selected, or why the table-selection step still asks. Empty when the
+// request named no table.
+func namedTablesNote(requested, qualified, missing []string, ambiguous map[string][]string, ok bool) string {
+	if len(requested) == 0 {
+		return ""
+	}
+	if shouldPreselectNamedTables(qualified, missing, ambiguous, ok) {
+		return "📋 Pre-selected only the tables you named: " + backtickList(qualified) + "."
+	}
+	const pick = " Choose the tables in the table-selection step."
+	if !ok {
+		return "📋 I couldn't read the source's table list to check " + backtickList(requested) + "." + pick
+	}
+	var parts []string
+	if len(missing) > 0 {
+		parts = append(parts, "I couldn't find "+backtickList(missing)+" in the source.")
+	}
+	if len(ambiguous) > 0 {
+		names := make([]string, 0, len(ambiguous))
+		for n := range ambiguous {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			parts = append(parts, fmt.Sprintf("`%s` exists in more than one schema (%s).", n, backtickList(ambiguous[n])))
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "I couldn't pre-select "+backtickList(requested)+".")
+	}
+	return "📋 " + strings.Join(parts, " ") + pick
+}
+
+// persistPreselectedTables stores the tables a chat message named as the
+// pipeline's selection (KI-NLCHAT-TABLENAME-IGNORED). With reviewTransforms it
+// also marks the pipeline transforms_review_pending: naming the tables skips the
+// table-selection pause, and the chat's transform step opens from that pause, so
+// the orchestrator pauses the first transfer once to show it
+// (backend-orchestrator transforms_review_gate.go). Not for a schedule-only
+// pipeline: its first run is unattended, and a pause there would park it until
+// someone opened the chat.
+func persistPreselectedTables(database *sql.DB, pipelineID string, qualified []string, reviewTransforms bool) error {
+	raw, err := json.Marshal(qualified)
+	if err != nil {
+		return err
+	}
+	mark := `{}`
+	if reviewTransforms {
+		mark = `{"transforms_review_pending": true}`
+	}
+	_, err = database.Exec(`
+		UPDATE pipelines
+		SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{selected_tables}', $2::jsonb, true) || $3::jsonb,
+		    updated_at = NOW()
+		WHERE id = $1
+	`, pipelineID, string(raw), mark)
+	return err
 }

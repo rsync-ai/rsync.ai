@@ -1,6 +1,6 @@
 """A shipped compose file may not command a Python module the public cut deletes.
 
-WHAT BROKE. `docker-compose.yml:1608` ran
+WHAT BROKE. `docker-compose.yml:1604` ran
 
     command: ["python", "-m", "src.agents.tool_generator.service"]
 

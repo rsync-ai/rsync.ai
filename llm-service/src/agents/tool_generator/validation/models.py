@@ -49,12 +49,7 @@ class ValidationResult:
     def has_warnings(self) -> bool:
         """Check if there are warnings"""
         return len(self.warnings) > 0
-    
-    @property
-    def all_messages(self) -> List[ValidationError]:
-        """Get all validation messages (errors + warnings + info)"""
-        return self.errors + self.warnings + self.info
-    
+
     def add_error(
         self,
         message: str,
@@ -87,19 +82,7 @@ class ValidationResult:
             code=code,
             fix_suggestion=fix_suggestion,
         ))
-    
-    def add_info(
-        self,
-        message: str,
-        location: Optional[str] = None,
-    ) -> None:
-        """Add informational message"""
-        self.info.append(ValidationError(
-            message=message,
-            severity=ValidationSeverity.INFO,
-            location=location,
-        ))
-    
+
     def merge(self, other: 'ValidationResult') -> None:
         """Merge another validation result into this one"""
         self.errors.extend(other.errors)

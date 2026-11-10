@@ -47,7 +47,7 @@ const IssueConfidenceCap = AutoBand - 0.01
 // component_type is NOT enough to guarantee it holds a UUID: the WAL watchdog
 // writes component_type='cdc_pipeline' with the replication SLOT NAME as the
 // component_id whenever the slot has no pipeline attached —
-// cdc_wal_watchdog.go:305-307. One orphaned slot is therefore enough to make
+// cdc_wal_watchdog.go:572-576. One orphaned slot is therefore enough to make
 // `c.component_id::uuid` raise
 //
 //	ERROR: invalid input syntax for type uuid: "rsync_slot_abc"

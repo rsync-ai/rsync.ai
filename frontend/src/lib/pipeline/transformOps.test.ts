@@ -83,10 +83,9 @@ describe("fromApiTransforms", () => {
   it("translates the API's DB shape into the shape the builder renders", () => {
     const [r] = fromApiTransforms(apiResponse);
 
-    // The page filters cards with `t.type === "producer"` and reads `t.operation`.
-    // Storing the raw row left both undefined, so Generate returned 200 and drew
-    // nothing at all.
-    expect(r.type).toBe("producer");
+    // The page reads `t.operation`; storing the raw row left it undefined, so
+    // Generate returned 200 and drew nothing at all.
+    expect(r.type).toBe("both");
     expect(r.operation).toBe("filter");
     expect(r.config).toEqual({ condition: "amount > 100" });
     expect(r.enabled).toBe(true);
@@ -96,9 +95,13 @@ describe("fromApiTransforms", () => {
     expect(r.config.operation).toBeUndefined();
   });
 
-  it("routes a consumer row to the CDC side", () => {
-    const [r] = fromApiTransforms([{ ...apiResponse[0], transform_type: "consumer" }]);
-    expect(r.type).toBe("consumer");
+  it("makes a generated rule run on both paths, whatever side the parser named", () => {
+    // The parser defaults to "producer". Taking that literally saved the rule for
+    // batch only, so a CDC pipeline's changes arrived untransformed.
+    for (const side of ["producer", "consumer"]) {
+      const [r] = fromApiTransforms([{ ...apiResponse[0], transform_type: side }]);
+      expect(r.type).toBe("both");
+    }
   });
 
   it("drops a parsed rule no engine can run", () => {

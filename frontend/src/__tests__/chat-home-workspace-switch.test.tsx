@@ -3,7 +3,7 @@ import { act, render, screen, waitFor } from "@testing-library/react"
 import type { Mock } from "vitest"
 
 import { AgenticPipelineHome } from "@/components/chat/AgenticPipelineHome"
-import { HomeAgentWidget } from "@/components/home/HomeAgentWidget"
+import { shortConnectorName } from "@/components/chat/home/suggestions"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { ACTIVE_WORKSPACE_EVENT, ACTIVE_WORKSPACE_KEY } from "@/lib/workspace/active-workspace"
 
@@ -12,16 +12,20 @@ import { ACTIVE_WORKSPACE_EVENT, ACTIVE_WORKSPACE_KEY } from "@/lib/workspace/ac
 // live Run button — under the personal workspace's name in the header. It
 // persisted indefinitely, because the hero fetched once on mount with an empty
 // dependency array and never subscribed to the workspace-change signal. Ten list
-// surfaces were converted in #712; these two were missed.
+// surfaces were converted in #712; this one was missed.
+//
+// The page no longer lists connections or pipelines by name (Pipelines and Runs
+// do): what it shows from the connections is the Quick Pipelines cards, one per
+// connected source → destination type pair. So each fixture's types make a pair
+// that is not a curated template, and the tests watch that pair's card.
 //
 // These pin both halves of the contract every workspace-scoped list owes:
 //   1. refetch when the active workspace changes (same tab AND cross tab), and
 //      clear first so the previous tenant's rows don't linger during the refetch
 //   2. drop a response that a switch overtook mid-flight
 //
-// Blast radius was display-only — RunPipeline is workspace-gated server-side, so
-// the Run button would have 404'd — but the rows themselves are another tenant's
-// data on screen with nothing to indicate it.
+// Blast radius was display-only — creating from another tenant's pair would fail
+// server-side — but the cards are still another tenant's setup on screen.
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("next/navigation", () => ({
@@ -53,54 +57,40 @@ beforeAll(() => {
 const DEMO_WS = "0df2f291-0000-0000-0000-000000000001"
 const PERSONAL_WS = "f71b4b51-0000-0000-0000-000000000002"
 
-type Fixture = { connections: string[]; pipelines: string[] }
+type Conn = { name: string; connector_type: string; type: "source" | "destination" }
+type Fixture = { connections: Conn[] }
 
+// Neither pair is a curated template, so each card exists only because of that
+// workspace's connections.
 const DEMO: Fixture = {
-  connections: ["Demo Mysql", "Demo Postgresql"],
-  pipelines: ["Chat Pipeline 08:56:18", "Chat Pipeline 08:08:30"],
+  connections: [
+    { name: "Demo Mysql", connector_type: "mysql", type: "source" },
+    { name: "Demo BigQuery", connector_type: "bigquery", type: "destination" },
+  ],
 }
 const PERSONAL: Fixture = {
-  connections: ["Personal Warehouse"],
-  pipelines: ["Nightly Export"],
+  connections: [
+    { name: "Personal Postgres", connector_type: "postgresql", type: "source" },
+    { name: "Personal Bucket", connector_type: "gcs", type: "destination" },
+  ],
 }
+const DEMO_CARD = `${shortConnectorName("mysql")} → ${shortConnectorName("bigquery")}`
+const PERSONAL_CARD = `${shortConnectorName("postgresql")} → ${shortConnectorName("gcs")}`
 
-function conn(name: string, i: number) {
-  return {
-    id: `conn-${name}-${i}`,
-    name,
-    connector_type: "postgresql",
-    type: i % 2 === 0 ? "source" : "destination",
-    status: "active",
-  }
-}
-
-function pipe(name: string, i: number) {
-  return {
-    id: `pipe-${name}-${i}`,
-    name,
-    status: "completed",
-    updated_at: "2026-07-29T00:00:00Z",
-  }
+function conn(c: Conn, i: number) {
+  return { id: `conn-${c.name}-${i}`, ...c, status: "active" }
 }
 
 /** Serves whichever fixture matches the workspace currently in localStorage. */
 function serveByActiveWorkspace(byWorkspace: Record<string, Fixture>) {
   ;(authFetch as Mock).mockImplementation(async (url: string) => {
     const active = window.localStorage.getItem(ACTIVE_WORKSPACE_KEY) ?? ""
-    const fx = byWorkspace[active] ?? { connections: [], pipelines: [] }
-    const u = String(url)
-    if (u.includes("/connections")) {
+    const fx = byWorkspace[active] ?? { connections: [] }
+    if (String(url).includes("/connections")) {
       return {
         ok: true,
         status: 200,
         json: async () => ({ connections: fx.connections.map(conn) }),
-      }
-    }
-    if (u.includes("/pipelines")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ pipelines: fx.pipelines.map(pipe), total: fx.pipelines.length }),
       }
     }
     return { ok: true, status: 200, json: async () => ({}) }
@@ -124,32 +114,25 @@ afterEach(() => {
 })
 
 describe("AgenticPipelineHome — active workspace", () => {
-  it("replaces the previous workspace's connections and pipelines on switch", async () => {
+  it("replaces the previous workspace's suggestions on switch", async () => {
     serveByActiveWorkspace({ [DEMO_WS]: DEMO, [PERSONAL_WS]: PERSONAL })
-    render(<AgenticPipelineHome onSubmit={() => {}} />)
+    render(<AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />)
 
-    await screen.findByText("Demo Mysql")
-    expect(screen.getByText("Chat Pipeline 08:56:18")).toBeTruthy()
+    await screen.findByText(DEMO_CARD)
 
     await act(async () => {
       switchWorkspace(PERSONAL_WS)
     })
 
-    await screen.findByText("Personal Warehouse")
-    await waitFor(() => {
-      // The exact prod symptom: demo's rows still on screen under personal.
-      expect(screen.queryByText("Demo Mysql")).toBeNull()
-      expect(screen.queryByText("Demo Postgresql")).toBeNull()
-      expect(screen.queryByText("Chat Pipeline 08:56:18")).toBeNull()
-      expect(screen.queryByText("Chat Pipeline 08:08:30")).toBeNull()
-    })
-    expect(screen.getByText("Nightly Export")).toBeTruthy()
+    await screen.findByText(PERSONAL_CARD)
+    // The exact prod symptom: demo's setup still on screen under personal.
+    expect(screen.queryByText(DEMO_CARD)).toBeNull()
   })
 
   it("refetches when the workspace changes in another tab", async () => {
     serveByActiveWorkspace({ [DEMO_WS]: DEMO, [PERSONAL_WS]: PERSONAL })
-    render(<AgenticPipelineHome onSubmit={() => {}} />)
-    await screen.findByText("Demo Mysql")
+    render(<AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />)
+    await screen.findByText(DEMO_CARD)
 
     // Cross-tab: the other tab writes localStorage, this tab only sees `storage`.
     await act(async () => {
@@ -157,13 +140,13 @@ describe("AgenticPipelineHome — active workspace", () => {
       window.dispatchEvent(new StorageEvent("storage", { key: ACTIVE_WORKSPACE_KEY }))
     })
 
-    await screen.findByText("Personal Warehouse")
-    expect(screen.queryByText("Demo Mysql")).toBeNull()
+    await screen.findByText(PERSONAL_CARD)
+    expect(screen.queryByText(DEMO_CARD)).toBeNull()
   })
 
   it("drops a response that a switch overtook mid-flight", async () => {
     // demo's fetch is held open, then released AFTER the switch to personal. Its
-    // rows must never reach the screen: authFetch stamped X-Workspace-ID at call
+    // connections must never reach the screen: authFetch stamped X-Workspace-ID at call
     // time, so this response is demo's data arriving under personal.
     let releaseDemo: (() => void) | undefined
     const demoInFlight = new Promise<void>((resolve) => {
@@ -172,25 +155,20 @@ describe("AgenticPipelineHome — active workspace", () => {
 
     ;(authFetch as Mock).mockImplementation(async (url: string) => {
       const active = window.localStorage.getItem(ACTIVE_WORKSPACE_KEY) ?? ""
-      const u = String(url)
       if (active === DEMO_WS) await demoInFlight
       const fx = active === DEMO_WS ? DEMO : PERSONAL
-      if (u.includes("/connections")) {
+      if (String(url).includes("/connections")) {
         return { ok: true, status: 200, json: async () => ({ connections: fx.connections.map(conn) }) }
       }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ pipelines: fx.pipelines.map(pipe), total: fx.pipelines.length }),
-      }
+      return { ok: true, status: 200, json: async () => ({}) }
     })
 
-    render(<AgenticPipelineHome onSubmit={() => {}} />)
+    render(<AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />)
 
     await act(async () => {
       switchWorkspace(PERSONAL_WS)
     })
-    await screen.findByText("Personal Warehouse")
+    await screen.findByText(PERSONAL_CARD)
 
     await act(async () => {
       releaseDemo?.()
@@ -198,25 +176,8 @@ describe("AgenticPipelineHome — active workspace", () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText("Personal Warehouse")).toBeTruthy()
+      expect(screen.getByText(PERSONAL_CARD)).toBeTruthy()
     })
-    expect(screen.queryByText("Demo Mysql")).toBeNull()
-    expect(screen.queryByText("Chat Pipeline 08:56:18")).toBeNull()
-  })
-})
-
-describe("HomeAgentWidget — active workspace", () => {
-  it("replaces the previous workspace's connections on switch", async () => {
-    serveByActiveWorkspace({ [DEMO_WS]: DEMO, [PERSONAL_WS]: PERSONAL })
-    render(<HomeAgentWidget />)
-
-    await screen.findByText(/Demo Mysql/)
-
-    await act(async () => {
-      switchWorkspace(PERSONAL_WS)
-    })
-
-    await screen.findByText(/Personal Warehouse/)
-    expect(screen.queryByText(/Demo Mysql/)).toBeNull()
+    expect(screen.queryByText(DEMO_CARD)).toBeNull()
   })
 })

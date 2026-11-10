@@ -20,6 +20,6 @@ test("pipelines/new redirects to chat (wizard flow removed)", async ({ page }) =
   await page.waitForURL(/\/chat/i)
 
   // Chat input should be present
-  await expect(page.getByPlaceholder("Describe what data you want to move…")).toBeVisible()
+  await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible()
 })
 

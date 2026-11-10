@@ -503,6 +503,25 @@ func findDebeziumConnectorName(pipelineID string) (string, error) {
 // then restart the sink so it subscribes to the new topics. They are extracted
 // because the CDC auto-pickup watcher performs the very same sequence on a
 // schedule; keeping two copies is how a fix lands in one path and not the other.
+//
+// Each one sends its request detached from the caller's context, bounded by its
+// own wait only. They run one after another once the change is committed, and
+// every caller's context ends early: Cloudflare cuts the browser's request at
+// 100s, the watcher's per-pipeline sweep has a 3-minute deadline that discovery
+// also spends, and three waits past their orchestrator budgets add up past both.
+// Cancelling one half-way leaves the change half-made, a sink restart cut between
+// stop_sink and start_sink leaves no worker, so a helper outlives its caller.
+
+// cdcUpdateTablesProxyTimeout is how long the gateway waits for a table-list push:
+// past the orchestrator's 60s cdcUpdateTablesBudget, because the orchestrator applies
+// the list whether or not the gateway is still listening, and a gateway that gives up
+// first reports a failure for a change that landed. Short of Cloudflare's 100s cut.
+const cdcUpdateTablesProxyTimeout = 65 * time.Second
+
+// cdcSinkRestartProxyTimeout is how long the gateway waits for a sink restart: past
+// the orchestrator's 60s cdcSinkRestartBudget, so the caller hears whether a worker is
+// running again. Short of Cloudflare's 100s cut.
+const cdcSinkRestartProxyTimeout = 65 * time.Second
 
 // pushCDCTableList sends the desired table list to the orchestrator, which owns
 // the P0 safety guards (hard PK validation for database destinations, MongoDB included) before
@@ -515,13 +534,13 @@ func pushCDCTableList(ctx context.Context, pipelineID string, tables []string) (
 		"tables":      tables,
 	})
 	url := fmt.Sprintf("%s/api/v1/cdc/tables", orchestratorBaseURL())
-	r, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(payload))
+	r, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodPut, url, bytes.NewReader(payload))
 	if err != nil {
 		return 0, nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
 	setInternalServiceSecret(r)
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	resp, err := (&http.Client{Timeout: cdcUpdateTablesProxyTimeout}).Do(r)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -588,14 +607,14 @@ func requestCDCBackfill(ctx context.Context, pipelineID string, tables []string,
 	}
 	payload, _ := json.Marshal(reqBody)
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/backfill", orchestratorBaseURL(), pipelineID)
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	r, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		result["error"] = err.Error()
 		return result
 	}
 	r.Header.Set("Content-Type", "application/json")
 	setInternalServiceSecret(r)
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	resp, err := (&http.Client{Timeout: cdcBackfillProxyTimeout}).Do(r)
 	if err != nil {
 		result["error"] = err.Error()
 		return result
@@ -640,14 +659,14 @@ func restartCDCSink(ctx context.Context, pipelineID string) gin.H {
 		"success":   false,
 	}
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/sink/restart", orchestratorBaseURL(), pipelineID)
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	r, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		result["error"] = err.Error()
 		return result
 	}
 	r.Header.Set("Content-Type", "application/json")
 	setInternalServiceSecret(r)
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	resp, err := (&http.Client{Timeout: cdcSinkRestartProxyTimeout}).Do(r)
 	if err != nil {
 		result["error"] = err.Error()
 		return result

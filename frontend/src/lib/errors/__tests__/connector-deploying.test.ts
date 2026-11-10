@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest"
 import {
+  CONNECTOR_BUILD_FAILED_MARKER,
   CONNECTOR_DEPLOYING_MARKER,
+  connectorBuildFailedSaveNotice,
   connectorDeployingErrorMessage,
   connectorDeployingMessage,
   connectorDeployingSaveNotice,
+  isConnectorBuildFailedText,
   isConnectorDeployingResponse,
 } from "../connector-deploying"
 
@@ -69,5 +72,41 @@ describe("connector-deploying", () => {
     ).toBeNull()
     expect(connectorDeployingSaveNotice(503, { error: "connection_test_interrupted" })).toBeNull()
     expect(connectorDeployingSaveNotice(503, null)).toBeNull()
+  })
+})
+
+// A failed image build as the gateway answers it (orchestrator
+// mcp.FriendlyTestConnectionError over tool-generator BUILD_FAILED_PREFIX). Its log
+// ends in an import error, which must not read as "still being set up".
+const BUILD_FAILED_MSG =
+  "The Acme connector image failed to build. End of the build log:\n" +
+  "Step 5/9 : RUN pip install -r requirements.txt\n" +
+  "ERROR: No matching distribution found for acme-sdk==9.9\n" +
+  "ModuleNotFoundError: No module named 'acme'"
+
+describe("connector image failed to build", () => {
+  it("is a failure, never a wait", () => {
+    expect(isConnectorBuildFailedText(BUILD_FAILED_MSG)).toBe(true)
+    expect(BUILD_FAILED_MSG).toContain(CONNECTOR_BUILD_FAILED_MARKER)
+    expect(isConnectorDeployingResponse({ success: false, status: "failed", error: BUILD_FAILED_MSG })).toBe(false)
+    expect(connectorDeployingErrorMessage(BUILD_FAILED_MSG, "Acme")).toBeNull()
+    // A bare import error from an older backend is still the deploying case.
+    expect(isConnectorDeployingResponse({ success: false, error: "No module named 'pymongo'" })).toBe(true)
+  })
+
+  it("maps the gateway's save refusal to the build log", () => {
+    const body = {
+      error: "connector_build_failed",
+      status: "connector_build_failed",
+      message: "The connector image failed to build, so nothing was saved.",
+      test_error: BUILD_FAILED_MSG,
+    }
+    expect(connectorBuildFailedSaveNotice(422, body)).toEqual({
+      title: "Connector image failed to build — changes not saved",
+      description: BUILD_FAILED_MSG,
+    })
+    expect(connectorBuildFailedSaveNotice(422, { error: "connection_test_failed", test_error: "x" })).toBeNull()
+    expect(connectorBuildFailedSaveNotice(503, body)).toBeNull()
+    expect(connectorDeployingSaveNotice(422, body)).toBeNull()
   })
 })

@@ -1,0 +1,23 @@
+{
+  "_comment": "What one Ask rsync.ai step reports about its own size, as llm-service's POST /v1/assistant/step returns it and api-gateway's assistant loop reads it. provider_usage is an OpenAI chat completion's usage block, the one provider shape that reports cached and reasoning tokens; step_usage is the route's `usage` for it, and step_chars an example of its `chars` (characters sent per part, from src/egress/guard.py sent_chars). A key renamed on one side reads as 0 on the other, so a test of each side alone stays green while every count is lost. Readers: llm-service tests/test_assistant_step_usage_golden.py (the route builds exactly these keys) and api-gateway internal/assistant/usage_test.go (StepResponse decodes every key, and only these).",
+  "provider_usage": {
+    "prompt_tokens": 13120,
+    "completion_tokens": 212,
+    "total_tokens": 13332,
+    "prompt_tokens_details": {"cached_tokens": 11904},
+    "completion_tokens_details": {"reasoning_tokens": 64}
+  },
+  "step_usage": {
+    "prompt_tokens": 13120,
+    "cached_tokens": 11904,
+    "completion_tokens": 212,
+    "reasoning_tokens": 64
+  },
+  "step_chars": {
+    "system": 18342,
+    "tools": 27911,
+    "user": 41,
+    "assistant": 96,
+    "tool": 2304
+  }
+}

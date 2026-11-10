@@ -1,0 +1,106 @@
+# settings: {"type":"table","columns":["day","region","amount"],"sort":"x_desc"}
+
+-- postgres
+SELECT src."day" AS "day", src."region" AS "region", src."amount" AS "amount"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+ORDER BY src."day" DESC, src."region" ASC, src."amount" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+-- when a column cannot be ordered, with the same values
+SELECT src."day" AS "day", src."region" AS "region", src."amount" AS "amount"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+ORDER BY src."day" DESC
+LIMIT 10001
+
+-- mysql
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+ORDER BY src.`day` DESC, src.`region` ASC, src.`amount` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+-- when a column cannot be ordered, with the same values
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+ORDER BY src.`day` DESC
+LIMIT 10001
+
+-- sqlserver
+SELECT TOP (10001) src.[day] AS [day], src.[region] AS [region], src.[amount] AS [amount]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+ORDER BY src.[day] DESC, src.[region] ASC, src.[amount] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+-- when a column cannot be ordered, with the same values
+SELECT TOP (10001) src.[day] AS [day], src.[region] AS [region], src.[amount] AS [amount]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+ORDER BY src.[day] DESC
+
+-- bigquery
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+ORDER BY src.`day` DESC, src.`region` ASC, src.`amount` ASC
+LIMIT 10001
+-- unfiltered: day, region
+-- when a column cannot be ordered, with the same values
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+ORDER BY src.`day` DESC
+LIMIT 10001
+
+-- snowflake
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", src."AMOUNT" AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+ORDER BY src."DAY" DESC, src."REGION" ASC, src."AMOUNT" ASC
+LIMIT 10001
+-- unfiltered: day, region
+-- when a column cannot be ordered, with the same values
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", src."AMOUNT" AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+ORDER BY src."DAY" DESC
+LIMIT 10001
+
+-- databricks
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+ORDER BY src.`day` DESC, src.`region` ASC, src.`amount` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+-- when a column cannot be ordered, with the same values
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+ORDER BY src.`day` DESC
+LIMIT 10001
+
+-- clickhouse
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+ORDER BY src.`day` DESC, src.`region` ASC, src.`amount` ASC
+LIMIT 10001
+-- unfiltered: day, region
+-- when a column cannot be ordered, with the same values
+SELECT src.`day` AS `day`, src.`region` AS `region`, src.`amount` AS `amount`
+FROM `gold`.`orders` src
+ORDER BY src.`day` DESC
+LIMIT 10001
+
+-- oracle
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", src."AMOUNT" AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+ORDER BY src."DAY" DESC, src."REGION" ASC, src."AMOUNT" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region
+-- when a column cannot be ordered, with the same values
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", src."AMOUNT" AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+ORDER BY src."DAY" DESC
+FETCH FIRST 10001 ROWS ONLY

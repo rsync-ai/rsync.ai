@@ -59,11 +59,15 @@ user: |
   Table: {{ table.schema }}.{{ table.name }}
   Columns:
   {% for col in table.columns %}
-    - {{ col.name }} ({{ col.type }}){% if col.is_primary_key %} [PK]{% endif %}{% if col.is_nullable %} [NULL]{% endif %}
+    - {{ col.name }} ({{ col.type }}){% if col.is_primary_key %} [PK]{% endif %}{% if col.is_nullable %} [NULL]{% endif +%}
   {% endfor %}
   {% endfor %}
   </SCHEMA>
 
-  Previous context: {{ previous_context | default('None') }}
-
   Respond with JSON only.
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  question: user_text
+  selected_tables: catalog

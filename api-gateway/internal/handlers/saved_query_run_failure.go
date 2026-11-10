@@ -281,6 +281,10 @@ func RecordSavedQueryModelRunFailureInternal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	if req.UpstreamKind == upstreamKindWorkflow {
+		recordWorkflowModelRunFailureInternal(c, database, id, req)
+		return
+	}
 	if _, err := uuid.Parse(req.ScheduleID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid schedule id"})
 		return
@@ -330,6 +334,9 @@ func RecordSavedQueryModelRunFailureInternal(c *gin.Context) {
 	case runFailureDuplicate:
 		c.JSON(http.StatusOK, gin.H{"recorded": false, "duplicate": true})
 	default:
+		// A run nobody answered is a run nobody saw fail. A duplicate was told about
+		// by the delivery that recorded it.
+		notifyRecordedModelRunFailure(id, rec.StartedAt)
 		c.JSON(http.StatusOK, gin.H{"recorded": true})
 	}
 }

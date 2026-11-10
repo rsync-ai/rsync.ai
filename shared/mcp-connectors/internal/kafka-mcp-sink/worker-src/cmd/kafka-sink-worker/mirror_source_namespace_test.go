@@ -117,8 +117,7 @@ func deliverTwoDatabases(t *testing.T, mirror bool, namespace string) (*cdcDBBat
 		destType:     "mongodb",
 		destCfg:      cfg.DestinationConfig,
 		params:       cdcBatchingParams{enabled: true, maxEvents: 100, maxRetries: 0, backoff: time.Millisecond},
-		reader:       reader,
-		hw:           newHighWaterTracker(),
+		gate:         newCommitGate(reader.CommitMessages, newHighWaterTracker()),
 		httpClient:   &http.Client{Transport: dest},
 		ddl:          &DDLSupport{},
 		eventsWriter: &kafka.Writer{},
@@ -203,7 +202,7 @@ func TestCDCDeleteMirrorsSourceNamespace(t *testing.T) {
 	}
 	sm.PK = map[string]interface{}{"id": 1}
 	sm.KeyFields = []string{"id"}
-	commit, err := processCDCEvent(context.Background(), newHighWaterTracker(), nil, &http.Client{Transport: dest}, cfg,
+	commit, err := processCDCEvent(context.Background(), newCommitGate(nil, newHighWaterTracker()), nil, &http.Client{Transport: dest}, cfg,
 		&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msg, sm, &Metrics{},
 		&sync.Map{}, &sync.Map{}, &sync.Map{}, &sync.Map{}, time.Minute)
 	if err != nil || !commit {

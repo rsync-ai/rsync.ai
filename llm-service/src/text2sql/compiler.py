@@ -11,8 +11,7 @@ import re
 from typing import Optional
 
 import sqlglot
-from sqlglot import exp, MappingSchema
-from sqlglot.dialects import Dialects
+from sqlglot import exp
 
 from .schema import TypedSchema
 from .query_spec import (
@@ -648,11 +647,3 @@ def compile_query_spec(
     sql = select.sql(dialect=sqlglot_dialect, pretty=False)
 
     return sql
-
-
-class CompilationError(Exception):
-    """Raised when query compilation fails."""
-
-    def __init__(self, message: str, details: Optional[dict] = None):
-        super().__init__(message)
-        self.details = details or {}

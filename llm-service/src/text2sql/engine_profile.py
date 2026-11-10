@@ -21,10 +21,6 @@ class EngineProfile:
     def is_mysql(self) -> bool:
         return self.family == "mysql"
 
-    @property
-    def is_postgres(self) -> bool:
-        return self.family == "postgres"
-
 
 def get_engine_profile(dialect: str) -> EngineProfile:
     d = (dialect or "").strip()

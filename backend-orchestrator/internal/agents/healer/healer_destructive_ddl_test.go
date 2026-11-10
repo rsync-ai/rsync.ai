@@ -78,35 +78,35 @@ func TestNotAutoAppliedDDL(t *testing.T) {
 	}
 }
 
-// CDC-D1: the cdcstats agent reports source drops that CDC does not mirror by
-// publishing them onto HealerTopic with applied=false, so they take this package's
-// ordinary classify → file → notify path. That is only safe because these statements
-// are never executed — approving one records the decision and leaves the apply to the
-// user. The producer normalizes to exactly these two shapes for that reason.
+// CDC-D1: the cdcstats agent reports a source table that CDC stopped seeing by
+// publishing it onto HealerTopic with applied=false, so it takes this package's ordinary
+// route → file → notify path. A dropped table is the one change that waits for a person,
+// and approving it drops the destination table through the connector, never by running
+// this statement. It no longer reports dropped columns: the destination keeps them.
 //
-// The dependency runs cdcstats → healer, so the assertion has to live here. If
-// isDestructiveDDL is ever narrowed such that one of these stops matching, CDC would
-// start handing users an Approve button that runs DROP against their destination.
-func TestCDCReportedDropsAreDestructive(t *testing.T) {
+// The dependency runs cdcstats → healer, so the assertion has to live here. If either
+// predicate is ever narrowed such that this stops matching, CDC would file a dropped
+// table as something to apply.
+func TestCDCReportedDropTableAwaitsDecision(t *testing.T) {
 	// Keep in lockstep with classifySchemaChange in
-	// internal/agents/cdcstats/schema_changes.go — these are the only two DDL forms
-	// it emits.
-	for _, ddl := range []string{
-		"DROP TABLE pipeline_test.cdc_drift",
-		"ALTER TABLE pipeline_test.cdc_drift DROP COLUMN note",
-	} {
-		if !isDestructiveDDL(ddl) {
-			t.Errorf("cdcstats emits %q; isDestructiveDDL must classify it destructive or the healer will execute it against the destination", ddl)
-		}
+	// internal/agents/cdcstats/schema_changes.go — the only DDL form it emits.
+	ddl := "DROP TABLE pipeline_test.cdc_drift"
+	if !isDestructiveDDL(ddl) {
+		t.Errorf("cdcstats emits %q; isDestructiveDDL must classify it destructive or applyMigration would run it", ddl)
+	}
+	if got := routeSchemaChange(SchemaChange{ChangeType: "drop_table", Table: "pipeline_test.cdc_drift", DDL: ddl}); got != routeAwaitDecision {
+		t.Errorf("routeSchemaChange(cdcstats drop_table) = %v, want routeAwaitDecision", got)
 	}
 }
 
-// handleApprovedChange must not touch applyMigration for destructive DDL. The
-// Agent here has a nil db and nil kafkaManager: if the destructive branch is ever
-// removed, applyMigration is reached and dereferences a.db, so this test fails
-// loudly (panic) rather than silently passing.
+// handleApprovedChange must not touch applyMigration for destructive DDL other than a
+// dropped table. If the destructive branch is ever removed, applyMigration refuses the
+// statement and the handler raises "Approved DDL failed to apply" — so the test asserts
+// that no notification is sent and no connector is called.
 func TestHandleApprovedChange_DestructiveDDL_NotApplied(t *testing.T) {
-	a := &Agent{}
+	exec := &recordingExecutor{}
+	a := &Agent{mcpClient: exec, loadDestination: postgresDestination}
+	sent := captureNotifications(a)
 	payload, err := json.Marshal(map[string]interface{}{
 		"event_type":  "schema_change_approved",
 		"approval_id": "approval-1",
@@ -123,20 +123,28 @@ func TestHandleApprovedChange_DestructiveDDL_NotApplied(t *testing.T) {
 	if err := a.handleApprovedChange(context.Background(), &sarama.ConsumerMessage{Value: payload}); err != nil {
 		t.Fatalf("handleApprovedChange returned error: %v", err)
 	}
-	// Reaching here means no apply was attempted, so nothing marked the user's
-	// approval `failed` and nothing alarmed them.
+	if len(exec.requests) != 0 {
+		t.Errorf("destructive DDL reached the destination connector: %v", exec.operations())
+	}
+	if len(*sent) != 0 {
+		t.Errorf("approving destructive DDL raised %d notification(s); first: %s", len(*sent), (*sent)[0].UserMessage)
+	}
 }
 
 // B1: the same guarantee for advisory notes. Approving one used to send a SQL
 // comment to the destination, which executed it happily and left the row marked
-// `applied` having applied nothing — the C1 falsehood from the other side. Same
-// nil-db Agent, so a regression that reaches applyMigration panics here.
+// `applied` having applied nothing — the C1 falsehood from the other side. A dropped
+// column is now an advisory note too (DroppedColumnNote), so an old pending row for one
+// must record the approval and run nothing.
 func TestHandleApprovedChange_AdvisoryDDL_NotApplied(t *testing.T) {
 	for _, ddl := range []string{
 		"-- drift: table public.shipments appeared in source",
 		"-- drift: public.orders.note declared type changed in the source from varchar(50) to varchar(10) (both map to string, so the destination column is unchanged)",
+		DroppedColumnNote("public.orders", "note"),
 	} {
-		a := &Agent{}
+		exec := &recordingExecutor{}
+		a := &Agent{mcpClient: exec, loadDestination: postgresDestination}
+		sent := captureNotifications(a)
 		payload, err := json.Marshal(map[string]interface{}{
 			"event_type":  "schema_change_approved",
 			"approval_id": "approval-advisory",
@@ -151,6 +159,12 @@ func TestHandleApprovedChange_AdvisoryDDL_NotApplied(t *testing.T) {
 		}
 		if err := a.handleApprovedChange(context.Background(), &sarama.ConsumerMessage{Value: payload}); err != nil {
 			t.Fatalf("handleApprovedChange(%q) returned error: %v", ddl, err)
+		}
+		if len(exec.requests) != 0 {
+			t.Errorf("advisory note %q reached the destination connector: %v", ddl, exec.operations())
+		}
+		if len(*sent) != 0 {
+			t.Errorf("approving advisory note %q raised %d notification(s); first: %s", ddl, len(*sent), (*sent)[0].UserMessage)
 		}
 	}
 }

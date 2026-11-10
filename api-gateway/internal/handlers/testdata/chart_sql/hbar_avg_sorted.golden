@@ -1,0 +1,71 @@
+# settings: {"type":"hbar","x":{"column":"region"},"measure":{"aggregate":"avg","column":"amount","format":"decimal"},"sort":"value_asc"}
+
+-- postgres
+SELECT src."region" AS "region", AVG(src."amount") AS "amount"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY src."region"
+ORDER BY AVG(src."amount") ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT src.`region` AS `region`, AVG(src.`amount`) AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`
+ORDER BY AVG(src.`amount`) ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) src.[region] AS [region], AVG(src.[amount]) AS [amount]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY src.[region]
+ORDER BY AVG(src.[amount]) ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT src.`region` AS `region`, AVG(src.`amount`) AS `amount`
+FROM `gold`.`orders` src
+GROUP BY src.`region`
+ORDER BY AVG(src.`amount`) ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT src."REGION" AS "REGION", AVG(src."AMOUNT") AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."REGION"
+ORDER BY AVG(src."AMOUNT") ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT src.`region` AS `region`, AVG(src.`amount`) AS `amount`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY src.`region`
+ORDER BY AVG(src.`amount`) ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT src.`region` AS `region`, AVG(src.`amount`) AS `amount`
+FROM `gold`.`orders` src
+GROUP BY src.`region`
+ORDER BY AVG(src.`amount`) ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT src."REGION" AS "REGION", AVG(src."AMOUNT") AS "AMOUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."REGION"
+ORDER BY AVG(src."AMOUNT") ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

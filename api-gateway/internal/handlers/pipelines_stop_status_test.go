@@ -211,3 +211,164 @@ func TestStopPipeline_BatchStopSucceedsWhenTheSinkStopFails(t *testing.T) {
 		t.Fatalf("db expectations: %v", err)
 	}
 }
+
+// Stop tells the pipeline's owner, through the notifier (bell and Slack), every
+// time, the owner's own Stop included: on a shared workspace the owner is often
+// not the one who pressed it, and a stopped stream looks the same as a running
+// one from outside. A streaming CDC pipeline has no live run whose end would
+// raise the temporal adapter's PIPELINE_RUN_STOPPED: its setup run finished
+// long ago, so the gateway is the only one who can say it.
+func TestStopPipeline_StreamingCDCStopTellsTheOwnerOnce(t *testing.T) {
+	mock, _, _, cleanup := stopCDCHarness(t, "running", http.StatusOK)
+	defer cleanup()
+	// The setup run's workflow is long finished: the cancel signal is answered
+	// "already completed", so no workflow is left to report the stop.
+	tc := installHITLTemporal(t, nil, []string{wsScopeExecution})
+	rec := captureRunNotices(t)
+
+	mock.ExpectQuery(`FROM pipeline_progress`).WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"execution_id"}).AddRow(wsScopeExecution))
+	mock.ExpectExec(`UPDATE pipelines SET status = 'stopped'`).
+		WithArgs(wsScopePipeline, wsScopeWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE executions[\s\S]*WHERE id = \$1 AND status IN`).
+		WithArgs(wsScopeExecution).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`UPDATE pipeline_progress`).
+		WithArgs(wsScopePipeline, wsScopeExecution).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE executions[\s\S]*WHERE pipeline_id = \$1 AND status IN \('running','pending'\)`).
+		WithArgs(wsScopePipeline).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := serveStop(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := tc.delivered(); len(got) != 0 {
+		t.Fatalf("signals delivered = %v; the setup run is closed, nothing should have received one", got)
+	}
+
+	sent := rec.notices(t)
+	if len(sent) != 1 {
+		t.Fatalf("stop notices sent = %d, want exactly 1: the owner of a stopped stream is told once", len(sent))
+	}
+	n := sent[0]
+	env := noticeError(t, n)
+	if env["code"] != "CDC_PIPELINE_STOPPED" {
+		t.Errorf("code = %v, want CDC_PIPELINE_STOPPED: a stream was stopped, no run ended", env["code"])
+	}
+	if n["pipeline_id"] != wsScopePipeline {
+		t.Errorf("pipeline_id = %v, want %s: the notifier routes to that pipeline's owner", n["pipeline_id"], wsScopePipeline)
+	}
+	if env["severity"] != "warning" {
+		t.Errorf("severity = %v, want warning", env["severity"])
+	}
+	if n["action_url"] != "/pipelines/"+wsScopePipeline {
+		t.Errorf("action_url = %v", n["action_url"])
+	}
+	if s, _ := env["dedup_subject"].(string); !strings.HasPrefix(s, "user-stop|") {
+		t.Errorf("dedup_subject = %q, want a user-stop|<time> subject: a second Stop is a second stop", s)
+	}
+	assertMetadataOnly(t, n, "pipeline_id")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// The control: a batch Stop whose cancel signal reached the run's live workflow
+// is reported by that workflow, whose terminal defer raises PIPELINE_RUN_STOPPED
+// (temporal adapter pipeline_failure_notification.go). The gateway saying it
+// too would tell the owner twice.
+func TestStopPipeline_StopThatReachedALiveWorkflowLeavesTheNoticeToIt(t *testing.T) {
+	mock, cleanup := stopBatchHarnessWithExecution(t)
+	defer cleanup()
+	tc := installHITLTemporal(t, []string{wsScopeExecution}, nil)
+	rec := captureRunNotices(t)
+
+	w := serveStop(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := tc.delivered(); len(got) != 1 || got[0] != wsScopeExecution+" cancel" {
+		t.Fatalf("signals delivered = %v; the control needs the cancel to reach the live run", got)
+	}
+	if sent := rec.notices(t); len(sent) != 0 {
+		t.Fatalf("stop notices sent = %d, want 0: the live workflow reports its own stop", len(sent))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// ...and the same batch Stop with no live workflow to receive the signal is the
+// gateway's to report, keyed by the run's execution id: if the run's workflow
+// does raise PIPELINE_RUN_STOPPED for it after all, the notifier sees the same
+// code, link and subject, and the owner is told once.
+func TestStopPipeline_BatchStopThatReachedNoWorkflowTellsTheOwner(t *testing.T) {
+	mock, cleanup := stopBatchHarnessWithExecution(t)
+	defer cleanup()
+	installHITLTemporal(t, nil, []string{wsScopeExecution})
+	rec := captureRunNotices(t)
+
+	w := serveStop(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	sent := rec.notices(t)
+	if len(sent) != 1 {
+		t.Fatalf("stop notices sent = %d, want 1", len(sent))
+	}
+	env := noticeError(t, sent[0])
+	if env["code"] != "PIPELINE_RUN_STOPPED" || env["dedup_subject"] != wsScopeExecution {
+		t.Errorf("code = %v, dedup_subject = %v; want PIPELINE_RUN_STOPPED keyed by the execution id, as the adapter keys it",
+			env["code"], env["dedup_subject"])
+	}
+	assertMetadataOnly(t, sent[0], "pipeline_id")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// A Stop the connector refused stopped nothing, so there is nothing to tell.
+func TestStopPipeline_CDCConnectorRefusedTellsNobody(t *testing.T) {
+	mock, _, _, cleanup := stopCDCHarness(t, "running", http.StatusBadGateway)
+	defer cleanup()
+	installHITLTemporal(t, nil, nil)
+	rec := captureRunNotices(t)
+
+	w := serveStop(t)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s; want the orchestrator's 502", w.Code, w.Body.String())
+	}
+	if sent := rec.notices(t); len(sent) != 0 {
+		t.Fatalf("stop notices sent = %d, want 0 for a stop that did not happen", len(sent))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// stopBatchHarnessWithExecution is a running batch pipeline whose current run is
+// wsScopeExecution, with the writes Stop makes for it.
+func stopBatchHarnessWithExecution(t *testing.T) (sqlmock.Sqlmock, func()) {
+	t.Helper()
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	t.Setenv("ORCHESTRATOR_URL", orch.URL)
+
+	mock, cleanup := wsScopeMockDB(t)
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
+		WithArgs(wsScopePipeline, wsScopeUser, wsScopeWS).
+		WillReturnRows(gateRoleRows("member"))
+	mock.ExpectQuery(`SELECT p\.status, .* FROM pipelines p WHERE p\.id = \$1 AND p\.workspace_id = \$2`).
+		WithArgs(wsScopePipeline, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "is_cdc"}).AddRow("running", false))
+	mock.ExpectQuery(`FROM pipeline_progress`).WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"execution_id"}).AddRow(wsScopeExecution))
+	mock.ExpectExec(`UPDATE pipelines SET status = 'stopped'`).
+		WithArgs(wsScopePipeline, wsScopeWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE executions[\s\S]*WHERE id = \$1 AND status IN`).
+		WithArgs(wsScopeExecution).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE pipeline_progress`).
+		WithArgs(wsScopePipeline, wsScopeExecution).WillReturnResult(sqlmock.NewResult(0, 1))
+	return mock, func() { cleanup(); orch.Close() }
+}

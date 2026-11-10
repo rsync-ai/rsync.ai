@@ -22,7 +22,10 @@ import { fetchMCPConnectors, fetchMCPConnector, saveConnection } from "@/lib/api
 import { GenericConnectorForm } from "@/components/connectors/GenericConnectorForm"
 import { classifyError } from "@/lib/utils/error-handling"
 import { ConnectionLogo } from "@/components/connectors/ConnectionLogo"
+import { ConnectorGeneratedByNote } from "@/components/connectors/ConnectorGeneratedByNote"
 import { safeNextPath } from "@/lib/auth/safe-next"
+import { SampleRowsNotice } from "@/components/assistant/SampleRowsNotice"
+import { notifyTableCheck } from "@/components/connectors/ConnectionTablesCheck"
 
 // The wizard owns direction + connector selection; the shared GenericConnectorForm
 // owns configure + test + save (name, type, sync/CDC mode, the auth-method picker,
@@ -164,13 +167,14 @@ function NewConnectionPageContent() {
   const handleSaveConnection = async (payload: Record<string, unknown>) => {
     if (!payload.connection_type) payload.connection_type = connectionType
     if (!payload.connector_type) payload.connector_type = selectedConnector?.name
-    await saveConnection(payload)
+    const saved = await saveConnection(payload)
     toast.success("Connection created successfully!")
+    notifyTableCheck(saved)
     router.push(returnTo)
   }
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto">
+    <div className="space-y-5 max-w-4xl mx-auto">
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button asChild variant="ghost" size="icon">
@@ -179,7 +183,7 @@ function NewConnectionPageContent() {
           </Link>
         </Button>
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-white">
+          <h1 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">
             Add New Connection
           </h1>
           <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
@@ -187,6 +191,8 @@ function NewConnectionPageContent() {
           </p>
         </div>
       </div>
+
+      <SampleRowsNotice />
 
       {/* Progress Steps */}
       <div className="flex items-center gap-4 py-4 flex-wrap">
@@ -284,7 +290,7 @@ function NewConnectionPageContent() {
                     {Object.entries(groupedConnectors).map(([category, items]) => (
                       <div key={category}>
                         <h4 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-3 capitalize">{category}</h4>
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                        <div className="grid grid-cols-1 @xl:grid-cols-2 @3xl:grid-cols-3 gap-3">
                           {items.map((connector) => (
                             <button
                               key={connector.name}
@@ -339,6 +345,7 @@ function NewConnectionPageContent() {
                       {selectedConnector.display_name}
                     </p>
                     <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{selectedConnector.description}</p>
+                    <ConnectorGeneratedByNote connector={selectedConnector} className="mt-1" />
                   </div>
                   <Button variant="outline" size="sm" onClick={backToConnectorList}>
                     <ArrowLeft className="h-4 w-4 mr-2" />
@@ -375,7 +382,7 @@ function StepIndicator({ step, currentStep, label }: { step: Step; currentStep: 
         "flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium transition-all",
         isComplete && "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300",
         isCurrent && "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300",
-        !isComplete && !isCurrent && "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400",
+        !isComplete && !isCurrent && "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
       )}
     >
       {isComplete ? (

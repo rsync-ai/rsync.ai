@@ -7,8 +7,8 @@ import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { adminRead, type AdminReadFailure } from "@/lib/api/admin"
+import { AdminReadFailureState } from "@/components/admin/AdminStates"
 
 type RawEventsResponse = {
   pipeline_id: string
@@ -31,15 +31,14 @@ export default function AdminRawEventsPage() {
   const [justification, setJustification] = useState("")
 
   const [loading, setLoading] = useState(false)
-  const [status, setStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
+  /** A form field the request cannot be sent without. */
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<RawEventsResponse | null>(null)
 
   async function run() {
     setLoading(true)
-    setStatus(null)
-    setRetryAfter(null)
+    setFailure(null)
     setError(null)
     setData(null)
 
@@ -60,47 +59,17 @@ export default function AdminRawEventsPage() {
     if (Number.isFinite(lim) && lim > 0) params.set("limit", String(lim))
     if (executionId.trim()) params.set("execution_id", executionId.trim())
 
-    const res = await authFetch(`/api/v1/admin/pipelines/${encodeURIComponent(pid)}/events/raw?${params.toString()}`, {
-      method: "POST",
-      body: JSON.stringify({ justification: justification.trim() }),
-    }).catch(() => null)
-
-    if (!res) {
-      setError("Network error")
-      setLoading(false)
-      return
-    }
-
-    if (res.status === 401) {
-      window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`
-      return
-    }
-    if (res.status === 403) {
-      setStatus(403)
-      setLoading(false)
-      return
-    }
-    if (res.status === 429) {
-      setStatus(429)
-      const ra = parseInt(res.headers.get("Retry-After") || "", 10)
-      setRetryAfter(Number.isFinite(ra) ? ra : null)
-      setLoading(false)
-      return
-    }
-    if (!res.ok) {
-      const json = await res.json().catch(() => null)
-      setError((json && (json.error || json.message)) || `HTTP ${res.status}`)
-      setLoading(false)
-      return
-    }
-
-    const json = (await res.json().catch(() => null)) as RawEventsResponse | null
-    setData(json)
+    const r = await adminRead<RawEventsResponse>(
+      `/api/v1/admin/pipelines/${encodeURIComponent(pid)}/events/raw?${params.toString()}`,
+      { method: "POST", body: JSON.stringify({ justification: justification.trim() }) },
+    )
+    if (r.ok) setData(r.data)
+    else setFailure(r)
     setLoading(false)
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader
         heading="Admin: Raw events"
         description="Fetch less-redacted pipeline events. Requires justification and is audited."
@@ -108,7 +77,7 @@ export default function AdminRawEventsPage() {
       <AdminNav />
 
       <Card className="p-4 space-y-3">
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="grid gap-3 @xl:grid-cols-2">
           <div className="space-y-1">
             <div className="text-sm text-zinc-500 dark:text-zinc-400">Pipeline ID</div>
             <Input value={pipelineId} onChange={(e) => setPipelineId(e.target.value)} placeholder="uuid" />
@@ -119,7 +88,7 @@ export default function AdminRawEventsPage() {
           </div>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="grid gap-3 @xl:grid-cols-2">
           <div className="space-y-1">
             <div className="text-sm text-zinc-500 dark:text-zinc-400">Limit (max 200)</div>
             <Input value={limit} onChange={(e) => setLimit(e.target.value)} placeholder="50" />
@@ -143,8 +112,7 @@ export default function AdminRawEventsPage() {
             onClick={() => {
               setData(null)
               setError(null)
-              setStatus(null)
-              setRetryAfter(null)
+              setFailure(null)
             }}
           >
             Clear
@@ -152,8 +120,7 @@ export default function AdminRawEventsPage() {
         </div>
       </Card>
 
-      {status === 403 ? <AccessDeniedState /> : null}
-      {status === 429 ? <RateLimitExceededState retryAfterSeconds={retryAfter} /> : null}
+      {failure ? <AdminReadFailureState failure={failure} onRetry={run} /> : null}
 
       {error ? (
         <Card className="border border-red-200 bg-red-50 p-4 dark:border-red-900/40 dark:bg-red-950/20">

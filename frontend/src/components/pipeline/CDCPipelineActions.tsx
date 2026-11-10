@@ -49,9 +49,17 @@ interface CDCPipelineActionsProps {
   // Destination connection name, surfaced in the Reload confirm dialog so the user
   // sees exactly which destination will be dropped and rebuilt.
   destinationName?: string
+  // false when the destination is an app's API (reverse ETL): the gateway refuses a
+  // Reload, so the button is not offered.
+  reloadSupported?: boolean
 }
 
-export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCPipelineActionsProps) {
+export function CDCPipelineActions({
+  pipelineId,
+  status,
+  destinationName,
+  reloadSupported = true,
+}: CDCPipelineActionsProps) {
   const router = useRouter()
   const [isLoading, setIsLoading] = useState(false)
   const [loadingAction, setLoadingAction] = useState<string | null>(null)
@@ -82,7 +90,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
   // The dependency-aware /runtime endpoint is the source of truth for whether the CDC
   // stream is actually alive. /state can freeze at "running" after the feed dies, so
   // gating actions on it alone paints a dead stream as "running" (→ Pause) instead of
-  // offering recovery. Mirror PipelineExecutionStatusBadge's reconciliation.
+  // offering recovery; see reconcilePipelineStatus below.
   const { runtime } = usePipelineRuntime(pipelineId)
 
   // The header's one shared /state poll (usePipelineStatePoll); the server-rendered
@@ -132,7 +140,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       } else {
         toast.error(await readResponseErrorMessage(response, "Pause"))
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to pause CDC pipeline")
     } finally {
       setIsLoading(false)
@@ -157,7 +165,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       } else {
         toast.error(await readResponseErrorMessage(response, "Resume"))
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to resume CDC pipeline")
     } finally {
       setIsLoading(false)
@@ -342,7 +350,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
         {isRunning ? null : isPaused ? (
           <Button
             size="sm"
-            className="bg-gradient-to-r from-violet-600 to-indigo-600"
             onClick={handleResumeConnector}
             disabled={isLoading}
           >
@@ -360,7 +367,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
           <>
             <Button
               size="sm"
-              className="bg-gradient-to-r from-violet-600 to-indigo-600"
               onClick={handleStart}
               disabled={isLoading}
               title={
@@ -408,25 +414,26 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                 Recover
               </Button>
             )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setReloadConfirmOpen(true)}
-              disabled={isLoading}
-              title="Reload: drop and rebuild the destination, re-copying all data from scratch."
-            >
-              {loadingAction === "reload" ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
-                <RefreshCw className="h-4 w-4 mr-2" />
-              )}
-              Reload
-            </Button>
+            {reloadSupported && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setReloadConfirmOpen(true)}
+                disabled={isLoading}
+                title="Reload: drop and rebuild the destination, re-copying all data from scratch."
+              >
+                {loadingAction === "reload" ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                )}
+                Reload
+              </Button>
+            )}
           </>
         ) : (
           <Button
             size="sm"
-            className="bg-gradient-to-r from-violet-600 to-indigo-600"
             onClick={handleStart}
             disabled={isLoading}
             title={statusLabel}
@@ -547,10 +554,12 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                     </div>
                   </dl>
                 ) : null}
-                <p className="text-xs">
-                  If the stream cannot be repositioned, use <span className="font-medium">Reload</span> to
-                  rebuild from scratch.
-                </p>
+                {reloadSupported && (
+                  <p className="text-xs">
+                    If the stream cannot be repositioned, use <span className="font-medium">Reload</span> to
+                    rebuild from scratch.
+                  </p>
+                )}
               </div>
             </AlertDialogDescription>
           </AlertDialogHeader>

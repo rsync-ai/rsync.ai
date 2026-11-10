@@ -253,15 +253,15 @@ template change would then be a 3-line descriptor emit — but that is explicitl
 - **Sink flush timer (separate fix, recommended alongside):** a small CDC batch waits for the
   flush interval before it is written; the timer is checked after each message and on the
   consumer's 1 s idle poll, but nothing flushes the moment a partition drains. The interval
-  defaults to 5 s for relational destinations (`newCDCDBBatcher`) and 30 s for object storage
-  (`resolveCDCBatchingParams`), where it can be set per destination with
+  defaults to 5 s for relational destinations (`newCDCDBBatcher`) and 240 s for object storage
+  (`newCDCObjectBatcher`), where it can be set per destination with
   `max_file_interval_seconds` (1–240 s; see
   [cloud-storage-config.md § Group C](cloud-storage-config.md)). Adding
   **flush-on-partition-drained** would remove that fixed wait on small/medium syncs. This is
   independent of the load-strategy work and can land separately.
-- **Batch size:** bulk paths benefit from larger batches. The CDC defaults are `maxEvents`
-  (2000) and `maxBytes` (24 MB) for both batchers; object storage can change them per
-  destination with `max_file_rows`/`max_file_mb`. `max_batch_size` can be raised once bulk is
+- **Batch size:** bulk paths benefit from larger batches. The relational CDC defaults are
+  `maxEvents` (2000) and `maxBytes` (24 MB); object storage has no row cap and rolls at
+  32 MB, and can change both per destination with `max_file_rows`/`max_file_mb`. `max_batch_size` can be raised once bulk is
   in place; tune against the destination's `max_batch_rows`.
 
 ---

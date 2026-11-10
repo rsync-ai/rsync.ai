@@ -22,7 +22,6 @@ messages:
       - State: {{state}}
       - Pending Source: {{pending_source}}
       - Pending Destination: {{pending_destination}}
-      - Last Assistant Message: {{last_response}}
       
       ## Extraction Rules
       
@@ -86,3 +85,11 @@ parameters:
   temperature: 0.0
   max_tokens: 300
   response_format: { "type": "json_object" }
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  user_message: user_text
+  state: enum
+  pending_source: identifier
+  pending_destination: identifier

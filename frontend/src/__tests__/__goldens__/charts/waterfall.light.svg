@@ -1,0 +1,58 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M41.2 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 226.5L560 226.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 186.5L560 186.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 147.5L560 147.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 107.5L560 107.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 67.5L560 67.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M41.2 28.5L560 28.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:Inter;" y="-3.0250000000000004" transform="translate(41.25 13)" fill="#71717a">Cash</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(300.625 288.95)" fill="#71717a">Step</text>
+<path d="M41.2 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#e4e4e7" stroke-linecap="round" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 265.95)" fill="#71717a">0</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 226.2917)" fill="#71717a">300</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 186.6333)" fill="#71717a">600</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 146.975)" fill="#71717a">900</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 107.3167)" fill="#71717a">1,200</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 67.6583)" fill="#71717a">1,500</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(33.25 28)" fill="#71717a">1,800</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(84.4792 273.95)" fill="#71717a">1 Opening</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(170.9375 273.95)" fill="#71717a">2 Sales</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(257.3958 273.95)" fill="#71717a">3 Refunds</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(343.8542 273.95)" fill="#71717a">4 Payroll</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(430.3125 273.95)" fill="#71717a">5 Interest</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(516.7708 273.95)" fill="#71717a">Total</text>
+<path d="M70.5 266l28 0l0 0l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M156.9 266l28 0l0 -132.2l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M243.4 266l28 0l0 -194.3l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="2" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M329.9 266l28 0l0 -99.1l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="3" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M416.3 266l28 0l0 -99.1l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="4" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M502.8 266l28 0l0 0l-28 0Z" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="5" ecmeta_ssr_type="chart" ecmeta_silent="true" class="zr-cls-0"></path>
+<path d="M72.5 133.8L96.5 133.8A2 2 0 0 1 98.5 135.8L98.5 264A2 2 0 0 1 96.5 266L72.5 266A2 2 0 0 1 70.5 264L70.5 135.8A2 2 0 0 1 72.5 133.8Z" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M158.9 47.8L182.9 47.8A2 2 0 0 1 184.9 49.8L184.9 131.8A2 2 0 0 1 182.9 133.8L158.9 133.8A2 2 0 0 1 156.9 131.8L156.9 49.8A2 2 0 0 1 158.9 47.8Z" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M245.4 47.8L269.4 47.8A2 2 0 0 1 271.4 49.8L271.4 69.6A2 2 0 0 1 269.4 71.6L245.4 71.6A2 2 0 0 1 243.4 69.6L243.4 49.8A2 2 0 0 1 245.4 47.8Z" fill="#de7b2a" ecmeta_series_index="1" ecmeta_data_index="2" ecmeta_ssr_type="chart" class="zr-cls-2"></path>
+<path d="M331.9 71.6L355.9 71.6A2 2 0 0 1 357.9 73.6L357.9 164.8A2 2 0 0 1 355.9 166.8L331.9 166.8A2 2 0 0 1 329.9 164.8L329.9 73.6A2 2 0 0 1 331.9 71.6Z" fill="#de7b2a" ecmeta_series_index="1" ecmeta_data_index="3" ecmeta_ssr_type="chart" class="zr-cls-2"></path>
+<path d="M418.3 160.9L442.3 160.9A2 2 0 0 1 444.3 162.9L444.3 164.8A2 2 0 0 1 442.3 166.8L418.3 166.8A2 2 0 0 1 416.3 164.8L416.3 162.9A2 2 0 0 1 418.3 160.9Z" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="4" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M504.8 160.9L528.8 160.9A2 2 0 0 1 530.8 162.9L530.8 264A2 2 0 0 1 528.8 266L504.8 266A2 2 0 0 1 502.8 264L502.8 162.9A2 2 0 0 1 504.8 160.9Z" fill="#8e8e98" ecmeta_series_index="1" ecmeta_data_index="5" ecmeta_ssr_type="chart" class="zr-cls-3"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+.zr-cls-2:hover {
+cursor:pointer;
+fill:rgba(244,135,46,1);
+}
+.zr-cls-3:hover {
+cursor:pointer;
+fill:rgba(156,156,167,1);
+}
+
+]]>
+
+</style>
+</svg>

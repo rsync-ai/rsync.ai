@@ -40,8 +40,8 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 import {
   PipelineLiveStatePanel,
   buildAgenticStagesFromEvents,
+  deriveStepInfo,
   finishedSetupSummary,
-  stepInfoFromEvents,
 } from "@/components/pipeline/PipelineLiveStatePanel"
 import type { PipelineRunEvent } from "@/lib/pipeline/eventNormalizer"
 import { stageTiming } from "@/lib/duration"
@@ -183,7 +183,7 @@ describe("a streaming CDC pipeline's Overview once setup is over", () => {
   })
 
   it("counts eight steps in the header, not nine", () => {
-    expect(stepInfoFromEvents(STREAMING, STATE as never)?.total_steps).toBe(8)
+    expect(deriveStepInfo(stagesOf(STREAMING), undefined, "running")?.total_steps).toBe(8)
   })
 
   it("does not call a stage that ran twice without failing retried", () => {

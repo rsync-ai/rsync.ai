@@ -486,16 +486,61 @@ def test_query_parameter_matching_ignores_case_but_keeps_the_declared_spelling()
     assert resource["limit_param"] == "PageSize"
 
 
-@pytest.mark.parametrize("param", ["updated_since", "modified_since", "if_modified_since"])
+@pytest.mark.parametrize("param", [
+    "updated_since", "modified_since", "since",
+    # Named any other way: an update-time stem, then a lower bound.
+    "date_updated_gt", "updatedAfter", "updated_at[gte]", "filter[modified][from]", "lastModifiedSince",
+])
 def test_a_modification_filter_enables_incremental_sync(param):
     resource = _only_resource(_convert(_paged([param])))
     assert resource["supports_incremental"] is True
     assert resource["incremental_param"] == param
 
 
+@pytest.mark.parametrize("param", [
+    # A created or event time never returns an edited record.
+    "created_since", "created_after", "start_time",
+    # An upper bound, or a time that is not a modification.
+    "updated_before", "updated_at_lt", "due_after",
+])
+def test_a_filter_that_misses_edits_is_no_incremental_claim(param):
+    resource = _only_resource(_convert(_paged([param])))
+    assert "supports_incremental" not in resource
+
+
+def test_the_named_filter_wins_over_a_shaped_one():
+    resource = _only_resource(_convert(_paged(["date_updated_gt", "updated_since"])))
+    assert resource["incremental_param"] == "updated_since"
+
+
 def test_no_modification_filter_means_no_incremental_claim():
     resource = _only_resource(_convert(_paged(["limit"])))
     assert "supports_incremental" not in resource
+
+
+def _assigned_literal(path, name):
+    """The literal a module assigns to `name` (a tuple, or a regex's pattern)."""
+    with open(path) as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            value = node.value
+            if isinstance(value, ast.Call):  # re.compile("…")
+                value = value.args[0]
+            return ast.literal_eval(value)
+    raise AssertionError(f"{name} is not assigned in {path}")
+
+
+def test_the_scaffold_reads_incremental_filters_like_the_discovery_path():
+    """The scaffold cannot import `openapi_discovery` (it is offline, stdlib only),
+    so it keeps its own copy of the same rule; the two must not drift."""
+    tg = os.path.join(os.path.dirname(__file__), "..", "src", "agents", "tool_generator")
+    scaffold = os.path.join(tg, "scaffold", "openapi_to_spec.py")
+    discovery = os.path.join(tg, "utils", "openapi_discovery.py")
+    assert _assigned_literal(scaffold, "_INCREMENTAL_PARAM_CANDIDATES") == _assigned_literal(
+        discovery, "_INCREMENTAL_PARAMS")
+    assert _assigned_literal(scaffold, "_INCREMENTAL_PARAM_RE") == _assigned_literal(
+        discovery, "_INCREMENTAL_PARAM_RE")
 
 
 def _enveloped(schema, components=None):

@@ -52,7 +52,7 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # base_connector lives next to this file in the Docker image; in the repo we walk
 # up so tests can import offline (clickhouse_connect is imported lazily in _connect).
@@ -83,6 +83,13 @@ except ImportError:  # pragma: no cover - dev/test path
 # to canonical_types (`COPY --from=shared namespace_filter.py`); the import above
 # already put the public/ root on sys.path for dev/test.
 import namespace_filter  # noqa: E402
+
+# Stable batch paging (KI-WAREHOUSE-BATCH-PAGING-UNORDERED), shipped the same
+# way (`COPY --from=shared sql_paging.py`).
+try:
+    import sql_paging  # noqa: E402
+except ImportError:  # pragma: no cover - an image built before it shipped
+    sql_paging = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -636,9 +643,11 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             self._safe_close(client)
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
-        """Optimized paginated read (offset default, keyset when cursor_column is
-        given, verbatim single-page for a raw query). Returns
-        paging_mode/has_more/next_cursor/truncated."""
+        """One page of a table, or a verbatim query as a single page.
+
+        A table pages through ``sql_paging``: a ClickHouse sorting key is not
+        unique, so a sweep orders by every orderable column (``cursor_column``
+        first, then the sorting key; KI-WAREHOUSE-BATCH-PAGING-UNORDERED)."""
         params = params or {}
         config = self._get_config(params)
         table = (params.get("table") or params.get("object") or "").strip()
@@ -656,7 +665,6 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if cursor_column is None:
                 return {"success": False,
                         "error": f"Unsafe cursor_column identifier: {raw_cursor!r}"}
-        cursor_value = params.get("cursor_value")
 
         if not table and not raw_query:
             return {"success": False, "error": "Missing 'table' (or 'query') parameter"}
@@ -664,64 +672,53 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             scope_error = self._server_level_read_error(config, table)
             if scope_error:
                 return {"success": False, "error": scope_error}
-
-        offset = 0
-        if raw_query:
-            paging_mode, sql = "query", raw_query
-        elif cursor_column:
-            paging_mode = "keyset"
-            db, tbl = self._resolve_db_table(config, table, params)
-            fq = self._qualify(db, tbl)
-            where = ""
-            if cursor_value is not None:
-                where = f"WHERE `{cursor_column}` > {self._sql_literal(cursor_value)} "
-            sql = (f"SELECT * FROM {fq} {where}"
-                   f"ORDER BY `{cursor_column}` ASC LIMIT {limit}")
-        else:
-            paging_mode = "offset"
-            offset = int(params.get("offset", 0) or 0)
-            db, tbl = self._resolve_db_table(config, table, params)
-            fq = self._qualify(db, tbl)
-            sql = f"SELECT * FROM {fq} LIMIT {limit} OFFSET {offset}"
+        if not raw_query and sql_paging is None:
+            return {"success": False,
+                    "error": "sql_paging.py is missing from this connector image; rebuild it"}
+        db, tbl = self._resolve_db_table(config, table, params) if not raw_query else ("", "")
 
         client = None
         try:
             client = self._connect(config)
-            qr = client.query(sql)
-            columns = list(qr.column_names)
-            data = [
-                {columns[i]: self._jsonify(row[i]) for i in range(len(columns))}
-                for row in qr.result_rows
-            ]
+            if not raw_query:
+                cur = sql_paging.QueryCursor(lambda sql, binds: self._run_query(client, sql, binds))
+                return sql_paging.export_page(
+                    client, cur, sql_paging.CLICKHOUSE, f"{db}.{tbl}", self._qualify(db, tbl), params,
+                    limit=limit, nominated=cursor_column or None,
+                    to_dict=lambda row, desc: {desc[i][0]: self._jsonify(row[i]) for i in range(len(desc))})
+            columns, rows = self._run_query(client, raw_query, None)
+            data = [{columns[i]: self._jsonify(row[i]) for i in range(len(columns))} for row in rows]
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
         finally:
             self._safe_close(client)
 
-        full_page = len(data) == limit
-        truncated = (paging_mode == "query") and full_page
-        has_more = (paging_mode != "query") and full_page
-        next_cursor = None
-        if has_more:
-            if paging_mode == "keyset":
-                next_cursor = data[-1].get(cursor_column) if data else None
-                if next_cursor is None:
-                    return {"success": False,
-                            "error": (f"keyset cursor column '{cursor_column}' missing "
-                                      "from result rows; cannot continue")}
-            else:
-                next_cursor = str(offset + limit)
-
+        # A verbatim query is one page; a full one may have been cut short.
         return {
             "success": True,
             "data": data,
             "columns": columns,
             "total_records": len(data),
-            "paging_mode": paging_mode,
-            "has_more": has_more,
-            "next_cursor": next_cursor,
-            "truncated": truncated,
+            "paging_mode": "query",
+            "has_more": False,
+            "next_cursor": None,
+            "truncated": len(data) == limit,
         }
+
+    def _run_query(self, client, sql: str, binds: Optional[Sequence[Any]]) -> Tuple[List[str], List[Any]]:
+        """(column names, rows) of ``sql``, each ``%s`` replaced by the next
+        bind as a literal. The binds are catalog names and the connector's own
+        cursor values; the SQL around them is built from checked identifiers."""
+        if binds:
+            pieces = sql.split("%s")
+            if len(pieces) != len(binds) + 1:
+                raise ValueError("bind count does not match the query's placeholders")
+            out = [pieces[0]]
+            for value, piece in zip(binds, pieces[1:]):
+                out += [self._sql_literal(value), piece]
+            sql = "".join(out)
+        qr = client.query(sql)
+        return list(qr.column_names), list(qr.result_rows)
 
     @staticmethod
     def _sql_literal(v: Any) -> str:
@@ -1053,19 +1050,31 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
         validated single-statement-ness before delegating here (executor.go
         ExplorerExecute → Operation "execute"); this method does not re-authorize.
         Read-shaped statements return rows/columns; everything else runs as a
-        command and reports rows_affected when ClickHouse exposes one."""
+        command and reports rows_affected when ClickHouse exposes one.
+
+        ``timeout_seconds`` (models) is a server-side deadline: it goes on the
+        call as ``max_execution_time``, so ClickHouse cancels the statement
+        itself. The client's HTTP read timeout (``send_receive_timeout``, from
+        ``query_timeout``, default 300 s) is raised to at least the deadline +
+        30 s so the socket never drops before ClickHouse reports the timeout."""
         params = params or {}
         config = self._get_config(params)
         sql = (params.get("statement") or params.get("query")
                or params.get("sql") or "").strip()
         if not sql:
             return {"success": False, "error": "Missing 'statement' (or 'query'/'sql')"}
+        timeout = self._timeout_seconds(params)
+        settings = None
+        if timeout:
+            settings = {"max_execution_time": timeout}
+            config["query_timeout"] = max(int(config.get("query_timeout") or 300),
+                                          timeout + 30)
 
         client = None
         try:
             client = self._connect(config)
             if self._READ_STMT_RE.match(self._strip_leading_sql_comments(sql)):
-                qr = client.query(sql)
+                qr = client.query(sql, settings=settings)
                 columns = list(qr.column_names)
                 data = [
                     {columns[i]: self._jsonify(row[i]) for i in range(len(columns))}
@@ -1073,13 +1082,25 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 ]
                 return {"success": True, "data": data, "columns": columns,
                         "row_count": len(data), "rows_affected": len(data)}
-            summary = client.command(sql)
+            summary = client.command(sql, settings=settings)
             return {"success": True, "executed": True,
                     "rows_affected": self._rows_affected_from_summary(summary, client)}
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
         finally:
             self._safe_close(client)
+
+    @staticmethod
+    def _timeout_seconds(params: Dict) -> Optional[int]:
+        """``timeout_seconds`` as a positive int, else None (no deadline)."""
+        v = params.get("timeout_seconds")
+        if isinstance(v, bool):
+            return None
+        try:
+            t = int(v)
+        except (TypeError, ValueError):
+            return None
+        return t if t > 0 else None
 
     @staticmethod
     def _strip_leading_sql_comments(sql: str) -> str:
@@ -1192,7 +1213,11 @@ def create_http_app():
 
     @app.post("/mcp")
     async def mcp(request: dict):
-        return server.handle_request(request)
+        # A model statement can run for minutes; run the blocking driver call
+        # on a worker thread so /health and other requests keep being served.
+        # The shared server is safe here: per-call state lives in params/config.
+        import asyncio
+        return await asyncio.to_thread(server.handle_request, request)
 
     @app.post("/invoke/{tool_name}")
     async def invoke(tool_name: str, params: dict = {}):
@@ -1234,7 +1259,8 @@ def create_http_app():
 
     @app.post("/execute")
     async def execute(params: dict = {}):
-        return server.execute(params)
+        import asyncio
+        return await asyncio.to_thread(server.execute, params)
 
     @app.post("/ensure_table")
     async def ensure_table(params: dict = {}):

@@ -71,6 +71,9 @@ type maskSpec struct {
 	pathNames []string
 	maskType  string
 	hashFunc  string
+	// remove drops a matched key instead of writing a masked value into it
+	// (mask_type "remove"). applyMask returns a value, so it cannot do this.
+	remove bool
 }
 
 func parseMaskStrings(v interface{}) []string {
@@ -188,6 +191,7 @@ func parseMaskSpec(config map[string]interface{}) (*maskSpec, error) {
 	if mt, ok := config["mask_type"].(string); ok && strings.TrimSpace(mt) != "" {
 		spec.maskType = mt
 	}
+	spec.remove = strings.EqualFold(strings.TrimSpace(spec.maskType), "remove")
 
 	// hash_function selects the digest used when mask_type=hash.
 	// Defaults to sha256 for backward compatibility.
@@ -195,7 +199,33 @@ func parseMaskSpec(config map[string]interface{}) (*maskSpec, error) {
 	if hf, ok := config["hash_function"].(string); ok && strings.TrimSpace(hf) != "" {
 		spec.hashFunc = strings.ToLower(strings.TrimSpace(hf))
 	}
+	if err := keyedHashWithoutKey(spec.maskType, spec.hashFunc); err != nil {
+		return nil, err
+	}
 	return spec, nil
+}
+
+// keyedHashWithoutKey refuses an hmac_sha256 hash when this process has no PII
+// hash key. HMAC under an empty key is a public function: anyone can hash every
+// candidate value of a low-cardinality column (gender, country) and read the
+// column back, so a rule labelled "keyed" must not quietly run unkeyed.
+// sha256/md5 are not refused - rules saved before a key existed keep running.
+func keyedHashWithoutKey(maskType, hashFunc string) error {
+	mt := strings.ToLower(strings.TrimSpace(maskType))
+	if mt != "" && mt != "hash" {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(hashFunc)) {
+	case "hmac_sha256", "hmac-sha256", "hmac256":
+	default:
+		return nil
+	}
+	if PIIHashKeyConfigured() {
+		return nil
+	}
+	return fmt.Errorf("mask_pii hash_function %q needs the install's PII hash key, and none is set: "+
+		"set RSYNC_PII_HASH_SALT (the same value) on the api-gateway, orchestrator and kafka-mcp-sink, "+
+		"or pick sha256", strings.TrimSpace(hashFunc))
 }
 
 // ApplyMaskWithStats applies one mask_pii config and reports how many values
@@ -225,8 +255,10 @@ func (e *SimpleTransformEngine) ApplyMaskWithStats(ctx context.Context, data []R
 			// Historical top-level path: exact key match, nested values shared.
 			for k, v := range row {
 				if idx, ok := spec.colIdx[k]; ok {
-					newRow[k] = applyMask(v, spec.maskType, spec.hashFunc)
 					counts[idx]++
+					if !spec.remove {
+						newRow[k] = applyMask(v, spec.maskType, spec.hashFunc)
+					}
 				} else {
 					newRow[k] = v
 				}
@@ -234,8 +266,10 @@ func (e *SimpleTransformEngine) ApplyMaskWithStats(ctx context.Context, data []R
 		default:
 			for k, v := range row {
 				if idx, ok := spec.deepIdx[strings.ToLower(k)]; ok {
-					newRow[k] = applyMask(v, spec.maskType, spec.hashFunc)
 					counts[idx]++
+					if !spec.remove {
+						newRow[k] = applyMask(v, spec.maskType, spec.hashFunc)
+					}
 					continue
 				}
 				nv, _ := spec.maskDeepValue(v, counts)
@@ -318,10 +352,11 @@ func (s *maskSpec) maskDeepMap(src map[string]interface{}, counts []int) (map[st
 	for k, val := range src {
 		var nv interface{}
 		changed := false
+		matched := false
 		if idx, ok := s.deepIdx[strings.ToLower(k)]; ok {
 			nv = applyMask(val, s.maskType, s.hashFunc)
 			counts[idx]++
-			changed = true
+			changed, matched = true, true
 		} else {
 			nv, changed = s.maskDeepValue(val, counts)
 		}
@@ -333,6 +368,10 @@ func (s *maskSpec) maskDeepMap(src map[string]interface{}, counts []int) (map[st
 			for k2, v2 := range src {
 				cp[k2] = v2
 			}
+		}
+		if matched && s.remove {
+			delete(cp, k)
+			continue
 		}
 		cp[k] = nv
 	}
@@ -417,6 +456,10 @@ func (s *maskSpec) maskMapAtPath(src map[string]interface{}, segs []string) (map
 	cp := make(map[string]interface{}, len(src))
 	for k, v := range src {
 		cp[k] = v
+	}
+	if len(segs) == 1 && s.remove {
+		delete(cp, segs[0])
+		return cp, n
 	}
 	cp[segs[0]] = nv
 	return cp, n

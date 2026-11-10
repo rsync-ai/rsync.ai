@@ -101,11 +101,14 @@ export function buildQuickPipelines(connections: HomeConnection[]): QuickPipelin
   return QUICK_PIPELINES.filter((p) => !p.demo).map((p) => ({ ...p, needsConnection: true }));
 }
 
-/** Example prompts for the hero input, grounded in the first suggestion the user can run. */
+/**
+ * Example prompts for the hero input, grounded in the first suggestion the user
+ * can run. Product names keep their makers' capitals (MongoDB, BigQuery).
+ */
 export function buildExamplePrompts(suggestions: QuickPipeline[]): string[] {
   const ready = suggestions.find((p) => !p.needsConnection && !p.demo);
-  if (!ready) return ['sync mysql to s3', 'backup postgres daily', 'stream mongodb changes to bigquery'];
-  const src = shortConnectorName(ready.source).toLowerCase();
-  const dst = shortConnectorName(ready.destination).toLowerCase();
-  return [`sync ${src} to ${dst}`, `stream ${src} changes to ${dst}`, `copy ${src} to ${dst} every night`];
+  if (!ready) return ['Sync MySQL to S3', 'Back up Postgres daily', 'Stream MongoDB changes to BigQuery'];
+  const src = shortConnectorName(ready.source);
+  const dst = shortConnectorName(ready.destination);
+  return [`Sync ${src} to ${dst}`, `Stream ${src} changes to ${dst}`, `Copy ${src} to ${dst} every night`];
 }

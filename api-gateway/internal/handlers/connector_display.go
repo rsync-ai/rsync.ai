@@ -26,6 +26,8 @@ func getFriendlyName(connectorType string) string {
 		"redis":      "Redis",
 		// Built-in zero-credential demo source (its metadata.json display_name)
 		"sample-data": "Sample Data (Demo)",
+		// NSE public end-of-day archive (its metadata.json display_name)
+		"nse-india": "NSE India",
 		// Object stores
 		"aws_s3":               "Amazon S3",
 		"aws-s3":               "Amazon S3",

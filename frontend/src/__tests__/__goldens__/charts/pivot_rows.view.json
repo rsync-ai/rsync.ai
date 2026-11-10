@@ -1,0 +1,36 @@
+{
+  "kind": "table",
+  "head": [
+    "Region",
+    "Revenue",
+    "Average amount"
+  ],
+  "body": [
+    [
+      "EU",
+      "500",
+      "100"
+    ],
+    [
+      "US",
+      "570",
+      "142.5"
+    ],
+    [
+      "Total",
+      "1,070",
+      "118.9"
+    ]
+  ],
+  "numeric": [
+    false,
+    true,
+    true
+  ],
+  "totals": [
+    false,
+    false,
+    true
+  ],
+  "notes": []
+}

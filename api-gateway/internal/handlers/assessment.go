@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rsync-ai/shared/crypto"
+	"github.com/rsync-ai/shared/sqlexec"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -75,6 +76,9 @@ const (
 	FindingSinkNoDDL         = "SINK_NO_DDL"
 	FindingSourceUnreachable = "SOURCE_UNREACHABLE"
 	FindingEmptyCatalog      = "EMPTY_CATALOG"
+	// A PostgreSQL NUMERIC with no precision or scale, which PostgreSQL discovery
+	// reports as the bare "numeric" (shared/unconstrained_numeric_golden.json).
+	FindingUnconstrainedNumeric = "UNCONSTRAINED_NUMERIC"
 	// Destination-mapping HITL (PR-C) finding codes.
 	FindingDestNamespaceInvalid     = "DEST_NAMESPACE_INVALID"      // name fails the identifier/stopword guard
 	FindingDestNamespaceMissing     = "DEST_NAMESPACE_MISSING"      // namespace doesn't exist and create is off
@@ -231,6 +235,14 @@ func sinkSupportsAutoCreate(connectorType string) bool {
 	if connectorAutoCreatesDestinationTables(ct) {
 		return true
 	}
+	// A REST/GraphQL API has resources, not tables: there is nothing to
+	// pre-create, so a SINK_NO_DDL stop is one the user cannot clear. Whether
+	// the named resource takes writes is checked when the sink starts
+	// (executor dest_writable_check.go). Read from the category, not a flag,
+	// so connectors generated before this fix are not blocked either.
+	if connectorMetadataString(ct, "category") == "api_saas" {
+		return true
+	}
 	return connectorSupportsDDL(ct)
 }
 
@@ -380,6 +392,45 @@ func assessTable(meta TableMetadata, sinkSupportsDDL bool, nominatedKeys []strin
 			Details: map[string]interface{}{
 				"column_count": len(jsonCols),
 				"columns":      jsonCols,
+			},
+		})
+	}
+
+	// A PostgreSQL NUMERIC with no precision or scale holds values no fixed-width
+	// decimal does, so only a PostgreSQL destination keeps it a number; every other
+	// destination stores the exact value as text. Warn, and hand over the ALTER
+	// that gives the column a width, since only the user knows which one fits.
+	numericCols := []string{}
+	for _, c := range meta.Columns {
+		if strings.EqualFold(strings.TrimSpace(c.Type), "numeric") {
+			numericCols = append(numericCols, c.Name)
+		}
+	}
+	if len(numericCols) > 0 {
+		table := sqlexec.QuotePGIdent(meta.Name)
+		if meta.Schema != "" {
+			table = sqlexec.QuotePGIdent(meta.Schema) + "." + table
+		}
+		alters := make([]string, 0, len(numericCols))
+		for _, c := range numericCols {
+			alters = append(alters, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE numeric(p,s);", table, sqlexec.QuotePGIdent(c)))
+		}
+		out.Findings = append(out.Findings, AssessmentFinding{
+			Code:     FindingUnconstrainedNumeric,
+			Severity: AssessmentWarning,
+			Message: fmt.Sprintf(
+				"%d columns in %q are NUMERIC with no precision or scale: %s. A PostgreSQL destination gets NUMERIC; any other destination stores the exact value as text, never a rounded number. A destination table that already exists keeps its column type.",
+				len(numericCols), meta.Name, strings.Join(numericCols, ", "),
+			),
+			Details: map[string]interface{}{
+				"column_count": len(numericCols),
+				"columns":      numericCols,
+				"steps": []string{
+					"To land these columns as numbers on every destination, pick a precision p and scale s that hold every stored value.",
+					"Run the ALTER below on the source, then run the assessment again.",
+					"Or leave the columns as they are: the values still arrive exact, as text outside PostgreSQL.",
+				},
+				"sql_to_run": alters,
 			},
 		})
 	}

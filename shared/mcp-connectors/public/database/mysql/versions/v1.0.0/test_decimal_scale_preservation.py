@@ -78,14 +78,18 @@ def test_bare_decimal_falls_back_to_wide_lossless():
     assert "decimal(10,0)" not in ddl, f"silent (10,0) round: {ddl}"
 
 
-def test_bare_numeric_falls_back_to_wide_lossless():
+def test_unconstrained_numeric_lands_as_exact_text():
+    # PostgreSQL discovery reports a NUMERIC with no precision or scale as the
+    # bare "numeric". No MySQL DECIMAL holds every value it can hold, and
+    # DECIMAL(38,9) rounded at the ninth decimal place, so it is stored as text.
     ddl = _ddl_for("numeric")
-    assert "decimal(38,9)" in ddl, f"bare numeric not widened: {ddl}"
+    assert "`amount` text" in ddl, f"unconstrained numeric not stored as text: {ddl}"
+    assert "decimal" not in ddl, f"unconstrained numeric given a fixed width: {ddl}"
 
 
 if __name__ == "__main__":
     test_parametric_numeric_preserves_scale()
     test_parametric_decimal_preserves_scale()
     test_bare_decimal_falls_back_to_wide_lossless()
-    test_bare_numeric_falls_back_to_wide_lossless()
+    test_unconstrained_numeric_lands_as_exact_text()
     print("OK: mysql decimal scale-preservation tests passed")

@@ -27,12 +27,29 @@ import { AlertCircle } from 'lucide-react'
 
 /**
  * One definition of the "we cannot accept this" wording, shared by this form's
- * own alert and by the pipeline panel's notice, so the two cannot drift apart.
+ * own alert and by UnsupportedHitlNotice below, which the pipeline panel and the
+ * chat card both show, so they cannot drift apart.
  */
 export const UNSUPPORTED_HITL_TITLE = 'This request type is not supported by this build'
 export const UNSUPPORTED_HITL_DETAIL =
   'Nothing entered here can be submitted \u2014 update rsync.ai to a version that understands it, or stop the run and start it again.'
 export const UNSUPPORTED_HITL_MESSAGE = `${UNSUPPORTED_HITL_TITLE}. ${UNSUPPORTED_HITL_DETAIL}`
+
+/**
+ * Shown when a run is parked on a request this build has no UI for. The raw
+ * blocking type is printed because it is the one fact this build genuinely has,
+ * and it is what an operator needs to quote in a bug report.
+ */
+export function UnsupportedHitlNotice({ blockingType }: { blockingType?: string }) {
+  const t = String(blockingType || '').trim()
+  return (
+    <div role="alert" className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-100">
+      <div className="font-medium">{UNSUPPORTED_HITL_TITLE}</div>
+      <div className="mt-1">{UNSUPPORTED_HITL_DETAIL}</div>
+      {t ? <div className="mt-1 font-mono text-xs">{t}</div> : null}
+    </div>
+  )
+}
 
 export interface JsonSchema {
   type: string

@@ -122,6 +122,9 @@ func (c *Client) ExecuteWithContext(ctx context.Context, req ExecuteRequest) (*E
 		),
 	)
 	defer span.End()
+	if req.LongCall {
+		ctx = context.WithValue(ctx, longCallKey{}, true)
+	}
 
 	// Determine requested connector version early (needed for correct config validation).
 	version := req.Version
@@ -344,6 +347,41 @@ func (c *Client) ExecuteWithContext(ctx context.Context, req ExecuteRequest) (*E
 	return resp, nil
 }
 
+// httpCallCap and stdioCallCap bound one MCP call over each transport, so a slow or
+// hung connector cannot stall orchestration. Variables, not constants, so a test can
+// shrink them.
+var (
+	httpCallCap  = 30 * time.Second
+	stdioCallCap = 60 * time.Second
+)
+
+// longCallKey marks a context whose call may run past the transport cap (see
+// ExecuteRequest.LongCall).
+type longCallKey struct{}
+
+// callTimeout is how long one MCP call may take: the transport cap, or less when the
+// caller's deadline comes sooner. A LongCall is bounded by the caller's deadline alone,
+// because the caller set that deadline for this statement — a model build runs for
+// minutes, far past the cap meant for a read. With no deadline, a LongCall keeps the
+// cap: nothing else would bound it.
+func callTimeout(ctx context.Context, limit time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return limit
+	}
+	remaining := time.Until(deadline) + 250*time.Millisecond // small buffer
+	if remaining <= 0 {
+		return limit
+	}
+	if long, _ := ctx.Value(longCallKey{}).(bool); long {
+		return remaining
+	}
+	if remaining < limit {
+		return remaining
+	}
+	return limit
+}
+
 // annotateStdioFailure names the transport in a failed stdio response.
 //
 // StartServer only reaches the stdio fallback after every Docker container candidate
@@ -403,13 +441,7 @@ func (c *Client) executeViaStdio(ctx context.Context, server *ServerInfo, req JS
 
 	// IMPORTANT: stdio mode MUST respect ctx deadlines/cancellation.
 	// Without this, a slow/hung connector can block orchestration indefinitely.
-	timeout := 60 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline) + 250*time.Millisecond // small buffer
-		if remaining > 0 && remaining < timeout {
-			timeout = remaining
-		}
-	}
+	timeout := callTimeout(ctx, stdioCallCap)
 
 	type decodeResult struct {
 		resp JSONRPCResponse
@@ -536,14 +568,7 @@ func (c *Client) executeViaHTTP(ctx context.Context, server *ServerInfo, req JSO
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	// Execute request
-	timeout := 30 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline) + 250*time.Millisecond // small buffer
-		if remaining > 0 && remaining < timeout {
-			timeout = remaining
-		}
-	}
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{Timeout: callTimeout(ctx, httpCallCap)}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		if connectorIsGone(err) && c.serverManager != nil {

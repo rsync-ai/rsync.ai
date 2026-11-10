@@ -9,12 +9,12 @@ import { formatRelativeTime } from "@/lib/utils"
 import { LocalDateTime } from "@/components/ui/local-date-time"
 import { PipelineActions } from "@/components/pipeline/PipelineActions"
 import { CDCPipelineActions } from "@/components/pipeline/CDCPipelineActions"
-import { PipelineExecutionStatusBadge } from "@/components/pipeline/PipelineExecutionStatusBadge"
 import { SchemaDriftBadge } from "@/components/pipeline/SchemaDriftBadge"
 import { PipelineScheduleCreateDialogLauncher } from "@/components/pipeline/PipelineSchedulePanel"
 import { PipelineHeaderOverflowMenu } from "@/components/pipeline/PipelineHeaderOverflowMenu"
-import { PipelineCreateScheduleButton } from "@/components/pipeline/PipelineCreateScheduleButton"
 import { PipelineDetailTabsClient } from "@/components/pipeline/PipelineDetailTabsClient"
+import { ConnectionChip } from "@/components/connectors/ConnectionChip"
+import { CopyId } from "@/components/kit/CopyId"
 import { API_ENDPOINTS, API_GATEWAY_URL_INTERNAL } from "@/lib/config/api"
 import { connectionIsCDC, pipelineIsCDC } from "@/lib/pipeline/syncMode"
 import { cookies } from "next/headers"
@@ -99,8 +99,10 @@ async function getRegularPipeline(id: string) {
       sourceConnection: rawPipeline.source_connection as { id: string; name: string; connector_type: string; status: string } | null ?? null,
       destinationConnection: rawPipeline.destination_connection as { id: string; name: string; connector_type: string; status: string } | null ?? null,
       lastExecutionId: (rawPipeline.last_execution?.id as string | undefined) ?? null,
+      // false when the destination is an app's API (reverse ETL): no Reload.
+      reloadSupported: rawPipeline.reload_supported !== false,
     }
-  } catch (error) {
+  } catch {
     return null
   }
 }
@@ -121,24 +123,22 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
   }
 
   return (
-    <div className="space-y-6">
-      {/* Mounted outside tabs so "Create Schedule" works from any tab */}
+    <div className="space-y-5">
+      {/* The one Create schedule dialog: the Overview's schedule panel and the ?createSchedule=1 link open it */}
       {pipeline.type !== "cdc" && <PipelineScheduleCreateDialogLauncher pipelineId={pipeline.id} />}
-      {/* Header */}
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div className="flex min-w-0 items-center gap-4">
-          <Link href="/pipelines">
-            <Button variant="ghost" size="sm">
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back
-            </Button>
-          </Link>
+      {/* Header: name and type, then source → destination, when it was made and its id */}
+      <div className="flex flex-col gap-4 @3xl:flex-row @3xl:items-start @3xl:justify-between">
+        <div className="flex min-w-0 items-start gap-2">
+          <Button variant="ghost" size="sm" asChild className="mt-0.5 h-8 w-8 shrink-0 p-0">
+            <Link href="/pipelines" aria-label="Back to pipelines" title="Back to pipelines">
+              <ArrowLeft className="h-4 w-4" />
+            </Link>
+          </Button>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-3">
-              <h1 className="min-w-0 text-2xl font-bold tracking-tight text-zinc-900 dark:text-white break-words">
+              <h1 className="min-w-0 text-xl font-semibold tracking-tight text-zinc-900 dark:text-white break-words">
                 {pipeline.name}
               </h1>
-              <PipelineExecutionStatusBadge pipelineId={pipeline.id} />
               <SchemaDriftBadge pipelineId={pipeline.id} />
               <Badge
                 variant="outline"
@@ -151,30 +151,51 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
                 {pipeline.type.toUpperCase()}
               </Badge>
             </div>
-            {/* Connection identity strip — shows exactly which connections this pipeline uses */}
-            {(pipeline.sourceConnection || pipeline.destinationConnection) ? (
-              <div className="flex items-center gap-1.5 mt-1.5 text-sm text-zinc-600 dark:text-zinc-400">
-                {pipeline.sourceConnection ? (
-                  <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate max-w-[200px]" title={pipeline.sourceConnection.name}>
-                    {pipeline.sourceConnection.name}
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-zinc-600 dark:text-zinc-400">
+              {/* Connection identity strip — shows exactly which connections this pipeline uses */}
+              {pipeline.sourceConnection || pipeline.destinationConnection ? (
+                <span className="inline-flex min-w-0 items-center gap-1.5">
+                  {pipeline.sourceConnection ? (
+                    <ConnectionChip
+                      name={pipeline.sourceConnection.name}
+                      connectorType={pipeline.sourceConnection.connector_type}
+                      className="max-w-[200px] font-medium text-zinc-800 dark:text-zinc-200"
+                    />
+                  ) : (
+                    <span className="italic text-zinc-400">No source</span>
+                  )}
+                  <span className="shrink-0 text-zinc-400" aria-hidden>
+                    →
                   </span>
-                ) : (
-                  <span className="italic text-zinc-400">No source</span>
-                )}
-                <span className="text-zinc-400 shrink-0">→</span>
-                {pipeline.destinationConnection ? (
-                  <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate max-w-[200px]" title={pipeline.destinationConnection.name}>
-                    {pipeline.destinationConnection.name}
-                  </span>
-                ) : (
-                  <span className="italic text-zinc-400">No destination</span>
-                )}
-              </div>
-            ) : pipeline.description ? (
-              <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
-                {pipeline.description}
-              </p>
-            ) : null}
+                  <span className="sr-only">to</span>
+                  {pipeline.destinationConnection ? (
+                    <ConnectionChip
+                      name={pipeline.destinationConnection.name}
+                      connectorType={pipeline.destinationConnection.connector_type}
+                      className="max-w-[200px] font-medium text-zinc-800 dark:text-zinc-200"
+                    />
+                  ) : (
+                    <span className="italic text-zinc-400">No destination</span>
+                  )}
+                </span>
+              ) : pipeline.description ? (
+                <span>{pipeline.description}</span>
+              ) : null}
+              {/* Created / updated / id: they used to be a card under every tab. */}
+              {pipeline.createdAt && (
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                  · Created <LocalDateTime value={pipeline.createdAt} />
+                </span>
+              )}
+              {pipeline.updatedAt && (
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                  · Updated {formatRelativeTime(pipeline.updatedAt)}
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1 text-xs text-zinc-500 dark:text-zinc-400">
+                · <CopyId value={pipeline.id} label="pipeline ID" />
+              </span>
+            </div>
           </div>
         </div>
 
@@ -186,12 +207,10 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
               pipelineName={pipeline.name}
               status={pipeline.status}
               destinationName={pipeline.destinationConnection?.name}
+              reloadSupported={pipeline.reloadSupported}
             />
           ) : (
             <PipelineActions pipelineId={pipeline.id} status={pipeline.status} />
-          )}
-          {pipeline.type !== "cdc" && (
-            <PipelineCreateScheduleButton pipelineId={pipeline.id} />
           )}
           <PipelineHeaderOverflowMenu
             pipelineId={pipeline.id}
@@ -238,25 +257,6 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
         <PipelineDetailTabsClient key={pipeline.id} pipelineId={pipeline.id} pipelineType={pipeline.type} initialTab={tabValue} />
       </Suspense>
 
-          {/* Metadata */}
-          <Card>
-            <CardContent className="pt-6">
-              <div className="grid md:grid-cols-3 gap-4 text-sm">
-                <div>
-                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Pipeline ID</p>
-              <code className="bg-zinc-100 dark:bg-zinc-800 px-2 py-1 rounded text-xs">{pipeline.id}</code>
-                </div>
-                <div>
-                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Created</p>
-                  <p><LocalDateTime value={pipeline.createdAt} fallback="Unknown" /></p>
-                </div>
-                <div>
-                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Last Updated</p>
-                  <p>{pipeline.updatedAt ? formatRelativeTime(pipeline.updatedAt) : "Unknown"}</p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
     </div>
   )
 }

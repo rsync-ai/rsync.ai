@@ -555,4 +555,8 @@ func TestHeartbeatGateNamesTheSourcesTheConnectorHeartbeats(t *testing.T) {
 		t.Errorf("connector.py no longer heartbeats PostgreSQL (%v); #12 needs it so the "+
 			"slot acknowledges WAL it decoded and filtered out", want)
 	}
+	if !slices.Contains(want, "mysql") {
+		t.Errorf("connector.py no longer heartbeats MySQL/MariaDB (%v); without it the "+
+			"Sentinel cannot tell an idle binlog from a stalled stream", want)
+	}
 }

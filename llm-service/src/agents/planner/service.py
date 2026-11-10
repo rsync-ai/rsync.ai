@@ -26,20 +26,23 @@ import asyncio
 
 # Add parent directory to path to import utils
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+from src.egress.scope import workspace_headers
 from src.utils.llm_client import LLMClient
 from src.utils.telemetry import (
-    init_tracer, instrument_fastapi, instrument_requests,
-    start_span, get_current_trace_id, add_span_attributes, inject_trace_context,
-    setup_logging, bind_log_context, reset_log_context, ids_from_carrier
+    init_tracer,
+    instrument_fastapi,
+    instrument_requests,
+    get_current_trace_id,
+    inject_trace_context,
+    setup_logging,
+    bind_log_context,
+    reset_log_context,
+    ids_from_carrier,
 )
 from src.utils.ratelimit import get_limiter
-from src.utils.masking import mask_config, config_summary, mask_dict
+from src.utils.masking import mask_dict
 from src.utils.connector_paths import resolve_current_dir, iter_connector_dirs
-from opentelemetry.trace import SpanKind
 from opentelemetry import trace
-
-# DAG planner strategy (graph planning only; execution remains in Temporal)
-from src.agents.dag_planner.strategy import DAGPlanningStrategy
 
 # Setup trace-aware logging FIRST
 SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "planner")
@@ -56,6 +59,7 @@ from .strategies import (
     AsyncConnectorChecker,
     ToolRegistry,
     get_tool_registry,
+    connector_role_types,
     detect_tools_from_text,
     # Phase 1: Metadata-driven CDC Provider Selection
     CDCProviderRegistry,
@@ -96,6 +100,11 @@ instrument_fastapi(app)
 # Prometheus metrics endpoint (/prometheus) — scraped by the OTEL Collector. F-Obs-2.
 from src.utils.metrics import mount_metrics  # noqa: E402
 mount_metrics(app)
+
+# Holds the caller's X-Workspace-ID for the request, so every egress record
+# names its workspace (src/egress/scope.py).
+from src.egress.scope import WorkspaceScopeMiddleware  # noqa: E402
+app.add_middleware(WorkspaceScopeMiddleware)
 
 # ============================================================================
 # Phase 5: Safety controls (rate limiting + request size + concurrency)
@@ -184,9 +193,10 @@ llm_strategy = LLMPlanningStrategy(llm_client, tool_registry)
 heuristic_strategy = HeuristicPlanningStrategy(tool_registry)
 base_planning_strategy = CompositePlanningStrategy(primary=llm_strategy, fallback=heuristic_strategy)
 
-# DAG-first routing: only used when DAG strategy can_handle() returns True
-dag_strategy = DAGPlanningStrategy(llm_client, tool_registry)
-planning_strategy = CompositePlanningStrategy(primary=dag_strategy, fallback=base_planning_strategy)
+# No DAG-first routing: in-pipeline DAG mode is switched off, so every request
+# plans as a plain pipeline (docs/internal/adr-001-dag-mode-switched-off.md).
+# src/agents/dag_planner stays until the adapter's DAG runtime is removed.
+planning_strategy = base_planning_strategy
 
 # Async connector checker for non-blocking JIT generation
 connector_checker = AsyncConnectorChecker(CONNECTORS_DIR, TOOL_GENERATOR_URL)
@@ -376,7 +386,7 @@ def generate_connector_sync(connector_name: str, description: str = None) -> Tup
             "force_regenerate": False
         }
         
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **workspace_headers()}
         inject_trace_context(headers)
         
         # Tool-generator v1 API: POST /v1/generate (legacy /generate was removed)
@@ -406,7 +416,8 @@ def generate_connector_sync(connector_name: str, description: str = None) -> Tup
         return False, "Generation timed out (>120s)"
     except Exception as e:
         logger.exception(f"❌ JIT: Error generating connector: {e}")
-        return False, str(e)
+        # Fixed text: the caller logs and may surface it; the log has the rest.
+        return False, "Connector generation failed. See the planner log."
 
 
 def ensure_connectors_exist(tools: List[str], context: str = None) -> Tuple[List[str], List[str]]:
@@ -585,7 +596,9 @@ async def generate_cdc_config(request: CDCConfigRequest):
         
     except Exception as e:
         logger.exception(f"Error generating CDC config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fixed text: the request carries the source's connection_config, so its
+        # failure can name a host, a user or a password. The log has the rest.
+        raise HTTPException(status_code=500, detail="CDC config generation failed. See the planner log.")
 
 
 @app.get("/cdc/supported-databases", response_model=SupportedCDCDatabasesResponse)
@@ -606,7 +619,7 @@ async def get_supported_cdc_databases():
         )
     except Exception as e:
         logger.exception(f"Error getting supported databases: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Listing the CDC databases failed. See the planner log.")
 
 
 @app.post("/cdc/validate-config")
@@ -631,7 +644,7 @@ async def validate_cdc_config(config: Dict[str, Any]):
         }
     except Exception as e:
         logger.exception(f"Error validating CDC config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="CDC config validation failed. See the planner log.")
 
 
 # =============================================================================
@@ -742,7 +755,7 @@ async def recommend_pipeline_strategy(request: SmartStrategyRequest):
             phases=[],
             recommendation="",
             requires_user_confirmation=False,
-            error=str(e),
+            error="Strategy recommendation failed. See the planner log.",
         )
 
 
@@ -808,7 +821,7 @@ async def get_cdc_providers():
         }
     except Exception as e:
         logger.exception(f"Error getting CDC providers: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "Listing the CDC providers failed. See the planner log."}
 
 
 @app.get("/intelligence/topic-calculator")
@@ -856,7 +869,7 @@ async def calculate_topic_partitions(
         }
     except Exception as e:
         logger.exception(f"Error calculating partitions: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "Calculating the topic partitions failed. See the planner log."}
 
 
 @app.get("/intelligence/status")
@@ -895,7 +908,7 @@ async def get_intelligence_status():
         }
     except Exception as e:
         logger.exception(f"Error getting intelligence status: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "Reading the intelligence status failed. See the planner log."}
 
 
 @app.post("/connectors/ensure")
@@ -910,7 +923,6 @@ async def ensure_connectors(tools: List[str], background: bool = False):
     Returns:
         Status of connector availability
     """
-    from fastapi import BackgroundTasks
     import asyncio
     
     if background:
@@ -955,13 +967,9 @@ async def create_plan(request: PlanRequest):
         detected_tools = detect_tools_from_text(request.natural_language, tool_registry)
         
         # Augment with tools from explicit context (e.g. from Orchestrator)
+        context_source_type, context_destination_type = connector_role_types(request.context)
         if request.context:
-            if source_type := request.context.get("source_type"):
-                if isinstance(source_type, str):
-                    detected_tools.append(source_type.strip().lower().replace("_", "-"))
-            if dest_type := request.context.get("destination_type"):
-                if isinstance(dest_type, str):
-                    detected_tools.append(dest_type.strip().lower().replace("_", "-"))
+            detected_tools.extend(t for t in (context_source_type, context_destination_type) if t)
             detected_tools = list(set(detected_tools))
             
         logger.info(f"🔍 Detected tools: {detected_tools}")
@@ -1013,6 +1021,12 @@ async def create_plan(request: PlanRequest):
                 source_connection = next((c for c in available_connections if c.get("id") == src_id), None)
             if isinstance(dst_id, str) and dst_id:
                 destination_connection = next((c for c in available_connections if c.get("id") == dst_id), None)
+        # The lookup above needs a gateway session the planner may not hold, so the
+        # roles the caller already resolved stand in for an unresolved connection.
+        if source_connection is None and context_source_type:
+            source_connection = {"connector_type": context_source_type}
+        if destination_connection is None and context_destination_type:
+            destination_connection = {"connector_type": context_destination_type}
         
         # =================================================================
         # STEP 4: Build planning context and execute strategy
@@ -1103,7 +1117,7 @@ async def create_plan(request: PlanRequest):
             
     except Exception as e:
         logger.exception(f"Error creating plan: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Planning failed. See the planner log.")
 
 def main():
     """Run the service.

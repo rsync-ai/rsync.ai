@@ -21,12 +21,73 @@ in `ADAPTERS` without touching the generic template.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
+
+# Stable batch paging (KI-WAREHOUSE-BATCH-PAGING-UNORDERED). It sits next to
+# this file under public/; an image that ships this file without it (one that
+# never exports from BigQuery) gets a clear error instead of an import crash.
+try:
+    import sql_paging
+except ImportError:  # pragma: no cover
+    sql_paging = None
+
+# The canonical column-type map BigQuery discovery reports columns in, shipped
+# the same way (canonical_types.py); without it a column's type is "string".
+try:
+    import canonical_types
+except ImportError:  # pragma: no cover
+    canonical_types = None
+
+
+def _param_on(params: Dict[str, Any], key: str, default: bool) -> bool:
+    """A boolean request flag, whether it arrives as a bool or as text."""
+    value = params.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bigquery_column(field: Any) -> Dict[str, Any]:
+    """A discovered BigQuery column: canonical ``type`` (the discover contract),
+    the BigQuery type as ``source_type``. A REPEATED field is an array: json."""
+    raw = str(getattr(field, "field_type", None) or "STRING").upper()
+    mode = str(getattr(field, "mode", None) or "NULLABLE").upper()
+    if mode == "REPEATED":
+        canonical, source_type = "json", f"ARRAY<{raw}>"
+    else:
+        canonical = (canonical_types.canonicalize_type(raw, dialect="bigquery")
+                     if canonical_types is not None else "string")
+        source_type = raw
+    return {"name": field.name, "type": canonical, "source_type": source_type,
+            "nullable": mode != "REQUIRED"}
+
+
+def _bigquery_external_files(bq_table: Any) -> Optional[Dict[str, Any]]:
+    """Where an external table's rows live: its source URIs as BigQuery holds them,
+    and a hive table's partition prefix. None for any other table type.
+
+    The Lineage page links a lake pipeline's table folder to the warehouse table
+    that reads it from these (api-gateway lake_external_tables.go). They come from
+    the same get_table read as the columns: no query, no bytes billed."""
+    if str(getattr(bq_table, "table_type", None) or "").upper() != "EXTERNAL":
+        return None
+    ext = getattr(bq_table, "external_data_configuration", None)
+    uris = [str(u) for u in (getattr(ext, "source_uris", None) or []) if u]
+    hive = getattr(ext, "hive_partitioning", None)
+    prefix = str(getattr(hive, "source_uri_prefix", None) or "")
+    files: Dict[str, Any] = {"source_uris": uris}
+    if prefix:
+        files["source_uri_prefix"] = prefix
+    return files
 
 
 class DataWarehouseAdapter(Protocol):
@@ -52,6 +113,23 @@ class BigQueryWarehouseAdapter:
     - credentials_path (optional): path to SA JSON file; also supports GOOGLE_APPLICATION_CREDENTIALS
     - location (optional)
     """
+
+    # How long a verbatim read (``export`` with ``query``) may run before its job
+    # is cancelled: under the orchestrator's 30 s cap on one MCP call
+    # (mcp/client.go httpCallCap), so a slow read ends here, cleanly, instead of
+    # the call timing out and being re-issued.
+    READ_TIMEOUT_SECONDS = 25
+
+    # How long discover_schema may spend reading per-table metadata (columns,
+    # row counts) when the caller asks for it with include_table_details: under
+    # the same 30 s cap, after the dataset and table listing. A table not read
+    # in time is returned by name, marked "partial".
+    DISCOVER_DETAILS_BUDGET_SECONDS = 20
+    DISCOVER_DETAILS_WORKERS = 8
+
+    # The clock and the pause of that wait; tests swap in a fake clock.
+    _clock = staticmethod(time.monotonic)
+    _pause = staticmethod(time.sleep)
 
     def _client(self, config: Dict[str, Any]):
         try:
@@ -242,41 +320,136 @@ class BigQueryWarehouseAdapter:
             "tables": [],
         }
 
-        dataset_id = (config.get("dataset_id") or "").strip()
-        project_id = (config.get("project_id") or "").strip()
-        if not dataset_id or not project_id:
-            result["overall_status"] = "partial_success"
-            msg = "Missing project_id/dataset_id; cannot list tables."
-            result["warnings_objects"].append({"category": "config", "severity": "error", "message": msg})
+        started = time.monotonic()
+
+        def warn(msg: str, severity: str) -> Dict[str, Any]:
+            obj = {"category": "catalog_error", "severity": severity, "message": msg, "subsystem": "tables"}
+            result["warnings_objects"].append(obj)
             result["warnings_messages"].append(msg)
+            result["overall_status"] = "partial_success"
+            return obj
+
+        def done() -> Dict[str, Any]:
             result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
             return result
 
+        dataset_id = (config.get("dataset_id") or "").strip()
+        project_id = (config.get("project_id") or "").strip()
+        if not project_id:
+            result["overall_status"] = "partial_success"
+            msg = "Missing project_id; cannot list tables."
+            result["warnings_objects"].append({"category": "config", "severity": "error", "message": msg})
+            result["warnings_messages"].append(msg)
+            return done()
+
         try:
             client = self._client(config)
-            tables = list(client.list_tables(f"{project_id}.{dataset_id}"))
-            result["total_tables_available"] = len(tables)
-            out: List[Dict[str, Any]] = []
-            for t in tables[:max_tables]:
-                out.append(
-                    {
-                        "name": t.table_id,
-                        "endpoint": f"{project_id}.{dataset_id}.{t.table_id}",
-                        "discovery_status": "complete",
-                    }
-                )
-            result["tables"] = out
-            result["total_tables_discovered"] = len(out)
+            if dataset_id:
+                datasets = [dataset_id]
+            else:
+                # No dataset named (the Explorer asks this way, to show where
+                # models write as well as where pipelines land): every dataset
+                # the credentials can list, each table under its own dataset.
+                datasets = sorted({str(ds.dataset_id) for ds in client.list_datasets(project_id)
+                                   if getattr(ds, "dataset_id", None)})
         except Exception as e:
-            result["overall_status"] = "partial_success"
-            msg = f"BigQuery discovery failed: {e}"
-            result["warnings_objects"].append(
-                {"category": "catalog_error", "severity": "error", "message": msg, "subsystem": "tables"}
-            )
-            result["warnings_messages"].append(msg)
+            warn(f"BigQuery discovery failed: {e}", "error")
+            return done()
 
-        result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
-        return result
+        listed: List[tuple] = []
+        unreadable: List[Dict[str, Any]] = []
+        for ds in datasets:
+            try:
+                ids = [t.table_id for t in client.list_tables(f"{project_id}.{ds}")]
+            except Exception as e:
+                if dataset_id:
+                    warn(f"BigQuery discovery failed: {e}", "error")
+                    return done()
+                # One dataset the credentials cannot read does not hide the rest.
+                unreadable.append(warn(f"Could not list tables in dataset {ds}: {e}", "warning"))
+                continue
+            listed.extend((ds, table_id) for table_id in ids)
+        if unreadable and not listed:
+            # Nothing could be read at all: a failure, so the reason is shown.
+            for obj in unreadable:
+                obj["severity"] = "error"
+
+        result["total_tables_available"] = len(listed)
+        out: List[Dict[str, Any]] = [
+            {
+                "name": table_id,
+                # The table's namespace (namespace_model table_namespace
+                # "dataset"), in the field every source fills with its
+                # schema or database: the executor places a table under
+                # the connection's Scope by it, and a pick reaches export
+                # as "dataset.table" (_qualify_table).
+                "schema": ds,
+                "endpoint": f"{project_id}.{ds}.{table_id}",
+                "discovery_status": "complete",
+            }
+            for ds, table_id in listed[:max_tables]
+        ]
+        # Per-table metadata only when asked for: pipeline discovery does not
+        # ask, so a BigQuery-source pipeline's column types are unchanged.
+        if _param_on(params, "include_table_details", False) and out:
+            budget = float(self.DISCOVER_DETAILS_BUDGET_SECONDS)
+            self._read_table_details(
+                client, out, warn,
+                columns=_param_on(params, "include_columns", True),
+                row_counts=_param_on(params, "include_row_counts", True),
+                budget=budget,
+                remaining=max(0.0, started + budget - time.monotonic()),
+            )
+        result["tables"] = out
+        result["total_tables_discovered"] = len(out)
+        return done()
+
+    def _read_table_details(self, client, tables: List[Dict[str, Any]], warn, *,
+                            columns: bool, row_counts: bool, budget: float,
+                            remaining: float) -> None:
+        """Fill each table's columns and row count from its metadata (get_table:
+        no query, no bytes billed), several at a time, for at most ``remaining``
+        seconds. A table not read is marked "partial" and named in a warning."""
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.DISCOVER_DETAILS_WORKERS)
+        try:
+            futures = {pool.submit(client.get_table, t["endpoint"], timeout=budget): t for t in tables}
+            finished, _ = concurrent.futures.wait(futures, timeout=remaining)
+        finally:
+            # Do not wait for a slow read: it ends on its own timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        failed: List[str] = []
+        late: List[str] = []
+        for future, table in futures.items():
+            label = f"{table['schema']}.{table['name']}"
+            if future not in finished:
+                table["discovery_status"] = "partial"
+                late.append(label)
+                continue
+            try:
+                bq_table = future.result()
+            except Exception as e:
+                table["discovery_status"] = "partial"
+                failed.append(f"{label}: {e}")
+                continue
+            if columns:
+                table["columns"] = [_bigquery_column(f) for f in (getattr(bq_table, "schema", None) or [])]
+            num_rows = getattr(bq_table, "num_rows", None)
+            if row_counts and num_rows is not None:
+                table["row_count"] = int(num_rows)
+            external = _bigquery_external_files(bq_table)
+            if external is not None:
+                table["table_type"] = "external"
+                table.update(external)
+
+        for msg in failed[:10]:
+            warn(f"Could not read table {msg}", "warning")
+        if len(failed) > 10:
+            warn(f"Could not read {len(failed) - 10} more tables", "warning")
+        if late:
+            more = f" and {len(late) - 10} more" if len(late) > 10 else ""
+            warn(f"Columns not read within {budget:g} s for {len(late)} table(s): "
+                 f"{', '.join(late[:10])}{more}", "warning")
 
     def list_namespaces(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """List the project's datasets: the level metadata.json's
@@ -333,19 +506,12 @@ class BigQueryWarehouseAdapter:
         return "STRING"
 
     def export(self, config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-        """Paginated read (optimized for large tables via keyset continuation).
+        """One page of a table, or a verbatim ``query``/``sql`` as a single page.
 
-        Modes:
-        - keyset (preferred): pass ``cursor_column`` (aka ``order_by`` /
-          ``primary_key``) and, on continuation, the ``cursor_value`` echoed back
-          as ``next_cursor`` from the prior page. Emits
-          ``... WHERE col > @cursor ORDER BY col ASC LIMIT n`` and returns the
-          last row's key as ``next_cursor`` so the caller resumes to EOF instead
-          of capping at ``LIMIT``.
-        - offset (fallback, no cursor_column): ``... LIMIT n OFFSET off``;
-          ``next_cursor`` is the next offset. BigQuery does not guarantee a stable
-          order across pages here — prefer keyset for correctness on large tables.
-        - query (explicit ``query``/``sql``): run verbatim, single page.
+        A table pages through ``sql_paging``: BigQuery never enforces a primary
+        key, so a sweep orders by every orderable column (``cursor_column``
+        first) and pins its pages to one ``FOR SYSTEM_TIME AS OF`` point
+        (KI-WAREHOUSE-BATCH-PAGING-UNORDERED).
 
         Always returns ``paging_mode``, ``has_more`` and ``next_cursor`` alongside
         ``data`` / ``total_records``.
@@ -367,79 +533,180 @@ class BigQueryWarehouseAdapter:
         if raw_cursor:
             # cursor_column is interpolated into the SQL identifier position, so
             # it must be a plain identifier — reject anything else outright.
-            # NOTE: keyset correctness also requires cursor_column be UNIQUE; a
-            # non-unique column can skip rows sharing a boundary value across a
-            # page. Callers pass a primary key here (hence the alias).
             cursor_column = self._safe_identifier(raw_cursor)
             if cursor_column is None:
                 return {"success": False,
                         "error": f"Unsafe cursor_column identifier: {raw_cursor!r}"}
-        cursor_value = params.get("cursor_value")
 
         if not table and not raw_query:
             return {"success": False, "error": "Missing 'table' (or 'query') parameter"}
 
         client = self._client(config)
-        job_config = None
-        offset = 0
-
         if raw_query:
-            paging_mode = "query"
-            sql = raw_query
-        elif cursor_column:
-            paging_mode = "keyset"
-            fq = self._qualify_table(config, table)
-            where = ""
-            if cursor_value is not None:
-                bq = self._bq()
-                job_config = bq.QueryJobConfig(query_parameters=[
-                    bq.ScalarQueryParameter("cursor", self._param_type(cursor_value), cursor_value)
-                ])
-                where = "WHERE `%s` > @cursor " % cursor_column
-            sql = f"SELECT * FROM `{fq}` {where}ORDER BY `{cursor_column}` ASC LIMIT {limit}"
-        else:
-            paging_mode = "offset"
-            offset = int(params.get("offset", 0) or 0)
-            fq = self._qualify_table(config, table)
-            sql = f"SELECT * FROM `{fq}` LIMIT {limit} OFFSET {offset}"
+            read, refused = self._read_query(client, raw_query, limit)
+            if refused is not None:
+                return refused
+            columns, rows = read
+            data = [dict(r) for r in rows]
+            if not columns and data:
+                columns = list(data[0].keys())
+            # max_results caps a verbatim query: surface that as `truncated`
+            # instead of dropping rows silently. `columns` is the SELECT's order,
+            # the one order that survives the rows becoming a Go map
+            # (KI-DELEGATED-QUERY-COLUMN-ORDER).
+            return {
+                "success": True,
+                "data": data,
+                "columns": columns,
+                "total_records": len(data),
+                "paging_mode": "query",
+                "has_more": False,
+                "next_cursor": None,
+                "truncated": len(data) == limit,
+            }
 
-        if job_config is not None:
-            job = client.query(sql, job_config=job_config)
-        else:
-            job = client.query(sql)
-        rows = list(job.result(max_results=limit))
-        data = [dict(r) for r in rows]
+        if sql_paging is None:
+            return {"success": False,
+                    "error": "sql_paging.py is missing from this connector image; rebuild it"}
+        fq = self._qualify_table(config, table)
+        if any(ch in fq for ch in "`\\"):
+            return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+        cursor = sql_paging.QueryCursor(lambda sql, binds: self._run_query(client, sql, binds))
+        return sql_paging.export_page(client, cursor, sql_paging.BIGQUERY, fq, f"`{fq}`", params,
+                                      limit=limit, nominated=cursor_column or None)
 
-        # A full page (== limit) means there may be more; a short page is EOF.
-        full_page = len(data) == limit
-        # Verbatim queries aren't paginated by us, but max_results still caps
-        # the read — surface that as `truncated` instead of dropping silently.
-        truncated = (paging_mode == "query") and full_page
-        has_more = (paging_mode != "query") and full_page
-        next_cursor = None
-        if has_more:
-            if paging_mode == "keyset":
-                next_cursor = data[-1].get(cursor_column) if data else None
-                if next_cursor is None:
-                    # Full page but the cursor column is absent from the rows
-                    # (e.g. a pseudo/computed column not returned by SELECT *).
-                    # We can't emit a resumable cursor — fail loud rather than
-                    # silently truncate or restart from the top next call.
-                    return {"success": False,
-                            "error": (f"keyset cursor column '{cursor_column}' "
-                                      "missing from result rows; cannot continue")}
-            elif paging_mode == "offset":
-                next_cursor = str(offset + limit)
+    def _read_query(self, client, sql: str, limit: int):
+        """((columns, rows), None) of a verbatim read, or (None, failure) when it
+        may not run. The columns are the result schema's, so a read that matches
+        no rows still names them.
 
-        return {
-            "success": True,
-            "data": data,
-            "total_records": len(data),
-            "paging_mode": paging_mode,
-            "has_more": has_more,
-            "next_cursor": next_cursor,
-            "truncated": truncated,
-        }
+        BigQuery, not the gateway's keyword gate, decides what is a read: a dry
+        run parses the SQL and plans it without running anything, and only a
+        single ``SELECT`` goes on to run. DML, DDL, a script, ``CALL`` and
+        ``EXPORT DATA`` are refused before any job exists
+        (KI-WAREHOUSE-READS-RELY-ON-THE-GATE). The read then runs as one job
+        (``job_retry=None``) for at most ``READ_TIMEOUT_SECONDS``: a wait that runs
+        out cancels the job, and ``job_timeout_ms`` ends it server-side a little
+        later should the cancel not land. Neither failure message contains
+        "timeout": the orchestrator re-issues a call whose error does
+        (``executeWithRetry``), and a re-issued read would only run out again.
+        The wait is ``_wait_for_job``; ``result`` is called only once the job is
+        DONE, to fetch its rows."""
+        bq = self._bq()
+        plan = client.query(sql, job_config=bq.QueryJobConfig(dry_run=True, use_query_cache=False))
+        statement_type = getattr(plan, "statement_type", None)
+        if statement_type != "SELECT":
+            return None, {"success": False,
+                          "error": "A BigQuery read runs read-only: only a single SELECT may run, "
+                                   f"and BigQuery parses this as {statement_type or 'an unknown statement'}"}
+        timeout = self.READ_TIMEOUT_SECONDS
+        job = client.query(sql, job_config=bq.QueryJobConfig(job_timeout_ms=(timeout + 5) * 1000),
+                           job_retry=None)
+        if not self._wait_for_job(job, timeout):
+            return None, {"success": False,
+                          "error": f"The BigQuery read did not finish within {timeout}s; the job was cancelled"}
+        result = job.result(max_results=limit)
+        columns = [f.name for f in (getattr(result, "schema", None) or [])]
+        return (columns, list(result)), None
+
+    def _wait_for_job(self, job, timeout: Optional[float]) -> bool:
+        """Wait until ``job`` is DONE, for at most ``timeout`` seconds (None: no
+        limit); False, the job cancelled, when the time ran out. A wait that
+        raises cancels the job before the error goes on: a job whose wait
+        failed is reported as failed, so it must not go on to run unseen.
+
+        The wait polls ``jobs.get`` (``job.done``), which answers at once, against
+        our own clock. ``job.result(timeout=)`` is no limit: BigQuery holds each of
+        its ``getQueryResults`` calls up to 10 s and the timeout is checked only
+        between calls, so a 2 s wait returned after 12 s (measured live,
+        google-cloud-bigquery 3.42.2). Cancelling is best effort; the job's
+        ``job_timeout_ms`` still ends it server-side."""
+        deadline = None if timeout is None else self._clock() + timeout
+        pause = 0.1
+        try:
+            # One jobs.get answers in well under 2 s; a slower one is retried by the library.
+            while not job.done(timeout=2):
+                left = None if deadline is None else deadline - self._clock()
+                if left is not None and left <= 0:
+                    self._cancel_job(job)
+                    return False
+                self._pause(pause if left is None else min(pause, left))
+                pause = min(pause * 2, 1.0)
+        except Exception:
+            self._cancel_job(job)
+            raise
+        return True
+
+    @staticmethod
+    def _cancel_job(job) -> None:
+        try:
+            job.cancel()
+        except Exception:  # noqa: BLE001 - job_timeout_ms still ends it
+            pass
+
+    def _run_query(self, client, sql: str, binds: Optional[List[Any]]):
+        """(column names, dict rows) of ``sql``; bind i is ``@p<i>``."""
+        job_config = None
+        if binds:
+            bq = self._bq()
+            job_config = bq.QueryJobConfig(query_parameters=[
+                bq.ScalarQueryParameter(f"p{i}", self._param_type(v), v)
+                for i, v in enumerate(binds, start=1)
+            ])
+        job = client.query(sql, job_config=job_config) if job_config is not None else client.query(sql)
+        result = job.result()
+        columns = [f.name for f in (getattr(result, "schema", None) or [])]
+        return columns, [dict(r) for r in result]
+
+    def execute(self, config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run exactly ONE statement verbatim — the models feature's DDL/DML.
+
+        ``timeout_seconds`` is the job's ``job_timeout_ms``, so BigQuery itself
+        cancels the job when it runs over, and also the client's wait
+        (``_wait_for_job``, which ends when the limit says); a wait that runs
+        out or fails cancels the job too rather than leave it running. When
+        both ``project_id`` and ``dataset_id`` are configured they are the
+        job's ``default_dataset``, so an unqualified table name resolves the
+        way ``_qualify_table`` resolves it. Never retried: ``job_retry=None``
+        stops the client re-running a failed job (DDL is not idempotent).
+        ``rows_affected`` is ``num_dml_affected_rows`` — None for DDL."""
+        sql = ""
+        for key in ("query", "sql", "statement"):
+            v = params.get(key)
+            if isinstance(v, str) and v.strip():
+                sql = v.strip()
+                break
+        if not sql:
+            return {"success": False, "error": "Missing 'query' (or 'sql'/'statement') parameter"}
+        timeout = params.get("timeout_seconds")
+        try:
+            timeout = int(timeout) if not isinstance(timeout, bool) else 0
+        except (TypeError, ValueError):
+            timeout = 0
+        timeout = timeout if timeout > 0 else None
+
+        try:
+            client = self._client(config)
+            bq = self._bq()
+            job_kwargs: Dict[str, Any] = {}
+            if timeout:
+                job_kwargs["job_timeout_ms"] = timeout * 1000
+            project_id = (config.get("project_id") or "").strip()
+            dataset_id = (config.get("dataset_id") or "").strip()
+            if project_id and dataset_id:
+                job_kwargs["default_dataset"] = f"{project_id}.{dataset_id}"
+            job = client.query(sql, job_config=bq.QueryJobConfig(**job_kwargs), job_retry=None)
+            if not self._wait_for_job(job, timeout):
+                return {"success": False,
+                        "error": f"Statement did not finish within {timeout}s; the job was cancelled"}
+            # DONE: raises the job's own error, waits for nothing.
+            job.result()
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": str(e) or "The BigQuery request failed"}
+        rows_affected = getattr(job, "num_dml_affected_rows", None)
+        if not isinstance(rows_affected, int) or isinstance(rows_affected, bool):
+            rows_affected = None
+        return {"success": True, "executed": True, "rows_affected": rows_affected}
 
     def import_data(self, config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         table = (params.get("table") or "").strip()

@@ -133,6 +133,13 @@ spec:
             # quietly rather than failing the pod, so nothing turns red.
             - name: LLM_SERVICE_URL
               value: "http://{{ $fullname }}-llm-service:5000"
+            # A workflow's chart step asks the frontend to draw its chart as a
+            # PNG for the email (workflow_chart_step.go frontendChartPNG, with
+            # INTERNAL_SERVICE_SECRET, which frontend.yaml also sets). Its
+            # fallback is the compose name "frontend", which does not resolve
+            # here, so the email would go without its chart.
+            - name: FRONTEND_INTERNAL_URL
+              value: "http://{{ $fullname }}-frontend:{{ .Values.frontend.service.port }}"
             # llmServiceTimeout() (chat_nl_pipeline.go) falls back to 60s when
             # this is empty, sized for a hosted API; its old 10s against CPU
             # inference made every plain-English chat message return a canned
@@ -162,6 +169,16 @@ spec:
             # artifact opts out, exactly as docker-compose.quickstart.yml does.
             - name: RSYNC_BILLING_ENFORCED
               value: {{ .Values.apiGateway.billingEnforced | default false | quote }}
+            # Ask rsync.ai's sample rows; off on self-host. The same value goes
+            # to llm-service (generation.yaml), whose egress guard checks it too.
+            # Unset in the code means allowed (cloud), so this is always rendered.
+            - name: RSYNC_LLM_SAMPLE_ROWS_ALLOWED
+              value: {{ .Values.generation.llm.sampleRowsAllowed | default false | quote }}
+            # One workspace per install (values.yaml apiGateway.singleWorkspace).
+            # hasKey, not `| default true`: default would turn an explicit false
+            # back into true. A removed value renders true, the self-host intent.
+            - name: RSYNC_SINGLE_WORKSPACE
+              value: {{ if hasKey .Values.apiGateway "singleWorkspace" }}{{ .Values.apiGateway.singleWorkspace | quote }}{{ else }}"true"{{ end }}
             {{- if .Values.demo.enabled }}
             # Zero-credential try-it path. Unset -- the default, and what cloud
             # does -- makes the /demo endpoints report unavailable and the

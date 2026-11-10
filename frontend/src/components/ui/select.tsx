@@ -8,9 +8,9 @@ import { cn } from "@/lib/utils"
 
 const Select = SelectPrimitive.Root
 
-const SelectGroup = SelectPrimitive.Group
-
 const SelectValue = SelectPrimitive.Value
+
+const SelectGroup = SelectPrimitive.Group
 
 const SelectTrigger = React.forwardRef<
   React.ComponentRef<typeof SelectPrimitive.Trigger>,
@@ -99,18 +99,6 @@ const SelectContent = React.forwardRef<
 ))
 SelectContent.displayName = SelectPrimitive.Content.displayName
 
-const SelectLabel = React.forwardRef<
-  React.ComponentRef<typeof SelectPrimitive.Label>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Label>
->(({ className, ...props }, ref) => (
-  <SelectPrimitive.Label
-    ref={ref}
-    className={cn("py-1.5 pl-8 pr-2 text-sm font-semibold", className)}
-    {...props}
-  />
-))
-SelectLabel.displayName = SelectPrimitive.Label.displayName
-
 const SelectItem = React.forwardRef<
   React.ComponentRef<typeof SelectPrimitive.Item>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
@@ -134,27 +122,27 @@ const SelectItem = React.forwardRef<
 ))
 SelectItem.displayName = SelectPrimitive.Item.displayName
 
-const SelectSeparator = React.forwardRef<
-  React.ComponentRef<typeof SelectPrimitive.Separator>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Separator>
+/** A group's heading in the list (Models, Saved queries); not an option. */
+const SelectLabel = React.forwardRef<
+  React.ComponentRef<typeof SelectPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Label>
 >(({ className, ...props }, ref) => (
-  <SelectPrimitive.Separator
+  <SelectPrimitive.Label
     ref={ref}
-    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    className={cn("px-2 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400", className)}
     {...props}
   />
 ))
-SelectSeparator.displayName = SelectPrimitive.Separator.displayName
+SelectLabel.displayName = SelectPrimitive.Label.displayName
 
 export {
   Select,
   SelectGroup,
+  SelectLabel,
   SelectValue,
   SelectTrigger,
   SelectContent,
-  SelectLabel,
   SelectItem,
-  SelectSeparator,
   SelectScrollUpButton,
   SelectScrollDownButton,
 }

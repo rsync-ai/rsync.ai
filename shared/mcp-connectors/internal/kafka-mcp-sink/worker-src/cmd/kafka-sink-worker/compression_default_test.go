@@ -248,7 +248,7 @@ func TestCDCWriteDefaultsCompressionFromConnector(t *testing.T) {
 				CDCOp:      "u",
 			}
 			msg := kafka.Message{Topic: "t", Partition: 0, Offset: 7}
-			if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert"); err != nil {
+			if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert", msg.Offset); err != nil {
 				t.Fatalf("writeCDCToDestination errored: %v", err)
 			}
 			assertCodecAndKey(t, importDataArgs(t, ct), tc.wantCodec, tc.wantSuffix)

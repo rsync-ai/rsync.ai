@@ -737,7 +737,9 @@ func (s *BatchSentinel) emitBatchIssue(
 	metadata["pipeline_name"] = pipelineName
 	metaJSON, _ := json.Marshal(metadata)
 
-	_, err := s.db.ExecContext(ctx, `
+	// detected_at is when this episode opened: NOW() on insert, kept on conflict.
+	var detectedAt time.Time
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO sentinel_active_issues (
 			id, type, severity, component_id, component_type,
 			description, detected_at, occurrence_count, last_occurrence, metadata
@@ -748,14 +750,21 @@ func (s *BatchSentinel) emitBatchIssue(
 			severity         = EXCLUDED.severity,
 			description      = EXCLUDED.description,
 			metadata         = EXCLUDED.metadata
+		RETURNING detected_at
 	`, issueID, string(issueType), string(severity),
-		pipelineID, string(ComponentTypeBatchPipeline), description, metaJSON)
+		pipelineID, string(ComponentTypeBatchPipeline), description, metaJSON).Scan(&detectedAt)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
 			"pipeline_id": pipelineID,
 			"issue_id":    issueID,
 		}).Warn("🛡️ batch sentinel: failed to persist issue")
 	}
+
+	// Tell the pipeline's owner, if this is one they need to act on. The domain
+	// event below only reaches somebody already looking at the UI. The batch
+	// sentinel has no separate alert type — the issue type is what it puts on the
+	// domain event — so the issue type is what the policy sees.
+	publishSentinelAlert(s.kafkaManager, issueType, severity, string(issueType), pipelineID, description, metadata, detectedAt)
 
 	if s.kafkaManager == nil {
 		return
@@ -786,11 +795,6 @@ func (s *BatchSentinel) emitBatchIssue(
 	_ = s.kafkaManager.ProduceWithHeaders("pipeline.domain.events", []byte(pipelineID), b, map[string]string{
 		"trace_id": pipelineID,
 	})
-
-	// ...and tell the pipeline's owner, if this is one they need to act on.
-	// The batch sentinel has no separate alert type — the issue type is what it
-	// puts on the domain event — so the issue type is what the policy sees.
-	publishSentinelAlert(s.kafkaManager, issueType, severity, string(issueType), pipelineID, description, metadata)
 }
 
 // resolveStaleIssues deletes open issues in one class whose condition no longer

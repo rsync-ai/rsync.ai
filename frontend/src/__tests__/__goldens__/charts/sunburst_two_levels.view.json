@@ -1,0 +1,59 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "sunburst",
+    "description": "Revenue by Region and channel",
+    "levels": [
+      "Region",
+      "channel"
+    ],
+    "value": {
+      "label": "Revenue",
+      "format": "decimal"
+    },
+    "groups": [
+      {
+        "key": "US",
+        "label": "US",
+        "color": "series-2"
+      },
+      {
+        "key": "EU",
+        "label": "EU",
+        "color": "series-1"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "path": [
+        "EU",
+        "web"
+      ],
+      "value": 320
+    },
+    {
+      "path": [
+        "US",
+        "web"
+      ],
+      "value": 300
+    },
+    {
+      "path": [
+        "US",
+        "store"
+      ],
+      "value": 270
+    },
+    {
+      "path": [
+        "EU",
+        "store"
+      ],
+      "value": 180
+    }
+  ],
+  "series": [],
+  "notes": []
+}

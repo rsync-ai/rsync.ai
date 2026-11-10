@@ -73,33 +73,70 @@ def test_validate_config_requires_host_and_database():
 
 # ============================ READ: pagination ==============================
 
-def test_export_keyset_returns_next_cursor_and_has_more():
-    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 1}, {"id": 2}, {"id": 3}])
+# Redshift's catalog; SUPER and GEOMETRY cannot be ordered by.
+RS_COLUMNS = ("svv_columns", [
+    {"column_name": "id", "data_type": "integer"},
+    {"column_name": "doc", "data_type": "super"},
+    {"column_name": "name", "data_type": "character varying(64)"},
+    {"column_name": "shape", "data_type": "geometry"},
+])
+
+
+def test_export_sweep_orders_every_column():
+    """KI-WAREHOUSE-BATCH-PAGING-UNORDERED: the executor asks for stable paging
+    and never names a column. Redshift does not enforce a declared key, so the
+    page orders by every orderable column and the executor steps the offset."""
+    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 1}, {"id": 2}, {"id": 3}], answers=[RS_COLUMNS])
+    out = s.export({**CFG, "table": "t", "use_keyset_paging": True, "limit": 3})
+    assert out["success"] is True, out
+    assert out["paging_mode"] == "offset", out
+    assert out["has_more"] is True and out["next_cursor"] is None, out
+    assert conn.all_sql()[-1] == 'SELECT * FROM "public"."t" ORDER BY "id", "name" LIMIT 3 OFFSET 0', conn.all_sql()
+    catalog = next(e for e in conn.all_execs() if "svv_columns" in e["sql"])
+    assert catalog["params"] == ("public", "t"), catalog     # bound, not inlined
+
+
+def test_export_sweep_names_cursor_column_first():
+    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 9}], answers=[RS_COLUMNS])
+    out = s.export({**CFG, "table": "t", "cursor_column": "name", "limit": 10, "offset": 20})
+    assert out["success"] is True and out["has_more"] is False, out
+    assert conn.all_sql()[-1] == 'SELECT * FROM "public"."t" ORDER BY "name", "id" LIMIT 10 OFFSET 20'
+
+
+def test_export_sweep_retries_the_catalog_in_lower_case():
+    # Redshift folds unquoted names to lower case unless the cluster is
+    # case-sensitive, so a mixed-case name is looked up both ways.
+    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 1}], answers=[("svv_columns", [])])
+    s.export({**CFG, "table": "Orders", "use_keyset_paging": True, "limit": 10})
+    lookups = [e["params"] for e in conn.all_execs() if "svv_columns" in e["sql"]]
+    assert lookups == [("public", "Orders"), ("public", "orders")], lookups
+
+
+def test_export_unreadable_catalog_pages_by_the_named_column():
+    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+                                       answers=[("svv_columns", RuntimeError("permission denied"))])
     out = s.export({**CFG, "table": "t", "cursor_column": "id", "limit": 3})
     assert out["success"] is True, out
     assert out["paging_mode"] == "keyset", out
     assert out["next_cursor"] == 3 and out["has_more"] is True, out
-    sql = conn.all_sql()[-1]
-    assert 'ORDER BY "id" ASC' in sql and "LIMIT 3" in sql, sql
-    assert '"public"."t"' in sql, sql
+    assert conn.all_sql()[-1] == 'SELECT * FROM "public"."t" ORDER BY "id" LIMIT 3', conn.all_sql()
+    assert conn.rolled_back >= 1          # the failed catalog read is rolled back
 
-
-def test_export_keyset_continuation_uses_bound_param():
-    s, conn = _rs_fakes.make_connector(rs, rows=[{"id": 9}])
-    out = s.export({**CFG, "table": "t", "cursor_column": "id",
-                    "cursor_value": 8, "limit": 10})
+    out = s.export({**CFG, "table": "t", "cursor_column": "id", "cursor_value": 8, "limit": 10})
     assert out["success"] is True, out
     e = conn.all_execs()[-1]
     assert 'WHERE "id" > %s' in e["sql"], e["sql"]
-    assert e["params"] == [8], e["params"]           # parameterized, not inlined
+    assert e["params"] == (8,), e["params"]           # parameterized, not inlined
 
 
 def test_export_offset_fallback_advances():
+    """No stable paging asked for: plain OFFSET, and no next_cursor, so the
+    executor steps the offset itself."""
     s, conn = _rs_fakes.make_connector(rs, rows=[{"a": 1}, {"a": 2}])
     out = s.export({**CFG, "table": "t", "limit": 2, "offset": 4})
     assert out["paging_mode"] == "offset", out
-    assert out["has_more"] is True and out["next_cursor"] == "6", out
-    assert "LIMIT 2 OFFSET 4" in conn.all_sql()[-1], conn.all_sql()
+    assert out["has_more"] is True and out["next_cursor"] is None, out
+    assert conn.all_sql()[-1] == 'SELECT * FROM "public"."t" LIMIT 2 OFFSET 4', conn.all_sql()
 
 
 def test_export_rejects_unsafe_cursor_column():

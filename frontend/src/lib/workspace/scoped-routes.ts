@@ -33,7 +33,8 @@ interface ScopedSection {
 const SCOPED_SECTIONS: readonly ScopedSection[] = [
   // Covers /pipelines/{id} and everything under it (e.g. /schema-changes).
   { prefix: "/pipelines", listRoot: "/pipelines", label: "pipelines" },
-  { prefix: "/executions", listRoot: "/executions", label: "executions" },
+  // A pipeline run still opens at /executions/{id}; the list it belongs to is Runs.
+  { prefix: "/executions", listRoot: "/runs", label: "runs" },
   { prefix: "/connections", listRoot: "/connections", label: "connections" },
 ]
 

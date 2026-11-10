@@ -461,8 +461,10 @@ func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string,
 		// code is a stable identifier with a published doc URL and lives on
 		// persisted notification rows, so it is described accurately in the
 		// user-facing copy (api-gateway/internal/notifier/catalog.go) rather than
-		// renamed. SeverityError here BLOCKS the run — the catalog entry must not
-		// tell the user the rest of the pipeline continues.
+		// renamed. SeverityError here BLOCKS the run, except for a batch table the
+		// drift loop already has a baseline for: the orchestrator's RunAssessment
+		// (warnTablesAwaitingDropDecision) turns that one into a warning, because
+		// the run leaves it out and files a drop decision.
 		return Check{
 			Code: "CDC_TABLE_NOT_FOUND_IN_SOURCE", Severity: SeverityError, Passed: false,
 			Message: fmt.Sprintf("Table %s.%s does not exist in source", dbName, table),

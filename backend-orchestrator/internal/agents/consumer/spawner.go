@@ -295,19 +295,6 @@ func (s *DockerSpawner) Terminate(ctx context.Context, consumerID string) error 
 	return nil
 }
 
-// List lists all managed consumers
-func (s *DockerSpawner) List(ctx context.Context) ([]*ConsumerInstance, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result := make([]*ConsumerInstance, 0, len(s.instances))
-	for _, instance := range s.instances {
-		result = append(result, instance)
-	}
-
-	return result, nil
-}
-
 // Close closes the Docker client
 func (s *DockerSpawner) Close() error {
 	return nil

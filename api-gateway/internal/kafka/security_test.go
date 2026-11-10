@@ -169,8 +169,8 @@ func TestDialerAndTransportCarryClientID(t *testing.T) {
 	}
 }
 
-// The producer configs resolve their own broker list from the environment, so
-// they need the same trimming as the list main() hands down.
+// The producer config resolves its own broker list from the environment, so it
+// needs the same trimming as the list main() hands down.
 func TestDefaultProducerConfigsTrimBrokerList(t *testing.T) {
 	clearKafkaEnv(t)
 	t.Setenv("KAFKA_BROKERS", "b1:9092, b2:9092,")
@@ -181,7 +181,6 @@ func TestDefaultProducerConfigsTrimBrokerList(t *testing.T) {
 		got  []string
 	}{
 		{"unified", DefaultUnifiedConfig().Brokers},
-		{"avro", DefaultAvroConfig().Brokers},
 	} {
 		if len(tc.got) != len(want) {
 			t.Fatalf("%s brokers = %q, want %q", tc.name, tc.got, want)

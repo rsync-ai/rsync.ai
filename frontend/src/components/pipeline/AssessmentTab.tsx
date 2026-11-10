@@ -42,6 +42,7 @@ import {
   type AssessmentRemediation,
   type AssessmentRunSummary,
 } from "@/lib/api/pipelines"
+import { RowsSkeleton } from "@/components/kit/PageSkeleton"
 
 /** Fired after a run is saved so the tab badge re-reads the newest counts. */
 export const ASSESSMENT_UPDATED_EVENT = "rsync:assessment_updated"
@@ -279,7 +280,7 @@ function CountsBar({
   onPick: (f: Partial<CheckFilters>) => void
 }) {
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+    <div className="grid grid-cols-2 gap-2 @md:grid-cols-5">
       {COUNT_CARDS.map((c) => (
         <button
           key={c.key}
@@ -425,11 +426,7 @@ export function AssessmentTab({
   )
 
   if (loading && !current && runs.length === 0) {
-    return (
-      <div className="flex items-center gap-2 py-8 text-sm text-zinc-500 dark:text-zinc-400">
-        <Loader2 className="h-4 w-4 animate-spin" /> Loading assessment…
-      </div>
-    )
+    return <RowsSkeleton rows={5} label="Loading assessment…" />
   }
 
   if (loadError && !current) {
@@ -523,7 +520,7 @@ export function AssessmentTab({
               onChange={(e) => setFilters((prev) => ({ ...prev, search: e.target.value }))}
               placeholder="Search checks, tables or codes"
               aria-label="Search checks"
-              className="h-9 w-full sm:w-64"
+              className="h-9 w-full @md:w-64"
             />
             <select
               aria-label="Filter by level"

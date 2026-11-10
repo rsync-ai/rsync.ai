@@ -15,28 +15,6 @@ func TestNewOffsetTracker(t *testing.T) {
 	}
 }
 
-func TestOffsetTracker_SimulateOffsets(t *testing.T) {
-	config := DefaultConfig()
-	tracker := NewOffsetTracker(config)
-
-	offsets, err := tracker.GetConsumerGroupOffsets(context.Background(), "test-group", "test-topic")
-	if err != nil {
-		t.Fatalf("Error getting offsets: %v", err)
-	}
-
-	if offsets == nil {
-		t.Fatal("Expected non-nil offsets")
-	}
-
-	if offsets.ConsumerGroup != "test-group" {
-		t.Errorf("Expected group 'test-group', got '%s'", offsets.ConsumerGroup)
-	}
-
-	if len(offsets.Offsets) == 0 {
-		t.Error("Expected some partition offsets")
-	}
-}
-
 func TestBulkLoadDetector_RegisterBulkLoad(t *testing.T) {
 	config := DefaultConfig()
 	config.Retention.BulkLoadThreshold = 1000
@@ -108,13 +86,21 @@ func TestBulkLoadInfo_IsAllCaughtUp(t *testing.T) {
 	}
 }
 
+// caughtUpKafka answers as a broker on which consumer-1 has read test-topic to 100000.
+func caughtUpKafka() kafkaAnswers {
+	return kafkaAnswers{
+		"GET /topics/test-topic/configs":    `{"retention.ms":"604800000"}`,
+		"PUT /topics/test-topic/configs":    `{}`,
+		"GET /consumer-groups":              `["consumer-1"]`,
+		"GET /consumers/consumer-1/offsets": `{"offsets":[{"topic":"test-topic","partition":0,"offset":100000}]}`,
+	}
+}
+
 func TestSafetyChecker_CanCleanupSafely(t *testing.T) {
-	config := DefaultConfig()
+	config, _, manager := retentionWith(caughtUpKafka())
 	config.Safety.MinWaitAfterLoadMins = 0 // Disable for testing
 	config.Safety.GracePeriodMins = 0      // Disable for testing
-
-	tracker := NewOffsetTracker(config)
-	checker := NewSafetyChecker(config, tracker)
+	checker := manager.safetyChecker
 
 	info := &BulkLoadInfo{
 		Topic:             "test-topic",
@@ -138,16 +124,15 @@ func TestSafetyChecker_CanCleanupSafely(t *testing.T) {
 	if len(result.ChecksPerformed) == 0 {
 		t.Error("Expected some checks to be performed")
 	}
+	if !result.Safe {
+		t.Errorf("consumer-1 has read test-topic to its end; want safe, got %+v", result)
+	}
 }
 
 func TestCleanupManager_ExecuteCleanup(t *testing.T) {
-	config := DefaultConfig()
+	config, _, manager := retentionWith(caughtUpKafka())
 	config.Safety.MinWaitAfterLoadMins = 0
 	config.Safety.GracePeriodMins = 0
-
-	tracker := NewOffsetTracker(config)
-	checker := NewSafetyChecker(config, tracker)
-	manager := NewCleanupManager(config, checker)
 
 	info := &BulkLoadInfo{
 		ID:                "test-bulk-1",
@@ -162,7 +147,7 @@ func TestCleanupManager_ExecuteCleanup(t *testing.T) {
 
 	result, err := manager.ExecuteCleanup(context.Background(), info, ActionReduceRetention)
 	if err != nil {
-		t.Logf("Cleanup result (may fail in test): %v", err)
+		t.Fatalf("ExecuteCleanup: %v", err)
 	}
 
 	if result == nil {
@@ -280,8 +265,9 @@ func TestConfig_FromEnv(t *testing.T) {
 }
 
 func TestConsumerProgress(t *testing.T) {
-	config := DefaultConfig()
-	tracker := NewOffsetTracker(config)
+	_, tracker, _ := retentionWith(kafkaAnswers{
+		"GET /consumers/test-group/offsets": `{"offsets":[{"topic":"test-topic","partition":0,"offset":40000}]}`,
+	})
 
 	progress, err := tracker.GetConsumerProgress(
 		context.Background(),
@@ -304,6 +290,10 @@ func TestConsumerProgress(t *testing.T) {
 
 	if progress.TargetOffset != 100000 {
 		t.Errorf("Expected target offset 100000, got %d", progress.TargetOffset)
+	}
+
+	if progress.CurrentOffset != 40000 || progress.Lag != 60000 || progress.CaughtUp {
+		t.Errorf("Expected offset 40000, lag 60000, not caught up; got %+v", progress)
 	}
 }
 

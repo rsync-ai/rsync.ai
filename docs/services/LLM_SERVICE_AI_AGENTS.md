@@ -31,7 +31,7 @@ The LLM Service is the AI brain of rsync-ai. It contains multiple specialized ag
 │                                                                │
 │  ┌──────────────────┐  ┌──────────────────┐                    │
 │  │Connector Resolver│  │  DAG Planner     │                    │
-│  │ (Name Matching)  │  │ (Dependency)     │                    │
+│  │ (Name Matching)  │  │ (off, ADR-001)   │                    │
 │  └──────────────────┘  └──────────────────┘                    │
 │                                                                │
 │  ┌──────────────────┐  ┌──────────────────┐                    │
@@ -378,11 +378,16 @@ SQL Generator Output:
 
 ### 6. DAG Planner Agent
 
-**Purpose**: Optimize execution order and detect dependencies.
+**Purpose**: drafted in-pipeline DAGs from a plain-language request. **Not reached since DAG
+mode was switched off in [#1307](https://github.com/rsync-ai/rsync-ai/pull/1307)**
+(ADR-001): the planner routes no request to it
+([planner/service.py:196](../../llm-service/src/agents/planner/service.py:196)); every request
+plans as a plain pipeline. The code stays until the DAG runtime is removed; only
+`hitl_interpreter` is still called.
 
 **Location**: `/llm-service/src/agents/dag_planner/`
 
-**Dependency Detection**:
+**Dependency Detection** (historical, from before DAG mode was switched off):
 ```
 Tables to sync: [customers, orders, order_items]
 
@@ -405,7 +410,9 @@ Execution Order:
 
 **Purpose**: Detect personally identifiable information in data.
 
-**Location**: `/llm-service/src/agents/pii/`
+**Location**: `llm-service/src/agents/pii_scanner/` (the schema scan classifies by column name,
+[column_names.py](../../llm-service/src/agents/pii_scanner/column_names.py); a column scanned
+with samples goes through [ml_detector.py](../../llm-service/src/agents/pii_scanner/ml_detector.py))
 
 **Detection Patterns**:
 - Email addresses
@@ -415,14 +422,18 @@ Execution Order:
 - Names (using NER)
 - Addresses
 
-**Output**:
+**Output** ([pii_scanner/service.py:41](../../llm-service/src/agents/pii_scanner/service.py:41)):
 ```python
-class PIIDetectionResult(BaseModel):
-    column: str
-    pii_type: str  # "email", "phone", "ssn", etc.
+@dataclass
+class ColumnScanResult:
+    column_name: str
+    is_pii: bool
+    pii_type: Optional[str]  # "email", "phone", "ssn", etc.
     confidence: float
-    sample_match: str  # Redacted sample
-    recommendation: str  # "mask", "encrypt", "exclude"
+    detection_method: str  # "column_name", "ml" or "none"
+    sample_count: int
+    match_count: int
+    suggested_masking: str
 ```
 
 ---
@@ -531,7 +542,7 @@ hold.
 **Benefits**: no API costs · data privacy (on-premise) · works without internet.
 
 **Caveat**: the api-gateway enforces a 30 s timeout on the Explorer's LLM call
-([`explorer.go:3395`](../../api-gateway/internal/handlers/explorer.go#L3395)), so Explorer-on-Ollama
+([`explorer.go:1440`](../../api-gateway/internal/handlers/explorer.go#L1467)), so Explorer-on-Ollama
 needs a GPU. Batch and CDC are unaffected.
 
 **Configuration**:

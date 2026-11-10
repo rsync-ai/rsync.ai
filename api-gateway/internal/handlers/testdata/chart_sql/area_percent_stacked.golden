@@ -1,0 +1,127 @@
+# settings: {"version":2,"type":"area","roles":{"x":[{"column":"day"}],"series":[{"column":"region"}],"measure":[{"aggregate":"sum","column":"amount"}]},"stacked":true,"percent":true}
+
+-- postgres
+SELECT r."day" AS "day", CASE WHEN r."rsync_rank" <= 7 THEN r."region" END AS "region", SUM(r."amount") AS "amount", CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END AS "rsync_other", MAX(MAX(r."rsync_rank")) OVER () AS "rsync_series"
+FROM (
+SELECT g."day", g."region", g."amount", DENSE_RANK() OVER (ORDER BY CASE WHEN g."rsync_total" IS NULL THEN 1 ELSE 0 END, g."rsync_total" DESC, g."region" ASC) AS "rsync_rank"
+FROM (
+SELECT src."day" AS "day", src."region" AS "region", SUM(src."amount") AS "amount", SUM(ABS(SUM(src."amount"))) OVER (PARTITION BY src."region") AS "rsync_total"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY src."day", src."region"
+) g
+) r
+GROUP BY r."day", CASE WHEN r."rsync_rank" <= 7 THEN r."region" END, CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END
+ORDER BY r."day" ASC, CASE WHEN r."rsync_rank" <= 7 THEN r."region" END ASC, CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT r.`day` AS `day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, SUM(r.`amount`) AS `amount`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`
+FROM (
+SELECT g.`day`, g.`region`, g.`amount`, DENSE_RANK() OVER (ORDER BY CASE WHEN g.`rsync_total` IS NULL THEN 1 ELSE 0 END, g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`day` AS `day`, src.`region` AS `region`, SUM(src.`amount`) AS `amount`, SUM(ABS(SUM(src.`amount`))) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`day`, src.`region`
+) g
+) r
+GROUP BY r.`day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY r.`day` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) r.[day] AS [day], CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END AS [region], SUM(r.[amount]) AS [amount], CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END AS [rsync_other], MAX(MAX(r.[rsync_rank])) OVER () AS [rsync_series]
+FROM (
+SELECT g.[day], g.[region], g.[amount], DENSE_RANK() OVER (ORDER BY CASE WHEN g.[rsync_total] IS NULL THEN 1 ELSE 0 END, g.[rsync_total] DESC, g.[region] ASC) AS [rsync_rank]
+FROM (
+SELECT src.[day] AS [day], src.[region] AS [region], SUM(src.[amount]) AS [amount], SUM(ABS(SUM(src.[amount]))) OVER (PARTITION BY src.[region]) AS [rsync_total]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY src.[day], src.[region]
+) g
+) r
+GROUP BY r.[day], CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END, CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END
+ORDER BY r.[day] ASC, CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END ASC, CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT r.`day` AS `day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, SUM(r.`amount`) AS `amount`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`
+FROM (
+SELECT g.`day`, g.`region`, g.`amount`, DENSE_RANK() OVER (ORDER BY CASE WHEN g.`rsync_total` IS NULL THEN 1 ELSE 0 END, g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`day` AS `day`, src.`region` AS `region`, SUM(src.`amount`) AS `amount`, SUM(ABS(SUM(src.`amount`))) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+GROUP BY src.`day`, src.`region`
+) g
+) r
+GROUP BY r.`day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY r.`day` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT r."DAY" AS "DAY", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END AS "REGION", SUM(r."AMOUNT") AS "AMOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END AS "RSYNC_OTHER", MAX(MAX(r."RSYNC_RANK")) OVER () AS "RSYNC_SERIES"
+FROM (
+SELECT g."DAY", g."REGION", g."AMOUNT", DENSE_RANK() OVER (ORDER BY CASE WHEN g."RSYNC_TOTAL" IS NULL THEN 1 ELSE 0 END, g."RSYNC_TOTAL" DESC, g."REGION" ASC) AS "RSYNC_RANK"
+FROM (
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", SUM(src."AMOUNT") AS "AMOUNT", SUM(ABS(SUM(src."AMOUNT"))) OVER (PARTITION BY src."REGION") AS "RSYNC_TOTAL"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."DAY", src."REGION"
+) g
+) r
+GROUP BY r."DAY", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END
+ORDER BY r."DAY" ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT r.`day` AS `day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, SUM(r.`amount`) AS `amount`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`
+FROM (
+SELECT g.`day`, g.`region`, g.`amount`, DENSE_RANK() OVER (ORDER BY CASE WHEN g.`rsync_total` IS NULL THEN 1 ELSE 0 END, g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`day` AS `day`, src.`region` AS `region`, SUM(src.`amount`) AS `amount`, SUM(ABS(SUM(src.`amount`))) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY src.`day`, src.`region`
+) g
+) r
+GROUP BY r.`day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY r.`day` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT r.`day` AS `day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, SUM(r.`amount`) AS `amount`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`
+FROM (
+SELECT g.`day`, g.`region`, g.`amount`, DENSE_RANK() OVER (ORDER BY CASE WHEN g.`rsync_total` IS NULL THEN 1 ELSE 0 END, g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`day` AS `day`, src.`region` AS `region`, SUM(src.`amount`) AS `amount`, SUM(ABS(SUM(src.`amount`))) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+GROUP BY src.`day`, src.`region`
+) g
+) r
+GROUP BY r.`day`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY r.`day` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT r."DAY" AS "DAY", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END AS "REGION", SUM(r."AMOUNT") AS "AMOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END AS "RSYNC_OTHER", MAX(MAX(r."RSYNC_RANK")) OVER () AS "RSYNC_SERIES"
+FROM (
+SELECT g."DAY", g."REGION", g."AMOUNT", DENSE_RANK() OVER (ORDER BY CASE WHEN g."RSYNC_TOTAL" IS NULL THEN 1 ELSE 0 END, g."RSYNC_TOTAL" DESC, g."REGION" ASC) AS "RSYNC_RANK"
+FROM (
+SELECT src."DAY" AS "DAY", src."REGION" AS "REGION", SUM(src."AMOUNT") AS "AMOUNT", SUM(ABS(SUM(src."AMOUNT"))) OVER (PARTITION BY src."REGION") AS "RSYNC_TOTAL"
+FROM "GOLD"."ORDERS" src
+GROUP BY src."DAY", src."REGION"
+) g
+) r
+GROUP BY r."DAY", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END
+ORDER BY r."DAY" ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

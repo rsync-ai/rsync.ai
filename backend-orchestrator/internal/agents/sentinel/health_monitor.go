@@ -150,7 +150,7 @@ func (h *HealthMonitor) Stop() {
 //
 // last_error and metadata are written even though the original upsert omitted them: both
 // are columns GET /api/v1/monitoring/sentinel/health selects
-// (api-gateway/internal/handlers/monitoring.go:394), so leaving them out returned a status
+// (api-gateway/internal/handlers/monitoring.go:385), so leaving them out returned a status
 // with no explanation attached to it. They are written unconditionally, blank included, so
 // a component that recovers stops reporting the failure it recovered from.
 func (h *HealthMonitor) persistHealthToDB(health *ComponentHealth) {
@@ -202,7 +202,7 @@ func (h *HealthMonitor) persistHealthToDB(health *ComponentHealth) {
 // to h.componentHealth — a map that no code outside this file reads — so an unhealthy
 // PostgreSQL, Kafka or Kafka Connect was detected correctly and then told nobody. The row
 // is what the monitoring API and its infrastructure summary
-// (api-gateway/internal/handlers/monitoring.go:394 and :722) read.
+// (api-gateway/internal/handlers/monitoring.go:385 and :696) read.
 //
 // The write is synchronous: this runs on a 30s ticker over a handful of components, so
 // there is nothing to gain from a goroutine and a caller can be sure the row landed.

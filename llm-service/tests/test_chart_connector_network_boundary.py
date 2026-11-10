@@ -7,7 +7,7 @@ connector joins ONLY the dedicated `rsync-ai-mcp` network and never the internal
 exactly four services bridge into `rsync-ai-mcp` to call it. That boundary is
 named SEC-M-06 in scripts/mcp_generate_compose.py:12-16, and JIT-deployed
 connectors land on the same network
-(llm-service/src/agents/tool_generator/deployment/service.py:180-188).
+(llm-service/src/agents/tool_generator/deployment/service.py:179-188).
 
 KI-CHART-NO-CONNECTOR-NETWORK-BOUNDARY was that the Helm chart had no equivalent:
 its `allow-intra-release` NetworkPolicy set both the target selector and the

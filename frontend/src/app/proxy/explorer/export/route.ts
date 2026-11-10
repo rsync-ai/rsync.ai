@@ -63,16 +63,24 @@ function formatTimestampForFilename(d: Date): string {
 export async function POST(request: Request) {
   try {
     const cookieStore = await cookies()
-    const sessionToken = cookieStore.get("session_token")?.value
+    // The gateway's session cookie (auth.go setAuthCookie), not a name of our own.
+    const sessionToken = cookieStore.get("auth_token")?.value
+    if (!sessionToken) {
+      return NextResponse.json({ error: "Sign in to export query results" }, { status: 401 })
+    }
+    // The gateway's CSRF double-submit (csrf_middleware.go) guards its POST, so the
+    // pair is checked here first and then forwarded: this route runs the viewer's
+    // query, so a page on another site may not start it.
+    const csrf = cookieStore.get("csrf_token")?.value?.trim()
+    const csrfHeader = request.headers.get("x-csrf-token")?.trim()
+    if (!csrf || !csrfHeader || csrf !== csrfHeader) {
+      return NextResponse.json({ error: "Missing or invalid CSRF token" }, { status: 403 })
+    }
     // The upstream /api/v1/explorer/query is workspace-scoped; forward the
     // active-workspace selection alongside auth so an export of a shared-workspace
     // connection doesn't fall back to the personal workspace and 404. Merge into
-    // ONE Cookie header (a separate `cookie` header would clobber session_token).
-    const workspacePair = activeWorkspaceCookiePair(cookieStore)
-    const upstreamCookie = [
-      sessionToken ? `session_token=${sessionToken}` : null,
-      workspacePair,
-    ]
+    // ONE Cookie header (a separate `cookie` header would clobber auth_token).
+    const upstreamCookie = [`auth_token=${sessionToken}`, `csrf_token=${csrf}`, activeWorkspaceCookiePair(cookieStore)]
       .filter(Boolean)
       .join("; ")
 
@@ -102,7 +110,8 @@ export async function POST(request: Request) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...(upstreamCookie ? { Cookie: upstreamCookie } : {}),
+        Cookie: upstreamCookie,
+        "X-CSRF-Token": csrf,
       },
       body: JSON.stringify({ connection_id, sql, limit }),
     })

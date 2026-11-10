@@ -8,6 +8,9 @@ Companion to the mysql connector's test of the same name. The PG→MySQL bug
      destination keeps the scale too, while a bare "decimal" still maps to the
      lossless NUMERIC(38,9).
 
+A NUMERIC declared with no precision or scale is reported as the bare "numeric"
+and stays a plain NUMERIC here (shared/unconstrained_numeric_golden.json).
+
 Run inside the postgresql connector image:
     docker cp <thisfile> rsync-ai-postgresql-v1-0-0-mcp:/app/ && \
     docker exec rsync-ai-postgresql-v1-0-0-mcp python /app/test_decimal_scale_preservation.py
@@ -16,7 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from connector import PostgresqlMCPServer  # noqa: E402
+from connector import PostgresqlMCPServer, _discovered_column_type  # noqa: E402
 
 
 def _srv():
@@ -32,10 +35,27 @@ def test_parametric_decimal_preserved():
 
 
 def test_bare_decimal_is_wide_lossless_not_default():
-    # Bare "decimal"/"numeric" -> NUMERIC(38,9), never an unconstrained numeric
-    # that some clients round to scale 0.
+    # Bare "decimal" -> NUMERIC(38,9), never an unconstrained numeric that some
+    # clients round to scale 0.
     assert _srv()._pg_type_for("decimal") == "NUMERIC(38,9)"
-    assert _srv()._pg_type_for("numeric") == "NUMERIC(38,9)"
+
+
+def test_unconstrained_numeric_stays_unconstrained():
+    # Discovery reports a NUMERIC with no precision or scale as the bare
+    # "numeric"; NUMERIC(38,9) rounded it at the ninth decimal place.
+    assert _srv()._pg_type_for("numeric") == "NUMERIC"
+
+
+def test_discovery_marks_only_the_unconstrained_numeric():
+    # (information_schema data_type, numeric_precision, numeric_scale)
+    assert _discovered_column_type("numeric", None, None) == "numeric"
+    assert _discovered_column_type("numeric", 10, 2) == "numeric(10,2)"
+    assert _discovered_column_type("numeric", 12, None) == "numeric(12,0)"
+    # money is exact with two places: a fixed-width decimal, not the marker.
+    assert _discovered_column_type("money", None, None) == "decimal"
+    # integer reports numeric_precision=32; it is not a decimal.
+    assert _discovered_column_type("integer", 32, 0) == "integer"
+    assert _discovered_column_type("text", None, None) == "string"
 
 
 def test_pg_type_for_delegates_to_shared_authority():
@@ -70,5 +90,7 @@ if __name__ == "__main__":
     test_parametric_numeric_preserved()
     test_parametric_decimal_preserved()
     test_bare_decimal_is_wide_lossless_not_default()
+    test_unconstrained_numeric_stays_unconstrained()
+    test_discovery_marks_only_the_unconstrained_numeric()
     test_pg_type_for_delegates_to_shared_authority()
     print("OK: postgresql decimal scale-preservation tests passed")

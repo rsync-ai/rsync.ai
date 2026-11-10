@@ -87,7 +87,7 @@ func RecoverCDCPipeline(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcRecoverBudget)
 		defer cancel()
 
 		connectorName, err := findConnectorName(ctx, db, pipelineID)
@@ -212,19 +212,57 @@ func RecoverCDCPipeline(db *sql.DB) gin.HandlerFunc {
 			"reason":         reason,
 		}).Warn("CDC recovery requested")
 
-		// Pause connector (best-effort) to stabilize task state for offset reset.
-		_, _ = putConnectNoBody(ctx, connectURL, fmt.Sprintf("/connectors/%s/pause", connectorName))
-
+		// Every Kafka Connect answer from here on is checked: a refused step answers
+		// non-2xx and says where the connector was left, never "recovered".
 		offsetReset := gin.H{"attempted": req.ResetOffsets, "success": false}
+		fail := func(status int, code, message, connectorState string) {
+			log.WithFields(log.Fields{
+				"recovery_id": recoveryID, "pipeline_id": pipelineID, "connector_name": connectorName,
+				"error": code, "connector_state": connectorState,
+			}).Warn("CDC recovery failed: " + message)
+			c.JSON(status, gin.H{
+				"success":         false,
+				"error":           code,
+				"message":         message,
+				"recovery_id":     recoveryID,
+				"pipeline_id":     pipelineID,
+				"connector":       connectorName,
+				"connector_state": connectorState,
+				"offsets":         offsetReset,
+			})
+		}
+		// restore starts the connector again after a failure that changed nothing,
+		// putting it back as the operator found it, and says where it was left.
+		parked := "paused"
+		restore := func() string {
+			if code, err := putConnectNoBody(ctx, connectURL, "/connectors/"+connectorName+"/resume"); err != nil || code < 200 || code >= 300 {
+				return parked
+			}
+			return "resumed"
+		}
+
+		// Park the connector first. An offset reset needs it STOPPED: Kafka Connect's
+		// offsets API (KIP-875) refuses a paused connector. Without a reset a pause
+		// is enough, and the restart below brings the FAILED tasks back.
+		if req.ResetOffsets {
+			outcome, status, why := stopConnector(ctx, connectURL, connectorName)
+			if status == http.StatusOK && outcome == "absent" {
+				status, why = http.StatusNotFound, fmt.Sprintf("connector %s no longer exists in Kafka Connect", connectorName)
+			}
+			if status != http.StatusOK {
+				fail(status, "connector_park_failed", why, "unchanged")
+				return
+			}
+			parked = outcome
+		} else if status, why := connectStepFailure(putConnectNoBody(ctx, connectURL, "/connectors/"+connectorName+"/pause")); status != 0 {
+			fail(status, "connector_park_failed", "pause "+why, "unchanged")
+			return
+		}
+
 		if req.ResetOffsets {
 			if err := deleteConnectorOffsets(ctx, connectURL, connectorName); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"success":     false,
-					"error":       "offset_reset_failed",
-					"message":     err.Error(),
-					"pipeline_id": pipelineID,
-					"connector":   connectorName,
-				})
+				// The offsets are intact, so nothing has changed yet.
+				fail(http.StatusBadGateway, "offset_reset_failed", err.Error(), restore())
 				return
 			}
 			offsetReset["success"] = true
@@ -232,24 +270,63 @@ func RecoverCDCPipeline(db *sql.DB) gin.HandlerFunc {
 
 		// Apply updated config (snapshot.mode + optional pg publication/slot alignment).
 		if err := putKafkaConnectConfig(ctx, connectURL, connectorName, connCfg); err != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": err.Error()})
+			if req.ResetOffsets {
+				// The offsets are already gone. Started now, the connector would run its
+				// old snapshot.mode from no position — a snapshot nobody chose — so it
+				// stays parked until the recovery is run again.
+				fail(http.StatusBadGateway, "config_update_failed",
+					err.Error()+"; its offsets are already cleared, so the connector was left "+parked+": run the recovery again", parked)
+				return
+			}
+			fail(http.StatusBadGateway, "config_update_failed", err.Error(), restore())
 			return
 		}
 
-		// Restart + resume.
-		_, _ = postConnectNoBody(ctx, connectURL, fmt.Sprintf("/connectors/%s/restart?includeTasks=true&onlyFailed=false", connectorName))
-		_, _ = putConnectNoBody(ctx, connectURL, fmt.Sprintf("/connectors/%s/resume", connectorName))
+		// A stopped connector has no tasks; resuming it starts fresh ones from the new
+		// config. A paused one keeps its FAILED tasks until they are restarted.
+		restartWhy := ""
+		if parked == "paused" {
+			if status, why := connectStepFailure(postConnectNoBody(ctx, connectURL, "/connectors/"+connectorName+"/restart?includeTasks=true&onlyFailed=false")); status != 0 {
+				restartWhy = "restart " + why
+			}
+		}
+		if status, why := connectStepFailure(putConnectNoBody(ctx, connectURL, "/connectors/"+connectorName+"/resume")); status != 0 {
+			fail(status, "connector_resume_failed", "resume "+why+"; the connector was left "+parked, parked)
+			return
+		}
+		if restartWhy != "" {
+			fail(http.StatusBadGateway, "connector_restart_failed",
+				restartWhy+"; the connector was resumed with the new config, but its failed tasks were not restarted", "resumed")
+			return
+		}
 
+		message := fmt.Sprintf("CDC recovery applied: %s started again with snapshot.mode=%s.", connectorName, snapshotMode)
+		if req.ResetOffsets {
+			message = fmt.Sprintf("CDC recovery applied: %s offsets cleared and the connector started again with snapshot.mode=%s.", connectorName, snapshotMode)
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"success":     true,
-			"recovery_id": recoveryID,
-			"pipeline_id": pipelineID,
-			"connector":   connectorName,
-			"plan":        plan,
-			"offsets":     offsetReset,
-			"message":     "CDC recovery triggered (connector restarted).",
+			"success":         true,
+			"recovery_id":     recoveryID,
+			"pipeline_id":     pipelineID,
+			"connector":       connectorName,
+			"connector_state": "resumed",
+			"plan":            plan,
+			"offsets":         offsetReset,
+			"message":         message,
 		})
 	}
+}
+
+// connectStepFailure reads a Kafka Connect call's answer: 0 when it succeeded,
+// else the status to answer and why.
+func connectStepFailure(code int, err error) (int, string) {
+	if err != nil {
+		return http.StatusServiceUnavailable, fmt.Sprintf("failed: kafka connect unreachable: %v", err)
+	}
+	if code < 200 || code >= 300 {
+		return http.StatusBadGateway, fmt.Sprintf("refused by kafka connect (HTTP %d)", code)
+	}
+	return 0, ""
 }
 
 func normalizeSnapshotMode(v string) string {
@@ -344,3 +421,10 @@ func postConnectNoBody(ctx context.Context, connectURL, path string) (int, error
 	defer resp.Body.Close()
 	return resp.StatusCode, nil
 }
+
+// cdcRecoverBudget bounds one recovery, every Kafka Connect step included. It runs
+// detached from the request (context.WithoutCancel), so a caller that goes away — a closed
+// tab, a gateway that stops waiting — cannot cancel the recovery between two steps and
+// leave the connector stopped. The gateway's cdcRecoverProxyTimeout still outlasts it, so
+// the caller hears how the recovery ended.
+const cdcRecoverBudget = 90 * time.Second

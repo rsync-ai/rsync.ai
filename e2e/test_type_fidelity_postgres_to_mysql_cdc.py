@@ -248,6 +248,8 @@ DROP TABLE IF EXISTS e2e_db.{table};
     cfg = {
         "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
         "tasks.max": "1",
+        "topic.creation.default.replication.factor": "-1",
+        "topic.creation.default.partitions": "-1",
         "topic.prefix": connector,
         "database.hostname": PG_CONTAINER,
         "database.port": "5432",

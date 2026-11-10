@@ -158,8 +158,8 @@ func TestRowMovementTickRaisesTheFrozenCounterIssue(t *testing.T) {
 
 	mock.ExpectQuery(`FROM pipelines p`).
 		WillReturnRows(batchRowCountRows(pid, "nightly-export", "exec-1", 12000))
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	mock.ExpectQuery(`SELECT id FROM sentinel_active_issues`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
@@ -191,8 +191,8 @@ func TestRowMovementTickDoesNotDeleteTheIssueItJustRaised(t *testing.T) {
 
 	mock.ExpectQuery(`FROM pipelines p`).
 		WillReturnRows(batchRowCountRows(pid, "frozen", "exec-1", 7))
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	mock.ExpectQuery(`SELECT id FROM sentinel_active_issues`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(issueID))
 	mock.ExpectExec(`DELETE FROM sentinel_active_issues`).

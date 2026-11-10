@@ -17,6 +17,7 @@ from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from openai import OpenAI  # kept for type hints in the class
+from src.egress import guarded_call
 from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
 try:
     # Normal import when the src/ package tree is the root (production / Docker).
@@ -338,7 +339,9 @@ Be intelligent about:
         # Run agent loop (max 3 tool calls)
         try:
             for iteration in range(3):
-                response = self.client.chat.completions.create(
+                response = guarded_call(
+                    self.client,
+                    component="connector_resolver",
                     model=self._model,
                     messages=messages,
                     tools=tools,
@@ -379,7 +382,9 @@ Be intelligent about:
                     break
             
             # Get final answer from agent
-            final_response = self.client.chat.completions.create(
+            final_response = guarded_call(
+                self.client,
+                component="connector_resolver",
                 model=self._model,
                 messages=messages + [{
                     "role": "user",
@@ -404,7 +409,7 @@ If confidence < 0.7: Return top 3 similar + indicate no exact match"""
             
             # Parse agent's decision (tolerate rare markdown-wrapped output)
             from src.utils.json_extract import loads as _safe_json_loads
-            decision = _safe_json_loads(final_response.choices[0].message.content)
+            decision = _safe_json_loads(final_response.text)
             return ResolverResult(
                 canonical=decision.get("canonical"),
                 confidence=decision.get("confidence", 0.0),

@@ -28,7 +28,7 @@ export, models/schedules, any write.
 |---|---|
 | Mongo resolves `Supported: false`; the test pins it | [explorer_capability.go:136-140](../../api-gateway/internal/handlers/explorer_capability.go), [explorer_capability_test.go:92-97](../../api-gateway/internal/handlers/explorer_capability_test.go) |
 | `/explorer/query` runs the SQL validator **before** loading the connection, clamps limit to 500 | [explorer.go:466-493](../../api-gateway/internal/handlers/explorer.go) |
-| Delegated reads always call the connector's **`export`** tool with `{query, sql, limit, config}` — no way to pass a find spec | [executor.go:7624-7675](../../backend-orchestrator/internal/agents/executor/executor.go), route [main.go:1456-1500](../../backend-orchestrator/cmd/orchestrator/main.go) |
+| Delegated reads always call the connector's **`export`** tool with `{query, sql, limit, config}` — no way to pass a find spec | [executor.go:8498-8549](../../backend-orchestrator/internal/agents/executor/executor.go), route [main.go:1456-1500](../../backend-orchestrator/cmd/orchestrator/main.go) |
 | Mongo `export` ignores `query`, requires `collection`, has no filter (`_id` keyset only) | [connector.py:522-579](../../shared/mcp-connectors/public/database/mongodb/versions/v1.0.0/connector.py) |
 | Mongo `discover_schema` lists collections + fields sampled from 20 docs | [connector.py:369-441](../../shared/mcp-connectors/public/database/mongodb/versions/v1.0.0/connector.py) |
 | Tools are advertised from `get_capabilities().operations`; `mongodb_<op>` dispatches to `self.<op>` | [connector.py:488-509](../../shared/mcp-connectors/public/database/mongodb/versions/v1.0.0/connector.py), `base_connector.py` `_handle_tool_call` |
@@ -76,7 +76,7 @@ operators (deferred). Other limits:
 - Documents: default limit 50, max 500. Fetch `limit+1` to compute `has_more`.
 - Server time: `maxTimeMS` 15 000 on every find.
 - Response size: capped at 5 MB serialized; past that, truncate and set `truncated_bytes: true`.
-- Gateway → orchestrator timeout: 60 s, the same as `queryViaOrchestrator`.
+- Gateway → orchestrator timeout: 60 s, the same as `sqlexec.Orchestrator.ExplorerQuery` (`shared/go/sqlexec/orchestrator.go`).
 
 **D5 — Paging.**
 
@@ -94,8 +94,9 @@ and arrays and applies `shouldRedactColumnName` to **every key at every depth**.
 responses always redact, matching SQL previews.
 
 **D8 — Capability and guards.** Add `langDocument = "document"`. Mongo resolves to
-`{Supported: true, QueryLanguage: "document", ExecStrategy: execDelegated,
-SchemaStrategy: schemaMCPDiscover, SupportsMaterialization: false}`. Every SQL-shaped
+`{Supported: true, QueryLanguage: "document", SchemaStrategy: schemaMCPDiscover,
+SupportsMaterialization: false}`, and its engine is delegated (`sqlexec.IsDelegated`,
+`shared/go/sqlexec/engine.go`). Every SQL-shaped
 handler must then reject `QueryLanguage != "sql"` with a 400 that points at the new
 endpoint. Those handlers are:
 
@@ -187,10 +188,10 @@ precedent in `latest.json`'s changelog.
 
 ### PR 2 — Orchestrator + gateway (size: M)
 
-- **Orchestrator:** add `Agent.ExplorerFind(ctx, connectorType, config, spec)` next to `ExplorerQuery` (executor.go:~7624) and the `/agent/explorer-find` route with `requirePrincipal`. Log only shape metadata, never filter values. Unit-test the params it sends.
+- **Orchestrator:** add `Agent.ExplorerFind(ctx, connectorType, config, spec)` next to `ExplorerQuery` (executor.go:~8498) and the `/agent/explorer-find` route with `requirePrincipal`. Log only shape metadata, never filter values. Unit-test the params it sends.
 - **Gateway:**
   - `validators/document_filter.go` holds the D3 allowlist, with table tests. Keep it in lockstep with the Python constants: add a test that loads both lists, or at least a comment pointer in each.
-  - `handlers/explorer_documents.go` holds `FindExplorerDocuments`: auth → workspace-scoped connection load → capability must be `langDocument` → validate → orchestrator → `redactDocument` → response. Register it in `cmd/server/main.go` beside `/explorer/query` (~:1105).
+  - `handlers/explorer_documents.go` holds `FindExplorerDocuments`: auth → workspace-scoped connection load → capability must be `langDocument` → validate → orchestrator → `redactDocument` → response. Register it in `cmd/server/main.go` beside `/explorer/query` (~:1436).
   - `explorer_capability.go`: D8 resolver change. Update `explorer_capability_test.go` so Mongo is supported, document mode, delegated, materialization false. Add the guards on the handlers listed in D8, each with a handler test proving a Mongo connection gets a 400.
   - `buildSchemaIndex`: D9 branch, with a test using a stubbed orchestrator.
   - `redactDocument` with a nested and array test (`{"customer": {"email": …}, "contacts": [{"phone": …}]}`).
@@ -211,11 +212,11 @@ precedent in `latest.json`'s changelog.
 
 - The collections list reuses `SchemaBrowser` if its props fit the mapped index. If they don't, add a thin `CollectionList`. Caption it "fields sampled from 20 documents".
 - History is stored under a separate key, `rsync_explorer_doc_history_v1:<connectionId>`, with entries `{id, collection, filter, projection, sort, limit, timestamp, returned}`. That keeps the SQL history loader (which drops entries without `sql`) untouched.
-- Hidden in document mode: Export, Send to BI Tool, Saved tab, Steps timeline, NL box.
+- Hidden in document mode: Export, Saved tab, Steps timeline, NL box.
 - Remove PR 2's `explorer_mode` hide filter in this PR.
 - Tests:
   - Vitest for `JsonTree`, `documentSpec`, and `DocumentExplorer` with mocked fetch: renders, paging, 400 path error shown inline.
-  - A Playwright stub spec modeled on `e2e/explorer_nl2sql_corner_cases.spec.ts`, with a connection stub carrying `explorer_mode: "document"`.
+  - A Vitest page test modeled on `src/__tests__/explorer-query-tabs.test.tsx`, with a connection stub carrying `explorer_mode: "document"`. (The Playwright stub spec this named, `explorer_nl2sql_corner_cases.spec.ts`, was deleted in D2a: no CI lane ran it and its route stubs no longer matched `/api/v1/explorer/*`.)
 
 ## 7. Verification (evidence required before calling it done)
 
@@ -260,8 +261,8 @@ Not yet run live: items 6 (cross-workspace 404 — covered by handler test only)
 - **`/connections/:id/sample` returns unredacted values** (pre-existing, found while verifying this feature — the find path redacts `email`, the sample path does not). Needs its own triage.
 
 - **NL → filter:** an llm-service endpoint whose prompt holds collection and sampled field names/types only (metadata-only rule). Output is validated by the same D3 allowlist. Errors pass `scrub_error_for_llm`.
-- **Read-only `aggregate`:** stage allowlist (`$match $project $group $sort $limit $skip $unwind $count $addFields`, `$lookup` within the same database). Always blocks `$out $merge $function $accumulator $where`.
-- **Saved document queries:** needs a `query_language` + JSON spec column on saved queries; they are SQL-text-only today.
+- ~~**Read-only `aggregate`**~~ ✅ shipped with MongoDB models: the Document Browser's Pipeline tab (`POST /explorer/documents/aggregate`). A wider stage allowlist than proposed here (`AGGREGATE_STAGES`, mirrored by the gateway's `DocumentAggregateStages`); `$out $merge $function $accumulator $where` blocked at any depth.
+- ~~**Saved document queries**~~ ✅ shipped without a new column: on a document connection `sql_text` holds `{"database"?, "collection", "pipeline"}` and `query_language` is derived from the connection, not stored → [MongoDB models](saved-queries-and-models.md#mongodb-models).
 - **Export** of the current result as JSON/NDJSON.
 - **Schema panel for BigQuery/ClickHouse** by enabling the D9 branch for them (empty today per explorer.go:2208).
 
@@ -269,6 +270,6 @@ Not yet run live: items 6 (cross-workspace 404 — covered by handler test only)
 
 1. **Result format:** Relaxed Extended JSON (D6) vs the flattened strings `export` uses? *Proposed: Extended JSON.*
 2. **Viewer access:** may workspace viewers browse documents? *Proposed: yes, parity with SQL reads.*
-3. **`aggregate` in v1?** *Proposed: no, follow-up.*
+3. **`aggregate` in v1?** *Proposed: no, follow-up.* — Resolved: shipped later as the Pipeline tab, with MongoDB models.
 4. **Read preference:** honor an optional `read_preference` connection setting (e.g. `secondaryPreferred`) to keep browse load off the primary? *Proposed: honor it if set, driver default otherwise.*
 5. **Scope of D9:** also light up the BigQuery/ClickHouse schema panels in PR 2, or keep that separate? *Proposed: separate.*

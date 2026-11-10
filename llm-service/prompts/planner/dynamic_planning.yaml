@@ -71,3 +71,12 @@ messages:
       sync_mode: {{sync_mode}}
       cdc_mode: {{cdc_mode}}
 
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  available_tools: identifier
+  available_connections: connections
+  user_request: user_text
+  sync_mode: enum
+  cdc_mode: enum

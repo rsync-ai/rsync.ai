@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
 	"net"
 	"net/http"
@@ -171,6 +172,84 @@ func TestBuildEmailHeaderInjection(t *testing.T) {
 	}
 	if msg.Header.Get("Date") == "" || msg.Header.Get("MIME-Version") != "1.0" {
 		t.Errorf("missing Date or MIME-Version: %v", msg.Header)
+	}
+}
+
+// With files, the email is multipart/mixed: the text, then each file in base64
+// lines of 76, named on one line whatever the name holds.
+func TestBuildEmailAttachments(t *testing.T) {
+	png := make([]byte, 300)
+	for i := range png {
+		png[i] = byte(i)
+	}
+	raw, err := buildEmail(&mail.Address{Address: "alerts@example.com"}, &mail.Address{Address: "owner@example.com"},
+		emailMessage{Subject: "Orders", Body: "Línea uno\nThe chart is attached as orders.png.",
+			Attachments: []Attachment{
+				{Filename: "orders.png", ContentType: "image/png", Content: png},
+				{Filename: "a\r\nBcc: x@example.com.png", Content: []byte("x")},
+			}}, time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range strings.Split(string(raw), "\r\n") {
+		if len(l) > 998 {
+			t.Fatalf("a line is %d bytes, over RFC 5322's 998", len(l))
+		}
+	}
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Header.Get("Bcc") != "" {
+		t.Fatal("a file's name injected a header")
+	}
+	mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/mixed" {
+		t.Fatalf("content type %q (%v)", mt, err)
+	}
+	r := multipart.NewReader(msg.Body, params["boundary"])
+	text, err := r.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := io.ReadAll(text); string(body) != "Línea uno\r\nThe chart is attached as orders.png." {
+		t.Errorf("text = %q", body)
+	}
+	type file struct {
+		name, ct string
+		content  []byte
+	}
+	var files []file
+	for {
+		p, err := r.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Header.Get("Content-Transfer-Encoding") != "base64" {
+			t.Fatalf("encoding %q", p.Header.Get("Content-Transfer-Encoding"))
+		}
+		enc, err := io.ReadAll(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range strings.Split(strings.TrimSuffix(string(enc), "\r\n"), "\r\n") {
+			if len(l) > 76 {
+				t.Fatalf("a base64 line is %d bytes, over MIME's 76", len(l))
+			}
+		}
+		b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(string(enc), "\r\n", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ct, _, _ := mime.ParseMediaType(p.Header.Get("Content-Type"))
+		files = append(files, file{name: p.FileName(), ct: ct, content: b})
+	}
+	want := []file{{"orders.png", "image/png", png}, {"a Bcc: x@example.com.png", "application/octet-stream", []byte("x")}}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("files = %+v", files)
 	}
 }
 

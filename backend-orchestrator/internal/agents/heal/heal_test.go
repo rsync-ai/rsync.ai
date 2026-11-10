@@ -3,6 +3,7 @@ package heal
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
@@ -45,7 +46,7 @@ func TestHeal_HighConfidence_AutoExecutes(t *testing.T) {
 	}
 }
 
-func TestHeal_MediumConfidence_AsksFirst(t *testing.T) {
+func TestHeal_MediumConfidence_HoldsTheActionBack(t *testing.T) {
 	h := New()
 	exec := &fakeExecutor{action: diagnose.ActionRegenerateConnector}
 	h.Register(exec)
@@ -56,11 +57,11 @@ func TestHeal_MediumConfidence_AsksFirst(t *testing.T) {
 		Confidence:      0.70,
 		Rationale:       "source has rows but destination wrote zero",
 	})
-	if res.Outcome != OutcomeHITLRequested {
-		t.Errorf("outcome: want hitl_requested, got %s", res.Outcome)
+	if res.Outcome != OutcomeEscalated {
+		t.Errorf("outcome: want escalated, got %s", res.Outcome)
 	}
 	if res.ActionExecuted {
-		t.Error("ActionExecuted must be false until user approves")
+		t.Error("ActionExecuted must be false: a non-HITL-safe action is not run in the middle band")
 	}
 	if exec.calls != 0 {
 		t.Errorf("executor should NOT be called, got %d calls", exec.calls)
@@ -145,29 +146,48 @@ func TestHeal_NoOpAction(t *testing.T) {
 	}
 }
 
-func TestApproveHITL_RunsAction(t *testing.T) {
-	// Simulates the post-HITL approval flow.
-	h := New()
-	exec := &fakeExecutor{action: diagnose.ActionRegenerateConnector}
-	h.Register(exec)
+// No path approves a deferred heal: no endpoint, handler or worker calls back into
+// the Healer once a decision is written. So a hitl_requested decision whose action
+// did not run waits on an approval nobody can give, and the panel showed it as
+// "Needs approval" with nothing to click. hitl_requested is only honest when the
+// executor itself asked the user (it set the pipeline to waiting_for_user, and the
+// pipeline's own prompt takes the answer). An action held back for a person is a
+// recommendation handed to them: an escalation.
+func TestHeal_NoOutcomeWaitsOnAnApprovalNothingGives(t *testing.T) {
+	for _, hitlSafe := range []bool{false, true} {
+		for _, confidence := range []float64{HITLBand, 0.70, AutoBand - 0.01} {
+			h := New()
+			exec := &fakeExecutor{action: diagnose.ActionBackoffRetry, hitlSafe: hitlSafe}
+			h.Register(exec)
 
-	dx := diagnose.Diagnosis{
-		SuggestedAction: diagnose.ActionRegenerateConnector,
-		Confidence:      0.7,
-	}
-	// First call: medium confidence -> HITL.
-	res := h.Heal(context.Background(), diagnose.Signal{}, dx)
-	if res.Outcome != OutcomeHITLRequested {
-		t.Fatalf("expected hitl_requested, got %s", res.Outcome)
-	}
-
-	// Operator approves -> action runs.
-	approved := h.ApproveHITL(context.Background(), diagnose.Signal{}, dx)
-	if approved.Outcome != OutcomeAutoExecuted {
-		t.Errorf("post-approval outcome: want auto_executed, got %s", approved.Outcome)
-	}
-	if exec.calls != 1 {
-		t.Errorf("executor should be called once after approval, got %d", exec.calls)
+			res := h.Heal(context.Background(), diagnose.Signal{}, diagnose.Diagnosis{
+				SuggestedAction: diagnose.ActionBackoffRetry,
+				Confidence:      confidence,
+				Rationale:       "the run's workflow is gone",
+			})
+			if res.Outcome == OutcomeHITLRequested && !res.ActionExecuted {
+				t.Errorf("hitlSafe=%v confidence=%v: hitl_requested with the action not run — "+
+					"nothing approves a deferred heal, so this waits forever", hitlSafe, confidence)
+			}
+			if hitlSafe {
+				// Control: an executor that asks the user itself still reads as a request.
+				if res.Outcome != OutcomeHITLRequested || !res.ActionExecuted || exec.calls != 1 {
+					t.Errorf("hitlSafe confidence=%v: outcome=%s executed=%v calls=%d, want "+
+						"hitl_requested after the executor asked the user", confidence,
+						res.Outcome, res.ActionExecuted, exec.calls)
+				}
+				continue
+			}
+			if res.Outcome != OutcomeEscalated || res.ActionExecuted || exec.calls != 0 {
+				t.Errorf("confidence=%v: outcome=%s executed=%v calls=%d, want escalated with "+
+					"the action not run", confidence, res.Outcome, res.ActionExecuted, exec.calls)
+			}
+			if !strings.Contains(res.HITLPrompt, string(diagnose.ActionBackoffRetry)) ||
+				strings.Contains(res.HITLPrompt, "Approve") {
+				t.Errorf("confidence=%v: prompt %q should name the suggested action and ask "+
+					"for no approval", confidence, res.HITLPrompt)
+			}
+		}
 	}
 }
 
@@ -184,7 +204,8 @@ func TestBands_AreOverridable(t *testing.T) {
 		SuggestedAction: diagnose.ActionRefreshAuth,
 		Confidence:      0.95,
 	})
-	if res.Outcome != OutcomeHITLRequested {
-		t.Errorf("with strict bands 0.95 should ask, got %s", res.Outcome)
+	if res.Outcome != OutcomeEscalated || exec.calls != 0 {
+		t.Errorf("with strict bands 0.95 should not run the action: outcome=%s calls=%d",
+			res.Outcome, exec.calls)
 	}
 }

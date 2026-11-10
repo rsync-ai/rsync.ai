@@ -86,7 +86,7 @@ export function WorkspaceRolesMatrix({ currentRole }: WorkspaceRolesMatrixProps)
           </Table>
         </div>
 
-        <dl className="grid gap-3 sm:grid-cols-2">
+        <dl className="grid gap-3 @md:grid-cols-2">
           {WORKSPACE_ROLES.map((role) => (
             <div key={role} className="rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
               <dt className="text-sm font-semibold">{ROLE_LABELS[role]}</dt>

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect } from "react"
+import { useEffect, useMemo } from "react"
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -30,11 +30,7 @@ import { AlertTriangle } from "lucide-react"
 // @ts-ignore — dagre has no perfect types for this import style
 import dagre from "dagre"
 import {
-  CheckCircle2,
-  XCircle,
   Loader2,
-  Clock,
-  MinusCircle,
   Database,
   Cloud,
   Zap,
@@ -45,10 +41,11 @@ import {
   Circle,
   ServerCog,
 } from "lucide-react"
+import { FitViewOnResize } from "@/components/ui/fit-view-on-resize"
 import { cn } from "@/lib/utils"
 import { getConnectorLogoUrl } from "@/lib/api/mcp-connectors"
 import type { ExecutionPlanStage } from "./dagTypes"
-import { formatDuration } from "./dagHelpers"
+import { formatDuration } from "@/lib/duration"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -128,17 +125,6 @@ function KindIcon({ kind, className }: { kind: string; className?: string }) {
   }
   const Icon = icons[kind] ?? Circle
   return <Icon className={className} />
-}
-
-function StatusIcon({ status, className }: { status: string; className?: string }) {
-  if (status === "complete") return <CheckCircle2 className={className} />
-  if (status === "failed") return <XCircle className={className} />
-  if (status === "running") return <Loader2 className={cn(className, "animate-spin")} />
-  // A skipped step (e.g. "Generating Connectors" when connectors already exist)
-  // is neither pending nor running — a plain clock reads as "stuck". Show a
-  // distinct muted MinusCircle so it's clearly intentionally-skipped.
-  if (status === "skipped") return <MinusCircle className={cn(className, "text-zinc-400")} />
-  return <Clock className={className} />
 }
 
 // ─── Node dimensions (must match dagre layout) ───────────────────────────────
@@ -482,6 +468,25 @@ const edgeTypes: EdgeTypes = {
   animated: AnimatedEdge,
 }
 
+/** How the graph fits every stage, never zoomed in past a readable size. */
+const FIT = { padding: 0.15, maxZoom: 1.2 }
+
+const CANVAS_MIN_HEIGHT = 240
+const CANVAS_MAX_HEIGHT = 540
+
+/**
+ * The canvas is as tall as its rows, between 240 and 540 px. A fixed 540 px left
+ * a one-row pipeline floating in a mostly empty box. The graph's height at zoom
+ * 1 plus the fit's padding is an upper bound: a wide graph fits narrower than
+ * that, so it never needs more room than this.
+ */
+export function canvasHeight(nodes: Array<{ position: XY }>): number {
+  if (!nodes.length) return CANVAS_MIN_HEIGHT
+  const ys = nodes.map((n) => n.position.y)
+  const span = Math.max(...ys) + NODE_HEIGHT - Math.min(...ys)
+  return Math.round(Math.min(CANVAS_MAX_HEIGHT, Math.max(CANVAS_MIN_HEIGHT, span * (1 + FIT.padding))))
+}
+
 // ─── Main component (inner — needs ReactFlowProvider above) ──────────────────
 
 function DAGFlowInner({
@@ -506,6 +511,12 @@ function DAGFlowInner({
   }, [stagesKey, selectedStageId])
 
   const anyRunning = stages.some((s) => s.status === "running" || s.status === "waiting")
+  // A graph that fits its box needs no overview, and in a short box the map
+  // would sit on top of the last steps; it shows only when the box is at its cap.
+  const showMiniMap = canvasHeight(nodes) >= CANVAS_MAX_HEIGHT
+  // The stages and where they sit, not their status: the graph fits again when
+  // these change, and a status update leaves the view alone.
+  const shape = nodes.map((n) => `${n.id}@${n.position.x},${n.position.y}`).join("|")
 
   return (
     <ReactFlow
@@ -517,7 +528,7 @@ function DAGFlowInner({
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
       fitView
-      fitViewOptions={{ padding: 0.15, maxZoom: 1.2 }}
+      fitViewOptions={FIT}
       minZoom={0.3}
       maxZoom={1.5}
       nodesDraggable={false}
@@ -532,10 +543,15 @@ function DAGFlowInner({
         className="!bg-zinc-50 dark:!bg-zinc-950"
         color="currentColor"
       />
+      {/* fitView above fits once; this fits again when the window or the docked
+          Ask rsync.ai panel make the graph narrower. */}
+      <FitViewOnResize padding={FIT.padding} maxZoom={FIT.maxZoom} shape={shape} />
       <Controls
         showInteractive={false}
+        fitViewOptions={FIT}
         className="!shadow-none !border !border-zinc-200 dark:!border-zinc-700 !bg-white dark:!bg-zinc-900 !rounded-lg overflow-hidden"
       />
+      {showMiniMap && (
       <MiniMap
         nodeColor={(node) => {
           const stage = (node.data as StageNodeData).stage
@@ -550,6 +566,7 @@ function DAGFlowInner({
         pannable
         zoomable
       />
+      )}
       {anyRunning && (
         <Panel position="top-left">
           <div className="flex items-center gap-1.5 text-[11px] text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 px-2.5 py-1 rounded-full">
@@ -571,6 +588,7 @@ export interface DAGVisualizationV2Props {
 }
 
 export function DAGVisualizationV2({ stages, selectedStageId, onStageClick }: DAGVisualizationV2Props) {
+  const height = useMemo(() => canvasHeight(buildElements(stages).nodes), [stages])
   if (!stages.length) {
     return (
       <div className="flex items-center justify-center h-64 text-zinc-400 text-sm">
@@ -580,7 +598,11 @@ export function DAGVisualizationV2({ stages, selectedStageId, onStageClick }: DA
   }
 
   return (
-    <div className="w-full h-[540px] rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800">
+    <div
+      className="w-full rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800"
+      style={{ height }}
+      data-testid="dag-canvas"
+    >
       <ReactFlowProvider>
         <DAGFlowInner stages={stages} selectedStageId={selectedStageId} onStageClick={onStageClick} />
       </ReactFlowProvider>

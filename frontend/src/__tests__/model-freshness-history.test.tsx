@@ -93,13 +93,38 @@ describe("ModelFreshnessHistory", () => {
     const [open, rebuilt, widened] = bodyRows()
     // Open: the server's figure for now, not the one it recorded at detection.
     expect(open).toHaveTextContent("2h so far")
-    expect(open).toHaveTextContent("Its schedule is active but has not rebuilt it")
+    expect(open).toHaveTextContent("Its schedule is on, but no scheduled rebuild has succeeded in time")
     // Closed at 03:30 on a table last built at 00:00 under a 1h deadline.
     expect(rebuilt).toHaveTextContent("2h 30m")
     expect(rebuilt).toHaveTextContent("Its schedule is paused")
     expect(widened).toHaveTextContent("15m")
     expect(widened).toHaveTextContent("Nothing is scheduled to rebuild it")
     expect(widened).toHaveTextContent("never rebuilt successfully")
+  })
+
+  it("says a model that runs after its upstreams waits for them, not for a clock", async () => {
+    serve(res(200, { breaches: [OPEN, REBUILT], count: 2 }))
+    render(
+      <ModelFreshnessHistory
+        savedQueryId="q-1"
+        reloadTick={0}
+        schedule={{
+          scheduleType: "after_upstream",
+          upstreamPolicy: "all",
+          upstreams: [
+            { kind: "model", id: "m-1", name: "Loans" },
+            { kind: "model", id: "m-2", name: "Payments" },
+          ],
+        }}
+      />,
+    )
+
+    await screen.findByRole("table", { name: "Freshness misses" })
+    const [open, rebuilt] = bodyRows()
+    expect(open).toHaveTextContent("It rebuilds once Loans and Payments have both run")
+    expect(open).not.toHaveTextContent("scheduled rebuild")
+    // A paused schedule reads the same whatever starts the model.
+    expect(rebuilt).toHaveTextContent("Its schedule is paused")
   })
 
   it("does not call a widened deadline a fix", async () => {

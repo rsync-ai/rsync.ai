@@ -1,0 +1,9 @@
+{
+  "kind": "scorecard",
+  "label": "Count",
+  "value": 420,
+  "format": "integer",
+  "previous": 350,
+  "days": 7,
+  "notes": []
+}

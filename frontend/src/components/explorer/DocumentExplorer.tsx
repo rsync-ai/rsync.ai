@@ -1,7 +1,7 @@
 "use client"
 
 import { Fragment, useCallback, useEffect, useRef, useState } from "react"
-import { AlertCircle, Braces, ChevronDown, ChevronRight, Loader2, Play, Table2 } from "lucide-react"
+import { AlertCircle, Braces, ChevronDown, ChevronRight, Layers, Loader2, Play, Search, Table2 } from "lucide-react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -12,6 +12,7 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { cn } from "@/lib/utils"
 import type { SchemaTableLike } from "@/lib/explorer/schemaTree"
 import {
+  buildAggregateBody,
   buildFindBody,
   cellKind,
   DOCUMENT_FIND_DEFAULT_LIMIT,
@@ -23,7 +24,11 @@ import {
   type CellKind,
   type DocumentFindResult,
   type FindField,
+  type PipelineField,
 } from "@/lib/explorer/documentSpec"
+
+/** "find" browses a collection; "pipeline" previews an aggregation pipeline on it. */
+export type DocumentMode = "find" | "pipeline"
 
 export interface DocumentExplorerProps {
   connectionId: string
@@ -47,6 +52,15 @@ export interface DocumentExplorerProps {
    */
   collectionsError?: { title: string; message: string; hint?: string } | null
   onRetryCollections?: () => void
+  /**
+   * Find or Pipeline. With the pipeline text below, held by the page when it saves
+   * pipelines (a saved pipeline is a MongoDB model) and loads them back; left out,
+   * the component keeps both itself.
+   */
+  mode?: DocumentMode
+  onModeChange?: (mode: DocumentMode) => void
+  pipeline?: string
+  onPipelineChange?: (text: string) => void
 }
 
 // One option per database and collection: two databases may hold a collection
@@ -58,7 +72,7 @@ const COLLECTIONS_ERROR_HINT =
 
 interface FindError {
   message: string
-  field?: FindField
+  field?: FindField | PipelineField
   path?: string
   code?: string
 }
@@ -76,9 +90,15 @@ const KIND_CLASS: Record<CellKind, string> = {
   special: "text-rose-700 dark:text-rose-400",
 }
 
+const PIPELINE_PLACEHOLDER = `[
+  { "$match": { "status": "paid" } },
+  { "$group": { "_id": "$customer_id", "total": { "$sum": "$total" } } }
+]`
+
 /**
  * Document browse for MongoDB connections: a read-only find with filter, projection,
- * sort and paging, shown as a grid (one column per top-level field) or as raw JSON.
+ * sort and paging, or a preview of an aggregation pipeline's first page — shown as a
+ * grid (one column per top-level field) or as raw JSON.
  */
 export function DocumentExplorer({
   connectionId,
@@ -89,7 +109,16 @@ export function DocumentExplorer({
   loadingCollections,
   collectionsError,
   onRetryCollections,
+  mode: modeProp,
+  onModeChange,
+  pipeline: pipelineProp,
+  onPipelineChange,
 }: DocumentExplorerProps) {
+  const [ownMode, setOwnMode] = useState<DocumentMode>("find")
+  const [ownPipeline, setOwnPipeline] = useState("")
+  const mode = modeProp ?? ownMode
+  const pipeline = pipelineProp ?? ownPipeline
+  const setPipeline = onPipelineChange ?? setOwnPipeline
   const [filter, setFilter] = useState("")
   const [projection, setProjection] = useState("")
   const [sort, setSort] = useState("")
@@ -102,26 +131,9 @@ export function DocumentExplorer({
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const abortRef = useRef<AbortController | null>(null)
 
-  const runFind = useCallback(
-    async (append: boolean) => {
-      if (!collection) return
-      const page = append && result ? nextPageParams(result) : null
-      if (append && !page) return
-      const built = buildFindBody({
-        connectionId,
-        collection,
-        database,
-        filter,
-        projection,
-        sort,
-        limit,
-        ...(page ?? {}),
-      })
-      if (!built.ok) {
-        setError({ message: built.error, field: built.field })
-        return
-      }
-
+  // One request to a read-only document route; append adds a find's next page.
+  const send = useCallback(
+    async (url: string, body: string, append: boolean, what: string) => {
       abortRef.current?.abort()
       const ac = new AbortController()
       abortRef.current = ac
@@ -129,10 +141,10 @@ export function DocumentExplorer({
       if (append) setLoadingMore(true)
       else setLoading(true)
       try {
-        const res = await authFetch("/api/v1/explorer/documents/find", {
+        const res = await authFetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: built.body,
+          body,
           signal: ac.signal,
         })
         const raw = await res.text()
@@ -144,7 +156,7 @@ export function DocumentExplorer({
         }
         if (!res.ok) {
           setError({
-            message: typeof data.error === "string" && data.error ? data.error : `Find failed (HTTP ${res.status})`,
+            message: typeof data.error === "string" && data.error ? data.error : `${what} failed (HTTP ${res.status})`,
             path: typeof data.path === "string" && data.path ? data.path : undefined,
             code: typeof data.error_code === "string" ? data.error_code : undefined,
           })
@@ -170,7 +182,7 @@ export function DocumentExplorer({
         }
       } catch (e) {
         if (ac.signal.aborted) return
-        setError({ message: e instanceof Error ? e.message : "Find failed" })
+        setError({ message: e instanceof Error ? e.message : `${what} failed` })
       } finally {
         if (abortRef.current === ac) {
           setLoading(false)
@@ -178,18 +190,77 @@ export function DocumentExplorer({
         }
       }
     },
-    [collection, database, connectionId, filter, projection, sort, limit, result],
+    [],
   )
 
-  // Browsing starts as soon as a collection is picked. The ref keeps the effect keyed
-  // on the collection alone, so typing a filter does not re-run the find.
+  const runFind = useCallback(
+    async (append: boolean) => {
+      if (!collection) return
+      const page = append && result ? nextPageParams(result) : null
+      if (append && !page) return
+      const built = buildFindBody({
+        connectionId,
+        collection,
+        database,
+        filter,
+        projection,
+        sort,
+        limit,
+        ...(page ?? {}),
+      })
+      if (!built.ok) {
+        setError({ message: built.error, field: built.field })
+        return
+      }
+      await send("/api/v1/explorer/documents/find", built.body, append, "Find")
+    },
+    [collection, database, connectionId, filter, projection, sort, limit, result, send],
+  )
+
+  // A preview, never paged: the model built from this pipeline writes every result.
+  const runPipeline = useCallback(async () => {
+    const built = buildAggregateBody({ connectionId, collection, database, pipeline, limit })
+    if (!built.ok) {
+      setError({ message: built.error, field: built.field })
+      return
+    }
+    await send("/api/v1/explorer/documents/aggregate", built.body, false, "Pipeline")
+  }, [collection, database, connectionId, pipeline, limit, send])
+
+  const run = useCallback(
+    () => void (mode === "pipeline" ? runPipeline() : runFind(false)),
+    [mode, runPipeline, runFind],
+  )
+
+  const switchMode = (next: DocumentMode) => {
+    if (next === mode) return
+    if (onModeChange) onModeChange(next)
+    else setOwnMode(next)
+  }
+
+  // Browsing starts as soon as a collection is picked, or Find is chosen again. The ref
+  // keeps the effect keyed on those alone, so typing a filter does not re-run the find.
+  // A pipeline runs only when asked: it can be as expensive as the user makes it.
   const runFindRef = useRef(runFind)
   useEffect(() => {
     runFindRef.current = runFind
   }, [runFind])
+  // A result belongs to the mode that produced it, whether the switch was clicked here
+  // or made by the page loading a saved pipeline. Declared before the effect below so a
+  // find started by switching back is not the request this aborts.
+  const shownMode = useRef(mode)
   useEffect(() => {
-    if (collection) void runFindRef.current(false)
-  }, [connectionId, collection, database])
+    if (shownMode.current === mode) return
+    shownMode.current = mode
+    abortRef.current?.abort()
+    setResult(null)
+    setError(null)
+    setLoading(false)
+    setLoadingMore(false)
+  }, [mode])
+  useEffect(() => {
+    if (collection && mode === "find") void runFindRef.current(false)
+  }, [connectionId, collection, database, mode])
   useEffect(() => () => abortRef.current?.abort(), [])
 
   const picked = collections.find(
@@ -210,7 +281,7 @@ export function DocumentExplorer({
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault()
       e.stopPropagation()
-      void runFind(false)
+      run()
     }
   }
 
@@ -224,25 +295,58 @@ export function DocumentExplorer({
 
   const docs = result?.documents ?? []
   const shownForCollection = result && result.collection === collection
-  const canLoadMore = Boolean(result && nextPageParams(result))
+  const canLoadMore = mode === "find" && Boolean(result && nextPageParams(result))
   const listFailed = Boolean(collectionsError) && !loadingCollections
 
   return (
     <div className="space-y-6">
       <Card>
         <CardHeader className="px-4 pt-4 pb-3">
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Braces className="h-4 w-4 text-violet-500" />
-            Document Browser
-          </CardTitle>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Braces className="h-4 w-4 text-violet-500" />
+              Document Browser
+            </CardTitle>
+            <div className="flex items-center gap-1" role="group" aria-label="Browse mode">
+              <Button
+                variant={mode === "find" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => switchMode("find")}
+                aria-pressed={mode === "find"}
+                aria-label="Find mode"
+              >
+                <Search className="mr-1.5 h-4 w-4" />
+                Find
+              </Button>
+              <Button
+                variant={mode === "pipeline" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => switchMode("pipeline")}
+                aria-pressed={mode === "pipeline"}
+                aria-label="Pipeline mode"
+              >
+                <Layers className="mr-1.5 h-4 w-4" />
+                Pipeline
+              </Button>
+            </div>
+          </div>
           <CardDescription className="text-xs mt-1">
-            Read-only find on a collection. Filters use MongoDB query syntax with Extended JSON values, e.g.{" "}
-            <code className="font-mono">{`{"_id": {"$oid": "…"}}`}</code>. JavaScript operators such as $where are
-            not allowed.
+            {mode === "find" ? (
+              <>
+                Read-only find on a collection. Filters use MongoDB query syntax with Extended JSON values, e.g.{" "}
+                <code className="font-mono">{`{"_id": {"$oid": "…"}}`}</code>. JavaScript operators such as $where
+                are not allowed.
+              </>
+            ) : (
+              <>
+                Preview an aggregation pipeline on the collection: a JSON array of stages such as $match, $group and
+                $lookup. Read-only — $out and $merge are refused. Save it to build a collection from it on a schedule.
+              </>
+            )}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4 px-4 pb-4" onKeyDown={onKeyDown}>
-          <div className="grid gap-3 sm:grid-cols-[1fr_120px]">
+          <div className="grid gap-3 @md:grid-cols-[1fr_120px]">
             <div className="space-y-1.5">
               <Label htmlFor="doc-collection" className="text-xs">
                 Collection
@@ -318,6 +422,8 @@ export function DocumentExplorer({
             </div>
           )}
 
+          {mode === "find" ? (
+          <>
           <JsonInput
             id="doc-filter"
             label="Filter"
@@ -327,7 +433,7 @@ export function DocumentExplorer({
             placeholder={`{ "status": "paid", "total": { "$gte": 100 } }`}
             rows={4}
           />
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-3 @xl:grid-cols-2">
             <JsonInput
               id="doc-projection"
               label="Projection"
@@ -347,15 +453,28 @@ export function DocumentExplorer({
               rows={2}
             />
           </div>
+          </>
+          ) : (
+            <JsonInput
+              id="doc-pipeline"
+              label="Pipeline"
+              value={pipeline}
+              onChange={setPipeline}
+              invalid={error?.field === "pipeline"}
+              placeholder={PIPELINE_PLACEHOLDER}
+              rows={8}
+            />
+          )}
 
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
-              Cmd+Enter to run · the default _id order pages by cursor; a custom sort pages through the first 10,000
-              documents
+              {mode === "find"
+                ? "Cmd+Enter to run · the default _id order pages by cursor; a custom sort pages through the first 10,000 documents"
+                : "Cmd+Enter to run · shows the first page of results (the limit); a model built from it writes them all"}
             </span>
-            <Button size="sm" onClick={() => void runFind(false)} disabled={!collection || loading}>
+            <Button size="sm" onClick={run} disabled={!collection || loading}>
               {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
-              Find
+              {mode === "find" ? "Find" : "Run pipeline"}
             </Button>
           </div>
 
@@ -385,7 +504,9 @@ export function DocumentExplorer({
                     (result.execution_time_ms != null ? ` · ${result.execution_time_ms} ms` : "")
                   : listFailed
                     ? "No collections to browse until the connection problem above is fixed"
-                    : "Pick a collection to browse its documents"}
+                    : mode === "pipeline"
+                      ? "Write a pipeline and run it to preview its results"
+                      : "Pick a collection to browse its documents"}
               </CardDescription>
             </div>
             <div className="flex items-center gap-1">
@@ -416,7 +537,9 @@ export function DocumentExplorer({
               <Loader2 className="h-5 w-5 animate-spin text-violet-500" />
             </div>
           ) : !result ? null : docs.length === 0 ? (
-            <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">No documents match this filter</div>
+            <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">
+              {mode === "pipeline" ? "The pipeline returned no documents" : "No documents match this filter"}
+            </div>
           ) : view === "json" ? (
             <pre className="max-h-[560px] overflow-auto rounded-md border bg-zinc-50 p-3 text-xs dark:bg-zinc-900">
               {JSON.stringify(docs, null, 2)}
@@ -476,7 +599,10 @@ export function DocumentExplorer({
           {result && (result.warnings.length > 0 || result.truncated_bytes) && (
             <ul className="space-y-1 text-xs text-amber-700 dark:text-amber-400">
               {result.truncated_bytes && (
-                <li>This page stopped early to stay under the response size limit; add a projection to see more per page.</li>
+                <li>
+                  This page stopped early to stay under the response size limit;{" "}
+                  {mode === "pipeline" ? "add a $project stage" : "add a projection"} to see more per page.
+                </li>
               )}
               {result.warnings.map((w, i) => (
                 <li key={i}>{w}</li>

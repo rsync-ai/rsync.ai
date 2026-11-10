@@ -7,13 +7,7 @@ import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from .ml_detector import (
-    MLPIIDetector, 
-    PIIDetectionRequest, 
-    PIIDetectionResponse,
-    PIIEntity,
-    PIIType
-)
+from .ml_detector import MLPIIDetector, PIIEntity, PIIType
 from .column_names import DETECTION_METHOD, NAME_MATCH_CONFIDENCE, pii_type_for_column_name
 
 logger = logging.getLogger(__name__)
@@ -112,27 +106,7 @@ class PIIScannerService:
     def is_available(self) -> bool:
         """Check if ML detection is available."""
         return self.detector.is_available()
-    
-    def get_status(self) -> Dict[str, Any]:
-        """Get service status."""
-        return {
-            "service": "pii_scanner",
-            "ml_available": self.detector.is_available(),
-            "supported_entities": self.detector.get_supported_entities() if self.detector.is_available() else [],
-            "version": "1.0.0"
-        }
-    
-    def detect_texts(self, request: PIIDetectionRequest) -> PIIDetectionResponse:
-        """Detect PII in text samples.
-        
-        Args:
-            request: Detection request
-            
-        Returns:
-            Detection response with results
-        """
-        return self.detector.detect(request)
-    
+
     def scan_column(self, request: ColumnScanRequest, 
                     score_threshold: float = 0.5) -> ColumnScanResult:
         """Scan a column for PII.

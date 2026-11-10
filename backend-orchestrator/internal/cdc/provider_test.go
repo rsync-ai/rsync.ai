@@ -8,7 +8,7 @@ import (
 // The two built-in families must self-register via their init() functions.
 func TestBuiltinProvidersRegistered(t *testing.T) {
 	for _, dbType := range []string{"postgresql", "mysql"} {
-		if !IsSupportedDBType(dbType) {
+		if _, ok := NewProvider(dbType, nil); !ok {
 			t.Fatalf("expected %q to have a registered CDC provider", dbType)
 		}
 	}

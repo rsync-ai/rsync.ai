@@ -144,14 +144,17 @@ func TestPGZombieSweepReturnsOneRowPerReapWithCountsAttached(t *testing.T) {
 	}
 	defer rows.Close()
 
-	got := map[string]string{} // execID -> pipelineID
+	got := map[string]string{}  // execID -> pipelineID
+	notify := map[string]bool{} // execID -> notify_eligible
 	var reconciled, closed int
 	for rows.Next() {
 		var execID, pipelineID string
-		if err := rows.Scan(&execID, &pipelineID, &reconciled, &closed); err != nil {
+		var eligible bool
+		if err := rows.Scan(&execID, &pipelineID, &reconciled, &closed, &eligible); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		got[execID] = pipelineID
+		notify[execID] = eligible
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("row iteration: %v", err)
@@ -175,6 +178,77 @@ func TestPGZombieSweepReturnsOneRowPerReapWithCountsAttached(t *testing.T) {
 	if closed != 1 {
 		t.Errorf("pipelines_closed = %d, want 1 — the batch pipeline closes, the CDC one is "+
 			"carved out", closed)
+	}
+	if !notify[pgZombieBatchExecID] {
+		t.Error("the reaped batch run is not notify_eligible — a scheduled run that died is " +
+			"marked failed and nobody is told")
+	}
+	if notify[pgZombieCDCExecID] {
+		t.Error("the reaped CDC setup run is notify_eligible — its stream is still running, and " +
+			"its owner would be told it failed")
+	}
+}
+
+// TestPGZombieSweepDoesNotNotifyForAUserPause covers the two ways a user stops a run on
+// purpose. A run they paused sits at waiting_for_user / paused_by_user, and is reaped once
+// the park is older than AbandonedParkTimeout; a pipeline they paused or stopped keeps its
+// status while its open execution ages past ZombieTimeout. Both reaps must still happen, and
+// neither may tell anyone the run failed: they chose it.
+//
+// The flag reads pipelines and pipeline_progress in the statement's one snapshot, so it sees
+// them as they were before the sibling CTEs updated them. Only PostgreSQL can show that.
+func TestPGZombieSweepDoesNotNotifyForAUserPause(t *testing.T) {
+	db := pgHealDB(t)
+	pgSeedZombies(t, db)
+
+	mustExec := func(q string, args ...interface{}) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("pause fixture %.60q: %v", q, err)
+		}
+	}
+	// See TestPGZombieSweepBoundsTheHITLPark for why the trigger must be off to backdate.
+	mustExec(`ALTER TABLE pipeline_progress DISABLE TRIGGER update_pipeline_progress_updated_at`)
+	defer mustExec(`ALTER TABLE pipeline_progress ENABLE TRIGGER update_pipeline_progress_updated_at`)
+
+	// The batch run: paused by its user, longer ago than the park ceiling.
+	mustExec(`UPDATE pipeline_progress
+	          SET status = 'waiting_for_user', blocking_reason_type = 'paused_by_user',
+	              updated_at = NOW() - $2::interval
+	          WHERE execution_id = $1::uuid`, pgZombieBatchExecID, (AbandonedParkTimeout + time.Hour).String())
+	// The other pipeline, turned into a batch one so only its paused status can exclude it.
+	mustExec(`UPDATE pipelines SET status = 'paused', sync_mode = 'batch', cdc_mode = NULL
+	          WHERE id = $1::uuid`, pgZombieCDCPipeID)
+
+	rows, err := db.Query(sweepZombiesQuery, ZombieTimeout.String(), AbandonedParkTimeout.String())
+	if err != nil {
+		t.Fatalf("sweepZombiesQuery: %v", err)
+	}
+	defer rows.Close()
+	notify := map[string]bool{}
+	for rows.Next() {
+		var execID, pipelineID string
+		var reconciled, closed int
+		var eligible bool
+		if err := rows.Scan(&execID, &pipelineID, &reconciled, &closed, &eligible); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		notify[execID] = eligible
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("row iteration: %v", err)
+	}
+
+	for _, execID := range []string{pgZombieBatchExecID, pgZombieCDCExecID} {
+		eligible, reaped := notify[execID]
+		if !reaped {
+			t.Errorf("execution %s was not reaped; the fixture no longer exercises the flag", execID)
+			continue
+		}
+		if eligible {
+			t.Errorf("execution %s is notify_eligible, but its user paused it: they would be told "+
+				"a run they paused had failed", execID)
+		}
 	}
 }
 

@@ -63,7 +63,7 @@ func TestProbeKafkaBrokerWithoutAManagerIsUnknownNotHealthy(t *testing.T) {
 
 // The whole point of the check: a broker that does not answer must come back unhealthy,
 // with the transport error preserved. `last_error` is a column the monitoring API selects
-// (api-gateway/internal/handlers/monitoring.go:394), so dropping the text loses the only
+// (api-gateway/internal/handlers/monitoring.go:385), so dropping the text loses the only
 // clue about WHY Kafka is down.
 func TestProbeKafkaBrokerReportsUnhealthyAndKeepsTheBrokerError(t *testing.T) {
 	probe := &stubKafkaProbe{err: errors.New("dial tcp 10.0.0.4:9092: connect: connection refused")}

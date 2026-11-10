@@ -262,7 +262,7 @@ test.describe('DAG V2 polish surfaces', () => {
     await expect(
       page.getByRole('button', { name: /Why is "Aggregate Stats" slow/i }),
     ).toBeVisible()
-    await expect(page.locator('textarea[placeholder*="Ask about this pipeline"]')).toBeVisible()
+    await expect(page.locator('textarea[aria-label="Ask about this pipeline"]')).toBeVisible()
 
     await page.screenshot({ path: 'test-results/05-copilot-dock.png', fullPage: false })
 

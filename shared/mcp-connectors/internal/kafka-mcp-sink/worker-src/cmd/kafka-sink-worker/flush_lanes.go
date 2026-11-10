@@ -59,12 +59,17 @@ const (
 // does not merely forget 101-104, it classifies them as already-written duplicates
 // and drops them silently.
 //
-// Sharding on the offset space removes the hazard instead of managing it. Every
-// batch from one (topic, partition) lands on one lane, a lane is serial, and the
-// dispatcher submits in fetch order — so offsets still complete in ascending order
-// within the space that records them, and max(offset) stays correct. That is
-// Confluent's parallel-consumer PARTITION ordering; KEY ordering would split one
-// partition's offsets across lanes and force an offset encoder to carry the gaps.
+// Sharding on the offset space keeps one partition's writes serial: every batch
+// from one (topic, partition) lands on one lane, and a lane runs one write at a
+// time. That is Confluent's parallel-consumer PARTITION ordering; KEY ordering would
+// split one partition's offsets across lanes.
+//
+// It does NOT make offsets complete in ascending order. Several tables share a
+// topic partition (the executor routes dim_/lookup_ tables to one topic), each with
+// its own open batch, and a batch is submitted when it fills or ages out — so a
+// later table's batch can land while an earlier table's batch is still open. The
+// commit gate (cdc_commit_gate.go) carries that gap: it marks a partition only up
+// to the offset below the lowest batch still held (KI-CDC-SINK-COMMIT-PAST-HELD-CHANGES).
 //
 // Per-row order survives because Debezium keys each event on the source PK and
 // Kafka hashes that key to a partition, so one row's events never leave one

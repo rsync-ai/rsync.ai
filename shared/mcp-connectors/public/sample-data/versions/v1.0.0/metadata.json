@@ -6,6 +6,7 @@
   "version": "1.0.0",
   "description": "Zero-setup demo source with bundled customers, orders and products datasets — run a real sync without connecting a database of your own.",
   "category": "sample",
+  "source": "built_in",
   "runtime": "python",
   "entrypoint": "connector.py",
   "supports_source": true,

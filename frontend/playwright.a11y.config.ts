@@ -1,26 +1,33 @@
 import { defineConfig, devices } from '@playwright/test'
 import path from 'node:path'
-import fs from 'node:fs'
+import { A11Y_API_URL, A11Y_STUB_PORT, USES_STUB } from './e2e/fixtures/a11y-backend'
 
 /**
  * Playwright config for accessibility (axe-core) tests.
  *
  * Three projects:
- *   - `setup`             — logs in once and persists storageState. Skips
- *                           when no backend is reachable, so PR CI stays
- *                           green and authenticated specs simply don't run.
- *   - `public-a11y`       — unauthenticated routes (login, signup). Always
- *                           runs; no backend needed.
+ *   - `setup`             — logs in once and persists storageState. Fails when
+ *                           the backend cannot be reached: a skipped login used
+ *                           to mean the authenticated pages were never checked
+ *                           while the run still read green.
+ *   - `public-a11y`       — unauthenticated routes (login, signup).
  *   - `authenticated-a11y`— routes behind the middleware auth guard. Depends
- *                           on `setup`, loads its storageState, and only
- *                           runs when the setup project succeeded.
+ *                           on `setup` and loads its storageState.
+ *
+ * The backend is a11y-api-stub.mjs, started below, unless E2E_API_URL names a
+ * real api-gateway (e2e/fixtures/a11y-backend.ts).
  */
 
 const AUTH_STATE = path.join(__dirname, '.auth', 'user.json')
-// Only pass storageState if the file actually exists; otherwise Playwright
-// would throw at context creation. The authenticated spec self-skips when
-// the file is missing.
-const authStorageState = fs.existsSync(AUTH_STATE) ? AUTH_STATE : undefined
+const API_WS_URL = `${A11Y_API_URL.replace(/^http/, 'ws')}/ws`
+
+const stub = {
+  command: 'node e2e/fixtures/a11y-api-stub.mjs',
+  url: `${A11Y_API_URL}/health`,
+  reuseExistingServer: !process.env.CI,
+  timeout: 15_000,
+  env: { A11Y_STUB_PORT },
+}
 
 export default defineConfig({
   testDir: './e2e',
@@ -49,29 +56,33 @@ export default defineConfig({
       testMatch: /a11y\/authenticated_pages\.spec\.ts$/,
       use: {
         ...devices['Desktop Chrome'],
-        storageState: authStorageState,
+        storageState: AUTH_STATE,
       },
       dependencies: ['setup'],
     },
   ],
-  webServer: {
-    // `next start` against a prebuilt app. CI runs `next build` before this.
-    command: 'PORT=3100 npm run start',
-    url: 'http://localhost:3100/login',
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
-    env: {
-      // Public env vars must be present at build time, so these only matter
-      // if a contributor runs locally without a prior build.
-      NEXT_PUBLIC_API_URL: process.env.E2E_API_URL || 'http://localhost:5001',
-      NEXT_PUBLIC_WS_URL: 'ws://localhost:5001/ws',
-      // Server-side fetches in dashboard layout (getCurrentUser, etc.) default
-      // to the docker-compose hostname. Point them at the host-reachable URL
-      // so authenticated specs can complete the SSR auth check.
-      API_GATEWAY_INTERNAL_URL: process.env.E2E_API_URL || 'http://localhost:5001',
-      ORCHESTRATOR_INTERNAL_URL: process.env.E2E_ORCHESTRATOR_URL || 'http://localhost:8000',
+  webServer: [
+    ...(USES_STUB ? [stub] : []),
+    {
+      // `next start` against a prebuilt app. CI runs `next build` before this.
+      command: 'PORT=3100 npm run start',
+      url: 'http://localhost:3100/login',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+      env: {
+        // The build bakes NEXT_PUBLIC_*; PUBLIC_URL / PUBLIC_WS_URL are read per
+        // request (src/lib/config/runtime-env.ts) and outrank the baked value in
+        // the browser, so a prebuilt app reaches this run's backend.
+        NEXT_PUBLIC_API_URL: A11Y_API_URL,
+        NEXT_PUBLIC_WS_URL: API_WS_URL,
+        PUBLIC_URL: A11Y_API_URL,
+        PUBLIC_WS_URL: API_WS_URL,
+        // Server-side fetches in the dashboard layout (getCurrentUser, etc.)
+        // default to the docker-compose hostname.
+        API_GATEWAY_INTERNAL_URL: A11Y_API_URL,
+      },
     },
-  },
+  ],
   timeout: 30_000,
   expect: { timeout: 5_000 },
 })

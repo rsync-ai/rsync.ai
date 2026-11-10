@@ -1,0 +1,73 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "sankey",
+    "description": "Count from From page to To page",
+    "source": {
+      "label": "From page"
+    },
+    "target": {
+      "label": "To page"
+    },
+    "value": {
+      "label": "Count",
+      "format": "integer"
+    },
+    "nodes": [
+      {
+        "key": "visit",
+        "label": "visit",
+        "color": "series-1"
+      },
+      {
+        "key": "cart",
+        "label": "cart",
+        "color": "series-2"
+      },
+      {
+        "key": "left",
+        "label": "left",
+        "color": "series-3"
+      },
+      {
+        "key": "paid",
+        "label": "paid",
+        "color": "series-4"
+      },
+      {
+        "key": "refund",
+        "label": "refund",
+        "color": "series-5"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "source": "visit",
+      "target": "cart",
+      "value": 50
+    },
+    {
+      "source": "visit",
+      "target": "left",
+      "value": 30
+    },
+    {
+      "source": "cart",
+      "target": "left",
+      "value": 25
+    },
+    {
+      "source": "cart",
+      "target": "paid",
+      "value": 20
+    },
+    {
+      "source": "paid",
+      "target": "refund",
+      "value": 2
+    }
+  ],
+  "series": [],
+  "notes": []
+}

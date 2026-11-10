@@ -292,7 +292,7 @@ export function PreMigrationAssessmentModal({
   const canProceed = errorCount === 0 && allAcked && !submitting
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange} closeOnOutsideClick={false}>
       <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>Pre-migration assessment</DialogTitle>

@@ -12,7 +12,7 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 import {
   FRESHNESS_LIST_LIMIT,
   describeFreshnessCause,
@@ -21,6 +21,7 @@ import {
   overdueAtClose,
   overdueSeconds,
   parseBreaches,
+  type FreshnessSchedule,
   type ModelFreshnessBreach,
 } from "@/components/explorer/liveState"
 
@@ -34,7 +35,16 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1)
 }
 
-export function ModelFreshnessHistory({ savedQueryId, reloadTick }: { savedQueryId: string; reloadTick: number }) {
+export function ModelFreshnessHistory({
+  savedQueryId,
+  reloadTick,
+  schedule,
+}: {
+  savedQueryId: string
+  reloadTick: number
+  /** The model's schedule now: a miss does not keep the one it was detected under. */
+  schedule?: FreshnessSchedule
+}) {
   const [retryTick, setRetryTick] = useState(0)
   const [result, setResult] = useState<LoadResult | null>(null)
   const loadKey = `${savedQueryId}|${reloadTick}|${retryTick}`
@@ -116,7 +126,7 @@ export function ModelFreshnessHistory({ savedQueryId, reloadTick }: { savedQuery
             </TableHeader>
             <TableBody>
               {shown.breaches.map((b) => (
-                <BreachRow key={b.breach_id} b={b} />
+                <BreachRow key={b.breach_id} b={b} schedule={schedule} />
               ))}
             </TableBody>
           </Table>
@@ -140,7 +150,7 @@ function CapNote() {
   )
 }
 
-function BreachRow({ b }: { b: ModelFreshnessBreach }) {
+function BreachRow({ b, schedule }: { b: ModelFreshnessBreach; schedule?: FreshnessSchedule }) {
   const closedBy = overdueAtClose(b)
   const ending = describeFreshnessResolution(b.resolution)
   return (
@@ -149,7 +159,7 @@ function BreachRow({ b }: { b: ModelFreshnessBreach }) {
         {formatAbsoluteTime(b.detected_at)}
       </TableCell>
       <TableCell className="min-w-[200px] align-top text-xs">
-        <div>{capitalize(describeFreshnessCause(b.cause))}.</div>
+        <div>{capitalize(describeFreshnessCause(b.cause, schedule))}.</div>
         <div className="text-zinc-500 dark:text-zinc-400">
           {`Deadline ${formatSpan(b.deadline_seconds)}; `}
           {b.never_succeeded

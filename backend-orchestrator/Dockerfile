@@ -52,6 +52,9 @@ COPY --from=builder --chown=appuser:appgroup /build/backend-orchestrator/bin/orc
 COPY --from=builder /build/backend-orchestrator/bin/orchestrator.sha256 /tmp/
 RUN sha256sum -c /tmp/orchestrator.sha256 && rm /tmp/orchestrator.sha256
 
+# The licence attributions for what this image ships.
+COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
+
 USER appuser
 
 EXPOSE 8080

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -117,6 +118,46 @@ func envBool(name string, defaultVal bool) bool {
 		return false
 	default:
 		return defaultVal
+	}
+}
+
+// newKafkaClient is saramaauth.NewClient; a test swaps it to play a broker
+// that is still starting.
+var newKafkaClient = saramaauth.NewClient
+
+// kafkaStartupBudget is how long NewManager waits for Kafka to accept a
+// connection. The 2026-10-25 cold boot on two vCPUs took about two minutes,
+// and a dial that gives up turns into log.Fatalf and a container restart. Kept
+// under the chart's liveness window (90 s initial delay + 6 × 30 s = 270 s);
+// on Kubernetes the wait-for-kafka initContainer normally makes it zero.
+var (
+	kafkaStartupBudget = 3 * time.Minute
+	kafkaStartupWait   = 3 * time.Second
+)
+
+// connectKafkaClient dials until Kafka accepts a connection or budget is
+// spent, the same startup retry temporal-adapter runs for its producer. When
+// the VM boots, Docker starts this container and Kafka together, and a single
+// attempt that lost the race crash-looped the orchestrator until Kafka was up.
+// Running out of budget still fails startup: every consumer, the producer and
+// the cluster admin are built on this client.
+func connectKafkaClient(security kafkaclient.Config, cfg *sarama.Config, budget, wait time.Duration,
+	dial func(kafkaclient.Config, *sarama.Config) (sarama.Client, error)) (sarama.Client, error) {
+	brokers := strings.Join(security.Brokers, ",")
+	deadline := time.Now().Add(budget)
+	for attempt := 1; ; attempt++ {
+		client, err := dial(security, cfg)
+		if err == nil {
+			if attempt > 1 {
+				log.Infof("✅ Kafka reachable at %s after %d attempts", brokers, attempt)
+			}
+			return client, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("kafka not reachable at %s after %d attempts over %s: %w", brokers, attempt, budget, err)
+		}
+		log.Warnf("⏳ Kafka not reachable yet at %s (attempt %d): %v — retrying in %s", brokers, attempt, err, wait)
+		time.Sleep(wait)
 	}
 }
 
@@ -239,7 +280,7 @@ func NewManager(config Config) (*Manager, error) {
 	}
 
 	// Create client
-	client, err := saramaauth.NewClient(security, saramaConfig)
+	client, err := connectKafkaClient(security, saramaConfig, kafkaStartupBudget, kafkaStartupWait, newKafkaClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kafka client: %w", err)
 	}
@@ -544,20 +585,6 @@ func (m *Manager) injectTraceHeaders(ctx context.Context) map[string]string {
 	carrier := propagation.MapCarrier(headers)
 	propagator.Inject(ctx, carrier)
 	return headers
-}
-
-// extractTraceContext extracts OTel trace context from Kafka message headers
-func (m *Manager) extractTraceContext(headers []*sarama.RecordHeader) (context.Context, map[string]string) {
-	headerMap := make(map[string]string)
-	for _, h := range headers {
-		headerMap[string(h.Key)] = string(h.Value)
-	}
-
-	propagator := otel.GetTextMapPropagator()
-	carrier := propagation.MapCarrier(headerMap)
-	ctx := propagator.Extract(context.Background(), carrier)
-
-	return ctx, headerMap
 }
 
 // ConsumeHandler is a function that processes consumed messages
@@ -1331,6 +1358,7 @@ func (m *Manager) fetchConsumerGroupOffsets(groupID string) (committed, logEnd m
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get topics: %w", err)
 	}
+	requested := make(map[string][]int32)
 	for _, topic := range topics {
 		partitions, err := m.client.Partitions(topic)
 		if err != nil {
@@ -1340,23 +1368,16 @@ func (m *Manager) fetchConsumerGroupOffsets(groupID string) (committed, logEnd m
 		for _, partition := range partitions {
 			offsetsRequest.AddPartition(topic, partition)
 		}
+		requested[topic] = partitions
 	}
 
 	offsetsResponse, err := coordinator.FetchOffset(offsetsRequest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch offsets: %w", err)
 	}
-
-	// Collect the group's committed offset per topic/partition. Kafka reports -1 for a
-	// partition the group has NEVER committed to.
-	committed = make(map[string]map[int32]int64)
-	for topic, partitions := range offsetsResponse.Blocks {
-		for partition, block := range partitions {
-			if committed[topic] == nil {
-				committed[topic] = make(map[int32]int64)
-			}
-			committed[topic][partition] = block.Offset
-		}
+	committed, err = committedFromFetch(requested, offsetsResponse)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch offsets for group %s: %w", groupID, err)
 	}
 
 	// Fetch the log-end (high-watermark) offset ONLY for partitions this group has actually
@@ -1385,6 +1406,37 @@ func (m *Manager) fetchConsumerGroupOffsets(groupID string) (committed, logEnd m
 	}
 
 	return committed, logEnd, nil
+}
+
+// committedFromFetch collects the group's committed offset per topic/partition from an
+// OffsetFetch answer. Kafka reports -1 with no error for a partition the group has
+// NEVER committed to, and that stays -1.
+//
+// An offset the broker did not give is an error, never -1: while the group coordinator
+// is unavailable (a broker restart) the answer carries an error — top-level on v2+,
+// repeated on every partition with offset -1 on v0-1 — and read as -1 it made every
+// partition the group did commit look never-committed, so its lag vanished.
+func committedFromFetch(requested map[string][]int32, resp *sarama.OffsetFetchResponse) (map[string]map[int32]int64, error) {
+	if resp.Err != sarama.ErrNoError {
+		return nil, resp.Err
+	}
+	committed := make(map[string]map[int32]int64)
+	for topic, partitions := range requested {
+		for _, partition := range partitions {
+			block := resp.GetBlock(topic, partition)
+			if block == nil {
+				return nil, fmt.Errorf("no committed offset returned for %s/%d", topic, partition)
+			}
+			if block.Err != sarama.ErrNoError {
+				return nil, fmt.Errorf("%s/%d: %w", topic, partition, block.Err)
+			}
+			if committed[topic] == nil {
+				committed[topic] = make(map[int32]int64)
+			}
+			committed[topic][partition] = block.Offset
+		}
+	}
+	return committed, nil
 }
 
 // computeConsumerGroupLag is the pure core of GetConsumerGroupLag, split out so the
@@ -1647,6 +1699,40 @@ func (m *Manager) TopicMessageCount(topic string) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// TopicEndOffset is topic's log end offset summed over partitions: how many messages
+// were ever written to it. Unlike TopicMessageCount it never goes down when retention or
+// compaction removes old messages, so two readings answer "was anything written in
+// between" — what the CDC sentinel asks of a Debezium heartbeat topic.
+//
+// It checks the broker's topic list first and reports exists=false, with no error, for
+// a topic that is not there: a metadata request for a missing topic auto-creates it on a
+// broker with auto.create.topics.enable, and a watchdog must not create what it watches.
+func (m *Manager) TopicEndOffset(topic string) (int64, bool, error) {
+	if !m.connected {
+		return 0, false, fmt.Errorf("kafka manager not connected")
+	}
+	topics, err := m.client.Topics()
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to list topics: %w", err)
+	}
+	if !slices.Contains(topics, topic) {
+		return 0, false, nil
+	}
+	partitions, err := m.client.Partitions(topic)
+	if err != nil {
+		return 0, true, fmt.Errorf("failed to get partitions for topic %s: %w", topic, err)
+	}
+	var total int64
+	for _, p := range partitions {
+		newest, err := m.client.GetOffset(topic, p, sarama.OffsetNewest)
+		if err != nil {
+			return 0, true, fmt.Errorf("failed to read the end offset of %s/%d: %w", topic, p, err)
+		}
+		total += newest
+	}
+	return total, true, nil
 }
 
 // ListTopics returns all topic names known to the broker.

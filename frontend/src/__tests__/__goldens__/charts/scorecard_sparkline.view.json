@@ -1,0 +1,27 @@
+{
+  "kind": "scorecard",
+  "label": "Sum of amount",
+  "value": 48200,
+  "format": "compact",
+  "previous": 41000,
+  "days": 7,
+  "spark": [
+    {
+      "date": "2026-10-01",
+      "value": 6000
+    },
+    {
+      "date": "2026-10-02",
+      "value": 6900
+    },
+    {
+      "date": "2026-10-03",
+      "value": 7800
+    },
+    {
+      "date": "2026-10-04",
+      "value": 8700
+    }
+  ],
+  "notes": []
+}

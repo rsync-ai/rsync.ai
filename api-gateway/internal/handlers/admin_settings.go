@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"api-gateway/internal/config"
 	"api-gateway/internal/db"
 
 	"github.com/gin-gonic/gin"
@@ -48,8 +49,16 @@ func AdminGetSettings(c *gin.Context) {
 
 	// Provide defaults for known settings if not set. Safe only because every
 	// path above that could not read the table has already returned.
+	// registration_mode reports what Register enforces (defaultRegistrationMode).
 	if _, ok := settings["registration_mode"]; !ok {
-		settings["registration_mode"] = "open"
+		users := int64(-1)
+		if config.SingleWorkspace() {
+			if err := database.QueryRow("SELECT COUNT(*) FROM users").Scan(&users); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load settings"})
+				return
+			}
+		}
+		settings["registration_mode"] = defaultRegistrationMode(users)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"settings": settings})

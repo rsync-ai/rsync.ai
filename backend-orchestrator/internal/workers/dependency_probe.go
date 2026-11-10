@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -390,6 +391,14 @@ func (p *DependencyProbe) probeOne(ctx context.Context, pipelineID, kind, identi
 				details["dropped_source_tables"] = names
 				return "degraded", fmt.Sprintf("source table(s) dropped at origin: %s", strings.Join(names, ", ")), details
 			}
+			// Same class, second instance: a connector whose resume position has left
+			// the source's log stays RUNNING while capturing nothing. The Sentinel's
+			// freshness alarm is the only thing that notices, and while it was open the
+			// Monitor tab still read "Streaming · caught up" from this row.
+			if p.sourceStreamStalled(ctx, pipelineID) {
+				details["source_stream_stalled"] = true
+				return "degraded", "source stream stalled: committed position not advancing", details
+			}
 			return "healthy", "", details
 		}
 		if connState == "PAUSED" {
@@ -507,6 +516,31 @@ func (p *DependencyProbe) droppedSourceTables(ctx context.Context, pipelineID st
 		return nil
 	}
 	return names
+}
+
+// sourceStalledIssuePrefix mirrors sentinel.sourceStalledIssueID. The Sentinel owns
+// that alarm; the probe only reads whether its row is open (a row exists while the
+// issue is open and is deleted when it resolves).
+const sourceStalledIssuePrefix = "cdc-source-stalled-"
+
+// sourceStreamStalled reports whether the Sentinel has an open source-stall issue for
+// this pipeline. Fail-soft like droppedSourceTables: any error keeps the caller's
+// verdict, so the lookup can only ever make a green badge honest, never break one.
+func (p *DependencyProbe) sourceStreamStalled(ctx context.Context, pipelineID string) bool {
+	if p.db == nil || strings.TrimSpace(pipelineID) == "" {
+		return false
+	}
+	var one int
+	err := p.db.QueryRowContext(ctx,
+		`SELECT 1 FROM sentinel_active_issues WHERE id = $1`,
+		sourceStalledIssuePrefix+pipelineID).Scan(&one)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Debugf("dependency_probe: source stall lookup failed (ignored, pipeline=%s): %v", pipelineID, err)
+		}
+		return false
+	}
+	return true
 }
 
 // kafkaConnectBaseURL returns the Kafka Connect REST base URL (env override or

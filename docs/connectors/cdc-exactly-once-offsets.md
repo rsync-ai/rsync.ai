@@ -61,9 +61,17 @@ list of objects of this shape:
   "pipeline_id": "pl_abc123",   // scopes offsets to one pipeline
   "topic":       "dbserver1.public.orders",
   "partition":   0,             // Kafka partition (int)
-  "offset":      948213         // Kafka offset of the LAST message in this batch (int)
+  "offset":      948213         // the partition's safe floor (int) — see below
 }
 ```
+
+`offset` is the highest offset below which **every** change the sink consumed from that
+partition has landed — the batch's last offset unless another batch of the same partition
+is still open, then lower, or `-1` when nothing below the open batches is safe yet. One
+partition's changes sit in several batches at once (every table of a shared topic, every
+`partition_by` value of one table on object storage) and land in any order, so stamping a
+batch's own last offset would let a restart skip an earlier, still-open batch
+(KI-CDC-SINK-COMMIT-PAST-HELD-CHANGES; the sink's `commitGate`). Accept `-1` and keep the max.
 
 A batch spanning multiple partitions yields a **list** — one entry per partition, each
 carrying that partition's highest offset in the batch. A connector must take the
@@ -284,7 +292,8 @@ deterministic from the first offset, and the connector still keeps only objects 
   holds only the batch's **first** offset and no topic, so the key alone cannot give the
   high-water mark. Instead the sink stamps object metadata on every CDC `import_data`
   (`object_metadata`: `rsync_pipeline_id`, `rsync_topic`, `rsync_partition`,
-  `rsync_first_offset`, `rsync_last_offset` — `cdcObjectMetadata`) and calls
+  `rsync_first_offset`, `rsync_last_offset` — `cdcObjectMetadata`; `rsync_last_offset` is the
+  partition's safe floor from §2.1, which can be below the object's own last offset, or `-1`) and calls
   `get_cdc_offsets` with `prefix=<path_prefix>/<dataset>/` plus `bucket`/`container`
   (`getCDCOffsetsArgs`). The connector lists that prefix, keeps objects whose
   `rsync_pipeline_id` matches, and returns the max `rsync_last_offset` per

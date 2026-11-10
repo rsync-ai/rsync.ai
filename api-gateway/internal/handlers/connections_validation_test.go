@@ -40,7 +40,7 @@ func TestGetConnection_NonUUIDSlug_NotFoundReturns404(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "user_id", "name", "type", "connector_type", "connector_version",
 			"sync_mode", "cdc_mode", "description", "config", "status",
-			"last_tested_at", "last_test_status", "last_test_error", "created_at", "updated_at",
+			"last_tested_at", "last_test_status", "last_test_error", "last_table_check", "created_at", "updated_at", "week_start", "fiscal_year_start_month",
 		}))
 
 	gin.SetMode(gin.TestMode)

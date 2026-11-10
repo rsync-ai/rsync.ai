@@ -1,0 +1,622 @@
+{
+  "_comment": "A chart's settings saved before roles (version 1) and the same chart as version 2 (dashboards-design.md § 14.2, decision 14). Readers: api-gateway internal/charts/settings_v1_test.go (Decode upgrades each v1 to its v2 and reads each v2 as itself), internal/db/migration_147_integration_test.go (migration 147's SQL rewrites each v1 to the same v2), and the frontend's chart-golden.test.ts (each of its charts is drawn from the v2 of its v1 here, and draws as the v1 did before D4a).",
+  "cases": [
+    {
+      "name": "bar with a titled x and a measure's format and colour",
+      "v1": {
+        "type": "bar",
+        "x": {
+          "column": "day",
+          "title": "Day"
+        },
+        "measure": {
+          "aggregate": "sum",
+          "column": "amount",
+          "title": "Revenue",
+          "format": "compact",
+          "color": "series-2"
+        },
+        "sort": "x_asc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "sum",
+              "title": "Revenue",
+              "format": "compact",
+              "color": "series-2"
+            }
+          ],
+          "x": [
+            {
+              "column": "day",
+              "title": "Day"
+            }
+          ]
+        },
+        "sort": "x_asc"
+      }
+    },
+    {
+      "name": "stacked bar with pinned series colours",
+      "v1": {
+        "type": "bar",
+        "x": {
+          "column": "day"
+        },
+        "measure": {
+          "aggregate": "count"
+        },
+        "series": {
+          "column": "region",
+          "colors": [
+            {
+              "value": "EU",
+              "color": "series-1"
+            },
+            {
+              "value": "US",
+              "color": "series-2"
+            }
+          ]
+        },
+        "stacked": true
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "measure": [
+            {
+              "aggregate": "count"
+            }
+          ],
+          "series": [
+            {
+              "column": "region",
+              "colors": [
+                {
+                  "value": "EU",
+                  "color": "series-1"
+                },
+                {
+                  "value": "US",
+                  "color": "series-2"
+                }
+              ]
+            }
+          ],
+          "x": [
+            {
+              "column": "day"
+            }
+          ]
+        },
+        "stacked": true
+      }
+    },
+    {
+      "name": "horizontal bar by distinct count",
+      "v1": {
+        "type": "hbar",
+        "x": {
+          "column": "region"
+        },
+        "measure": {
+          "aggregate": "count_distinct",
+          "column": "customer_id"
+        },
+        "sort": "value_desc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "hbar",
+        "roles": {
+          "measure": [
+            {
+              "column": "customer_id",
+              "aggregate": "count_distinct"
+            }
+          ],
+          "x": [
+            {
+              "column": "region"
+            }
+          ]
+        },
+        "sort": "value_desc"
+      }
+    },
+    {
+      "name": "line with a description",
+      "v1": {
+        "type": "line",
+        "description": "Average order value per day.",
+        "x": {
+          "column": "day"
+        },
+        "measure": {
+          "aggregate": "avg",
+          "column": "amount",
+          "format": "decimal"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "line",
+        "description": "Average order value per day.",
+        "roles": {
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "avg",
+              "format": "decimal"
+            }
+          ],
+          "x": [
+            {
+              "column": "day"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "area with a series",
+      "v1": {
+        "type": "area",
+        "x": {
+          "column": "day"
+        },
+        "measure": {
+          "aggregate": "max",
+          "column": "amount"
+        },
+        "series": {
+          "column": "region"
+        },
+        "sort": "x_desc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "area",
+        "roles": {
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "max"
+            }
+          ],
+          "series": [
+            {
+              "column": "region"
+            }
+          ],
+          "x": [
+            {
+              "column": "day"
+            }
+          ]
+        },
+        "sort": "x_desc"
+      }
+    },
+    {
+      "name": "heatmap with a titled y",
+      "v1": {
+        "type": "heatmap",
+        "x": {
+          "column": "day"
+        },
+        "y": {
+          "column": "region",
+          "title": "Region"
+        },
+        "measure": {
+          "aggregate": "min",
+          "column": "amount",
+          "color": "series-4"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "heatmap",
+        "roles": {
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "min",
+              "color": "series-4"
+            }
+          ],
+          "x": [
+            {
+              "column": "day"
+            }
+          ],
+          "y": [
+            {
+              "column": "region",
+              "title": "Region"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "scorecard",
+      "v1": {
+        "type": "scorecard",
+        "measure": {
+          "aggregate": "sum",
+          "column": "amount",
+          "format": "compact"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "scorecard",
+        "roles": {
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "sum",
+              "format": "compact"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "scorecard with a comparison",
+      "v1": {
+        "type": "scorecard",
+        "measure": {
+          "aggregate": "count"
+        },
+        "compare": {
+          "column": "day",
+          "days": 7
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "scorecard",
+        "roles": {
+          "date": [
+            {
+              "column": "day"
+            }
+          ],
+          "measure": [
+            {
+              "aggregate": "count"
+            }
+          ]
+        },
+        "compare": {
+          "days": 7
+        }
+      }
+    },
+    {
+      "name": "table of rows",
+      "v1": {
+        "type": "table",
+        "columns": [
+          "day",
+          "region",
+          "amount"
+        ],
+        "sort": "x_desc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "table",
+        "roles": {
+          "columns": [
+            {
+              "column": "day"
+            },
+            {
+              "column": "region"
+            },
+            {
+              "column": "amount"
+            }
+          ]
+        },
+        "sort": "x_desc"
+      }
+    },
+    {
+      "name": "grouped table",
+      "v1": {
+        "type": "table",
+        "columns": [
+          "region",
+          "day"
+        ],
+        "measure": {
+          "aggregate": "sum",
+          "column": "amount"
+        },
+        "sort": "value_desc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "table",
+        "roles": {
+          "columns": [
+            {
+              "column": "region"
+            },
+            {
+              "column": "day"
+            }
+          ],
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "sum"
+            }
+          ]
+        },
+        "sort": "value_desc"
+      }
+    },
+    {
+      "name": "version 1 said out loud",
+      "v1": {
+        "version": 1,
+        "type": "bar",
+        "x": {
+          "column": "Straße",
+          "title": "Umsatz – € je Tag"
+        },
+        "measure": {
+          "aggregate": "count"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "measure": [
+            {
+              "aggregate": "count"
+            }
+          ],
+          "x": [
+            {
+              "column": "Straße",
+              "title": "Umsatz – € je Tag"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "bar summing a column",
+      "v1": {
+        "type": "bar",
+        "x": {
+          "column": "day"
+        },
+        "measure": {
+          "aggregate": "sum",
+          "column": "amount"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "x": [
+            {
+              "column": "day"
+            }
+          ],
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "sum"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "stacked bar with one pinned series colour and a titled x",
+      "v1": {
+        "type": "bar",
+        "x": {
+          "column": "day",
+          "title": "Day"
+        },
+        "measure": {
+          "aggregate": "count"
+        },
+        "series": {
+          "column": "region",
+          "colors": [
+            {
+              "value": "EU",
+              "color": "series-2"
+            }
+          ]
+        },
+        "stacked": true
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "x": [
+            {
+              "column": "day",
+              "title": "Day"
+            }
+          ],
+          "series": [
+            {
+              "column": "region",
+              "colors": [
+                {
+                  "value": "EU",
+                  "color": "series-2"
+                }
+              ]
+            }
+          ],
+          "measure": [
+            {
+              "aggregate": "count"
+            }
+          ]
+        },
+        "stacked": true
+      }
+    },
+    {
+      "name": "horizontal bar by average, sorted by value",
+      "v1": {
+        "type": "hbar",
+        "x": {
+          "column": "region"
+        },
+        "measure": {
+          "aggregate": "avg",
+          "column": "amount",
+          "format": "decimal"
+        },
+        "sort": "value_asc"
+      },
+      "v2": {
+        "version": 2,
+        "type": "hbar",
+        "roles": {
+          "x": [
+            {
+              "column": "region"
+            }
+          ],
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "avg",
+              "format": "decimal"
+            }
+          ]
+        },
+        "sort": "value_asc"
+      }
+    },
+    {
+      "name": "line by distinct count with a measure title",
+      "v1": {
+        "type": "line",
+        "x": {
+          "column": "day"
+        },
+        "measure": {
+          "aggregate": "count_distinct",
+          "column": "customer_id",
+          "title": "Customers"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "line",
+        "roles": {
+          "x": [
+            {
+              "column": "day"
+            }
+          ],
+          "measure": [
+            {
+              "column": "customer_id",
+              "aggregate": "count_distinct",
+              "title": "Customers"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "heatmap with a coloured measure",
+      "v1": {
+        "type": "heatmap",
+        "x": {
+          "column": "day"
+        },
+        "y": {
+          "column": "region"
+        },
+        "measure": {
+          "aggregate": "min",
+          "column": "amount",
+          "color": "series-4"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "heatmap",
+        "roles": {
+          "x": [
+            {
+              "column": "day"
+            }
+          ],
+          "y": [
+            {
+              "column": "region"
+            }
+          ],
+          "measure": [
+            {
+              "column": "amount",
+              "aggregate": "min",
+              "color": "series-4"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "bar summing a masked column",
+      "v1": {
+        "type": "bar",
+        "x": {
+          "column": "region"
+        },
+        "measure": {
+          "aggregate": "sum",
+          "column": "salary"
+        }
+      },
+      "v2": {
+        "version": 2,
+        "type": "bar",
+        "roles": {
+          "x": [
+            {
+              "column": "region"
+            }
+          ],
+          "measure": [
+            {
+              "column": "salary",
+              "aggregate": "sum"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

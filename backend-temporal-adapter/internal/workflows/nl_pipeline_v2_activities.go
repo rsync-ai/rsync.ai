@@ -1,7 +1,6 @@
 package workflows
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -96,9 +95,17 @@ func toTemporalError(e *ActivityError) error {
 	if e == nil {
 		return nil
 	}
-	switch e.Type {
-	case ErrTypeTransient:
+	switch {
+	case e.Type == ErrTypeTransient:
 		return temporal.NewApplicationError(e.Error(), v2ActivityErrorTemporalType, e)
+	case e.Type == ErrTypePolicy && policyCodeIsAWait(e.Code):
+		// An expected outcome the workflow parks or loops on, not a failure. The
+		// benign category keeps the SDK from logging it at ERROR.
+		return temporal.NewApplicationErrorWithOptions(e.Error(), v2ActivityErrorTemporalType, temporal.ApplicationErrorOptions{
+			NonRetryable: true,
+			Details:      []interface{}{e},
+			Category:     temporal.ApplicationErrorCategoryBenign,
+		})
 	default:
 		// IMPORTANT: NewNonRetryableApplicationError signature is (message, type, cause, details...).
 		// We want our structured ActivityError to be stored as DETAILS (so the workflow can decode Metadata),
@@ -813,6 +820,18 @@ type pgColumn struct {
 	Type string // formatted SQL type for ADD COLUMN
 }
 
+// maxAutoSchemaDDL is the most missing columns the run adds to a destination on
+// its own; more is a change for a person to make.
+const maxAutoSchemaDDL = 10
+
+// noMissingColumnReason is why a drift with no column missing from the
+// destination is not repaired: adding columns is the only repair the run makes.
+const noMissingColumnReason = "no column is missing from the destination, so adding columns cannot repair this drift"
+
+func tooManyColumnsReason(n int) string {
+	return fmt.Sprintf("%d columns are missing from the destination; rsync.ai adds at most %d on its own", n, maxAutoSchemaDDL)
+}
+
 type SchemaRepairChange struct {
 	Table  string `json:"table"`
 	Column string `json:"column"`
@@ -1102,12 +1121,19 @@ func PlanSchemaDriftRepairActivity(ctx context.Context, sourceConnectionID, dest
 	}
 
 	// Safe if we only need a small number of additive changes.
-	safe := len(ddl) > 0 && len(ddl) <= 10
+	safe := len(ddl) > 0 && len(ddl) <= maxAutoSchemaDDL
+	reason := "Additive columns detected"
+	switch {
+	case len(ddl) == 0:
+		reason = noMissingColumnReason
+	case !safe:
+		reason = tooManyColumnsReason(len(ddl))
+	}
 
 	return SchemaRepairPlan{
 		Safe:                    safe,
 		RequiresApproval:        !safe,
-		Reason:                  "Additive columns detected",
+		Reason:                  reason,
 		DDL:                     ddl,
 		Changes:                 changes,
 		SourceConnectionID:      sourceConnectionID,
@@ -1438,204 +1464,6 @@ func getMapKeys(m map[string]interface{}) []string {
 		keys = append(keys, k)
 	}
 	return keys
-}
-
-// ==============================================================================
-// HITL NODE INPUT INTERPRETATION ACTIVITY
-// ==============================================================================
-
-// InterpretNodeInputInput is the input for InterpretNodeInputActivity
-type InterpretNodeInputInput struct {
-	PipelineID   string                 `json:"pipeline_id"`
-	ExecutionID  string                 `json:"execution_id"`
-	NodeID       string                 `json:"node_id"`
-	NodeKind     string                 `json:"node_kind"`
-	HITLPrompt   string                 `json:"hitl_prompt"`
-	UserResponse string                 `json:"user_response"`
-	NodeContext  map[string]interface{} `json:"node_context,omitempty"`
-}
-
-// InterpretNodeInputOutput is the output from InterpretNodeInputActivity
-type InterpretNodeInputOutput struct {
-	Success             bool                   `json:"success"`
-	ConfigPatch         map[string]interface{} `json:"config_patch,omitempty"`
-	Error               string                 `json:"error,omitempty"`
-	NeedsClarification  bool                   `json:"needs_clarification,omitempty"`
-	ClarificationPrompt string                 `json:"clarification_prompt,omitempty"`
-	Confidence          float64                `json:"confidence,omitempty"`
-}
-
-// InterpretNodeInputActivity interprets a user's NL response into structured config updates
-// This calls the llm-service's HITL interpreter endpoint
-func InterpretNodeInputActivity(ctx context.Context, input InterpretNodeInputInput) (*InterpretNodeInputOutput, error) {
-	logger := log.WithFields(log.Fields{
-		"activity":    "InterpretNodeInputActivity",
-		"pipeline_id": input.PipelineID,
-		"node_id":     input.NodeID,
-	})
-	logger.Info("🎯 InterpretNodeInputActivity started")
-
-	// Record heartbeat
-	activity.RecordHeartbeat(ctx, map[string]interface{}{
-		"node_id":      input.NodeID,
-		"status":       "interpreting",
-		"response_len": len(input.UserResponse),
-	})
-
-	// Call llm-service HITL interpreter via HTTP
-	llmServiceURL := os.Getenv("LLM_SERVICE_URL")
-	if llmServiceURL == "" {
-		llmServiceURL = "http://llm-service:5000"
-	}
-
-	requestBody := map[string]interface{}{
-		"node_id":       input.NodeID,
-		"node_kind":     input.NodeKind,
-		"hitl_prompt":   input.HITLPrompt,
-		"user_response": input.UserResponse,
-		"node_context":  input.NodeContext,
-	}
-
-	bodyJSON, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, toTemporalError(NewInfraError("JSON_MARSHAL_FAILED", fmt.Sprintf("Failed to marshal request: %v", err), nil))
-	}
-
-	// Make HTTP request to llm-service
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(
-		fmt.Sprintf("%s/v1/hitl/interpret", llmServiceURL),
-		"application/json",
-		bytes.NewReader(bodyJSON),
-	)
-	if err != nil {
-		logger.Warn("LLM service call failed, using heuristic interpretation", "error", err)
-		// Fallback to simple heuristic interpretation
-		return heuristicInterpretation(input), nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		logger.Warn("LLM service returned non-200, using heuristic", "status", resp.StatusCode, "body", string(bodyBytes))
-		return heuristicInterpretation(input), nil
-	}
-
-	var result InterpretNodeInputOutput
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		logger.Warn("Failed to decode LLM response, using heuristic", "error", err)
-		return heuristicInterpretation(input), nil
-	}
-
-	logger.Info("✅ Node input interpreted", "success", result.Success, "confidence", result.Confidence)
-	return &result, nil
-}
-
-// heuristicInterpretation provides simple fallback interpretation without LLM
-func heuristicInterpretation(input InterpretNodeInputInput) *InterpretNodeInputOutput {
-	response := strings.TrimSpace(input.UserResponse)
-	responseLower := strings.ToLower(response)
-
-	// Pattern 1: Yes/No confirmation
-	if strings.Contains(strings.ToLower(input.HITLPrompt), "confirm") ||
-		strings.Contains(strings.ToLower(input.HITLPrompt), "proceed") {
-		if containsAny(responseLower, []string{"yes", "yeah", "yep", "confirm", "ok", "sure", "proceed"}) {
-			return &InterpretNodeInputOutput{
-				Success:     true,
-				ConfigPatch: map[string]interface{}{"confirmed": true},
-				Confidence:  0.9,
-			}
-		}
-		if containsAny(responseLower, []string{"no", "nope", "cancel", "stop"}) {
-			return &InterpretNodeInputOutput{
-				Success:     true,
-				ConfigPatch: map[string]interface{}{"confirmed": false},
-				Confidence:  0.9,
-			}
-		}
-	}
-
-	// Pattern 2: Table selection
-	if strings.Contains(strings.ToLower(input.HITLPrompt), "table") {
-		tables := extractTableNames(response)
-		if len(tables) > 0 {
-			return &InterpretNodeInputOutput{
-				Success:     true,
-				ConfigPatch: map[string]interface{}{"tables": tables},
-				Confidence:  0.85,
-			}
-		}
-	}
-
-	// Pattern 3: Path/location
-	if strings.Contains(strings.ToLower(input.HITLPrompt), "path") ||
-		strings.Contains(strings.ToLower(input.HITLPrompt), "location") {
-		// Look for path-like strings
-		if strings.Contains(response, "/") || strings.Contains(response, "s3://") {
-			return &InterpretNodeInputOutput{
-				Success:     true,
-				ConfigPatch: map[string]interface{}{"path": response},
-				Confidence:  0.8,
-			}
-		}
-	}
-
-	// Fallback: treat as raw input
-	return &InterpretNodeInputOutput{
-		Success:     true,
-		ConfigPatch: map[string]interface{}{"user_input": response},
-		Confidence:  0.5,
-	}
-}
-
-// containsAny checks if s contains any of the substrings
-func containsAny(s string, substrs []string) bool {
-	for _, sub := range substrs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// extractTableNames extracts table names from user response
-func extractTableNames(response string) []string {
-	// Simple extraction - split by common separators
-	response = strings.ToLower(response)
-	// Remove noise words
-	noise := []string{"the", "table", "tables", "sync", "select", "from", "and", "or", ","}
-
-	words := strings.Fields(response)
-	var tables []string
-
-	for _, word := range words {
-		word = strings.Trim(word, ",.;:\"'")
-		if word == "" {
-			continue
-		}
-		isNoise := false
-		for _, n := range noise {
-			if word == n {
-				isNoise = true
-				break
-			}
-		}
-		if !isNoise && len(word) > 1 {
-			// Basic table name validation (alphanumeric + underscore)
-			valid := true
-			for _, c := range word {
-				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-					valid = false
-					break
-				}
-			}
-			if valid {
-				tables = append(tables, word)
-			}
-		}
-	}
-
-	return tables
 }
 
 // CleanupPartialDataActivityV2 is called as a best-effort compensation step when a pipeline

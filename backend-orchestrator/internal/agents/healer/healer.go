@@ -1,14 +1,11 @@
 package healer
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -24,7 +21,6 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 	appmetrics "github.com/rsync-ai/backend-orchestrator/internal/metrics"
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
-	"github.com/rsync-ai/backend-orchestrator/pkg/llmjson"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 )
 
@@ -33,20 +29,27 @@ var healerTracer = otel.Tracer("healer-agent")
 const (
 	HealerTopic = "rsync.healer.schema-changes"
 
-	// ResultsTopic carries one HealingResult per handled schema change
-	// (publishHealingResult); the api-gateway notifier consumes it. It belongs
-	// to the schema-drift path, so like HealerTopic and ApprovedChangeTopic it
-	// is produced to, consumed and provisioned (kafka.EnsurePlatformTopics) only
-	// when RSYNC_SCHEMA_DRIFT_ENABLED=true.
+	// ResultsTopic carries one HealingResult per user-approved change the healer
+	// executes (publishHealingResult); the api-gateway notifier turns an applied
+	// one into the "Schema change applied" confirmation. A change the healer
+	// handles on its own is announced by its own drift notification instead
+	// (notifyDrift), so it is not published here: both would reach the inbox
+	// under different codes and the user would read every change twice. It
+	// belongs to the schema-drift path, so like HealerTopic and
+	// ApprovedChangeTopic it is produced to, consumed and provisioned
+	// (kafka.EnsurePlatformTopics) only when RSYNC_SCHEMA_DRIFT_ENABLED=true.
 	//
 	// NotifyTopic is rsync.notifications, the user-notification topic the
 	// api-gateway notifier always consumes (notifyUserStructured). Not gated.
 	ResultsTopic = "rsync.healer.results"
 	NotifyTopic  = "rsync.notifications"
-
-	LLMServiceURL   = "http://llm-service:5000"
-	AnalysisTimeout = 30 * time.Second
 )
+
+// connectorExecutor is the slice of *mcp.Client the healer uses: one call to a
+// destination connector tool. An interface so tests can stand in for the connector.
+type connectorExecutor interface {
+	ExecuteWithContext(ctx context.Context, req mcp.ExecuteRequest) (*mcp.ExecuteResponse, error)
+}
 
 // Agent represents the Healer agent for self-healing pipelines
 type Agent struct {
@@ -54,12 +57,18 @@ type Agent struct {
 	db           *sql.DB
 	ctx          context.Context
 	cancel       context.CancelFunc
-	httpClient   *http.Client
-	// mcpClient invokes destination connector tools (e.g. ensure_table) so an
-	// approved column change (add_column or a safe type widening) lands via the
-	// SAME path the batch write uses, instead of running source-shaped DDL
-	// directly against the dest. See ensureColumnViaConnector.
-	mcpClient *mcp.Client
+	// mcpClient invokes destination connector tools: ensure_table, so a column
+	// change lands via the SAME path the batch write uses instead of running
+	// source-shaped DDL directly against the dest (ensureColumnViaConnector), and
+	// drop_table for an approved table drop (dropDestinationTable).
+	mcpClient connectorExecutor
+	// loadDestination resolves a pipeline's destination connector type and
+	// config. Nil means the pipelines and connections tables, which is the
+	// production path; tests set it so they need no connection store.
+	loadDestination func(ctx context.Context, pipelineID string) (connectorType string, cfg map[string]string, err error)
+	// notifications, when set, receives each user notification instead of Kafka.
+	// Tests only.
+	notifications func(pipelineID string, se *diagnose.StructuredError)
 }
 
 // SchemaChangeEvent represents a schema change event from kafka-mcp-sink
@@ -87,17 +96,6 @@ type SchemaChange struct {
 	Error      string `json:"error"`
 }
 
-// LLMAnalysisResponse represents the LLM's analysis of a schema change
-type LLMAnalysisResponse struct {
-	SafeToAutoMigrate bool     `json:"safe_to_auto_migrate"`
-	Reasoning         string   `json:"reasoning"`
-	SuggestedDDL      string   `json:"suggested_ddl,omitempty"`
-	Risks             []string `json:"risks,omitempty"`
-	RequiresApproval  bool     `json:"requires_approval"`
-	NotifyUser        bool     `json:"notify_user"`
-	UserMessage       string   `json:"user_message,omitempty"`
-}
-
 // HealingResult represents the result of a healing operation
 type HealingResult struct {
 	PipelineID   string `json:"pipeline_id"`
@@ -110,8 +108,8 @@ type HealingResult struct {
 }
 
 // NewAgent creates a new Healer agent. toolsDir is the MCP connectors root used
-// to build the destination-connector client for applying approved additive DDL
-// via ensure_table (empty is tolerated — it resolves to the default tools dir).
+// to build the destination-connector client for ensure_table and drop_table
+// (empty is tolerated — it resolves to the default tools dir).
 func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, toolsDir string) *Agent {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -121,9 +119,6 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, toolsDir string) *Agent {
 		ctx:          ctx,
 		cancel:       cancel,
 		mcpClient:    mcp.NewClient(mcp.NewServerManager(toolsDir)),
-		httpClient: &http.Client{
-			Timeout: AnalysisTimeout,
-		},
 	}
 }
 
@@ -212,7 +207,15 @@ func (a *Agent) handleApprovedChange(ctx context.Context, msg *sarama.ConsumerMe
 		attribute.String("approval_id", approvalID),
 	)
 
-	// Destructive DDL is never applied, approved or not — applyMigration would
+	// A dropped source table is the one change that waits for a person, and approving
+	// it is the one destructive action the healer takes: it drops the destination table.
+	// It is run through the destination connector, never as the stored statement.
+	if isDropTableChange(changeType, ddl) {
+		a.dropApprovedTable(ctx, approvalID, pipelineID, changeType, tableName, ddl)
+		return nil
+	}
+
+	// Any other destructive DDL is never applied, approved or not — applyMigration would
 	// refuse it a few lines below and we would then mark the user's approval
 	// `failed` and alarm them, for approving a change the UI told them they would
 	// have to run by hand. api-gateway no longer dispatches these; this is the
@@ -279,6 +282,108 @@ func (a *Agent) handleApprovedChange(ctx context.Context, msg *sarama.ConsumerMe
 	return nil
 }
 
+// dropApprovedTable drops the destination table of a source table the user approved
+// dropping. The api-gateway has already taken the table out of the pipeline. The
+// approval row is checked here, not trusted from the message: nothing is dropped
+// unless schema_change_approvals says a person approved this exact row, so no other
+// producer on the topic can make the healer drop a table.
+func (a *Agent) dropApprovedTable(ctx context.Context, approvalID, pipelineID, changeType, tableName, ddl string) {
+	if a.db == nil || strings.TrimSpace(approvalID) == "" {
+		log.Warnf("[HealerAgent] Table drop for pipeline %s has no approval row to check; nothing dropped", pipelineID)
+		return
+	}
+	var approvedTable string
+	err := a.db.QueryRowContext(ctx, `
+		SELECT table_name FROM schema_change_approvals
+		WHERE id = $1 AND pipeline_id = $2 AND status = 'approved'
+	`, approvalID, pipelineID).Scan(&approvedTable)
+	if err != nil {
+		log.Warnf("[HealerAgent] Table drop %s for pipeline %s is not an approved row (%v); nothing dropped",
+			approvalID, pipelineID, err)
+		return
+	}
+
+	table := bareTable(approvedTable)
+	if fields := strings.Fields(strings.TrimRight(strings.TrimSpace(ddl), ";")); table == "" && len(fields) >= 3 {
+		table = bareTable(fields[len(fields)-1]) // DROP TABLE [IF EXISTS] <t>
+	}
+
+	dropped, dropErr := a.dropDestinationTable(ctx, pipelineID, table)
+	if dropErr != nil {
+		log.Errorf("[HealerAgent] Approved table drop failed (approval %s): %v", approvalID, dropErr)
+		_, _ = a.db.ExecContext(ctx, `
+			UPDATE schema_change_approvals
+			SET status = 'failed', error_message = $1, updated_at = NOW()
+			WHERE id = $2
+		`, dropErr.Error(), approvalID)
+		a.notifyUser(pipelineID, fmt.Sprintf("⚠️ Approved table drop failed: %s", dropErr.Error()))
+		return
+	}
+
+	_, _ = a.db.ExecContext(ctx, `
+		UPDATE schema_change_approvals
+		SET status = 'applied', applied_at = NOW(), updated_at = NOW()
+		WHERE id = $1
+	`, approvalID)
+
+	reason := "User approved: the destination table was dropped and the table was removed from this pipeline"
+	if !dropped {
+		reason = "User approved: the destination table was already gone, and the table was removed from this pipeline"
+	}
+	log.Infof("[HealerAgent] ✅ Approved table drop done (approval %s, table %s, dropped=%v)", approvalID, table, dropped)
+	result := &HealingResult{
+		PipelineID: pipelineID,
+		ChangeType: changeType,
+		Table:      tableName,
+		Status:     "applied",
+		Reason:     reason,
+		DDLApplied: ddl,
+	}
+	a.recordHealingResult(ctx, result)
+	a.publishHealingResult(result)
+}
+
+// dropDestinationTable runs the destination connector's drop_table, the same call and
+// parameters a reload uses (executor, run_mode=reload): the bare table name, the
+// pipeline's destination namespace, and the pipeline id for the connector's ownership
+// check. Reports whether a table was actually dropped.
+func (a *Agent) dropDestinationTable(ctx context.Context, pipelineID, table string) (bool, error) {
+	if strings.TrimSpace(table) == "" {
+		return false, fmt.Errorf("no destination table to drop")
+	}
+	connectorType, cfg, err := a.destination(ctx, pipelineID)
+	if err != nil {
+		return false, err
+	}
+	if a.mcpClient == nil {
+		return false, fmt.Errorf("mcp client not configured for drop_table")
+	}
+	destConn := normalizeDestConnector(connectorType)
+	resp, err := a.mcpClient.ExecuteWithContext(ctx, mcp.ExecuteRequest{
+		Connector: destConn,
+		Version:   "latest",
+		Operation: "drop_table",
+		Config:    cfg,
+		Params: map[string]interface{}{
+			"table":       table,
+			"namespace":   a.destinationNamespace(ctx, pipelineID),
+			"pipeline_id": pipelineID,
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("drop_table on the %s destination failed: %v", destConn, err)
+	}
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil && strings.TrimSpace(resp.Error) != "" {
+			msg = resp.Error
+		}
+		return false, fmt.Errorf("drop_table on the %s destination failed: %s", destConn, msg)
+	}
+	dropped, _ := resp.Result["dropped"].(bool)
+	return dropped, nil
+}
+
 // Stop gracefully shuts down the healer agent
 func (a *Agent) Stop() {
 	log.Info("[HealerAgent] Stopping...")
@@ -313,324 +418,448 @@ func (a *Agent) handleSchemaChangeMessage(ctx context.Context, msg *sarama.Consu
 	// A change the producer already applied is history, not a decision. The CDC sink's
 	// additive reconciler adds a new source column to the destination the moment it
 	// appears (kafka-mcp-sink reportAppliedSchemaDrift) — by the time this message
-	// lands, the column is live. Running the normal path on it would produce one of two
-	// wrong answers: `pending_approval`, inviting a human to approve something that has
-	// already happened, or auto-apply, re-running DDL against a destination that has it.
-	// Record it as applied and say so. This is the ONLY reason CDC drift is now visible
-	// at all; before it, the same ADD COLUMN that blocks a batch pipeline on human
-	// approval passed through a CDC pipeline with no row, no badge and no notification.
+	// lands, the column is live. Queueing it would invite a human to approve something
+	// that has already happened, and applying it would re-run DDL against a destination
+	// that has it. Record it and say so.
 	if event.SchemaChange.Applied {
 		return a.recordAlreadyAppliedChange(ctx, &event)
 	}
 
-	// Analyze the change using LLM
-	analysis, err := a.analyzeWithLLM(ctx, &event)
-	if err != nil {
-		log.Errorf("[HealerAgent] LLM analysis failed: %v, using rule-based fallback", err)
-		analysis = a.fallbackAnalysis(&event)
+	// One policy for batch and CDC: only a dropped table waits for a person.
+	switch routeSchemaChange(event.SchemaChange) {
+	case routeAwaitDecision:
+		a.queueForDecision(ctx, &event)
+	case routeRecord:
+		a.recordDriftNotice(ctx, &event)
+	default:
+		a.autoApplyChange(ctx, &event)
 	}
-
-	// Take action based on analysis
-	result := a.processAnalysis(ctx, &event, analysis)
-
-	// Record the result
-	a.recordHealingResult(ctx, result)
-
-	// Publish result for tracking
-	a.publishHealingResult(result)
-
 	return nil
 }
 
-// extractJSONObject delegates to the shared llmjson helper. The implementation
-// moved to pkg/llmjson so api-gateway's chat pipeline strips fences the same way
-// — a second copy is how one caller keeps the old behaviour. Kept as a local
-// name so the existing guards in healer_llm_parse_test.go still exercise it.
-func extractJSONObject(s string) string { return llmjson.ExtractObject(s) }
+// errUnsupportedDestination marks a destination the healer does not change column
+// definitions on. It is not a failure of the change: the healer has nothing to run
+// there, so the change is recorded rather than reported as broken.
+var errUnsupportedDestination = errors.New("unsupported destination for schema changes")
 
-func (a *Agent) analyzeWithLLM(ctx context.Context, event *SchemaChangeEvent) (*LLMAnalysisResponse, error) {
-	prompt := buildAnalysisPrompt(event)
+// driftRoute is what the healer does with one detected schema change. The policy is
+// the same for batch and CDC: only a dropped table waits for a person. Everything
+// else is handled on the spot, and the user is told what happened after the fact.
+type driftRoute int
 
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"prompt_name": "chat/schema_healer",
-		"variables": map[string]interface{}{
-			"prompt": prompt,
-		},
-	})
+const (
+	// routeApply runs the change against the destination (a new column, a type change).
+	routeApply driftRoute = iota
+	// routeRecord files the change and runs nothing: a notice about the source (a new
+	// table, a declared-type change) or a dropped column, which the destination keeps.
+	routeRecord
+	// routeAwaitDecision queues the change for a person. Only a dropped table lands
+	// here, plus any other destructive statement a producer might send, which is
+	// never run without a decision.
+	routeAwaitDecision
+)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", LLMServiceURL+"/v1/completion", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var llmResp map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return nil, err
-	}
-
-	content, ok := llmResp["content"].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid LLM response format")
-	}
-
-	var analysis LLMAnalysisResponse
-	if err := json.Unmarshal([]byte(extractJSONObject(content)), &analysis); err != nil {
-		return nil, fmt.Errorf("failed to parse LLM analysis: %w (content: %s)", err, content)
-	}
-
-	return &analysis, nil
-}
-
-func buildAnalysisPrompt(event *SchemaChangeEvent) string {
-	return fmt.Sprintf(`Analyze this schema change and determine if it's safe to auto-migrate.
-
-## Schema Change
-- **Pipeline ID**: %s
-- **Change Type**: %s
-- **Table**: %s.%s
-- **Column**: %s (%s)
-- **DDL**: %s
-- **Risk Level**: %s
-
-## Context
-- Auto-apply enabled: %v
-- Skip destructive enabled: %v
-
-## Rules
-1. ADD COLUMN (nullable) -> Safe to auto-apply
-2. DROP COLUMN -> NOT safe, requires approval (data loss risk)
-3. MODIFY COLUMN (widening) -> Safe if data won't be truncated
-4. MODIFY COLUMN (narrowing) -> NOT safe, requires approval
-5. CREATE TABLE -> Safe to auto-apply
-6. DROP TABLE -> NOT safe, requires approval
-
-Respond with JSON:
-{
-  "safe_to_auto_migrate": true/false,
-  "reasoning": "Brief explanation",
-  "suggested_ddl": "DDL to apply if different from source",
-  "risks": ["list of potential risks"],
-  "requires_approval": true/false,
-  "notify_user": true/false,
-  "user_message": "Message for user if notification needed"
-}`,
-		event.PipelineID,
-		event.SchemaChange.ChangeType,
-		event.SchemaChange.Database,
-		event.SchemaChange.Table,
-		event.SchemaChange.ColumnName,
-		event.SchemaChange.ColumnType,
-		// The one free-form field in this prompt. Table/column/type names are
-		// schema metadata, which the privacy contract allows verbatim; a DDL
-		// statement additionally carries LITERALS -- a DEFAULT value, a CHECK
-		// bound -- which are customer data. Scrub preserves the SQL shape and
-		// every identifier and replaces only the quoted literals, so the model
-		// still sees the change it is being asked to classify.
-		//
-		// This file already scrubbed what it sends OUT to the user (:630, :1112,
-		// :1222) while sending this IN to the model raw, which is the direction
-		// that leaves the platform.
-		llmscrub.Scrub(event.SchemaChange.DDL),
-		event.SchemaChange.RiskLevel,
-		event.Context["auto_apply_enabled"],
-		event.Context["skip_destructive_enabled"],
-	)
-}
-
-func (a *Agent) fallbackAnalysis(event *SchemaChangeEvent) *LLMAnalysisResponse {
-	change := event.SchemaChange
-
-	switch change.ChangeType {
-	case "add_column":
-		return &LLMAnalysisResponse{
-			SafeToAutoMigrate: true,
-			Reasoning:         "ADD COLUMN is generally safe for data pipelines",
-			RequiresApproval:  false,
-			NotifyUser:        false,
-		}
-
-	case "drop_column", "drop_table":
-		return &LLMAnalysisResponse{
-			SafeToAutoMigrate: false,
-			Reasoning:         "Destructive operations require manual approval",
-			RequiresApproval:  true,
-			NotifyUser:        true,
-			Risks:             []string{"Data loss", "Breaking downstream dependencies"},
-			UserMessage: fmt.Sprintf("Schema change detected: %s on %s. Manual approval required.",
-				change.ChangeType, change.Table),
-		}
-
-	case "modify_column":
-		return &LLMAnalysisResponse{
-			SafeToAutoMigrate: false,
-			Reasoning:         "Column type changes may cause data truncation",
-			RequiresApproval:  true,
-			NotifyUser:        true,
-			Risks:             []string{"Data truncation", "Type conversion errors"},
-			UserMessage: fmt.Sprintf("Column type change on %s.%s requires review.",
-				change.Table, change.ColumnName),
-		}
-
-	case "create_table":
-		return &LLMAnalysisResponse{
-			SafeToAutoMigrate: true,
-			Reasoning:         "CREATE TABLE is safe - no existing data affected",
-			RequiresApproval:  false,
-			NotifyUser:        false,
-		}
-
+// routeSchemaChange is the single statement of the drift policy.
+func routeSchemaChange(sc SchemaChange) driftRoute {
+	ddl := strings.TrimSpace(sc.DDL)
+	switch {
+	case isDropTableChange(sc.ChangeType, ddl):
+		return routeAwaitDecision
+	case isDroppedColumn(sc), isAdvisoryDDL(ddl):
+		return routeRecord
+	case isDestructiveDDL(ddl):
+		return routeAwaitDecision
 	default:
-		return &LLMAnalysisResponse{
-			SafeToAutoMigrate: false,
-			Reasoning:         "Unknown change type, requiring manual review",
-			RequiresApproval:  true,
-			NotifyUser:        true,
+		return routeApply
+	}
+}
+
+// isDropTableChange reports whether a change is a dropped source table, by its
+// change type or by its statement.
+func isDropTableChange(changeType, ddl string) bool {
+	if strings.EqualFold(strings.TrimSpace(changeType), "drop_table") {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ddl)), "drop table")
+}
+
+// parseDropColumnDDL extracts (table, column) from "ALTER TABLE <t> DROP COLUMN
+// [IF EXISTS] <c>", the statement older producers sent for a dropped column.
+func parseDropColumnDDL(ddl string) (table, column string, ok bool) {
+	fields := strings.Fields(strings.TrimRight(strings.TrimSpace(ddl), ";"))
+	if len(fields) < 6 ||
+		!strings.EqualFold(fields[0], "ALTER") || !strings.EqualFold(fields[1], "TABLE") ||
+		!strings.EqualFold(fields[3], "DROP") || !strings.EqualFold(fields[4], "COLUMN") {
+		return "", "", false
+	}
+	rest := fields[5:]
+	if len(rest) >= 3 && strings.EqualFold(rest[0], "IF") && strings.EqualFold(rest[1], "EXISTS") {
+		rest = rest[2:]
+	}
+	if len(rest) != 1 {
+		return "", "", false
+	}
+	return fields[2], rest[0], true
+}
+
+// isDroppedColumn reports whether a change is a column dropped from the source.
+func isDroppedColumn(sc SchemaChange) bool {
+	if strings.EqualFold(strings.TrimSpace(sc.ChangeType), "drop_column") {
+		return true
+	}
+	_, _, ok := parseDropColumnDDL(sc.DDL)
+	return ok
+}
+
+// DroppedColumnNote is the recorded "DDL" for a column dropped from the source. It is
+// a note, not a statement: the destination keeps the column, with its history, and
+// rsync.ai stops writing to it, so there is nothing to run. The batch detector and this
+// package both build it here, so the UNIQUE (pipeline_id, ddl) row for one dropped
+// column is the same row whichever path reported it.
+func DroppedColumnNote(table, column string) string {
+	return fmt.Sprintf(
+		"-- drift: column %s.%s was dropped in the source. The destination keeps the column; rsync.ai no longer writes values to it.",
+		strings.TrimSpace(table), strings.TrimSpace(column))
+}
+
+// normalizeDroppedColumn rewrites a dropped column reported as a DROP COLUMN statement
+// into the note, so no path can ever run it and the row dedups with the batch one.
+func normalizeDroppedColumn(sc *SchemaChange) {
+	if isAdvisoryDDL(sc.DDL) {
+		return
+	}
+	table, column, _ := parseDropColumnDDL(sc.DDL)
+	if c := strings.TrimSpace(sc.ColumnName); c != "" {
+		column = c
+	}
+	if column == "" {
+		return
+	}
+	if t := strings.TrimSpace(sc.Table); t != "" {
+		table = t
+	}
+	sc.ColumnName = column
+	sc.DDL = DroppedColumnNote(table, column)
+}
+
+// driftNotice picks the sentence the user is told for one change.
+type driftNotice int
+
+const (
+	noticeApplied driftNotice = iota
+	noticeKept
+	noticeRecorded
+	noticeFailed
+	noticeAwaitingDecision
+)
+
+// driftOutcome is how one change the healer handled on its own ends up: the
+// schema_change_approvals status, who acted, why, and what the user is told.
+type driftOutcome struct {
+	status string // schema_change_approvals.status: applied | approved | failed
+	actor  string
+	reason string
+	errMsg string
+	notice driftNotice
+}
+
+// appliedBySchemaDrift is the reviewed_by attribution for a change the healer handled
+// without a person, mirroring appliedByCDCSink.
+const appliedBySchemaDrift = "system:schema-drift"
+
+// fileDriftOutcome records a change the healer handled on its own: the row on the
+// schema changes page, the healing history, and one notification. It deliberately
+// does not publish to ResultsTopic; the notification here is the only announcement.
+func (a *Agent) fileDriftOutcome(ctx context.Context, event *SchemaChangeEvent, o driftOutcome) {
+	sc := event.SchemaChange
+	if a.db != nil {
+		var appliedAt, errMsg interface{}
+		if o.status == "applied" {
+			appliedAt = time.Now().UTC()
+		}
+		if o.errMsg != "" {
+			errMsg = o.errMsg
+		}
+		// ON CONFLICT keeps the UNIQUE (pipeline_id, ddl) row authoritative: a change
+		// reported twice (a retry, or batch and CDC both seeing it) is one row, and a
+		// row queued under the old policy takes the outcome it has now.
+		if _, err := a.db.ExecContext(ctx, `
+			INSERT INTO schema_change_approvals (
+				pipeline_id, change_type, table_name, ddl, reasoning, status,
+				reviewed_by, reviewed_at, applied_at, error_message, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, NOW())
+			ON CONFLICT (pipeline_id, ddl) DO UPDATE SET
+				status = EXCLUDED.status,
+				reasoning = EXCLUDED.reasoning,
+				reviewed_by = EXCLUDED.reviewed_by,
+				reviewed_at = NOW(),
+				applied_at = EXCLUDED.applied_at,
+				error_message = EXCLUDED.error_message,
+				updated_at = NOW()
+		`,
+			event.PipelineID, sc.ChangeType, sc.Table, sc.DDL, o.reason, o.status,
+			o.actor, appliedAt, errMsg,
+		); err != nil {
+			log.Errorf("[HealerAgent] Failed to record schema change outcome: %v", err)
 		}
 	}
-}
 
-// schemaDriftAutoApplyEnabled reports whether the operator has opted in to letting
-// the healer apply "safe" (additive) DDL to the destination WITHOUT human approval.
-// It is a deliberately separate opt-in from RSYNC_SCHEMA_DRIFT_ENABLED (which only
-// turns on detection): enabling detection alone must never silently mutate a
-// destination schema. Default OFF — only the literal "true" opts in, mirroring
-// schemaDriftEnabled() in the executor package.
-func schemaDriftAutoApplyEnabled() bool {
-	return os.Getenv("RSYNC_SCHEMA_DRIFT_AUTOAPPLY") == "true"
-}
-
-// shouldAutoApply reports whether a classified schema change may be applied to the
-// destination without human approval. Auto-apply requires ALL of: the operator
-// opt-in (autoApplyEnabled), the classifier deeming the change safe, and the change
-// not independently requiring approval. Anything destructive or approval-required
-// fails closed regardless of the opt-in, and a nil analysis never auto-applies.
-func shouldAutoApply(analysis *LLMAnalysisResponse, autoApplyEnabled bool) bool {
-	if analysis == nil {
-		return false
-	}
-	return autoApplyEnabled && analysis.SafeToAutoMigrate && !analysis.RequiresApproval
-}
-
-// resolveProposedDDL picks the statement processAnalysis is allowed to execute: the
-// model's suggestion when it made one, and otherwise the DDL the source actually
-// emitted.
-//
-// The bool is why this is a function and not an inline `if`. buildAnalysisPrompt now
-// hands the model a SCRUBBED DDL, so a suggestion that echoes a redaction marker back
-// would write "[redacted]" into the customer's schema the moment
-// RSYNC_SCHEMA_DRIFT_AUTOAPPLY is on. Such a suggestion is discarded exactly like an
-// empty one — the caller already holds the real, unscrubbed source DDL — and the bool
-// lets it say so in the log rather than swallowing the substitution.
-func resolveProposedDDL(suggested, sourceDDL string) (string, bool) {
-	if llmscrub.ContainsRedaction(suggested) {
-		return sourceDDL, true
-	}
-	if suggested == "" {
-		return sourceDDL, false
-	}
-	return suggested, false
-}
-
-func (a *Agent) processAnalysis(ctx context.Context, event *SchemaChangeEvent, analysis *LLMAnalysisResponse) *HealingResult {
 	result := &HealingResult{
+		PipelineID:   event.PipelineID,
+		ChangeType:   sc.ChangeType,
+		Table:        sc.Table,
+		Status:       "skipped",
+		Reason:       o.reason,
+		ErrorMessage: o.errMsg,
+	}
+	switch o.status {
+	case "applied":
+		result.Status = "applied"
+		result.DDLApplied = sc.DDL
+	case "failed":
+		result.Status = "failed"
+	}
+	a.recordHealingResult(ctx, result)
+	a.notifyDrift(event, o.notice)
+
+	log.Infof("[HealerAgent] Schema change %s on %s (pipeline %s): %s — %s",
+		sc.ChangeType, sc.Table, event.PipelineID, o.status, o.reason)
+}
+
+// autoApplyChange runs a change against the destination without asking: a new column,
+// or a type change that is a safe widening. A narrowing type change is refused by the
+// connector (strict), and that refusal is what the user reads.
+func (a *Agent) autoApplyChange(ctx context.Context, event *SchemaChangeEvent) {
+	err := a.applyMigration(ctx, event.PipelineID, event.SchemaChange.DDL)
+	switch {
+	case err == nil:
+		a.fileDriftOutcome(ctx, event, driftOutcome{
+			status: "applied",
+			actor:  appliedBySchemaDrift,
+			reason: "Applied automatically: only a dropped table waits for approval",
+			notice: noticeApplied,
+		})
+	case errors.Is(err, errUnsupportedDestination):
+		a.fileDriftOutcome(ctx, event, driftOutcome{
+			status: "approved",
+			actor:  appliedBySchemaDrift,
+			reason: "Recorded automatically. The healer changes column definitions only on PostgreSQL and MySQL destinations, so nothing was run against this one",
+			notice: noticeRecorded,
+		})
+	default:
+		log.Errorf("[HealerAgent] Automatic schema change failed for pipeline %s: %v", event.PipelineID, err)
+		a.fileDriftOutcome(ctx, event, driftOutcome{
+			status: "failed",
+			actor:  appliedBySchemaDrift,
+			reason: "Could not be applied automatically",
+			errMsg: err.Error(),
+			notice: noticeFailed,
+		})
+	}
+}
+
+// recordDriftNotice files a change that asks nothing of the destination: a dropped
+// column, which the destination keeps, or a notice about the source.
+func (a *Agent) recordDriftNotice(ctx context.Context, event *SchemaChangeEvent) {
+	if isDroppedColumn(event.SchemaChange) {
+		normalizeDroppedColumn(&event.SchemaChange)
+		a.fileDriftOutcome(ctx, event, driftOutcome{
+			status: "approved",
+			actor:  appliedBySchemaDrift,
+			reason: "Recorded automatically. The destination keeps the column and its history; rsync.ai no longer writes values to it",
+			notice: noticeKept,
+		})
+		return
+	}
+	a.fileDriftOutcome(ctx, event, driftOutcome{
+		status: "approved",
+		actor:  appliedBySchemaDrift,
+		reason: "Recorded automatically. This is a notice about the source, so nothing was run against the destination",
+		notice: noticeRecorded,
+	})
+}
+
+// queueForDecision files a change that waits for a person. The user is told once:
+// a change re-detected while it is still pending is not announced again.
+func (a *Agent) queueForDecision(ctx context.Context, event *SchemaChangeEvent) {
+	reason := "A destructive change waits for a decision; it is never run automatically"
+	var risks []string
+	if isDropTableChange(event.SchemaChange.ChangeType, event.SchemaChange.DDL) {
+		reason = "A dropped source table waits for a decision. Approve drops the destination table, Reject keeps it, and either way the table leaves this pipeline"
+		risks = []string{"Approve permanently deletes the destination table and its rows"}
+	}
+	if !a.storePendingApproval(ctx, event, reason, risks) {
+		log.Infof("[HealerAgent] %s on %s (pipeline %s) is already waiting for a decision; not announced again",
+			event.SchemaChange.ChangeType, event.SchemaChange.Table, event.PipelineID)
+		return
+	}
+	a.recordHealingResult(ctx, &HealingResult{
 		PipelineID: event.PipelineID,
 		ChangeType: event.SchemaChange.ChangeType,
 		Table:      event.SchemaChange.Table,
+		Status:     "pending_approval",
+		Reason:     reason,
+	})
+	a.notifyDrift(event, noticeAwaitingDecision)
+}
+
+// storePendingApproval queues a change for a decision and reports whether it is newly
+// pending. A row already pending stays as it is, which is what keeps a batch pipeline
+// that re-detects a dropped table on every run from re-announcing it. A row decided
+// before this detection goes back to pending, because the change has happened again.
+// A row decided after it is left alone: the message is older than the decision.
+// Approved is never re-pended, because an approved row is a drop already in flight.
+// Withdrawn (WithdrawPendingTableDrops) is, so a table that vanishes again is asked
+// about again.
+func (a *Agent) storePendingApproval(ctx context.Context, event *SchemaChangeEvent, reasoning string, risks []string) bool {
+	if a.db == nil {
+		return true
 	}
-
-	// Auto-apply is opt-in. With RSYNC_SCHEMA_DRIFT_AUTOAPPLY off (the default), a
-	// change the classifier deems safe is NOT applied silently — it routes to the
-	// approval queue below so a human sees it in the /schema-changes surface first.
-	autoApplyEnabled := schemaDriftAutoApplyEnabled()
-
-	// An advisory note has nothing to apply, so it must not enter the auto-apply
-	// branch even with the opt-in on: applyMigration would refuse it and the user
-	// would get a "Migration failed" alert for a change that asked nothing of them.
-	// Falling through routes it to the approval queue, which is where a notice
-	// belongs — visible in /schema-changes, dismissable, never executed.
-	proposedDDL, echoedRedaction := resolveProposedDDL(analysis.SuggestedDDL, event.SchemaChange.DDL)
-	if echoedRedaction {
-		log.Warnf("[HealerAgent] Ignoring suggested_ddl for pipeline %s: it echoes redacted input", event.PipelineID)
+	var detectedAt interface{}
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(event.SchemaChange.DetectedAt)); err == nil {
+		detectedAt = t.UTC()
 	}
+	var risksText interface{}
+	if len(risks) > 0 {
+		risksText = strings.Join(risks, "; ")
+	}
+	var id string
+	err := a.db.QueryRowContext(ctx, `
+		INSERT INTO schema_change_approvals (
+			pipeline_id, change_type, table_name, ddl, reasoning, risks, status, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
+		ON CONFLICT (pipeline_id, ddl) DO UPDATE SET
+			reasoning = EXCLUDED.reasoning,
+			risks = EXCLUDED.risks,
+			status = 'pending',
+			reviewed_by = NULL,
+			reviewed_at = NULL,
+			applied_at = NULL,
+			error_message = NULL,
+			updated_at = NOW()
+		WHERE schema_change_approvals.status IN ('rejected', 'applied', 'failed', 'withdrawn')
+			AND schema_change_approvals.reviewed_at IS NOT NULL
+			AND schema_change_approvals.reviewed_at < $7
+		RETURNING id
+	`,
+		event.PipelineID,
+		event.SchemaChange.ChangeType,
+		event.SchemaChange.Table,
+		event.SchemaChange.DDL,
+		reasoning,
+		risksText,
+		detectedAt,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	if err != nil {
+		log.Errorf("[HealerAgent] Failed to store pending approval: %v", err)
+		return false
+	}
+	return true
+}
 
-	if shouldAutoApply(analysis, autoApplyEnabled) && !isAdvisoryDDL(proposedDDL) {
-		ddl := proposedDDL
+// DroppedTableIsBackReason is shown on a pending drop decision withdrawn because
+// the table is in the source again.
+const DroppedTableIsBackReason = "The table is back in the source, so nothing was dropped and it stays in this pipeline."
 
-		if err := a.applyMigration(ctx, event.PipelineID, ddl); err != nil {
-			result.Status = "failed"
-			result.Reason = "Migration failed"
-			result.ErrorMessage = err.Error()
-		} else {
-			result.Status = "applied"
-			result.Reason = analysis.Reasoning
-			result.DDLApplied = ddl
+// WithdrawPendingTableDrops withdraws a pipeline's pending dropped-table decisions
+// for source tables that turn out to be there: back in the source's list, or left
+// out of it only because the connection is missing a setting the table needs.
+// Approve on such a row would drop a destination table whose source table exists,
+// so it must stop being offered. Only a pending drop_table row moves; a decided
+// one is left as it is. reason replaces the row's reasoning, which the schema
+// changes page shows. It returns the tables withdrawn. Best-effort: an error is
+// logged and nothing is withdrawn.
+func WithdrawPendingTableDrops(ctx context.Context, db *sql.DB, pipelineID string, tables []string, reason string) []string {
+	if db == nil {
+		return nil
+	}
+	withdrawn, err := withdrawPendingTableDrops(ctx, db, pipelineID, tables, reason)
+	if err != nil {
+		log.Warnf("[HealerAgent] pipeline %s: could not withdraw pending table drops: %v", pipelineID, err)
+		return nil
+	}
+	return withdrawn
+}
+
+// WithdrawPendingTableDropsTx is WithdrawPendingTableDrops inside the caller's
+// transaction, for a caller that changes another fact about the same table and
+// must not commit one without the other. It returns the error for the rollback.
+func WithdrawPendingTableDropsTx(ctx context.Context, tx *sql.Tx, pipelineID string, tables []string, reason string) ([]string, error) {
+	return withdrawPendingTableDrops(ctx, tx, pipelineID, tables, reason)
+}
+
+func withdrawPendingTableDrops(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, pipelineID string, tables []string, reason string) ([]string, error) {
+	if strings.TrimSpace(pipelineID) == "" || len(tables) == 0 {
+		return nil, nil
+	}
+	list, err := json.Marshal(tables)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.QueryContext(ctx, `
+		UPDATE schema_change_approvals
+		SET status = 'withdrawn', reviewed_by = $3, reviewed_at = NOW(), reasoning = $4, updated_at = NOW()
+		WHERE pipeline_id = $1
+			AND table_name IN (SELECT jsonb_array_elements_text($2::jsonb))
+			AND change_type = 'drop_table'
+			AND status = 'pending'
+		RETURNING table_name
+	`, pipelineID, string(list), appliedBySchemaDrift, reason)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var withdrawn []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err == nil {
+			withdrawn = append(withdrawn, table)
 		}
-	} else if analysis.RequiresApproval || analysis.SafeToAutoMigrate {
-		// Routes here when the change requires approval, OR when it is a "safe"
-		// additive change that was NOT auto-applied because the auto-apply opt-in
-		// is off. Either way it lands in the approval queue and surfaces in the
-		// /schema-changes UI for a human decision — the default, brand-safe path.
-		result.Status = "pending_approval"
-		result.Reason = analysis.Reasoning
-
-		a.storePendingApproval(ctx, event, analysis)
-
-		// Notify on explicit request, or whenever a safe change is being held for
-		// approval only because auto-apply is disabled (the user asked to be told
-		// the moment drift happens, so don't stay silent just because it's additive).
-		if analysis.NotifyUser || (analysis.SafeToAutoMigrate && !autoApplyEnabled) {
-			msg := analysis.UserMessage
-			if msg == "" {
-				msg = schemaDriftNotificationText(event.SchemaChange.ChangeType, event.SchemaChange.Table, false)
-			}
-			// Deep-link the notification to the schema changes page and carry the
-			// full remediation envelope. Build the canonical schema-drift
-			// StructuredError (Category=schema_drift ⇒ code SCHEMA_DRIFT_DETECTED +
-			// remediation steps + doc URL), then override its generic user message
-			// with the specific change detail. Category is what routes action_url to
-			// /pipelines/{id}/schema-changes in notifyUserStructured — the legacy
-			// notifyUser path never set it, so drift alerts used to land on the
-			// pipeline overview instead. Scrub the message defensively (parity with
-			// the legacy notifyUser path) before it is persisted + shown to the user.
-			se := diagnose.FromDiagnosis(
-				diagnose.Diagnosis{Category: diagnose.CategorySchemaDrift},
-				diagnose.Signal{PipelineID: event.PipelineID},
-			)
-			se.UserMessage = llmscrub.Scrub(msg)
-			// Every drift on a pipeline shares this code AND this action_url, so
-			// without a subject the notifier's 60-minute window collapsed them all
-			// into the first one: drop a column, then drop a table five minutes
-			// later, and only the column was ever announced. Built from the
-			// structured fields rather than the message, because UserMessage can be
-			// LLM-authored and would vary between retries of the SAME drift.
-			se.DedupSubject = schemaDriftDedupSubject(event.SchemaChange)
-			a.notifyUserStructured(event.PipelineID, se)
-		}
-	} else {
-		result.Status = "skipped"
-		result.Reason = analysis.Reasoning
 	}
+	return withdrawn, rows.Err()
+}
 
-	log.Infof("[HealerAgent] Processed change: %s -> %s (%s)",
-		event.SchemaChange.ChangeType, result.Status, result.Reason)
+// notifyDrift sends the one notification for a change. Category=schema_drift
+// deep-links it to the schema changes page (actionURLForError).
+func (a *Agent) notifyDrift(event *SchemaChangeEvent, notice driftNotice) {
+	se := diagnose.FromDiagnosis(
+		diagnose.Diagnosis{Category: diagnose.CategorySchemaDrift},
+		diagnose.Signal{PipelineID: event.PipelineID},
+	)
+	se.Code, se.Severity = driftNoticeCode(notice)
+	se.UserMessage = llmscrub.Scrub(schemaDriftNotificationText(event.SchemaChange, notice))
+	// Every drift on a pipeline shares this code AND this action_url, so without a
+	// subject the notifier's 60-minute window collapsed them all into the first one:
+	// drop a column, then drop a table five minutes later, and only the column was
+	// ever announced.
+	se.DedupSubject = schemaDriftDedupSubject(event.SchemaChange)
+	a.notifyUserStructured(event.PipelineID, se)
+}
 
-	return result
+// driftNoticeCode is the notification code and severity for one notice. Only a change
+// awaiting a decision keeps SCHEMA_DRIFT_DETECTED, the one code the notifier gives Slack
+// Approve/Reject buttons; a button on a change already handled would act on whatever
+// else happens to be pending on the pipeline.
+func driftNoticeCode(notice driftNotice) (string, diagnose.Severity) {
+	switch notice {
+	case noticeAwaitingDecision:
+		return diagnose.CodeSchemaDriftDetected, diagnose.SeverityWarning
+	case noticeFailed:
+		return diagnose.CodeSchemaDriftApplyFailed, diagnose.SeverityWarning
+	default:
+		return diagnose.CodeSchemaDriftHandled, diagnose.SeverityInfo
+	}
 }
 
 // isDestructiveDDL reports whether this DDL drops or truncates, in which case the
-// healer never runs it — not on auto-apply, and not after a user approves it. It
+// healer never runs it as a statement — not automatically, and not after a user
+// approves it. An approved dropped table is dropped through the destination
+// connector's drop_table (dropApprovedTable), never by running its DDL. It
 // is the single definition behind both the applyMigration guard and the
 // approved-changes handler, so the two cannot drift into disagreeing about the
 // same statement. The api-gateway mirrors it in autoApplicableDDL
@@ -673,7 +902,8 @@ func (a *Agent) applyMigration(ctx context.Context, pipelineID, ddl string) erro
 		return fmt.Errorf("missing ddl")
 	}
 
-	// Safety guard: do not auto-apply destructive DDL even if the LLM misclassifies.
+	// Safety guard: never run a destructive statement. An approved table drop goes
+	// through the connector's drop_table (dropApprovedTable), not through here.
 	if isDestructiveDDL(ddl) {
 		return fmt.Errorf("refusing to auto-apply potentially destructive ddl")
 	}
@@ -685,22 +915,9 @@ func (a *Agent) applyMigration(ctx context.Context, pipelineID, ddl string) erro
 		return fmt.Errorf("refusing to apply advisory drift note as ddl")
 	}
 
-	var destConnectionID string
-	var destConnectorType string
-	err := a.db.QueryRowContext(ctx, `
-		SELECT p.destination_connection_id, c.connector_type
-		FROM pipelines p
-		JOIN connections c ON c.id = p.destination_connection_id
-		WHERE p.id = $1
-	`, pipelineID).Scan(&destConnectionID, &destConnectorType)
-
+	destConnectorType, cfg, err := a.destination(ctx, pipelineID)
 	if err != nil {
-		return fmt.Errorf("failed to get destination connection: %w", err)
-	}
-	destConnectionID = strings.TrimSpace(destConnectionID)
-	destConnectorType = strings.ToLower(strings.TrimSpace(destConnectorType))
-	if destConnectionID == "" || destConnectorType == "" {
-		return fmt.Errorf("destination connection missing for pipeline")
+		return err
 	}
 
 	log.Infof("[HealerAgent] Applying DDL to %s destination for pipeline %s: %s",
@@ -708,11 +925,6 @@ func (a *Agent) applyMigration(ctx context.Context, pipelineID, ddl string) erro
 
 	// MVP: Apply directly for DB destinations we can safely connect to.
 	// (Cloud warehouses / APIs should be routed via MCP in a future phase.)
-	cfg, cfgErr := connections.NewManager(a.db).Get(ctx, destConnectionID)
-	if cfgErr != nil {
-		return fmt.Errorf("failed to load destination connection config: %w", cfgErr)
-	}
-
 	destConn := normalizeDestConnector(destConnectorType)
 
 	// Additive ADD COLUMN → route through the destination connector's idempotent
@@ -748,8 +960,39 @@ func (a *Agent) applyMigration(ctx context.Context, pipelineID, ddl string) erro
 	case "mysql":
 		return applyDDLMySQL(ctx, cfg, ddl)
 	default:
-		return fmt.Errorf("unsupported destination for auto-migration: %s", destConnectorType)
+		return fmt.Errorf("%w: %s", errUnsupportedDestination, destConnectorType)
 	}
+}
+
+// destination resolves a pipeline's destination connector type (lower-cased) and its
+// connection config.
+func (a *Agent) destination(ctx context.Context, pipelineID string) (string, map[string]string, error) {
+	if a.loadDestination != nil {
+		return a.loadDestination(ctx, pipelineID)
+	}
+	if a.db == nil {
+		return "", nil, fmt.Errorf("no database to resolve the destination connection from")
+	}
+	var destConnectionID, destConnectorType string
+	err := a.db.QueryRowContext(ctx, `
+		SELECT p.destination_connection_id, c.connector_type
+		FROM pipelines p
+		JOIN connections c ON c.id = p.destination_connection_id
+		WHERE p.id = $1
+	`, pipelineID).Scan(&destConnectionID, &destConnectorType)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get destination connection: %w", err)
+	}
+	destConnectionID = strings.TrimSpace(destConnectionID)
+	destConnectorType = strings.ToLower(strings.TrimSpace(destConnectorType))
+	if destConnectionID == "" || destConnectorType == "" {
+		return "", nil, fmt.Errorf("destination connection missing for pipeline")
+	}
+	cfg, err := connections.NewManager(a.db).Get(ctx, destConnectionID)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to load destination connection config: %w", err)
+	}
+	return destConnectorType, cfg, nil
 }
 
 // normalizeDestConnector folds destination connector aliases to the canonical MCP
@@ -832,24 +1075,24 @@ func bareTable(qualified string) string {
 	return q
 }
 
-// DestinationQualifiedTable renders the object name that DESTRUCTIVE, never-auto-applied
-// DDL must carry, given the table's SOURCE key and the pipeline's destination namespace.
+// DestinationQualifiedTable renders the object name a drop_table statement carries,
+// given the table's SOURCE key and the pipeline's destination namespace.
 //
-// drop_column and drop_table are refused by both auto-apply gates (autoApplicableDDL in
-// api-gateway, notAutoAppliedDDL here) before AND after approval, so their DDL string is
-// never executed by us — it is an instruction, shown to the user as "apply this on the
-// destination yourself". It was being built from the SOURCE key
+// The statement itself is never executed. It is what the user reads on the approval
+// card: approving runs the destination connector's drop_table with the bare table name
+// and the pipeline's namespace (dropApprovedTable), not this string. So it must name
+// the table that will actually be dropped. It was being built from the SOURCE key
 // (`<source_schema>.<table>`), which on this product is almost never the destination's
 // name for the same table: the destination lives in the pipeline's own namespace
-// (`rsync_<src-schema>_<id8>`). Handing someone `DROP TABLE public.orders` to run against
-// the destination is not a harmless typo — `public.orders` very plausibly EXISTS on the
+// (`rsync_<src-schema>_<id8>`). Showing `DROP TABLE public.orders` for a destination
+// table is not a harmless typo — `public.orders` very plausibly EXISTS on the
 // destination and is a different, real table.
 //
 // Empty or "default" namespace = legacy pipeline with nothing persisted; the connector
 // writes to its own default schema, so the bare table name is what resolves in the user's
 // destination session. The source qualifier is never a correct answer here.
 //
-// Only the never-applied statements go through this. add_column/modify_column keep the
+// Only drop_table goes through this. add_column/modify_column keep the
 // source key because the healer rewrites them at apply time (bareTable +
 // destinationNamespace in ensureColumnViaConnector), and changing their text would
 // re-key the schema_change_approvals UNIQUE(pipeline_id, ddl) dedup for no gain.
@@ -899,11 +1142,11 @@ func (a *Agent) destinationNamespace(ctx context.Context, pipelineID string) str
 // is NOT a safe widening report a clear error instead of silently succeeding — used for
 // approved type changes, where the user must learn an unsafe cast could not be applied.
 func (a *Agent) ensureColumnViaConnector(ctx context.Context, pipelineID, destConn string, cfg map[string]string, srcTable, column, columnType string, strict bool) error {
+	if destConn != "postgresql" && destConn != "mysql" {
+		return fmt.Errorf("%w: %s", errUnsupportedDestination, destConn)
+	}
 	if a.mcpClient == nil {
 		return fmt.Errorf("mcp client not configured for connector-based apply")
-	}
-	if destConn != "postgresql" && destConn != "mysql" {
-		return fmt.Errorf("unsupported destination for auto-migration: %s", destConn)
 	}
 
 	table := bareTable(srcTable)
@@ -1031,77 +1274,38 @@ func applyDDLMySQL(ctx context.Context, cfg map[string]string, ddl string) error
 	return nil
 }
 
-// recordAlreadyAppliedChange files a schema change the producer has already applied to
-// the destination, so it appears on the pipeline's schema changes page as history rather
-// than vanishing. It never queues an approval and never applies anything.
+// recordAlreadyAppliedChange files a schema change the CDC sink has already handled, so
+// it appears on the pipeline's schema changes page as history rather than vanishing. It
+// never queues an approval and never applies anything.
 //
-// It exists because batch and CDC answer "who approves a schema change?" oppositely:
-// batch stops and waits for a human, CDC's sink applies additive changes on the spot.
-// Both answers are defensible; what was not defensible is that CDC's answer was
-// invisible. This does NOT change CDC's behaviour — additive changes are still applied
-// without asking, drops are still not propagated, and column types are still never
-// altered. It changes only whether the user is told.
+// Batch and CDC now follow one policy (routeSchemaChange): only a dropped table waits
+// for a person. The sink adds a new column itself, and keeps a dropped column in the
+// destination; this records what it did and tells the user once. It used to publish to
+// ResultsTopic as well, which reached the inbox as a second notification for the same
+// change.
 func (a *Agent) recordAlreadyAppliedChange(ctx context.Context, event *SchemaChangeEvent) error {
-	result := &HealingResult{
-		PipelineID: event.PipelineID,
-		ChangeType: event.SchemaChange.ChangeType,
-		Table:      event.SchemaChange.Table,
-		Status:     "applied",
-		Reason:     "Applied automatically by the CDC sink's additive schema reconciler",
-		DDLApplied: event.SchemaChange.DDL,
+	if isDroppedColumn(event.SchemaChange) {
+		normalizeDroppedColumn(&event.SchemaChange)
+		a.fileDriftOutcome(ctx, event, driftOutcome{
+			status: "approved",
+			actor:  appliedByCDCSink,
+			reason: "Recorded automatically. The destination keeps the column and its history; rsync.ai no longer writes values to it",
+			notice: noticeKept,
+		})
+		return nil
 	}
-
-	if a.db != nil {
-		// status='applied' + applied_at, never 'pending': there is nothing to approve.
-		// ON CONFLICT keeps the UNIQUE (pipeline_id, ddl) row authoritative if the same
-		// DDL was previously queued — a change that is live in the destination must not
-		// keep rendering as a pending decision.
-		if _, err := a.db.ExecContext(ctx, `
-			INSERT INTO schema_change_approvals (
-				pipeline_id, change_type, table_name, ddl,
-				reasoning, status, reviewed_by, reviewed_at, applied_at, created_at
-			) VALUES ($1, $2, $3, $4, $5, 'applied', $6, NOW(), NOW(), NOW())
-			ON CONFLICT (pipeline_id, ddl) DO UPDATE SET
-				status = 'applied',
-				reasoning = EXCLUDED.reasoning,
-				applied_at = NOW(),
-				error_message = NULL,
-				updated_at = NOW()
-		`,
-			event.PipelineID,
-			event.SchemaChange.ChangeType,
-			event.SchemaChange.Table,
-			event.SchemaChange.DDL,
-			result.Reason,
-			appliedByCDCSink,
-		); err != nil {
-			log.Errorf("[HealerAgent] Failed to record already-applied schema change: %v", err)
-		}
-
-		a.recordHealingResult(ctx, result)
-	}
-
-	a.publishHealingResult(result)
-
-	// Tell the user. Category=schema_drift deep-links the notification to the schema
-	// changes page, same as the batch path — the difference is the wording, which must
-	// not ask for a decision that is no longer available.
-	se := diagnose.FromDiagnosis(
-		diagnose.Diagnosis{Category: diagnose.CategorySchemaDrift},
-		diagnose.Signal{PipelineID: event.PipelineID},
-	)
-	se.UserMessage = llmscrub.Scrub(
-		schemaDriftNotificationText(event.SchemaChange.ChangeType, event.SchemaChange.Table, true))
-	a.notifyUserStructured(event.PipelineID, se)
-
-	log.Infof("[HealerAgent] Recorded already-applied change: %s on %s (pipeline %s)",
-		event.SchemaChange.ChangeType, event.SchemaChange.Table, event.PipelineID)
+	a.fileDriftOutcome(ctx, event, driftOutcome{
+		status: "applied",
+		actor:  appliedByCDCSink,
+		reason: "Applied automatically by the CDC sink's additive schema reconciler",
+		notice: noticeApplied,
+	})
 	return nil
 }
 
-// schemaDriftNotificationText renders the user-facing drift notification: the applied
-// variant for a change CDC has already made, the review variant for one waiting on a
-// human. Both are deliberately APOSTROPHE-FREE, and that is load-bearing, not style.
+// schemaDriftNotificationText renders the user-facing drift notification, one sentence
+// per outcome (driftNotice). Every variant is deliberately APOSTROPHE-FREE, and that is
+// load-bearing, not style.
 //
 // Every notification body passes through llmscrub.Scrub, whose dangling-quote rule is
 // fail-closed: a log pipeline can truncate a quoted literal open, so an unpaired ' masks
@@ -1110,7 +1314,7 @@ func (a *Agent) recordAlreadyAppliedChange(ctx context.Context, event *SchemaCha
 // tab" and reached users as "…in the pipeline'[redacted]", cutting off the one
 // instruction the notification existed to give.
 //
-// Both variants also name the SCHEMA CHANGES PAGE, not a tab. The apostrophe fix above
+// Every variant also names the SCHEMA CHANGES PAGE, not a tab. The apostrophe fix above
 // preserved the words "Schema Changes tab", and no such tab exists: the pipeline detail
 // renders exactly six (Overview, Execution History, Steps/DAG, Table statistics,
 // Transforms, Data flow). Drift lives on its own route, /pipelines/{id}/schema-changes,
@@ -1123,14 +1327,39 @@ func (a *Agent) recordAlreadyAppliedChange(ctx context.Context, event *SchemaCha
 // Extracted so TestDriftNotificationCopySurvivesScrub can assert the rendered sentence
 // passes through Scrub unchanged. Weakening the scrubber instead would trade a user
 // data-leak guard for a copy nit, and would have to be mirrored in the Python scrubber.
-func schemaDriftNotificationText(changeType, table string, applied bool) string {
-	if applied {
+func schemaDriftNotificationText(sc SchemaChange, notice driftNotice) string {
+	const where = "It is recorded on the schema changes page for this pipeline, which the Review change link opens."
+	changeType, table := sc.ChangeType, sc.Table
+	switch notice {
+	case noticeApplied:
 		return fmt.Sprintf(
-			"Schema change applied automatically: %s on %s. CDC pipelines apply new columns as they appear, so no approval was required. It is recorded on the schema changes page for this pipeline, which the Review change link opens.",
+			"Schema change applied automatically: %s on %s. Only a dropped table waits for approval, so nothing was needed from you. %s",
+			changeType, table, where)
+	case noticeKept:
+		if c := strings.TrimSpace(sc.ColumnName); c != "" {
+			return fmt.Sprintf(
+				"Column %s was dropped from %s in the source. The destination keeps the column, and rsync.ai no longer writes values to it. %s",
+				c, table, where)
+		}
+		return fmt.Sprintf(
+			"A column was dropped from %s in the source. The destination keeps the column, and rsync.ai no longer writes values to it. %s",
+			table, where)
+	case noticeRecorded:
+		return fmt.Sprintf(
+			"Schema change recorded: %s on %s. Nothing was run against the destination for it. %s",
+			changeType, table, where)
+	case noticeFailed:
+		return fmt.Sprintf(
+			"Schema change could not be applied automatically: %s on %s. The reason is on the schema changes page for this pipeline, which the Review change link opens.",
 			changeType, table)
 	}
+	if isDropTableChange(changeType, sc.DDL) {
+		return fmt.Sprintf(
+			"Source table %s was dropped. Approve drops the destination table, Reject keeps it, and either way the table leaves this pipeline. Decide on the schema changes page for this pipeline, which the Review change link opens.",
+			table)
+	}
 	return fmt.Sprintf(
-		"Schema change detected: %s on %s. Review and approve it on the schema changes page for this pipeline, which the Review change link opens.",
+		"Schema change detected: %s on %s. Review it on the schema changes page for this pipeline, which the Review change link opens.",
 		changeType, table)
 }
 
@@ -1161,30 +1390,6 @@ func schemaDriftDedupSubject(sc SchemaChange) string {
 // Naming the actor keeps the schema changes page honest: the row says who applied it,
 // and it was not the user.
 const appliedByCDCSink = "system:cdc-sink"
-
-func (a *Agent) storePendingApproval(ctx context.Context, event *SchemaChangeEvent, analysis *LLMAnalysisResponse) {
-	_, err := a.db.ExecContext(ctx, `
-		INSERT INTO schema_change_approvals (
-			pipeline_id, change_type, table_name, ddl, 
-			reasoning, risks, status, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
-		ON CONFLICT (pipeline_id, ddl) DO UPDATE SET
-			reasoning = EXCLUDED.reasoning,
-			status = 'pending',
-			updated_at = NOW()
-	`,
-		event.PipelineID,
-		event.SchemaChange.ChangeType,
-		event.SchemaChange.Table,
-		event.SchemaChange.DDL,
-		analysis.Reasoning,
-		fmt.Sprintf("%v", analysis.Risks),
-	)
-
-	if err != nil {
-		log.Errorf("[HealerAgent] Failed to store pending approval: %v", err)
-	}
-}
 
 // notifyUser sends a notification with just a string message.
 //
@@ -1252,6 +1457,10 @@ func (a *Agent) notifyUserStructured(pipelineID string, se *diagnose.StructuredE
 	if se.PipelineID == "" {
 		se.PipelineID = pipelineID
 	}
+	if a.notifications != nil {
+		a.notifications(pipelineID, se)
+		return
+	}
 	actionURL := actionURLForError(pipelineID, se)
 
 	notification := map[string]interface{}{
@@ -1285,23 +1494,23 @@ func (a *Agent) notifyUserStructured(pipelineID string, se *diagnose.StructuredE
 }
 
 func (a *Agent) recordHealingResult(ctx context.Context, result *HealingResult) {
-	_, err := a.db.ExecContext(ctx, `
-		INSERT INTO healing_history (
-			pipeline_id, change_type, table_name, 
-			status, reason, ddl_applied, error_message, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-	`,
-		result.PipelineID,
-		result.ChangeType,
-		result.Table,
-		result.Status,
-		result.Reason,
-		result.DDLApplied,
-		result.ErrorMessage,
-	)
-
-	if err != nil {
-		log.Errorf("[HealerAgent] Failed to record healing result: %v", err)
+	if a.db != nil {
+		if _, err := a.db.ExecContext(ctx, `
+			INSERT INTO healing_history (
+				pipeline_id, change_type, table_name,
+				status, reason, ddl_applied, error_message, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+		`,
+			result.PipelineID,
+			result.ChangeType,
+			result.Table,
+			result.Status,
+			result.Reason,
+			result.DDLApplied,
+			result.ErrorMessage,
+		); err != nil {
+			log.Errorf("[HealerAgent] Failed to record healing result: %v", err)
+		}
 	}
 
 	// F-Obs-2: record the schema-change healing action by change type and

@@ -72,13 +72,6 @@ function getTraceHeaders(): Record<string, string> {
 }
 
 /**
- * Get access token (returns null - no auth required)
- */
-export async function getAccessToken(): Promise<string | null> {
-  return null
-}
-
-/**
  * Does the API still recognise this session?
  *
  * `authFetch` used to read EVERY 401 as "your session expired" and force a
@@ -142,7 +135,7 @@ async function probeSession(): Promise<SessionProbe> {
 let loggingOut = false
 
 /** Navigate to /logout once, however many requests 401 in the same tick. */
-function redirectToLogout(): void {
+export function redirectToLogout(): void {
   if (loggingOut) return
   loggingOut = true
   const next = `${window.location.pathname}${window.location.search}`
@@ -317,48 +310,6 @@ export async function authPost<T>(
     ...options,
     method: "POST",
     body: data ? JSON.stringify(data) : undefined,
-  })
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: "Request failed" }))
-    throw new Error(extractErrorMessage(error) || `HTTP ${response.status}`)
-  }
-  
-  return response.json()
-}
-
-/**
- * PUT request
- */
-export async function authPut<T>(
-  endpoint: string,
-  data?: unknown,
-  options: FetchOptions = {}
-): Promise<T> {
-  const response = await authFetch(endpoint, {
-    ...options,
-    method: "PUT",
-    body: data ? JSON.stringify(data) : undefined,
-  })
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: "Request failed" }))
-    throw new Error(extractErrorMessage(error) || `HTTP ${response.status}`)
-  }
-  
-  return response.json()
-}
-
-/**
- * DELETE request
- */
-export async function authDelete<T>(
-  endpoint: string,
-  options: FetchOptions = {}
-): Promise<T> {
-  const response = await authFetch(endpoint, {
-    ...options,
-    method: "DELETE",
   })
   
   if (!response.ok) {

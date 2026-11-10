@@ -212,8 +212,7 @@ func docBatchFixture(t *testing.T, destType string, dest http.RoundTripper, dlq 
 		destType:     destType,
 		destCfg:      map[string]interface{}{},
 		params:       cdcBatchingParams{maxRetries: 0, backoff: time.Millisecond},
-		reader:       reader,
-		hw:           newHighWaterTracker(),
+		gate:         newCommitGate(reader.CommitMessages, newHighWaterTracker()),
 		httpClient:   &http.Client{Transport: dest},
 		ddl:          &DDLSupport{},
 		eventsWriter: &kafka.Writer{},
@@ -270,7 +269,7 @@ func TestCDCDBBatch_DocumentDestinationGetsLastEventPerKey(t *testing.T) {
 	if ins, upd := loadCounter(c.inserts, "public.orders"), loadCounter(c.updates, "public.orders"); ins != 2 || upd != 2 {
 		t.Errorf("inserts=%d updates=%d, want 2 and 2: every event was applied", ins, upd)
 	}
-	if !b.hw.seen("cdc.public.orders", 0, 13) {
+	if !b.gate.seen("cdc.public.orders", 0, 13) {
 		t.Error("the batch's last offset was not committed")
 	}
 }
@@ -314,7 +313,7 @@ func TestCDCDBBatch_SkippedDocumentRowIsDeadLettered(t *testing.T) {
 	if got := c.metrics.processed; got != 3 {
 		t.Errorf("processed = %d, want 3", got)
 	}
-	if !b.hw.seen("cdc.public.orders", 0, 13) {
+	if !b.gate.seen("cdc.public.orders", 0, 13) {
 		t.Error("the batch's last offset was not committed")
 	}
 }
@@ -336,7 +335,7 @@ func TestCDCDBBatch_SkippedDocumentRowWithoutDLQFailsClosed(t *testing.T) {
 	if !strings.Contains(*msg, "no DLQ") || strings.Contains(*msg, "secret") {
 		t.Errorf("fail-closed message %q: want it to name the missing DLQ and carry no row value", *msg)
 	}
-	if b.hw.seen("cdc.public.orders", 0, 10) || loadCounter(c.inserts, "public.orders") != 0 {
+	if b.gate.seen("cdc.public.orders", 0, 10) || loadCounter(c.inserts, "public.orders") != 0 {
 		t.Error("a batch that failed closed committed or counted rows")
 	}
 }
@@ -353,7 +352,7 @@ func TestCDCDBBatch_RelationalDestinationIgnoresDocumentRules(t *testing.T) {
 	if ins, upd := loadCounter(c.inserts, "public.orders"), loadCounter(c.updates, "public.orders"); ins != 1 || upd != 1 {
 		t.Errorf("inserts=%d updates=%d, want 1 and 1", ins, upd)
 	}
-	if !b.hw.seen("cdc.public.orders", 0, 11) {
+	if !b.gate.seen("cdc.public.orders", 0, 11) {
 		t.Error("the batch was not committed")
 	}
 }
@@ -378,7 +377,7 @@ func TestProcessCDCEvent_SkippedDocumentRowIsPoison(t *testing.T) {
 	sms[0].PK = map[string]interface{}{"id": "secret-7"}
 	sms[0].KeyFields = []string{"id"}
 	cfg := &WorkerConfig{PipelineID: ackFKPipelineID, SinkMode: "cdc", DestinationConnector: "mongodb", DestinationConfig: map[string]interface{}{}}
-	commit, err := processCDCEvent(context.Background(), newHighWaterTracker(), nil, &http.Client{Transport: skipAll}, cfg,
+	commit, err := processCDCEvent(context.Background(), newCommitGate(nil, newHighWaterTracker()), nil, &http.Client{Transport: skipAll}, cfg,
 		&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msgs[0], sms[0], c.metrics,
 		c.inserts, c.updates, c.deletes, &sync.Map{}, time.Minute)
 	if commit || !isPoison(err) {

@@ -2,8 +2,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { Mock } from "vitest"
 import { act, fireEvent, render, screen, within } from "@testing-library/react"
 
-import ScheduledQueriesPage from "@/app/(dashboard)/explorer/schedules/page"
-import { LiveStateDetail } from "@/components/explorer/ModelLiveState"
+import ScheduledQueriesPage from "@/app/(dashboard)/models/page"
+import { LiveStateCell, LiveStateDetail } from "@/components/explorer/ModelLiveState"
 import { liveCellFor, type Fetched, type RunningModelsResponse } from "@/components/explorer/liveState"
 import { authFetch } from "@/lib/api/auth-fetch"
 
@@ -19,10 +19,14 @@ import { authFetch } from "@/lib/api/auth-fetch"
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
-  usePathname: () => "/explorer/schedules",
+  usePathname: () => "/models",
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({ role: "admin", can: () => true }),
 }))
@@ -104,7 +108,7 @@ const IDLE = {
   workflow_id: "model-refresh-m-idle",
   state: "idle",
   detail_available: false,
-  message: "no open refresh loop; the last run has closed",
+  message: "not rebuilding now; it rebuilds when an upstream finishes",
 }
 
 function breach(savedQueryId: string, name: string, over: Record<string, unknown> = {}) {
@@ -280,7 +284,7 @@ describe("schedules page: what each row may say", () => {
     // never cleared within the run, so the badge says it happened, not that it is failing.
     const failed = within(nowCell("orders_daily")).getByText("Rebuild failed this run")
     expect(failed.closest("[title]")?.getAttribute("title")).toBe(
-      "A rebuild failed during this run of the refresh loop: relation analytics.stg_orders does not exist. It is not cleared when a later rebuild succeeds.",
+      "An earlier rebuild failed after its retries: relation analytics.stg_orders does not exist. This stays until the model goes idle, even if a later rebuild succeeded.",
     )
     expect(nowCell("stuck_model").textContent).toBe("WaitingRebuild failed this run")
     expect(nowCell("waiting_model").textContent).toBe("Waiting")
@@ -288,7 +292,7 @@ describe("schedules page: what each row may say", () => {
     expect(nowCell("quiet_model").textContent).toBe("Running · no detail")
     expect(nowCell("legacy_model").textContent).toBe("Unreachable")
     expect(within(nowCell("legacy_model")).getByText("Unreachable").closest("[title]")?.getAttribute("title")).toBe(
-      "The refresh loop could not be asked what it is doing (deadline exceeded).",
+      "The server could not ask it what it is doing (deadline exceeded).",
     )
     expect(nowCell("mystery_model").textContent).toBe("Unknown")
     expect(nowCell("nightly_rollup").textContent).toBe("—")
@@ -362,10 +366,17 @@ describe("schedules page: overdue markers", () => {
 
     expect(nowCell("revenue_model").textContent).toBe("IdleOverdue 2h")
     const badge = within(nowCell("revenue_model")).getByText("Overdue 2h")
-    expect(badge.closest("[title]")?.getAttribute("title")).toMatch(/1h freshness deadline by 2h: its schedule is active/)
+    // An after-upstream model is overdue because an upstream stopped finishing: the
+    // marker names it rather than blaming a schedule that has no clock.
+    expect(badge.closest("[title]")?.getAttribute("title")).toBe(
+      "Past its 1h freshness deadline by 2h: it rebuilds when orders_sync finishes, and no rebuild has succeeded in time: check when orders_sync last ran.",
+    )
     expect(nowCell("orders_daily").textContent).not.toMatch(/Overdue/)
     // Overdue is about the table, not the trigger, so a clock schedule can carry one.
     expect(nowCell("nightly_rollup").textContent).toBe("—Overdue 1d 1h")
+    expect(
+      within(nowCell("nightly_rollup")).getByText("Overdue 1d 1h").closest("[title]")?.getAttribute("title"),
+    ).toMatch(/: its schedule is on, but no scheduled rebuild has succeeded in time\.$/)
     expect(screen.getByText(/1 model past its freshness deadline has no row on this page/)).toHaveTextContent(
       "ghost_model",
     )
@@ -397,7 +408,7 @@ describe("the live-state detail on a model's page", () => {
       />,
     )
 
-    expect(screen.getByText(/^Rebuilding since .+, woken by pipeline orders_sync$/)).toBeInTheDocument()
+    expect(screen.getByText(/^Rebuilding since .+, started by pipeline orders_sync$/)).toBeInTheDocument()
     expect(screen.getByText("2 completions queued · refresh 4 of 20 this run")).toBeInTheDocument()
     expect(screen.getByText(/Last rebuild failure this run: relation analytics.stg_orders does not exist/)).toBeInTheDocument()
     expect(
@@ -405,9 +416,45 @@ describe("the live-state detail on a model's page", () => {
     ).toBeInTheDocument()
   })
 
+  // A fan-in on "all" is not rebuilt by the next upstream to land, so neither the Waiting
+  // line nor its badge may say it is. Same bug class as the overdue line's "A or B".
+  it("says a waiting model on all needs every upstream, and the badge agrees", () => {
+    const waiting = {
+      saved_query_id: "m-fan",
+      name: "fan_in",
+      state: "running",
+      detail_available: true,
+      detail: refreshState({ saved_query_id: "m-fan", phase: "waiting", queued_completions: 0, current: null }),
+    }
+    const cell = liveCellFor("after_upstream", "m-fan", answered([waiting]))
+    const ups = [
+      { kind: "model", id: "a", name: "A" },
+      { kind: "model", id: "b", name: "B" },
+    ]
+    const { unmount } = render(
+      <>
+        <LiveStateCell cell={cell} waitsForAll />
+        <LiveStateDetail cell={cell} scheduleType="after_upstream" upstreams={ups} upstreamPolicy="all" />
+      </>,
+    )
+    expect(screen.getByText("Waiting for every upstream to run before it rebuilds again")).toBeInTheDocument()
+    expect(screen.getByText("Waiting").getAttribute("title")).toBe("Waiting for every upstream to run before it rebuilds again.")
+    expect(screen.queryByText(/next upstream/)).not.toBeInTheDocument()
+    unmount()
+
+    render(
+      <>
+        <LiveStateCell cell={cell} />
+        <LiveStateDetail cell={cell} scheduleType="after_upstream" upstreams={ups} upstreamPolicy="any" />
+      </>,
+    )
+    expect(screen.getByText("Waiting for the next upstream to finish before it rebuilds again")).toBeInTheDocument()
+    expect(screen.getByText("Waiting").getAttribute("title")).toBe("Waiting for the next upstream to finish before it rebuilds again.")
+  })
+
   it("says why an idle model is idle, in the server's words", () => {
     render(<LiveStateDetail cell={liveCellFor("after_upstream", "m-idle", answered([REBUILDING, IDLE]))} />)
-    expect(screen.getByText("Idle: no open refresh loop; the last run has closed")).toBeInTheDocument()
+    expect(screen.getByText("Idle: not rebuilding now; it rebuilds when an upstream finishes")).toBeInTheDocument()
   })
 
   it("says why an answer on screen was set aside while the page asks again", () => {

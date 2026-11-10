@@ -300,6 +300,92 @@ def test_get_oracle_connection_sid_and_wallet():
     assert captured.get("config_dir") == "/wallet"
 
 
+# ============================ execute (models) ==============================
+
+# Exactly what the gateway sends for a model's drop-if-exists: a PL/SQL block
+# whose final ``END;`` is part of the syntax (stripping it raises PLS-00103).
+_DROP_BLOCK = ("BEGIN EXECUTE IMMEDIATE 'DROP TABLE \"S\".\"X\" PURGE'; "
+               "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;")
+
+
+def test_execute_keeps_a_plsql_blocks_end_semicolon():
+    for block in (_DROP_BLOCK,
+                  "begin null; end;",
+                  "DECLARE n NUMBER; BEGIN n := 1; END;",
+                  "-- drop the old table\nBEGIN NULL; END;"):
+        s, conn = _ora_fakes.make_connector(ora)
+        res = s.execute({**CFG, "query": block})
+        assert res["success"] is True, (block, res)
+        assert conn.all_sql() == [block], conn.all_sql()  # END; intact, sent once
+
+
+def test_execute_strips_one_trailing_semicolon_from_plain_sql():
+    s, conn = _ora_fakes.make_connector(ora)
+    assert s.execute({**CFG, "sql": "SELECT 1;"})["success"] is True
+    assert conn.all_sql() == ["SELECT 1"], conn.all_sql()  # ORA-00911 otherwise
+    s, conn = _ora_fakes.make_connector(ora)
+    s.execute({**CFG, "statement": 'ALTER TABLE "S"."T" RENAME TO "T__RSYNC_OLD"'})
+    assert conn.all_sql() == ['ALTER TABLE "S"."T" RENAME TO "T__RSYNC_OLD"'], conn.all_sql()
+
+
+def test_execute_sets_call_timeout_in_ms_before_the_statement():
+    s, conn = _ora_fakes.make_connector(ora)
+    sql = 'CREATE TABLE "S"."T__RSYNC_NEW" AS SELECT * FROM "S"."SRC"'
+    res = s.execute({**CFG, "query": sql, "timeout_seconds": 45})
+    assert res["success"] is True, res
+    assert res["rows_affected"] is None, res  # DDL has no affected-row count
+    assert conn.all_execs() == [{"sql": sql, "params": None, "call_timeout": 45000}], \
+        conn.all_execs()
+
+
+def test_execute_commits_dml_and_returns_rowcount():
+    s, conn = _ora_fakes.make_connector(ora, dml_rowcount=4)
+    res = s.execute({**CFG, "query": 'INSERT INTO "S"."T" SELECT * FROM "S"."SRC"'})
+    assert res["success"] is True and res["rows_affected"] == 4, res
+    assert conn.committed == 1, "DML must be committed"
+    assert conn.closed is True
+
+
+def test_execute_failure_returns_the_engine_error_without_retrying():
+    def boom(sql, params):
+        raise Exception("ORA-00942: table or view does not exist")
+    s, conn = _ora_fakes.make_connector(ora, router=boom)
+    res = s.execute({**CFG, "query": 'DROP TABLE "S"."NOPE"', "timeout_seconds": 5})
+    assert res["success"] is False, res
+    assert "ORA-00942" in res["error"] and "pw" not in res["error"], res
+    assert len(conn.all_execs()) == 1 and conn.committed == 0, conn.all_execs()
+    assert conn.closed is True
+
+
+def test_execute_requires_a_statement():
+    s, conn = _ora_fakes.make_connector(ora)
+    res = s.execute({**CFG, "query": "  "})
+    assert res["success"] is False and conn.all_execs() == [], res
+
+
+def test_execute_is_advertised_and_routed():
+    caps = ora.OracleMCPServer().get_capabilities({})
+    assert "execute" in {op["name"] for op in caps["operations"]}, caps["operations"]
+    import json
+    with open(os.path.join(_HERE, "metadata.json")) as f:
+        meta = json.load(f)
+    assert "execute" in {op["name"] for op in meta["operations"]}, meta["operations"]
+
+
+def test_export_query_mode_keeps_driver_keys_and_applies_the_limit():
+    # The gateway's catalog probe: keys must come back exactly as the driver
+    # names them (Oracle folds unquoted names to UPPERCASE).
+    q = "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = 'S' AND TABLE_NAME IN ('A', 'B', 'C')"
+    s, conn = _ora_fakes.make_connector(ora, columns=["TABLE_NAME"],
+                                        rows=[("A",), ("B",), ("C",)])
+    res = s.export({**CFG, "query": q, "limit": 2})
+    assert res["success"] is True, res
+    assert res["data"] == [{"TABLE_NAME": "A"}, {"TABLE_NAME": "B"}], res
+    assert res["columns"] == ["TABLE_NAME"], res
+    assert res["paging_mode"] == "query" and res["truncated"] is True, res
+    assert conn.all_sql() == [q], conn.all_sql()  # verbatim, no table needed
+
+
 # ============================== runner =====================================
 
 def _run():

@@ -1,0 +1,42 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M53.5 28L53.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M124.5 28L124.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M196.5 28L196.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M267.5 28L267.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M338.5 28L338.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M409.5 28L409.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M481.5 28L481.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M552.5 28L552.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:Inter;" y="-3.0250000000000004" transform="translate(53.35 13)" fill="#71717a">region</text>
+<path d="M53.5 28L53.5 265" fill="none" pointer-events="visible" stroke="#e4e4e7" stroke-linecap="round" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="3.0250000000000004" transform="translate(302.675 288.95)" fill="#71717a">Average amount</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(45.35 57.6188)" fill="#71717a">APAC</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(45.35 116.8563)" fill="#71717a">US</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(45.35 176.0938)" fill="#71717a">EU</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(45.35 235.3313)" fill="#71717a">(empty)</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(53.35 272.95)" fill="#71717a">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(124.5857 272.95)" fill="#71717a">10</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(195.8214 272.95)" fill="#71717a">20</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(267.0571 272.95)" fill="#71717a">30</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(338.2929 272.95)" fill="#71717a">40</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(409.5286 272.95)" fill="#71717a">50</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(480.7643 272.95)" fill="#71717a">60</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(552 272.95)" fill="#71717a">70</text>
+<path d="M53.4 43.6L344.2 43.6A3 3 0 0 1 347.2 46.6L347.2 68.6A3 3 0 0 1 344.2 71.6L53.4 71.6L53.4 43.6Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M53.4 102.9L460 102.9A3 3 0 0 1 463 105.9L463 127.9A3 3 0 0 1 460 130.9L53.4 130.9L53.4 102.9Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M53.4 162.1L500 162.1A3 3 0 0 1 503 165.1L503 187.1A3 3 0 0 1 500 190.1L53.4 190.1L53.4 162.1Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="2" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M53.4 221.3L135.8 221.3A3 3 0 0 1 138.8 224.3L138.8 246.3A3 3 0 0 1 135.8 249.3L53.4 249.3L53.4 221.3Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="3" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+
+]]>
+
+</style>
+</svg>

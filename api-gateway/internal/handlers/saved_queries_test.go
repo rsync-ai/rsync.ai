@@ -75,7 +75,7 @@ func savedQueryRowsOnConnector(connectorType, createdBy, visibility, sqlText, cl
 			// savedQueryFixtureUpdatedAt. A string here would hand the handler the
 			// answer instead of making it produce one.
 			createdBy, createdBy, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
-			"none", "", "", "", "", "", nil, connectorType, nil)
+			"none", "", "", "", "", "", nil, connectorType, nil, "")
 }
 
 // savedQueryScanColumns is the exact column list, in order, that both reads scan.
@@ -90,6 +90,8 @@ var savedQueryScanColumns = []string{
 	"connector_type",
 	// The model's freshness promise (migration 101); NULL = none.
 	"freshness_deadline_seconds",
+	// The model's medallion layer (migration 127); '' = none.
+	"layer",
 }
 
 // savedQueryRowsScheduled is savedQueryRows with the joined schedule filled in.
@@ -99,7 +101,7 @@ func savedQueryRowsScheduled(status, scheduleType, spec string) *sqlmock.Rows {
 			"SELECT 1", "", "read", "workspace",
 			wsScopeUser, wsScopeUser, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
 			"table", "public.daily_mrr", "", "",
-			status, scheduleType, []byte(spec), "postgresql", nil)
+			status, scheduleType, []byte(spec), "postgresql", nil, "")
 }
 
 // savedQueryFixtureUpdatedAt is the updated_at both fixtures above carry, as a
@@ -255,15 +257,20 @@ func TestListSavedQueries_ReportsMaterializationSupportFromTheConnector(t *testi
 	for _, tc := range []struct {
 		connectorType string
 		want          bool
+		language      string
 	}{
-		{"postgresql", true},
-		{"mysql", true},
-		// Queries fine in the Explorer; no execute-DDL path, so it cannot be a model.
-		{"bigquery", false},
-		{"clickhouse", false},
-		{"databricks", false},
+		{"postgresql", true, "sql"},
+		{"mysql", true, "sql"},
+		// The warehouses run models without a gateway driver.
+		{"bigquery", true, "sql"},
+		{"databricks", true, "sql"},
+		// A document store's model is a pipeline, written with $out — and the text the
+		// row holds is that pipeline, which query_language tells the client.
+		{"mongodb", true, "document"},
+		// Not an Explorer connector at all.
+		{"shopify", false, ""},
 		// The connection is gone — the LEFT JOIN yields '' and the honest answer is no.
-		{"", false},
+		{"", false, ""},
 	} {
 		t.Run(tc.connectorType, func(t *testing.T) {
 			mock, cleanup := wsScopeMockDB(t)
@@ -286,6 +293,9 @@ func TestListSavedQueries_ReportsMaterializationSupportFromTheConnector(t *testi
 			if got[0].SupportsMaterialization != tc.want {
 				t.Errorf("connector %q: supports_materialization=%v, want %v",
 					tc.connectorType, got[0].SupportsMaterialization, tc.want)
+			}
+			if got[0].QueryLanguage != tc.language {
+				t.Errorf("connector %q: query_language=%q, want %q", tc.connectorType, got[0].QueryLanguage, tc.language)
 			}
 			// The engine is carried too, because the dialog names it in the refusal.
 			if got[0].ConnectorType != tc.connectorType {
@@ -328,6 +338,7 @@ func decodeSavedQueryList(t *testing.T, w *httptest.ResponseRecorder) []struct {
 	// the same value the LEFT JOIN produced.
 	ConnectorType           string `json:"connector_type"`
 	SupportsMaterialization bool   `json:"supports_materialization"`
+	QueryLanguage           string `json:"query_language"`
 } {
 	t.Helper()
 	var body struct {
@@ -336,6 +347,7 @@ func decodeSavedQueryList(t *testing.T, w *httptest.ResponseRecorder) []struct {
 			NextRunAt               *time.Time `json:"next_run_at"`
 			ConnectorType           string     `json:"connector_type"`
 			SupportsMaterialization bool       `json:"supports_materialization"`
+			QueryLanguage           string     `json:"query_language"`
 		} `json:"saved_queries"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
@@ -382,6 +394,7 @@ func TestCreateSavedQuery_StampsActiveWorkspaceAndCreator(t *testing.T) {
 	mock.ExpectQuery(`FROM connections r\s+JOIN workspace_members`).
 		WithArgs(savedQueryConn, wsScopeUser, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("member"))
+	expectSavedQueryConnectorType(mock, "postgresql")
 	mock.ExpectQuery(`INSERT INTO saved_queries`).
 		WithArgs(wsScopeWS, savedQueryConn, "Daily MRR", "", "SELECT 1", "",
 			"read", "workspace", wsScopeUser).
@@ -453,6 +466,7 @@ func TestCreateSavedQuery_MemberMaySaveDestructiveSQL(t *testing.T) {
 
 	mock.ExpectQuery(`FROM connections r\s+JOIN workspace_members`).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("member"))
+	expectSavedQueryConnectorType(mock, "postgresql")
 	mock.ExpectQuery(`INSERT INTO saved_queries`).
 		WithArgs(wsScopeWS, savedQueryConn, "Cleanup", "", "DROP TABLE staging", "",
 			"destructive", "workspace", wsScopeUser).
@@ -548,7 +562,7 @@ func TestGetSavedQuery_ReportsTheFreshnessDeadline(t *testing.T) {
 						"SELECT 1", "", "read", "workspace",
 						wsScopeUser, wsScopeUser, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
 						"table", "public.daily_mrr", "", "",
-						"", "", nil, "postgresql", tc.stored))
+						"", "", nil, "postgresql", tc.stored, ""))
 
 			r := savedQueryRouter(http.MethodGet, "/explorer/saved/:id", "viewer", GetSavedQuery)
 			w := doJSON(r, http.MethodGet, "/explorer/saved/"+savedQueryID, nil)
@@ -661,6 +675,7 @@ func TestCreateSavedQuery_AlterDropClassifiesDestructive(t *testing.T) {
 
 	mock.ExpectQuery(`FROM connections r\s+JOIN workspace_members`).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("member"))
+	expectSavedQueryConnectorType(mock, "postgresql")
 	mock.ExpectQuery(`INSERT INTO saved_queries`).
 		WithArgs(wsScopeWS, savedQueryConn, "Drop col", "",
 			"ALTER TABLE revenue DROP COLUMN amount", "",

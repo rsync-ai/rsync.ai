@@ -25,12 +25,12 @@ export default function ExecutionNotFound() {
         <h1 className="text-xl font-semibold text-zinc-900 dark:text-white">Execution not found</h1>
         <p className="max-w-md text-sm text-zinc-500 dark:text-zinc-400">
           This run may have been deleted, or it belongs to a different workspace.
-          Switch workspaces from the header, or head back to your executions.
+          Switch workspaces from the header, or head back to your runs.
         </p>
       </div>
-      <Link href="/executions">
+      <Link href="/runs">
         <Button variant="default" size="sm">
-          Back to executions
+          Back to runs
         </Button>
       </Link>
     </div>

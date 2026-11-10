@@ -353,6 +353,12 @@ func (p *infraPreflightStage) checkMCPUser(
 			log.Errorf("❌ Infra preflight: %s failed to start as HTTP: %v", svc.name, err)
 			return preflightResult{Service: svc.name, OK: false, Err: err}
 		}
+		if mcp.IsConnectorBuildFailedMessage(err.Error()) {
+			// The connector's image does not build, so its dependencies do not install:
+			// stdio would run it without them. Stop the run with the build log's cause.
+			log.Errorf("❌ Infra preflight: %s image failed to build: %v", svc.name, err)
+			return preflightResult{Service: svc.name, OK: false, Err: err}
+		}
 		// Batch — stdio fallback available; not a blocking failure
 		log.Warnf("⚠️  Infra preflight: %s could not start Docker HTTP container (stdio fallback will be used): %v", svc.name, err)
 		p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s: using stdio fallback", svc.displayName()))

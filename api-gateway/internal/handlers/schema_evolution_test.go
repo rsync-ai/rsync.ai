@@ -104,6 +104,15 @@ func expectDriftBadgeClear(mock sqlmock.Sqlmock, pipelineID string, pending int)
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
+// expectDecidedRow stamps the read of the row a decision just claimed: what the
+// decision does next depends on its change type.
+func expectDecidedRow(mock sqlmock.Sqlmock, changeID, pipelineID, changeType, table, ddl string) {
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, pipeline_id, change_type, table_name, ddl FROM schema_change_approvals WHERE id = $1`)).
+		WithArgs(changeID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "change_type", "table_name", "ddl"}).
+			AddRow(changeID, pipelineID, changeType, table, ddl))
+}
+
 // newApproveRouter installs the handler with a tiny shim that sets
 // user_email, user_id, and the active workspace + role on the gin context.
 // Real prod middleware does this — we short-circuit it for the test rather
@@ -535,6 +544,7 @@ func TestRejectSchemaChange_HappyPath_Returns200(t *testing.T) {
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
 			WithArgs("alice@example.com", "change-1", schemaEvoTestPipelineUUID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
+		expectDecidedRow(mock, "change-1", schemaEvoTestPipelineUUID, "add_column", "orders", "ALTER TABLE orders ADD COLUMN x int")
 		expectDriftBadgeClear(mock, schemaEvoTestPipelineUUID, 0)
 
 		r := newApproveRouter(RejectSchemaChange, "alice@example.com", "user-A")
@@ -618,6 +628,7 @@ func TestRejectSchemaChange_MemberAllowed(t *testing.T) {
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
 			WithArgs("alice@example.com", "change-1", schemaEvoTestPipelineUUID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
+		expectDecidedRow(mock, "change-1", schemaEvoTestPipelineUUID, "add_column", "orders", "ALTER TABLE orders ADD COLUMN x int")
 		expectDriftBadgeClear(mock, schemaEvoTestPipelineUUID, 0)
 
 		r := newApproveRouter(RejectSchemaChange, "alice@example.com", "user-A")

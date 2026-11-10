@@ -130,23 +130,11 @@ func (m *MySQLManager) CheckBinlogRetention(ctx context.Context, connectionID st
 	}
 	defer targetDB.Close()
 
-	// MySQL 8.0+: binlog_expire_logs_seconds (0 = no automatic purge).
-	var name, val string
-	if err := targetDB.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_expire_logs_seconds'").Scan(&name, &val); err == nil {
-		if secs, perr := strconv.Atoi(strings.TrimSpace(val)); perr == nil {
-			if secs > 0 {
-				return secs, nil
-			}
-			// 0 means no automatic expiry by seconds; fall through to legacy days.
-		}
+	secs, err := binlogRetentionSeconds(ctx, targetDB)
+	if err != nil {
+		return 0, nil // unknown
 	}
-	// Legacy MySQL 5.7 / fallback: expire_logs_days (0 = no automatic purge).
-	if err := targetDB.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'expire_logs_days'").Scan(&name, &val); err == nil {
-		if days, perr := strconv.Atoi(strings.TrimSpace(val)); perr == nil && days > 0 {
-			return days * 86400, nil
-		}
-	}
-	return 0, nil // unlimited / unknown
+	return secs, nil // 0 = unlimited
 }
 
 // readBinlogIndex returns the source's binlog files (in order) and their sizes via

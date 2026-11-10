@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { describeUpstreamNextRun, formatDuration } from "@/components/explorer/scheduledModel"
+import { describeUpstreamNextRun } from "@/components/explorer/scheduledModel"
+import { formatDurationOrDash as formatDuration } from "@/lib/duration"
 
 describe("formatDuration", () => {
   // Seen in a browser on 2026-09-16: stg_orders' runs took 14 to 181 ms, and every one of

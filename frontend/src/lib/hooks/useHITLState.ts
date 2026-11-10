@@ -1,15 +1,29 @@
 "use client"
 
 import { useCallback, useRef, useState } from "react"
-import { resumePipelineConnectors, resumePipelineNodeInput, resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
-import { authFetch } from "@/lib/api/auth-fetch"
+import {
+  isStaleHITLAnswer,
+  resumePipelineConnectors,
+  resumePipelineNodeInput,
+  resumePipelineTables,
+  type DestinationConfig,
+} from "@/lib/api/pipelines"
 import { truncatedTableTotal } from "@/lib/api/connections"
-import { API_ENDPOINTS } from "@/lib/config/api"
 import { useOptimisticAction } from "@/lib/pipeline/usePipelineState"
-import type { TransformSuggestion } from "@/lib/api/suggestions"
+import { notifyStaleHITLAnswer } from "@/lib/pipeline/staleHitlAnswer"
+import { parseConnectionRequirements, type ConnectionRequirements } from "@/lib/pipeline/connectionRequirements"
 import type { PipelineUIState } from "@/lib/pipeline/pipelineStateReducer"
 import { normalizeSuggestedTables, type AvailableTable, type SuggestedTable } from "@/components/pipeline/PipelineTableSelector"
 import type { TableMetadata } from "@/components/chat/SuggestionsReviewDialog"
+import {
+  fetchTransformStepSchema,
+  resumeAfterTransformStep,
+  transformsReviewTables,
+} from "@/lib/pipeline/transformStep"
+
+// Shared with the pipeline pages (lib/pipeline/transformStep.ts); re-exported
+// for the callers that read it from here.
+export { transformsReviewTables }
 
 function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
@@ -42,13 +56,7 @@ export function useHITLState({
 
   // Connection HITL
   const [unifiedSelectorOpen, setUnifiedSelectorOpen] = useState(false)
-  const [connectionRequirements, setConnectionRequirements] = useState<{
-    source: { connector_type: string }
-    destination: { connector_type: string }
-    // Directions the user must still pick. Derived from the backend's
-    // `missing_connections`; absent → both required (backward compatible).
-    missing?: ("source" | "destination")[]
-  } | null>(null)
+  const [connectionRequirements, setConnectionRequirements] = useState<ConnectionRequirements | null>(null)
 
   // Table HITL
   const [tableSelectorOpen, setTableSelectorOpen] = useState(false)
@@ -96,17 +104,26 @@ export function useHITLState({
     async (detailsOverride?: Record<string, unknown>) => {
       if (!pipelineId || !pipelineState.hitl) return
       await optimisticAction(
-        () =>
-          resumePipelineConnectors(pipelineId, {
-            execution_id: pipelineState.metadata.executionId || undefined,
-            connectors: (() => {
-              const override = (detailsOverride || {})["missing_connectors"]
-              if (Array.isArray(override)) return override
-              const fromHitl = pipelineState.hitl?.blockingReason.details?.missing_connectors
-              return Array.isArray(fromHitl) ? fromHitl : []
-            })(),
-            metadata: detailsOverride || pipelineState.hitl?.blockingReason.details || undefined,
-          }),
+        async () => {
+          try {
+            return await resumePipelineConnectors(pipelineId, {
+              execution_id: pipelineState.metadata.executionId || undefined,
+              connectors: (() => {
+                const override = (detailsOverride || {})["missing_connectors"]
+                if (Array.isArray(override)) return override
+                const fromHitl = pipelineState.hitl?.blockingReason.details?.missing_connectors
+                return Array.isArray(fromHitl) ? fromHitl : []
+              })(),
+              metadata: detailsOverride || pipelineState.hitl?.blockingReason.details || undefined,
+            })
+          } catch (err) {
+            // The step was answered elsewhere or the run ended. Rolling back to the
+            // pause would only have the auto-open answer it again.
+            if (!isStaleHITLAnswer(err)) throw err
+            notifyStaleHITLAnswer(err)
+            return null
+          }
+        },
         { type: "HITL_RESOLVED", payload: { timestamp: Date.now() } },
         {
           type: "HITL_REQUIRED",
@@ -122,83 +139,12 @@ export function useHITLState({
   )
 
   const handleOpenConnectionModal = useCallback(() => {
-    const details = asRecord(pipelineState.hitl?.blockingReason.details)
-    let sourceType = ""
-    let destType = ""
-
-    const required = details["required_connections"]
-    if (required && typeof required === "object" && !Array.isArray(required)) {
-      const req = required as Record<string, unknown>
-      const src = asRecord(req["source"])
-      const dst = asRecord(req["destination"])
-      sourceType = String(src["connector_type"] || "")
-      destType = String(dst["connector_type"] || "")
-    }
-
-    if (!sourceType) sourceType = String(details["source_connector"] || details["source_type"] || "")
-    if (!destType) destType = String(details["destination_connector"] || details["destination_type"] || "")
-
     // The backend lists ONLY the directions that still need a user-selected
-    // connection in `missing_connections`. A direction it already resolved and
-    // auto-assigned is intentionally absent. Treat that list as authoritative so
-    // we don't render a bogus picker (e.g. "Source: Unknown") for an already-wired
-    // side — which previously left users unable to complete the modal.
-    const missingRaw = details["missing_connections"]
-    let missing: ("source" | "destination")[] | undefined
-    if (Array.isArray(missingRaw)) {
-      const dirs: ("source" | "destination")[] = []
-      for (const m of (missingRaw as Array<Record<string, unknown>>)) {
-        const dir = String(m?.["direction"] || "").toLowerCase()
-        const typ = String(m?.["type"] || m?.["connector_type"] || m?.["connector"] || "").trim()
-        if (dir === "source") {
-          if (!dirs.includes("source")) dirs.push("source")
-          if (typ && !sourceType) sourceType = typ
-        } else if (dir === "destination") {
-          if (!dirs.includes("destination")) dirs.push("destination")
-          if (typ && !destType) destType = typ
-        }
-      }
-      if (dirs.length > 0) missing = dirs
-    }
-
-    // Only fall back to the "unknown" placeholder for directions the user must
-    // actually choose. Leaving a resolved direction as "unknown" was the root
-    // cause of the unsatisfiable "No Unknown sources found" picker.
-    const needsSource = !missing || missing.includes("source")
-    const needsDest = !missing || missing.includes("destination")
-    if (needsSource && !sourceType) sourceType = "unknown"
-    if (needsDest && !destType) destType = "unknown"
-
-    setConnectionRequirements({
-      source: { connector_type: sourceType },
-      destination: { connector_type: destType },
-      missing,
-    })
+    // connection in `missing_connections`, and for a run that stopped on a
+    // missing setting, that connection and the setting — see the parser.
+    setConnectionRequirements(parseConnectionRequirements(pipelineState.hitl?.blockingReason.details))
     setUnifiedSelectorOpen(true)
   }, [pipelineState.hitl])
-
-  const handleOpenTableModal = useCallback(
-    (overrideDetails?: Record<string, unknown>) => {
-      const details = asRecord(overrideDetails || pipelineState.hitl?.blockingReason?.details)
-      const tables = details["available_tables"]
-      setAvailableTables(Array.isArray(tables) ? (tables as AvailableTable[]) : [])
-      // Key absent → undefined (selector self-fetches as fallback); key present
-      // (even a malformed/empty value) → normalized array, which is
-      // authoritative and suppresses the selector's self-fetch.
-      const rawSuggested = details["suggested_tables"]
-      setSuggestedTables(rawSuggested === undefined ? undefined : normalizeSuggestedTables(rawSuggested))
-      setTableSourceType(String(details["source_type"] || details["source_connector"] || ""))
-      setTableHitlNodeId(String(details["node_id"] || "").trim())
-      const ds = String(details["discovery_status"] || "")
-      setTableDiscoveryStatus(ds === "empty" || ds === "failed" || ds === "ok" ? ds : undefined)
-      setTableSourceDatabase(String(details["source_database"] || ""))
-      setTableSourceServerLevel(details["source_server_level"] === true)
-      setTableTruncatedTotal(truncatedTableTotal(details))
-      setTableDiscoveryReason(String(details["reason"] || ""))
-      setTableSelectorOpen(true)
-    },
-    [pipelineState.hitl]
-  )
 
   const handleTablesSelected = useCallback(
     async (tables: string[], destCfg?: DestinationConfig) => {
@@ -249,17 +195,8 @@ export function useHITLState({
       setSuggestionsReviewOpen(true)
       setTableSelectorOpen(false)
 
-      authFetch(
-        `${API_ENDPOINTS.CONNECTIONS.GET(sourceConnId)}/metadata?tables=${encodeURIComponent(tables.join(","))}&include_columns=true`,
-        { cache: "no-store" }
-      )
-        .then((r) => (r.ok ? r.json() : Promise.resolve({})))
-        .then((data: Record<string, unknown>) =>
-          setPrefetchedSchemaForSuggestions(
-            Array.isArray(data?.["tables"]) ? (data["tables"] as TableMetadata[]) : []
-          )
-        )
-        .catch(() => {/* dialog falls back gracefully */})
+      // Best effort: the dialog loads the columns itself when this comes back empty.
+      void fetchTransformStepSchema(sourceConnId, tables).then(setPrefetchedSchemaForSuggestions)
     },
     [
       authoritativePipelineMetadata,
@@ -272,8 +209,52 @@ export function useHITLState({
     ]
   )
 
+  const handleOpenTableModal = useCallback(
+    (overrideDetails?: Record<string, unknown>) => {
+      const details = asRecord(overrideDetails || pipelineState.hitl?.blockingReason?.details)
+      // Tables named in the chat message were already chosen; this wait exists
+      // only to show the transform step (orchestrator transforms_review_gate.go).
+      // Skip the picker and open that step with them. Needs the source
+      // connection handleTablesSelected reads (without it, it resumes at once,
+      // with no step); then the picker below shows exactly the named tables.
+      const reviewTables = transformsReviewTables(details)
+      const hitlDetails = asRecord(pipelineState.hitl?.blockingReason?.details)
+      const meta = asRecord(authoritativePipelineMetadata)
+      if (reviewTables && String(hitlDetails["source_connection_id"] || meta["source_connection_id"] || "")) {
+        void handleTablesSelected(reviewTables)
+        return
+      }
+      const tables = details["available_tables"]
+      setAvailableTables(Array.isArray(tables) ? (tables as AvailableTable[]) : [])
+      // Key absent → undefined (selector self-fetches as fallback); key present
+      // (even a malformed/empty value) → normalized array, which is
+      // authoritative and suppresses the selector's self-fetch.
+      const rawSuggested = details["suggested_tables"]
+      setSuggestedTables(rawSuggested === undefined ? undefined : normalizeSuggestedTables(rawSuggested))
+      setTableSourceType(String(details["source_type"] || details["source_connector"] || ""))
+      setTableHitlNodeId(String(details["node_id"] || "").trim())
+      const ds = String(details["discovery_status"] || "")
+      setTableDiscoveryStatus(ds === "empty" || ds === "failed" || ds === "ok" ? ds : undefined)
+      setTableSourceDatabase(String(details["source_database"] || ""))
+      setTableSourceServerLevel(details["source_server_level"] === true)
+      setTableTruncatedTotal(truncatedTableTotal(details))
+      setTableDiscoveryReason(String(details["reason"] || ""))
+      setTableSelectorOpen(true)
+    },
+    [authoritativePipelineMetadata, handleTablesSelected, pipelineState.hitl]
+  )
+
+  const closeSuggestionsReview = useCallback(() => {
+    setSuggestionsReviewOpen(false)
+    setSelectedTablesForSuggestions([])
+    setSourceConnectionIdForSuggestions("")
+    setTableHitlNodeId("")
+  }, [])
+
+  // The transform step has already saved its rules to transform_definitions; the
+  // resume carries only how many it added (resumeAfterTransformStep says why).
   const handleApplySuggestions = useCallback(
-    async (transforms: TransformSuggestion[]) => {
+    async (saved: { count: number }) => {
       if (!pipelineId) return
       const hitlDetails = asRecord(pipelineState.hitl?.blockingReason?.details)
       const nodeId =
@@ -285,33 +266,30 @@ export function useHITLState({
       // retry — an optimistic close-first would discard those edits on a failed resume.
       // The modal shows an "Applying…" spinner during the await, so the click still
       // reads as responsive.
-      if (nodeId) {
-        await resumePipelineNodeInput(pipelineId, {
-          execution_id: pipelineState.metadata.executionId ?? undefined,
-          node_id: nodeId,
-          config_patch: {
-            selected_tables: selectedTablesForSuggestions,
-            metadata: { transforms, applied_at: new Date().toISOString() },
-            ...(destCfg ? { destination_config: destCfg } : {}),
-          },
+      try {
+        await resumeAfterTransformStep(pipelineId, {
+          executionId: pipelineState.metadata.executionId ?? undefined,
+          nodeId,
+          tables: selectedTablesForSuggestions,
+          destinationConfig: destCfg,
+          outcome: { saved: saved.count },
         })
-      } else {
-        await resumePipelineTables(pipelineId, {
-          execution_id: pipelineState.metadata.executionId ?? undefined,
-          selected_tables: selectedTablesForSuggestions,
-          metadata: { transforms, applied_at: new Date().toISOString() },
-          ...(destCfg ? { destination_config: destCfg } : {}),
-        })
+      } catch (err) {
+        // This dialog outlived its step: it was answered in another tab, or the run
+        // ended. The transforms it saved stay saved, so close it instead of offering
+        // a retry that cannot succeed. The pause stays shown until /state stops
+        // reporting it, so the auto-open does not bring this dialog back.
+        if (!isStaleHITLAnswer(err)) throw err
+        notifyStaleHITLAnswer(err)
+        closeSuggestionsReview()
+        return
       }
 
       suppressHitlUntilRef.current = Date.now() + 15000
       lastBlockingKeyRef.current = ""
       resolveHITL()
       flashResumingState()
-      setSuggestionsReviewOpen(false)
-      setSelectedTablesForSuggestions([])
-      setSourceConnectionIdForSuggestions("")
-      setTableHitlNodeId("")
+      closeSuggestionsReview()
     },
     [
       pipelineId,
@@ -321,6 +299,7 @@ export function useHITLState({
       resolveHITL,
       tableHitlNodeId,
       flashResumingState,
+      closeSuggestionsReview,
     ]
   )
 
@@ -345,33 +324,27 @@ export function useHITLState({
     // keeps the modal open so the user can retry instead of losing their table
     // selection. The modal shows a "Skipping…" spinner during the await, so the click
     // still reads as responsive.
-    if (nodeId) {
-      await resumePipelineNodeInput(pipelineId, {
-        execution_id: pipelineState.metadata.executionId,
-        node_id: nodeId,
-        config_patch: {
-          selected_tables: selectedTablesForSuggestions,
-          metadata: { transforms: [], skipped_suggestions: true, skipped_at: new Date().toISOString() },
-          ...(destCfg ? { destination_config: destCfg } : {}),
-        },
+    try {
+      await resumeAfterTransformStep(pipelineId, {
+        executionId: pipelineState.metadata.executionId,
+        nodeId,
+        tables: selectedTablesForSuggestions,
+        destinationConfig: destCfg,
+        outcome: { skipped: true },
       })
-    } else {
-      await resumePipelineTables(pipelineId, {
-        execution_id: pipelineState.metadata.executionId,
-        selected_tables: selectedTablesForSuggestions,
-        metadata: { transforms: [], skipped_suggestions: true, skipped_at: new Date().toISOString() },
-        ...(destCfg ? { destination_config: destCfg } : {}),
-      })
+    } catch (err) {
+      // Same as Apply: the step is no longer this dialog's to answer.
+      if (!isStaleHITLAnswer(err)) throw err
+      notifyStaleHITLAnswer(err)
+      closeSuggestionsReview()
+      return
     }
 
     suppressHitlUntilRef.current = Date.now() + 15000
     lastBlockingKeyRef.current = ""
     resolveHITL()
     flashResumingState()
-    setSuggestionsReviewOpen(false)
-    setSelectedTablesForSuggestions([])
-    setSourceConnectionIdForSuggestions("")
-    setTableHitlNodeId("")
+    closeSuggestionsReview()
   }, [
     pipelineId,
     pipelineState.hitl?.blockingReason?.details,
@@ -380,6 +353,7 @@ export function useHITLState({
     resolveHITL,
     tableHitlNodeId,
     flashResumingState,
+    closeSuggestionsReview,
   ])
 
   return {

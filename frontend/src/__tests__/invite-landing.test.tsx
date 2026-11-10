@@ -161,7 +161,11 @@ describe("InviteLanding", () => {
     const loginLink = screen.getByRole("link", { name: /log in/i })
     const signupLink = screen.getByRole("link", { name: /create an account/i })
     expect(loginLink.getAttribute("href")).toBe(`/login?next=${encodeURIComponent("/invite/tok-1")}`)
-    expect(signupLink.getAttribute("href")).toBe(`/signup?next=${encodeURIComponent("/invite/tok-1")}`)
+    // Sign-up carries the invite itself: on a single-workspace install, sign-up
+    // after the first user is invite-only, and this token is the invitee's way in.
+    expect(signupLink.getAttribute("href")).toBe(
+      `/signup?workspace_invite=tok-1&next=${encodeURIComponent("/invite/tok-1")}`,
+    )
     expect(screen.queryByRole("button", { name: /accept invitation/i })).toBeNull()
     // a11y: CTAs are single anchors, not <button> nested inside <a>
     expect(screen.queryByRole("button", { name: /log in to accept/i })).toBeNull()

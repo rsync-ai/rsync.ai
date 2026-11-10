@@ -48,13 +48,13 @@ test.describe('Connectors Page', () => {
     // Wait for loading to complete
     await page.waitForSelector('.animate-spin', { state: 'hidden', timeout: 10000 }).catch(() => {})
     
-    // Find All button - it contains "All" and a count in parentheses
-    const allButton = page.locator('button').filter({ hasText: /^All \(/ }).first()
+    // The Category chips: "All" first, each with its count
+    const allButton = page.getByRole('group', { name: 'Category' }).getByRole('button', { name: /^All/ })
     await expect(allButton).toBeVisible({ timeout: 5000 })
     await allButton.click()
     
     // Check if database filter exists (common category)
-    const databaseButton = page.locator('button').filter({ hasText: /database/i }).first()
+    const databaseButton = page.getByRole('group', { name: 'Category' }).getByRole('button', { name: /^Database/ })
     if (await databaseButton.isVisible({ timeout: 2000 }).catch(() => false)) {
       await databaseButton.click()
       // Just verify the click worked
@@ -199,18 +199,6 @@ test.describe('Pipelines Page', () => {
     expect(hasPipelinesText || hasContent).toBeTruthy()
   })
 
-  test('new pipeline button or link is visible', async ({ page }) => {
-    // Look for any element that navigates to new pipeline
-    const newLink = page.locator('a').filter({ hasText: /New/i })
-    const newButton = page.locator('button').filter({ hasText: /New/i })
-    
-    const hasNewLink = await newLink.first().isVisible({ timeout: 3000 }).catch(() => false)
-    const hasNewButton = await newButton.first().isVisible({ timeout: 3000 }).catch(() => false)
-    
-    // It's okay if the button doesn't exist (empty state)
-    expect(true).toBeTruthy()
-  })
-
   test('page renders correctly', async ({ page }) => {
     // Just verify the page structure is present
     await expect(page.locator('body')).toBeVisible()
@@ -277,7 +265,7 @@ test.describe('Home - Create with AI quick start', () => {
 test.describe('Dashboard', () => {
   test.beforeEach(async ({ page }) => {
     await setupAuth(page)
-    await page.goto('/dashboard')
+    await page.goto('/')
     await page.waitForLoadState('networkidle')
   })
 
@@ -368,7 +356,7 @@ test.describe('Responsive Design', () => {
   test('mobile viewport loads correctly', async ({ page }) => {
     await setupAuth(page)
     await page.setViewportSize({ width: 375, height: 667 })
-    await page.goto('/dashboard')
+    await page.goto('/')
     
     // On mobile, page should still load
     await page.waitForTimeout(500)

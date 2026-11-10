@@ -2,7 +2,7 @@
 # cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
 # under QEMU. CGO is off (no C toolchain in this image), which is what makes the
 # cross-compile a pure GOARCH switch.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS worker-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS worker-builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
@@ -53,6 +53,9 @@ COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/wo
 # The binary this stage received is the one the builder built, byte for byte.
 COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/kafka-sink-worker.sha256 /tmp/
 RUN cd /app/worker && sha256sum -c /tmp/kafka-sink-worker.sha256 && rm /tmp/kafka-sink-worker.sha256
+
+# The licence attributions for what this image ships.
+COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 # Run as an unprivileged user (defense-in-depth: the sink processes untrusted
 # upstream data, so least privilege limits blast radius). Nothing here writes to

@@ -5,10 +5,14 @@
  * running / "Streaming pipeline active", so /state says a stream is live whether or
  * not a single row ever reaches the destination. api-gateway's /runtime now reports
  * phase waiting_for_data when nothing has been delivered past a grace period
- * (pipeline_runtime.go cdcLivenessPhase). These tests render the three detail-page
+ * (pipeline_runtime.go cdcLivenessPhase). These tests render the two detail-page
  * surfaces that repeated /state's claim and pin that they say "Waiting for first
  * data" instead — and, as controls, that a streaming phase still renders LIVE /
  * running and a paused /state is never relabelled by a stale runtime poll.
+ *
+ * The Data flow tab's Activity card (PipelineMonitoringPanel) used to be a third:
+ * it now says no status at all, nor the run link or Pause/Resume/Stop, which the
+ * page header says once.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -109,6 +113,25 @@ describe("PipelineHealthHeader", () => {
     expect(screen.getByText("last event 12s ago")).toBeInTheDocument()
     expect(screen.queryByText("Waiting for first data")).toBeNull()
   })
+
+  // The header's pill is the page's only status: while the pipeline waits on the
+  // user, /runtime's phase is "validating" and /state says what is needed.
+  it("says Needs input while /state waits on the user, not the runtime's Validating", async () => {
+    runtimeValue = runtime("validating", { mode: "batch", message: "Waiting for table selection" })
+    routeWith(handoffState("waiting_for_user"))
+    render(<PipelineHealthHeader pipelineId="p1" />)
+    expect(await screen.findByText("Needs input")).toBeInTheDocument()
+    expect(screen.queryByText("Validating")).toBeNull()
+  })
+
+  it("control: the same runtime with a running /state reads Validating", async () => {
+    runtimeValue = runtime("validating", { mode: "batch", message: "Waiting for table selection" })
+    routeWith(handoffState("running"))
+    render(<PipelineHealthHeader pipelineId="p1" />)
+    await waitFor(() => expect(authFetch).toHaveBeenCalled())
+    expect(await screen.findByText("Validating")).toBeInTheDocument()
+    expect(screen.queryByText("Needs input")).toBeNull()
+  })
 })
 
 describe("PipelineLiveStatePanel", () => {
@@ -145,22 +168,55 @@ describe("PipelineLiveStatePanel", () => {
 })
 
 describe("PipelineMonitoringPanel", () => {
-  it("shows Waiting for first data and the runtime message instead of running", async () => {
-    runtimeValue = runtime("waiting_for_data")
-    routeWith({ ...handoffState(), summary: "Streaming pipeline active" })
-    render(<PipelineMonitoringPanel pipelineId="p1" />)
-    expect(await screen.findByText("Waiting for first data")).toBeInTheDocument()
-    expect(screen.getByText(WAITING_MESSAGE)).toBeInTheDocument()
-    expect(screen.queryByText("running")).toBeNull()
-    expect(screen.queryByText("Streaming pipeline active")).toBeNull()
+  it.each(["waiting_for_data", "streaming"])(
+    "says no status, run link or Pause/Resume/Stop of its own (%s)",
+    async (phase) => {
+      runtimeValue = runtime(phase)
+      routeWith({ ...handoffState(), summary: "Streaming pipeline active" })
+      const { container } = render(<PipelineMonitoringPanel pipelineId="p1" variant="activity" />)
+      // The /state and /events reads both ran: the card has what it used to show.
+      await waitFor(() => {
+        const urls = authFetch.mock.calls.map((c) => String(c[0]))
+        expect(urls.some((u) => u.includes("/state"))).toBe(true)
+        expect(urls.some((u) => u.includes("/events"))).toBe(true)
+      })
+      expect(screen.getByText("Activity")).toBeInTheDocument()
+      expect(screen.queryByText("running")).toBeNull()
+      expect(screen.queryByText("Streaming pipeline active")).toBeNull()
+      expect(screen.queryByText("Waiting for first data")).toBeNull()
+      expect(screen.queryByText(WAITING_MESSAGE)).toBeNull()
+      for (const name of ["Pause", "Resume", "Stop"]) {
+        expect(screen.queryByRole("button", { name })).toBeNull()
+      }
+      expect(container.querySelector('a[href*="/executions/"]')).toBeNull()
+    }
+  )
+})
+
+describe("PipelineLiveStatePanel: Stop", () => {
+  const stuck = {
+    ...handoffState("processing"),
+    current_stage: "executor",
+    execution_plan: { mode: "batch", stages: [] },
+    is_stale: true,
+    stale_reason: "No update for 10m 0s (expected heartbeat every 180s)",
+    stale_elapsed_seconds: 600,
+    cancel_recommended: true,
+  }
+
+  it("has no Stop in its header while a run is processing; the page header has it", async () => {
+    runtimeValue = runtime("running", { mode: "batch" })
+    routeWith({ ...stuck, is_stale: false, cancel_recommended: false })
+    render(<PipelineLiveStatePanel pipelineId="p1" />)
+    expect(await screen.findByText("processing")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull()
   })
 
-  it("control: a streaming phase keeps the running badge and the /state summary", async () => {
-    runtimeValue = runtime("streaming")
-    routeWith({ ...handoffState(), summary: "Streaming pipeline active" })
-    render(<PipelineMonitoringPanel pipelineId="p1" />)
-    await waitFor(() => expect(screen.getByText("running")).toBeInTheDocument())
-    expect(screen.getByText("Streaming pipeline active")).toBeInTheDocument()
-    expect(screen.queryByText("Waiting for first data")).toBeNull()
+  it("control: a stuck run's callout keeps its Stop Pipeline, next to the reason", async () => {
+    runtimeValue = runtime("running", { mode: "batch" })
+    routeWith(stuck)
+    render(<PipelineLiveStatePanel pipelineId="p1" />)
+    expect(await screen.findByRole("button", { name: "Stop Pipeline" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull()
   })
 })

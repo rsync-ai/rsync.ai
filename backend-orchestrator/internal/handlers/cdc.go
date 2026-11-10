@@ -301,6 +301,11 @@ func cleanupCDCSources(ctx context.Context, db *sql.DB, pipelineID string) []str
 	return errs
 }
 
+// cdcUpdateTablesBudget bounds one table-list update. It runs on context.Background(),
+// so a caller that gives up does not cancel it; the gateway's cdcUpdateTablesProxyTimeout
+// still outlasts it, or the change lands and the caller is told it failed.
+const cdcUpdateTablesBudget = 60 * time.Second
+
 // UpdateCDCTables updates the table.include.list for a CDC connector. reaper
 // (nil-safe) deletes the Kafka topics of removed tables once the sink has
 // applied them (#20).
@@ -317,7 +322,7 @@ func UpdateCDCTables(db *sql.DB, reaper *RemovedTopicReaper) gin.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), cdcUpdateTablesBudget)
 		defer cancel()
 
 		log.WithFields(log.Fields{
@@ -757,6 +762,12 @@ type cdcSignalProducer interface {
 	ProduceWithContext(ctx context.Context, topic string, key, value []byte) error
 }
 
+// cdcBackfillBudget bounds one backfill request. It runs detached from the request
+// (context.WithoutCancel), so a caller that goes away — a closed tab, a gateway that stops
+// waiting — cannot cancel the backfill between two of its steps. The gateway's
+// cdcBackfillProxyTimeout still outlasts it, so the caller hears how the backfill ended.
+const cdcBackfillBudget = 60 * time.Second
+
 // BackfillCDCTables triggers an ad-hoc Debezium snapshot for the requested tables.
 //
 // There are two signalling channels, and which one a connector has is decided
@@ -819,7 +830,7 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnaps
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcBackfillBudget)
 		defer cancel()
 
 		connectorName, err := findConnectorName(ctx, db, pipelineID)

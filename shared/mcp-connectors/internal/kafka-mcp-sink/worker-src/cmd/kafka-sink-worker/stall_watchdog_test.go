@@ -152,7 +152,19 @@ func TestUnconsumedRecordsAgainstLiveKafka(t *testing.T) {
 
 	group := fmt.Sprintf("stallwatch-group-%d", stamp) // never joined, so never committed
 
-	waiting, detail, err := unconsumedRecords(ctx, broker, group, []string{full}, true, map[string]int64{}, nil)
+	// On a fresh broker the group coordinator is not up until __consumer_offsets
+	// exists, and OffsetFetch answers NOT_COORDINATOR. That is an error, not "never
+	// committed" (the watchdog skips the tick), so wait for a real answer.
+	var (
+		waiting bool
+		detail  string
+	)
+	for attempt := 0; attempt < 40; attempt++ {
+		if waiting, detail, err = unconsumedRecords(ctx, broker, group, []string{full}, true, map[string]int64{}, nil); err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("unconsumedRecords(full): %v", err)
 	}
@@ -231,11 +243,20 @@ func TestStallDecisionMatchesLiveReaderOutcome(t *testing.T) {
 
 		if !preCreate {
 			time.Sleep(2 * time.Second) // let the member join while the topic is still absent
+			// Created through the admin API, as Debezium does (topic.creation.*): the
+			// bundled brokers no longer auto-create a topic on first produce.
+			if err := admin.CreateTopics(kafka.TopicConfig{Topic: topic, NumPartitions: 1, ReplicationFactor: 1}); err != nil {
+				reader.Close()
+				cancel()
+				t.Fatalf("trial %d: create topic after the join: %v", i, err)
+			}
 		}
 
-		w := &kafka.Writer{Addr: kafka.TCP(broker), Topic: topic, RequiredAcks: kafka.RequireAll, AllowAutoTopicCreation: true}
+		w := &kafka.Writer{Addr: kafka.TCP(broker), Topic: topic, RequiredAcks: kafka.RequireAll}
 		var writeErr error
-		for attempt := 0; attempt < 20; attempt++ {
+		// 12s: the shared transport caches metadata for 6s, so a topic created a moment
+		// ago reads as unknown until the next refresh.
+		for attempt := 0; attempt < 48; attempt++ {
 			if writeErr = w.WriteMessages(ctx, kafka.Message{Value: []byte("row")}); writeErr == nil {
 				break
 			}

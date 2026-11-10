@@ -12,6 +12,8 @@ helm install rsync-ai ./deploy/helm/rsync-ai \
   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
+  --set secrets.blobStagingAccessKey="$(openssl rand -hex 16)" \
+  --set secrets.blobStagingSecretKey="$(openssl rand -base64 32)" \
   --set frontend.publicUrl=https://app.example.com \
   --set frontend.apiUrl=https://api.example.com
 ```

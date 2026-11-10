@@ -147,6 +147,7 @@ var assessmentCatalog = map[string]assessmentCheckSpec{
 	"POSTGRES_SCHEMA_NOT_VISIBLE":       {"Schema visible to the user", LevelCritical},
 	FindingNoPrimaryKey:                 {"Table primary key", LevelHigh},
 	FindingJSONCollapse:                 {"Nested columns land as JSON", LevelLow},
+	FindingUnconstrainedNumeric:         {"Numeric columns without precision", LevelMedium},
 
 	// PostgreSQL change data capture.
 	"POSTGRES_WAL_LEVEL_NOT_LOGICAL":            {"wal_level is logical", LevelCritical},
@@ -415,11 +416,44 @@ func attachChecks(report *AssessmentReport, ra *orchestratorAssessment) {
 				continue
 			}
 			level, result := gradeFinding(f.Code, f.Severity)
-			b.add(f.Code, category, level, result, object, f.Message, nil)
+			b.add(f.Code, category, level, result, object, f.Message, findingRemediation(f))
 		}
 	}
 	report.Checks = b.checks()
 	report.Counts = countChecks(report.Checks)
+}
+
+// findingRemediation lifts the fix a gateway finding carries in its details --
+// the steps and sql_to_run the pre-run modal already shows -- onto its row.
+func findingRemediation(f AssessmentFinding) *AssessmentRemediation {
+	rem := &AssessmentRemediation{
+		Steps:         detailStrings(f.Details["steps"]),
+		SQLToRun:      detailStrings(f.Details["sql_to_run"]),
+		CommandsToRun: detailStrings(f.Details["commands_to_run"]),
+	}
+	rem.DocURL, _ = f.Details["doc_url"].(string)
+	if len(rem.Steps) == 0 && len(rem.SQLToRun) == 0 && len(rem.CommandsToRun) == 0 && rem.DocURL == "" {
+		return nil
+	}
+	return rem
+}
+
+// detailStrings reads a string list from finding details: a []string when the
+// finding is fresh, a []interface{} once a stored report is read back from JSON.
+func detailStrings(v interface{}) []string {
+	switch xs := v.(type) {
+	case []string:
+		return xs
+	case []interface{}:
+		out := make([]string, 0, len(xs))
+		for _, x := range xs {
+			if s, ok := x.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func countChecks(checks []AssessmentCheck) *AssessmentCounts {

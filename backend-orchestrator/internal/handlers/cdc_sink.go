@@ -15,10 +15,18 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
+	"github.com/rsync-ai/backend-orchestrator/internal/connections"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 	"github.com/rsync-ai/shared/crypto"
 )
+
+// cdcSinkRestartBudget bounds one sink restart. It runs detached from the request
+// (context.WithoutCancel), so a caller that goes away cannot cancel the restart between
+// stop_sink and start_sink and leave no worker. The gateway's cdcSinkRestartProxyTimeout
+// still outlasts it, so the caller hears how the restart ended.
+const cdcSinkRestartBudget = 60 * time.Second
 
 // RestartCDCSink restarts the kafka-mcp-sink worker for a CDC pipeline so it picks up newly added Debezium topics.
 // This is required because a long-lived Kafka consumer group won't automatically subscribe to new topics.
@@ -46,7 +54,7 @@ func RestartCDCSink(db *sql.DB, mcpManager *mcp.ServerManager) gin.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcSinkRestartBudget)
 		defer cancel()
 
 		result, status, err := restartCDCSinkWorker(ctx, db, mcpManager, pipelineID)
@@ -119,11 +127,12 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 	if err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("failed to load destination config: %s", err.Error())
 	}
+	// A destination still at "latest" is pinned here, as a run would pin it,
+	// so a restart cannot move the sink onto a newer connector version.
 	destConcreteVer := strings.TrimSpace(destVersion)
-	if strings.TrimSpace(destConnector) != "" && mcpManager != nil {
-		if v, rerr := mcpManager.ResolveConcreteVersion(destConnector, destVersion); rerr == nil && strings.TrimSpace(v) != "" {
-			destConcreteVer = strings.TrimSpace(v)
-		}
+	if mcpManager != nil {
+		destConcreteVer = connections.ResolvePinned(ctx, db, mcpManager, destConnID, destConnector, destVersion)
+		destCfg["connector_version"] = destConcreteVer
 	}
 
 	// Destination namespace (schema/db) from pipelines.config so CDC writes land
@@ -184,6 +193,24 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 	// reads. See ResolveSinkConsumerGroup.
 	consumerGroup := ResolveSinkConsumerGroup(ctx, db, pipelineID)
 	client := mcp.NewClient(mcpManager)
+
+	// A destination that addresses each record by the id its API assigned takes no
+	// CDC sink (executor cdc_record_ids_check.go): a run start refuses one, and so
+	// does a restart, before the running worker is stopped. No answer → restart.
+	capCtx, capCancel := context.WithTimeout(ctx, 20*time.Second)
+	capResp, capErr := client.ExecuteWithContext(capCtx, mcp.ExecuteRequest{
+		Connector: destConnector,
+		Version:   destConcreteVer,
+		Operation: "get_capabilities",
+		Config:    destCfg,
+		Params:    map[string]interface{}{"config": destCfg},
+	})
+	capCancel()
+	if capErr == nil && capResp != nil && capResp.Success {
+		if msg := executor.CDCRecordIDsRefusal(capResp.Result, destConnector, destCfg); msg != "" {
+			return nil, http.StatusConflict, errors.New(msg)
+		}
+	}
 
 	// Best-effort: stop current worker (may not exist if sink wasn't started yet).
 	stopResp, _ := client.ExecuteWithContext(ctx, mcp.ExecuteRequest{
@@ -337,7 +364,7 @@ func getDecryptedConnectionForSink(ctx context.Context, db *sql.DB, connectionID
 	}
 	out := make(map[string]string, len(raw)+1)
 	for k, v := range raw {
-		out[k] = fmt.Sprint(v)
+		out[k] = utils.ConfigString(v)
 	}
 	// Helpful for downstream components that inspect config for versioning.
 	out["connector_version"] = connectorVersion

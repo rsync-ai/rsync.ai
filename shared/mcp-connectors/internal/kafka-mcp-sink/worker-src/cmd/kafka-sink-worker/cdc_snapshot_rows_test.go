@@ -63,7 +63,7 @@ func TestCDCCounters_SnapshotReadsAreNotInserts(t *testing.T) {
 				sm.Data = []map[string]interface{}{{"id": msgs[i].Offset}}
 				sm.PK = map[string]interface{}{"id": msgs[i].Offset}
 				sm.KeyFields = []string{"id"}
-				commit, err := processCDCEvent(context.Background(), newHighWaterTracker(), nil, client, cfg,
+				commit, err := processCDCEvent(context.Background(), newCommitGate(nil, newHighWaterTracker()), nil, client, cfg,
 					&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msgs[i], sm, c.metrics,
 					c.inserts, c.updates, c.deletes, &sync.Map{}, time.Minute)
 				if err != nil || !commit {

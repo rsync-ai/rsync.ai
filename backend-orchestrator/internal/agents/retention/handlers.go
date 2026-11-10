@@ -179,7 +179,12 @@ func (h *Handlers) GetBulkLoadProgress(c *gin.Context) {
 
 	progress, progressMap, err := h.agent.GetBulkLoadProgress(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		// Only a missing bulk load is a 404; Kafka that could not be read is not.
+		statusCode := http.StatusInternalServerError
+		if _, ok := err.(*BulkLoadNotFoundError); ok {
+			statusCode = http.StatusNotFound
+		}
+		c.JSON(statusCode, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -196,7 +201,12 @@ func (h *Handlers) CheckCleanupReadiness(c *gin.Context) {
 
 	result, err := h.agent.CheckCleanupReadiness(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		// Only a missing bulk load is a 404; Kafka that could not be read is not.
+		statusCode := http.StatusInternalServerError
+		if _, ok := err.(*BulkLoadNotFoundError); ok {
+			statusCode = http.StatusNotFound
+		}
+		c.JSON(statusCode, gin.H{"error": err.Error()})
 		return
 	}
 

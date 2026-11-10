@@ -1,0 +1,99 @@
+# settings: {"version":2,"type":"candlestick","roles":{"x":[{"column":"day","grain":"day"}],"y":[{"column":"amount"},{"column":"amount"},{"column":"amount"},{"column":"amount"}]}}
+
+-- postgres
+SELECT k."rsync_x" AS "day", MAX(CASE WHEN k."rsync_first" = 1 THEN k."rsync_o" END) AS "rsync_open", MAX(k."rsync_h") AS "rsync_high", MIN(k."rsync_l") AS "rsync_low", MAX(CASE WHEN k."rsync_last" = 1 THEN k."rsync_c" END) AS "rsync_close"
+FROM (
+SELECT DATE_TRUNC('day', src."day") AS "rsync_x", src."amount" AS "rsync_o", src."amount" AS "rsync_h", src."amount" AS "rsync_l", src."amount" AS "rsync_c", ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('day', src."day") ORDER BY src."day" ASC, src."amount" ASC) AS "rsync_first", ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('day', src."day") ORDER BY src."day" DESC, src."amount" DESC) AS "rsync_last"
+FROM "gold"."orders" src
+WHERE src."day" IS NOT NULL AND src."amount" IS NOT NULL AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+) k
+GROUP BY k."rsync_x"
+ORDER BY k."rsync_x" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT k.`rsync_x` AS `day`, MAX(CASE WHEN k.`rsync_first` = 1 THEN k.`rsync_o` END) AS `rsync_open`, MAX(k.`rsync_h`) AS `rsync_high`, MIN(k.`rsync_l`) AS `rsync_low`, MAX(CASE WHEN k.`rsync_last` = 1 THEN k.`rsync_c` END) AS `rsync_close`
+FROM (
+SELECT DATE(src.`day`) AS `rsync_x`, src.`amount` AS `rsync_o`, src.`amount` AS `rsync_h`, src.`amount` AS `rsync_l`, src.`amount` AS `rsync_c`, ROW_NUMBER() OVER (PARTITION BY DATE(src.`day`) ORDER BY src.`day` ASC, src.`amount` ASC) AS `rsync_first`, ROW_NUMBER() OVER (PARTITION BY DATE(src.`day`) ORDER BY src.`day` DESC, src.`amount` DESC) AS `rsync_last`
+FROM `gold`.`orders` src
+WHERE src.`day` IS NOT NULL AND src.`amount` IS NOT NULL AND src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+) k
+GROUP BY k.`rsync_x`
+ORDER BY k.`rsync_x` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) k.[rsync_x] AS [day], MAX(CASE WHEN k.[rsync_first] = 1 THEN k.[rsync_o] END) AS [rsync_open], MAX(k.[rsync_h]) AS [rsync_high], MIN(k.[rsync_l]) AS [rsync_low], MAX(CASE WHEN k.[rsync_last] = 1 THEN k.[rsync_c] END) AS [rsync_close]
+FROM (
+SELECT CAST(src.[day] AS date) AS [rsync_x], src.[amount] AS [rsync_o], src.[amount] AS [rsync_h], src.[amount] AS [rsync_l], src.[amount] AS [rsync_c], ROW_NUMBER() OVER (PARTITION BY CAST(src.[day] AS date) ORDER BY src.[day] ASC, src.[amount] ASC) AS [rsync_first], ROW_NUMBER() OVER (PARTITION BY CAST(src.[day] AS date) ORDER BY src.[day] DESC, src.[amount] DESC) AS [rsync_last]
+FROM [gold].[orders] src
+WHERE src.[day] IS NOT NULL AND src.[amount] IS NOT NULL AND src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+) k
+GROUP BY k.[rsync_x]
+ORDER BY k.[rsync_x] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT k.`rsync_x` AS `day`, MAX(CASE WHEN k.`rsync_first` = 1 THEN k.`rsync_o` END) AS `rsync_open`, MAX(k.`rsync_h`) AS `rsync_high`, MIN(k.`rsync_l`) AS `rsync_low`, MAX(CASE WHEN k.`rsync_last` = 1 THEN k.`rsync_c` END) AS `rsync_close`
+FROM (
+SELECT DATE(src.`day`) AS `rsync_x`, src.`amount` AS `rsync_o`, src.`amount` AS `rsync_h`, src.`amount` AS `rsync_l`, src.`amount` AS `rsync_c`, ROW_NUMBER() OVER (PARTITION BY DATE(src.`day`) ORDER BY src.`day` ASC, src.`amount` ASC) AS `rsync_first`, ROW_NUMBER() OVER (PARTITION BY DATE(src.`day`) ORDER BY src.`day` DESC, src.`amount` DESC) AS `rsync_last`
+FROM `gold`.`orders` src
+WHERE src.`day` IS NOT NULL AND src.`amount` IS NOT NULL
+) k
+GROUP BY k.`rsync_x`
+ORDER BY k.`rsync_x` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT k."RSYNC_X" AS "DAY", MAX(CASE WHEN k."RSYNC_FIRST" = 1 THEN k."RSYNC_O" END) AS "RSYNC_OPEN", MAX(k."RSYNC_H") AS "RSYNC_HIGH", MIN(k."RSYNC_L") AS "RSYNC_LOW", MAX(CASE WHEN k."RSYNC_LAST" = 1 THEN k."RSYNC_C" END) AS "RSYNC_CLOSE"
+FROM (
+SELECT DATE_TRUNC('DAY', src."DAY") AS "RSYNC_X", src."AMOUNT" AS "RSYNC_O", src."AMOUNT" AS "RSYNC_H", src."AMOUNT" AS "RSYNC_L", src."AMOUNT" AS "RSYNC_C", ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('DAY', src."DAY") ORDER BY src."DAY" ASC, src."AMOUNT" ASC) AS "RSYNC_FIRST", ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('DAY', src."DAY") ORDER BY src."DAY" DESC, src."AMOUNT" DESC) AS "RSYNC_LAST"
+FROM "GOLD"."ORDERS" src
+WHERE src."DAY" IS NOT NULL AND src."AMOUNT" IS NOT NULL
+) k
+GROUP BY k."RSYNC_X"
+ORDER BY k."RSYNC_X" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT k.`rsync_x` AS `day`, MAX(CASE WHEN k.`rsync_first` = 1 THEN k.`rsync_o` END) AS `rsync_open`, MAX(k.`rsync_h`) AS `rsync_high`, MIN(k.`rsync_l`) AS `rsync_low`, MAX(CASE WHEN k.`rsync_last` = 1 THEN k.`rsync_c` END) AS `rsync_close`
+FROM (
+SELECT DATE_TRUNC('DAY', src.`day`) AS `rsync_x`, src.`amount` AS `rsync_o`, src.`amount` AS `rsync_h`, src.`amount` AS `rsync_l`, src.`amount` AS `rsync_c`, ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('DAY', src.`day`) ORDER BY src.`day` ASC, src.`amount` ASC) AS `rsync_first`, ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('DAY', src.`day`) ORDER BY src.`day` DESC, src.`amount` DESC) AS `rsync_last`
+FROM `gold`.`orders` src
+WHERE src.`day` IS NOT NULL AND src.`amount` IS NOT NULL AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+) k
+GROUP BY k.`rsync_x`
+ORDER BY k.`rsync_x` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT k.`rsync_x` AS `day`, MAX(CASE WHEN k.`rsync_first` = 1 THEN k.`rsync_o` END) AS `rsync_open`, MAX(k.`rsync_h`) AS `rsync_high`, MIN(k.`rsync_l`) AS `rsync_low`, MAX(CASE WHEN k.`rsync_last` = 1 THEN k.`rsync_c` END) AS `rsync_close`
+FROM (
+SELECT toDate(src.`day`) AS `rsync_x`, src.`amount` AS `rsync_o`, src.`amount` AS `rsync_h`, src.`amount` AS `rsync_l`, src.`amount` AS `rsync_c`, ROW_NUMBER() OVER (PARTITION BY toDate(src.`day`) ORDER BY src.`day` ASC, src.`amount` ASC) AS `rsync_first`, ROW_NUMBER() OVER (PARTITION BY toDate(src.`day`) ORDER BY src.`day` DESC, src.`amount` DESC) AS `rsync_last`
+FROM `gold`.`orders` src
+WHERE src.`day` IS NOT NULL AND src.`amount` IS NOT NULL
+) k
+GROUP BY k.`rsync_x`
+ORDER BY k.`rsync_x` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT k."RSYNC_X" AS "DAY", MAX(CASE WHEN k."RSYNC_FIRST" = 1 THEN k."RSYNC_O" END) AS "RSYNC_OPEN", MAX(k."RSYNC_H") AS "RSYNC_HIGH", MIN(k."RSYNC_L") AS "RSYNC_LOW", MAX(CASE WHEN k."RSYNC_LAST" = 1 THEN k."RSYNC_C" END) AS "RSYNC_CLOSE"
+FROM (
+SELECT TRUNC(src."DAY", 'DD') AS "RSYNC_X", src."AMOUNT" AS "RSYNC_O", src."AMOUNT" AS "RSYNC_H", src."AMOUNT" AS "RSYNC_L", src."AMOUNT" AS "RSYNC_C", ROW_NUMBER() OVER (PARTITION BY TRUNC(src."DAY", 'DD') ORDER BY src."DAY" ASC, src."AMOUNT" ASC) AS "RSYNC_FIRST", ROW_NUMBER() OVER (PARTITION BY TRUNC(src."DAY", 'DD') ORDER BY src."DAY" DESC, src."AMOUNT" DESC) AS "RSYNC_LAST"
+FROM "GOLD"."ORDERS" src
+WHERE src."DAY" IS NOT NULL AND src."AMOUNT" IS NOT NULL
+) k
+GROUP BY k."RSYNC_X"
+ORDER BY k."RSYNC_X" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

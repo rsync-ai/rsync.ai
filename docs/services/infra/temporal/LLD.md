@@ -19,5 +19,6 @@ Admin tools:
 ### Task Queue (rsync-ai)
 Temporal Adapter registers workflows/activities on:
 - task queue: `pipeline-workflows`
+- task queue: `workflow-runs` — `WorkflowRunWorkflow` and its four steps (the Workflows page), on a worker of its own so a long pipeline cannot hold a workflow's alert behind it
 
 

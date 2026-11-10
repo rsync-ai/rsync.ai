@@ -5,6 +5,7 @@ Validates generated connector code after Jinja2 rendering.
 
 Checks:
 - Code compiles (valid Python syntax)
+- Every name the code reads is bound somewhere Python can resolve it
 - Required methods exist and aren't stubs
 - Category-specific I/O operations present
 - No obvious anti-patterns
@@ -13,10 +14,12 @@ VERSION: 1.0.0
 """
 
 import ast
+import builtins
 import logging
 import os
+import symtable
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 try:
     from ..schemas.spec import ConnectorSpec, ConnectorCategory
@@ -63,6 +66,7 @@ class PostGenerationValidator:
         
         # Run all validation checks
         self._validate_syntax(code, result)
+        self._validate_names(code, result)
         self._validate_class_structure(code, spec, result)
         self._validate_required_methods(code, spec, result)
         self._validate_category_specific(code, spec, result)
@@ -124,6 +128,70 @@ class PostGenerationValidator:
                 code="PARSE_ERROR"
             )
     
+    # Names a module has without binding them.
+    _MODULE_ATTRS = frozenset({
+        "__name__", "__file__", "__doc__", "__spec__", "__loader__",
+        "__package__", "__builtins__", "__path__", "__annotations__",
+    })
+
+    @classmethod
+    def undefined_names(cls, code: str) -> List[str]:
+        """Names ``code`` reads as globals that neither the module nor the
+        builtins bind. Python resolves those only at call time, and inside a
+        connector's broad ``except`` the NameError reads as a data warning
+        (every generated psycopg2 connector once discovered tables without
+        columns this way). Empty when the code does not parse or star-imports,
+        since a star import can bind anything."""
+        try:
+            tree = ast.parse(code)
+            top = symtable.symtable(code, "connector.py", "exec")
+        except (SyntaxError, ValueError):
+            return []
+        if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+               for n in ast.walk(tree)):
+            return []
+        bound = set(dir(builtins)) | cls._MODULE_ATTRS
+        read = set()
+
+        def walk(table):
+            for sym in table.get_symbols():
+                name = sym.get_name()
+                if table is top:
+                    if sym.is_assigned() or sym.is_imported() or sym.is_namespace():
+                        bound.add(name)
+                    elif sym.is_referenced():
+                        read.add(name)
+                else:
+                    # `global X` then `X = ...` in a function binds X too. A
+                    # name a class body binds is not in scope in its methods,
+                    # so a method reading it reads a global.
+                    if sym.is_declared_global() and sym.is_assigned():
+                        bound.add(name)
+                    if sym.is_global() and sym.is_referenced():
+                        read.add(name)
+            for child in table.get_children():
+                walk(child)
+
+        walk(top)
+        return sorted(read - bound)
+
+    def _validate_names(self, code: str, result: ValidationResult) -> None:
+        """Refuse code that calls a name nothing defines."""
+        missing = self.undefined_names(code)
+        if not missing:
+            return
+        first_line = {}
+        for node in ast.walk(ast.parse(code)):
+            if isinstance(node, ast.Name) and node.id in missing:
+                first_line[node.id] = min(first_line.get(node.id, node.lineno), node.lineno)
+        for name in missing:
+            result.add_error(
+                f"Generated code reads '{name}', which nothing defines or imports",
+                location=f"connector.py:{first_line.get(name, 0)}",
+                code="UNDEFINED_NAME",
+                fix_suggestion=f"Define or import '{name}' in the template that rendered this code",
+            )
+
     def _validate_class_structure(
         self,
         code: str,

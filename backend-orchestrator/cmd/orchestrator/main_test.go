@@ -164,7 +164,7 @@ func TestTopologyRoutesRequireAPrincipal(t *testing.T) {
 	}
 	defer db.Close()
 
-	router := setupRouter(nil, &kafka.TopologyManager{}, nil, nil, nil, db, nil, nil)
+	router := setupRouter(nil, &kafka.TopologyManager{}, nil, nil, nil, db, nil, nil, nil)
 
 	const topic = "rsync.cdc.abd8a64d"
 	cases := []struct {

@@ -186,7 +186,7 @@ export default function AdminNotificationsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Notification delivery" />
       <AdminNav />
 
@@ -335,7 +335,7 @@ export default function AdminNotificationsPage() {
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid gap-4 sm:grid-cols-[1fr_7rem]">
+              <div className="grid gap-4 @md:grid-cols-[1fr_7rem]">
                 <div className="space-y-2">
                   <Label htmlFor="smtp-host">SMTP host</Label>
                   <Input
@@ -376,7 +376,7 @@ export default function AdminNotificationsPage() {
                 )}
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
+              <div className="grid gap-4 @md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor="smtp-username">Username</Label>
                   <Input

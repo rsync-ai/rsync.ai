@@ -27,7 +27,7 @@ The Frontend is the **Next.js UI** for rsync-ai:
 - **API Gateway** (public): `NEXT_PUBLIC_API_URL` (default `http://localhost:5001`)
 - **WebSocket**: `NEXT_PUBLIC_WS_URL` for streaming progress updates
 - Internal server-side URLs (within docker network) for SSR calls:
-  - `API_GATEWAY_INTERNAL_URL`, `ORCHESTRATOR_INTERNAL_URL`
+  - `API_GATEWAY_INTERNAL_URL`
 
 ### Observability
 - Browser-side OTEL export endpoint (optional):

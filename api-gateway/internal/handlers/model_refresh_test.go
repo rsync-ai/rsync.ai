@@ -1,13 +1,8 @@
 package handlers
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"strings"
 	"testing"
-
-	"go.temporal.io/api/serviceerror"
 )
 
 // ============================================================================
@@ -245,112 +240,7 @@ func TestRunProvenance_AMalformedPayloadCostsTheProvenanceNotTheRow(t *testing.T
 	}
 }
 
-func TestStartUpstreamFanOut_NoTemporalMeansEverythingRunsLocally(t *testing.T) {
-	// A deployment with no Temporal is a supported mode, not a fault. Every target has
-	// to come back for the in-process path, or the trigger stops working entirely there.
-	targets := []modelRefreshTarget{{ModelID: "m1"}, {ModelID: "m2"}}
-	local := startUpstreamFanOut(context.Background(), nil, fanOutOf(pipelineSource("p1", "e1"), targets...))
-	if len(local) != len(targets) {
-		t.Fatalf("got %d local targets, want all %d", len(local), len(targets))
-	}
-}
-
-func TestStartUpstreamFanOut_AStartedFanOutDoesNotAlsoRunLocally(t *testing.T) {
-	// The whole point of the handover: a fan-out Temporal accepted must not also run on
-	// the goroutine path, or every completion would rebuild each model twice.
-	var seen []upstreamFanOut
-	dispatch := func(_ context.Context, f upstreamFanOut) error {
-		seen = append(seen, f)
-		return nil
-	}
-	targets := []modelRefreshTarget{{ModelID: "m1"}, {ModelID: "m2"}}
-	local := startUpstreamFanOut(context.Background(), dispatch, fanOutOf(pipelineSource("p1", "e1"), targets...))
-	if len(local) != 0 {
-		t.Errorf("got %d local targets after a successful fan-out, want 0", len(local))
-	}
-	// One call for the whole batch, not one per model — that is the change: the gateway
-	// can die the instant it returns and both models are still signalled.
-	if len(seen) != 1 {
-		t.Fatalf("dispatch was called %d times, want exactly one call carrying the whole batch", len(seen))
-	}
-	if len(seen[0].Targets) != 2 {
-		t.Errorf("the one call carried %d targets, want both", len(seen[0].Targets))
-	}
-}
-
-func TestStartUpstreamFanOut_AFailedStartSendsTheWholeBatchToTheLocalPath(t *testing.T) {
-	// There is one call now, so a half-dispatched batch is not a state that can exist.
-	// Every target comes back, because dropping any of them means a model that silently
-	// stops updating.
-	dispatch := func(context.Context, upstreamFanOut) error { return errors.New("temporal unavailable") }
-	targets := []modelRefreshTarget{{ModelID: "m1"}, {ModelID: "m2"}, {ModelID: "m3"}}
-	local := startUpstreamFanOut(context.Background(), dispatch, fanOutOf(pipelineSource("p1", "e1"), targets...))
-	if len(local) != len(targets) {
-		t.Fatalf("local targets = %v, want all %d back for the in-process path", local, len(targets))
-	}
-}
-
-func TestStartUpstreamFanOut_ACompletionAlreadyFannedOutIsNotRebuiltLocally(t *testing.T) {
-	// Temporal refusing the start because this exact completion already has a fan-out is
-	// "already done", not "did not happen". Falling back here would undo the duplicate
-	// suppression the workflow id buys, and would do it on the path with no coalescing —
-	// so a redelivered Kafka message would rebuild every model a second time.
-	dispatch := func(context.Context, upstreamFanOut) error {
-		return &serviceerror.WorkflowExecutionAlreadyStarted{}
-	}
-	targets := []modelRefreshTarget{{ModelID: "m1"}, {ModelID: "m2"}}
-	local := startUpstreamFanOut(context.Background(), dispatch, fanOutOf(pipelineSource("p1", "e1"), targets...))
-	if len(local) != 0 {
-		t.Fatalf("got %d local targets for a completion that was already fanned out, want 0", len(local))
-	}
-}
-
-func TestStartUpstreamFanOut_AWrappedAlreadyStartedIsStillRecognised(t *testing.T) {
-	// The SDK wraps service errors on the way out. Matching on the type rather than on a
-	// message keeps the distinction working through that wrapping; a string match would
-	// pass here and quietly fall back in production.
-	dispatch := func(context.Context, upstreamFanOut) error {
-		return fmt.Errorf("start workflow: %w", &serviceerror.WorkflowExecutionAlreadyStarted{})
-	}
-	local := startUpstreamFanOut(context.Background(), dispatch,
-		fanOutOf(pipelineSource("p1", "e1"), modelRefreshTarget{ModelID: "m1"}))
-	if len(local) != 0 {
-		t.Fatalf("a wrapped already-started error fell back to the local path: %v", local)
-	}
-}
-
-func TestStartUpstreamFanOut_FallbackKeepsTheIdentityTheRunNeeds(t *testing.T) {
-	// The fallback rebuild runs as run_as_user_id and audits against schedule_id, so a
-	// target that comes back has to come back whole, not just as a model id. It is also
-	// why run_as_user_id stays out of the workflow argument and lives only here.
-	dispatch := func(context.Context, upstreamFanOut) error { return errors.New("nope") }
-	want := modelRefreshTarget{ScheduleID: "s1", ModelID: "m1", RunAsUserID: "u1"}
-	local := startUpstreamFanOut(context.Background(), dispatch, fanOutOf(pipelineSource("p1", "e1"), want))
-	if len(local) != 1 || local[0] != want {
-		t.Fatalf("local = %v, want %v", local, want)
-	}
-}
-
-func TestStartUpstreamFanOut_TheWholeSourceReachesTemporalNotJustTheID(t *testing.T) {
-	// Depth is what stops a rebuild chain, and it only bounds anything if it survives every
-	// hop. This is the hop where it is easiest to lose: the dispatcher is the last place
-	// the source is a Go value before it becomes a workflow argument.
-	var got upstreamFanOut
-	dispatch := func(_ context.Context, f upstreamFanOut) error {
-		got = f
-		return nil
-	}
-	want := modelRefreshSource{
-		Kind:        upstreamKindModel,
-		ID:          "m0",
-		ExecutionID: "e9",
-		Depth:       3,
-	}
-	startUpstreamFanOut(context.Background(), dispatch, fanOutOf(want, modelRefreshTarget{ModelID: "m1"}))
-	if got.Source != want {
-		t.Fatalf("dispatch saw %+v, want %+v", got.Source, want)
-	}
-}
+// startUpstreamFanOut's retry, breaker and already-started handling: model_next_hop_test.go.
 
 // ============================================================================
 // Which upstreams a completion wakes

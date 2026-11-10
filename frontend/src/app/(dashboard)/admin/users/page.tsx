@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useRef, useState, useCallback } from "react"
 import { PageHeader } from "@/components/layout/PageHeader"
 import { AdminNav } from "@/components/admin/AdminNav"
 import { Card } from "@/components/ui/card"
@@ -47,11 +47,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 import { toast } from "sonner"
 import { MoreHorizontal, Search } from "lucide-react"
-import type { AdminUser } from "@/lib/api/admin"
+import type { AdminReadFailure, AdminUser } from "@/lib/api/admin"
 import {
   adminListUsers,
   adminUpdateUserRole,
@@ -76,8 +75,12 @@ export default function AdminUsersPage() {
   const [users, setUsers] = useState<AdminUser[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
-  const [status, setStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
+  // Set by the first good read. From then on the filters stay mounted
+  // through every reload: swapping them for a loading card on each
+  // keystroke unmounted the search box and dropped its focus.
+  const [loaded, setLoaded] = useState(false)
+  const latest = useRef(0)
   const [search, setSearch] = useState("")
   const [roleFilter, setRoleFilter] = useState("")
   const [statusFilter, setStatusFilter] = useState("")
@@ -90,29 +93,19 @@ export default function AdminUsersPage() {
   const [deleteDialogUser, setDeleteDialogUser] = useState<AdminUser | null>(null)
 
   const load = useCallback(async () => {
+    const request = ++latest.current
     setLoading(true)
-    setStatus(null)
-    try {
-      const res = await authFetch(
-        `/api/v1/admin/users?limit=50&offset=${offset}` +
-        (search ? `&q=${encodeURIComponent(search)}` : "") +
-        (roleFilter ? `&role=${roleFilter}` : "") +
-        (statusFilter ? `&status=${statusFilter}` : ""),
-        { method: "GET" }
-      )
-      if (res.status === 401) { window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`; return }
-      if (res.status === 403) { setStatus(403); setLoading(false); return }
-      if (res.status === 429) {
-        setStatus(429)
-        setRetryAfter(parseInt(res.headers.get("Retry-After") || "", 10))
-        setLoading(false)
-        return
-      }
-      const json = await res.json()
-      setUsers(json.data || [])
-      setTotal(json.total || 0)
-    } catch {
-      toast.error("Failed to load users")
+    const r = await adminListUsers({ limit: 50, offset, q: search, role: roleFilter, status: statusFilter })
+    // Typing sends a read per keystroke; an older one answering late must not
+    // replace the newer one's rows.
+    if (request !== latest.current) return
+    if (r.ok) {
+      setUsers(r.data.data || [])
+      setTotal(r.data.total || 0)
+      setFailure(null)
+      setLoaded(true)
+    } else {
+      setFailure(r)
     }
     setLoading(false)
   }, [offset, search, roleFilter, statusFilter])
@@ -157,18 +150,14 @@ export default function AdminUsersPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="User management" />
       <AdminNav />
 
-      {loading ? (
-        <LoadingState />
-      ) : status === 403 ? (
-        <AccessDeniedState />
-      ) : status === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
+      {!loaded ? (
+        failure && !loading ? <AdminReadFailureState failure={failure} onRetry={load} /> : <LoadingState />
       ) : (
-        <Card className="p-4">
+        <Card className="p-4" aria-busy={loading}>
           <div className="flex flex-wrap items-center gap-3 mb-4">
             <div className="relative flex-1 min-w-[200px]">
               <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-zinc-400" />
@@ -204,87 +193,93 @@ export default function AdminUsersPage() {
             <Button variant="outline" onClick={load}>Refresh</Button>
           </div>
 
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Email</TableHead>
-                <TableHead>Role</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="hidden md:table-cell">Created</TableHead>
-                <TableHead className="hidden md:table-cell">Last Login</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-8">
-                    No users found
-                  </TableCell>
-                </TableRow>
-              ) : (
-                users.map((user) => (
-                  <TableRow key={user.id}>
-                    <TableCell className="font-medium">{user.name || "-"}</TableCell>
-                    <TableCell className="text-sm text-zinc-600 dark:text-zinc-400">{user.email}</TableCell>
-                    <TableCell>
-                      <Badge variant={roleBadgeVariant[user.role] || "outline"}>{user.role}</Badge>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={statusBadgeVariant[user.status] || "outline"}>{user.status}</Badge>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
-                      {formatDate(user.created_at)}
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
-                      {user.last_login ? formatDate(user.last_login) : "-"}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
-                            <MoreHorizontal className="h-4 w-4" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem onClick={() => { setRoleDialogUser(user); setNewRole(user.role) }}>
-                            Change Role
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => setStatusDialogUser(user)}>
-                            {user.status === "active" ? "Deactivate" : "Activate"}
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem className="text-red-600" onClick={() => setDeleteDialogUser(user)}>
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </TableCell>
+          {failure ? (
+            <AdminReadFailureState failure={failure} onRetry={load} />
+          ) : (
+            <>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Email</TableHead>
+                    <TableHead>Role</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead className="hidden @xl:table-cell">Created</TableHead>
+                    <TableHead className="hidden @xl:table-cell">Last Login</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
+                </TableHeader>
+                <TableBody>
+                  {users.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={7} className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-8">
+                        No users found
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    users.map((user) => (
+                      <TableRow key={user.id}>
+                        <TableCell className="font-medium">{user.name || "-"}</TableCell>
+                        <TableCell className="text-sm text-zinc-600 dark:text-zinc-400">{user.email}</TableCell>
+                        <TableCell>
+                          <Badge variant={roleBadgeVariant[user.role] || "outline"}>{user.role}</Badge>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant={statusBadgeVariant[user.status] || "outline"}>{user.status}</Badge>
+                        </TableCell>
+                        <TableCell className="hidden @xl:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                          {formatDate(user.created_at)}
+                        </TableCell>
+                        <TableCell className="hidden @xl:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                          {user.last_login ? formatDate(user.last_login) : "-"}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={() => { setRoleDialogUser(user); setNewRole(user.role) }}>
+                                Change Role
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => setStatusDialogUser(user)}>
+                                {user.status === "active" ? "Deactivate" : "Activate"}
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem className="text-red-600" onClick={() => setDeleteDialogUser(user)}>
+                                Delete
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  )}
+                </TableBody>
+              </Table>
 
-          {total > 50 && (
-            <div className="flex items-center justify-between mt-4 text-sm text-zinc-500 dark:text-zinc-400">
-              <span>Showing {offset + 1}-{Math.min(offset + 50, total)} of {total}</span>
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>
-                  Previous
-                </Button>
-                <Button variant="outline" size="sm" disabled={offset + 50 >= total} onClick={() => setOffset(offset + 50)}>
-                  Next
-                </Button>
-              </div>
-            </div>
+              {total > 50 && (
+                <div className="flex items-center justify-between mt-4 text-sm text-zinc-500 dark:text-zinc-400">
+                  <span>Showing {offset + 1}-{Math.min(offset + 50, total)} of {total}</span>
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>
+                      Previous
+                    </Button>
+                    <Button variant="outline" size="sm" disabled={offset + 50 >= total} onClick={() => setOffset(offset + 50)}>
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </Card>
       )}
 
       {/* Role Change Dialog */}
-      <Dialog open={!!roleDialogUser} onOpenChange={() => setRoleDialogUser(null)}>
+      <Dialog open={!!roleDialogUser} onOpenChange={() => setRoleDialogUser(null)} closeOnOutsideClick={false}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Change Role</DialogTitle>
@@ -293,7 +288,7 @@ export default function AdminUsersPage() {
             </DialogDescription>
           </DialogHeader>
           <Select value={newRole} onValueChange={setNewRole}>
-            <SelectTrigger>
+            <SelectTrigger aria-label="Role">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>

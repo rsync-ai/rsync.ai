@@ -43,7 +43,7 @@ only when you choose it, otherwise none — see
 
 The Explorer inherits `LLM_PROVIDER` unless `EXPLORER_LLM_PROVIDER` overrides it
 ([resolve_explorer_provider()](../../llm-service/src/utils/openai_client.py#L434), called by
-[main.py:859](../../llm-service/src/gateway/main.py#L859),
+[main.py:862](../../llm-service/src/gateway/main.py#L862),
 [explorer/api.py:79](../../llm-service/src/agents/explorer/api.py#L79) and
 [explorer/rank_tables.py:78](../../llm-service/src/agents/explorer/rank_tables.py#L78) — one rule,
 three entry points, no way for them to disagree).
@@ -101,7 +101,7 @@ Three lines are expected, one per entry point:
 
 | Log line | Emitted by | Covers |
 |---|---|---|
-| `explorer llm:` | [main.py:889](../../llm-service/src/gateway/main.py#L889) | Query-spec assembly, NL→SQL |
+| `explorer llm:` | [main.py:892](../../llm-service/src/gateway/main.py#L892) | Query-spec assembly, NL→SQL |
 | `explorer router llm:` | [explorer/api.py:91](../../llm-service/src/agents/explorer/api.py#L91) | Table linking, column linking, next steps |
 | `rank-tables llm:` | [explorer/rank_tables.py:86](../../llm-service/src/agents/explorer/rank_tables.py#L86) | Table recommendations during pipeline setup |
 
@@ -146,7 +146,7 @@ gives you a 404 `DeploymentNotFound` rather than a wrong-model answer.
 | `EXPLORER_NEXT_STEPS_MODEL` | `OLLAMA_MODEL` or `llama3:latest` | Follow-up suggestions |
 | `EXPLORER_SQL_MODEL` | `OLLAMA_MODEL` or `sqlcoder:latest` | NL→SQL |
 | `EXPLORER_SQL_MODEL_MYSQL` | same | NL→SQL on MySQL/MariaDB |
-| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct`; the bundled overlay pins it to the pulled model | Retry chain when SQL generation fails ([main.py:2810-2836](../../llm-service/src/gateway/main.py#L2810)) |
+| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct`; the bundled overlay pins it to the pulled model | Retry chain when SQL generation fails ([main.py:2813-2836](../../llm-service/src/gateway/main.py#L2813)) |
 | `RANK_TABLES_MODEL` | `OLLAMA_MODEL` or `llama3:latest` | Table recommendations during pipeline setup ([rank_tables_default_model()](../../llm-service/src/utils/openai_client.py#L517)) |
 
 `RANK_TABLES_MODEL` deliberately does **not** follow `LLM_MODEL` on OpenAI — ranking is a bulk
@@ -331,8 +331,8 @@ that has no delivery path in the compose file that ships it.
 
 The neighbouring service is worth knowing about for the same reason. tool-generator carries a
 hard-coded `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` in both
-[`docker-compose.yml:1585`](../../docker-compose.yml#L1585) and
-[`docker-compose.prod.yml:789`](../../docker-compose.prod.yml#L789) — no interpolation, so nothing
+[`docker-compose.yml:1598`](../../docker-compose.yml#L1597) and
+[`docker-compose.prod.yml:781`](../../docker-compose.prod.yml#L789) — no interpolation, so nothing
 you put in an env file changes it. `docker-compose.ollama.yml` overrides that key directly; point
 that service at a different Ollama and you have to override it directly too.
 
@@ -341,7 +341,7 @@ that service at a different Ollama and you have to override it directly too.
 ## GPU is effectively mandatory for the Explorer
 
 The api-gateway gives the Explorer's LLM step a **hard 30-second timeout**
-([explorer.go:3395](../../api-gateway/internal/handlers/explorer.go#L3395)); the Python clients
+([explorer.go:1440](../../api-gateway/internal/handlers/explorer.go#L1467)); the Python clients
 allow 45 s sync / 120 s async ([openai_client.py:560](../../llm-service/src/utils/openai_client.py#L560),
 [`:607`](../../llm-service/src/utils/openai_client.py#L607)). The gateway's 30 s is the binding
 constraint.
@@ -408,7 +408,7 @@ variable; earlier revisions of this doc invented both.
 | `EXPLORER_SQL_MODEL` | NL→SQL | `OLLAMA_MODEL` or `sqlcoder:latest` |
 | `EXPLORER_SQL_MODEL_MYSQL` | NL→SQL on MySQL/MariaDB | same |
 | `EXPLORER_SQL_FALLBACK_MODELS` | SQL retry chain; the bundled overlay pins it to the pulled model | `qwen2.5:7b,llama3:latest,codellama:7b-instruct` |
-| `EXPLORER_SQL_OPENAI_MODEL` | NL→SQL model, applied only when the SQL provider resolves to `openai` ([main.py:2684-2687](../../llm-service/src/gateway/main.py#L2684)) | `LLM_MODEL`, else the prompt-registry `model` (`gpt-4o`) |
+| `EXPLORER_SQL_OPENAI_MODEL` | NL→SQL model, applied only when the SQL provider resolves to `openai` ([main.py:2687-2687](../../llm-service/src/gateway/main.py#L2687)) | `LLM_MODEL`, else the prompt-registry `model` (`gpt-4o`) |
 | `RANK_TABLES_LLM_PROVIDER` | Provider for `/agents/rank-tables` only | inherits `EXPLORER_LLM_PROVIDER`, then `LLM_PROVIDER` |
 | `RANK_TABLES_MODEL` | Model for `/agents/rank-tables` | `OLLAMA_MODEL`, else `llama3:latest` (offline), `gpt-4o-mini` on OpenAI |
 | `OPENAI_API_KEY` | Present ⇒ auto-detect picks `openai` | unset |

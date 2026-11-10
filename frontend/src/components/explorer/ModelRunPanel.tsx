@@ -10,15 +10,22 @@ import Link from "next/link"
 import { toast } from "sonner"
 import { Check, Copy, ExternalLink, Loader2 } from "lucide-react"
 
-import { cn, formatRelativeTime } from "@/lib/utils"
+import { cn, formatRelativeTime, formatAbsoluteTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
 import { getJson } from "@/components/explorer/getJson"
-import { formatDuration, runStatusBadge } from "@/components/explorer/scheduledModel"
-import { describeRunOrigin, describeSkipReason } from "@/components/explorer/runProvenance"
+import { QualifiedName, describeWhatItDoes, runStatusBadge } from "@/components/explorer/scheduledModel"
+import { formatDurationOrDash } from "@/lib/duration"
+import { describeRunOrigin, describeSkipReason, runMessage } from "@/components/explorer/runProvenance"
 import { LiveStateCell, LiveStateDetail } from "@/components/explorer/ModelLiveState"
-import { AFTER_UPSTREAM, liveCellFor, type Fetched, type LiveCell, type RunningModelsResponse } from "@/components/explorer/liveState"
+import {
+  AFTER_UPSTREAM,
+  liveCellFor,
+  waitsForAll,
+  type Fetched,
+  type LiveCell,
+  type RunningModelsResponse,
+} from "@/components/explorer/liveState"
 import {
   isWaitingSkip,
   runDurationMs,
@@ -29,6 +36,8 @@ import {
   type NodeLookup,
 } from "@/components/explorer/modelLineage"
 import { parseSqlHistory, sqlForRun, type RunSql, type SqlHistory } from "@/components/explorer/modelRunSql"
+import { isCheckBlocked } from "@/components/explorer/modelChecks"
+import { CheckBlockedBadge, RunCheckResults } from "@/components/explorer/ModelCheckResults"
 
 /** Runs listed in the panel; the Runs tab has the rest. */
 export const PANEL_RUNS_LIMIT = 25
@@ -57,7 +66,7 @@ type SqlState =
 const RUN_DOT: Record<string, string> = {
   succeeded: "bg-emerald-500",
   failed: "bg-red-500",
-  skipped: "bg-amber-400",
+  skipped: "bg-zinc-300 dark:bg-zinc-600",
 }
 
 export function runDotClass(r: LineageRun): string {
@@ -67,9 +76,10 @@ export function runDotClass(r: LineageRun): string {
 
 function runHeadline(r: LineageRun): string {
   if (r.status === "skipped") return skipLabel(r)
+  if (isCheckBlocked(r)) return "Blocked by a data check"
   const took = runDurationMs(r)
   const status = r.status.charAt(0).toUpperCase() + r.status.slice(1)
-  return took === null ? status : `${status} in ${formatDuration(took)}`
+  return took === null ? status : `${status} in ${formatDurationOrDash(took)}`
 }
 
 function runKey(r: LineageRun, i: number): string {
@@ -164,7 +174,7 @@ function PipelineBody({ target }: { target: RunPanelTarget }) {
             {took !== null && (
               <>
                 <dt className="text-zinc-500 dark:text-zinc-400">Took</dt>
-                <dd>{formatDuration(took)}</dd>
+                <dd>{formatDurationOrDash(took)}</dd>
               </>
             )}
             {exec.error_message && (
@@ -212,19 +222,26 @@ function ModelBody({ target, running }: { target: RunPanelTarget; running: Fetch
     <>
       <PanelHeader target={target} openLabel="Open model" />
 
+      {schedule && (
+        <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 text-xs">
+          <dt className="text-zinc-500 dark:text-zinc-400">Does</dt>
+          <dd>{describeWhatItDoes(schedule)}</dd>
+        </dl>
+      )}
+
       <section className="space-y-1">
         <h3 className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Now</h3>
         {liveRelevant ? (
           <>
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              <LiveStateCell cell={cell} />
+              <LiveStateCell cell={cell} waitsForAll={waitsForAll(schedule?.upstream_policy, schedule?.upstreams)} />
               {live && selection?.kind !== "now" && (
                 <Button size="sm" variant="outline" className="h-6 px-2 text-xs" onClick={() => setSelection({ kind: "now" })}>
                   Show its SQL
                 </Button>
               )}
             </div>
-            <LiveStateDetail cell={cell} upstreams={schedule?.upstreams} />
+            <LiveStateDetail cell={cell} upstreams={schedule?.upstreams} upstreamPolicy={schedule?.upstream_policy} />
           </>
         ) : (
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
@@ -272,7 +289,7 @@ function ModelBody({ target, running }: { target: RunPanelTarget; running: Fetch
         )}
       </section>
 
-      {selectedRun && <RunDetail run={selectedRun} />}
+      {selectedRun && <RunDetail run={selectedRun} modelId={node.id} />}
 
       <SqlSection
         // Keyed so "Show current SQL" is not carried over to the next run picked.
@@ -286,49 +303,68 @@ function ModelBody({ target, running }: { target: RunPanelTarget; running: Fetch
   )
 }
 
-function RunDetail({ run }: { run: LineageRun }) {
+function RunDetail({ run, modelId }: { run: LineageRun; modelId: string }) {
   const took = runDurationMs(run)
   const skip = describeSkipReason(run)
+  const message = runMessage(run)
+  const blocked = isCheckBlocked(run)
   return (
-    <section className="space-y-1">
-      <h3 className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">This run</h3>
-      <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1 text-xs">
-        <dt className="text-zinc-500 dark:text-zinc-400">Status</dt>
-        <dd>{runStatusBadge(run.status)}</dd>
-        {run.started_at && (
-          <>
-            <dt className="text-zinc-500 dark:text-zinc-400">Started</dt>
-            <dd>{formatAbsoluteTime(run.started_at)}</dd>
-          </>
-        )}
-        {took !== null && (
-          <>
-            <dt className="text-zinc-500 dark:text-zinc-400">Took</dt>
-            <dd>{formatDuration(took)}</dd>
-          </>
-        )}
-        <dt className="text-zinc-500 dark:text-zinc-400">Trigger</dt>
-        <dd>{describeRunOrigin({ ...run, trigger_source: run.trigger_source ?? "" }) || "—"}</dd>
-        {skip && (
-          <>
-            <dt className="text-zinc-500 dark:text-zinc-400">Skipped</dt>
-            <dd>{skip}</dd>
-          </>
-        )}
-        {typeof run.rows_affected === "number" && (
-          <>
-            <dt className="text-zinc-500 dark:text-zinc-400">Rows</dt>
-            <dd>{run.rows_affected.toLocaleString()}</dd>
-          </>
-        )}
-        {run.error && (
-          <>
-            <dt className="text-zinc-500 dark:text-zinc-400">Error</dt>
-            <dd className="break-words text-red-600 dark:text-red-400">{run.error}</dd>
-          </>
-        )}
-      </dl>
-    </section>
+    <>
+      <section className="space-y-1">
+        <h3 className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">This run</h3>
+        <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1 text-xs">
+          <dt className="text-zinc-500 dark:text-zinc-400">Status</dt>
+          <dd className="flex flex-wrap items-center gap-1">
+            {runStatusBadge(run.status)}
+            {blocked && <CheckBlockedBadge />}
+          </dd>
+          {run.started_at && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">Started</dt>
+              <dd>{formatAbsoluteTime(run.started_at)}</dd>
+            </>
+          )}
+          {took !== null && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">Took</dt>
+              <dd>{formatDurationOrDash(took)}</dd>
+            </>
+          )}
+          <dt className="text-zinc-500 dark:text-zinc-400">Trigger</dt>
+          <dd>{describeRunOrigin({ ...run, trigger_source: run.trigger_source ?? "" }) || "—"}</dd>
+          {skip && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">Skipped</dt>
+              <dd>{skip}</dd>
+            </>
+          )}
+          {run.status === "succeeded" && run.target_table && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">Wrote</dt>
+              <dd>
+                <QualifiedName name={run.target_table} />
+              </dd>
+            </>
+          )}
+          {typeof run.rows_affected === "number" && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">Rows</dt>
+              <dd>{run.rows_affected.toLocaleString()}</dd>
+            </>
+          )}
+          {/* A skip's message explains a decision, not a failure, as on the model's Runs tab. */}
+          {message && (
+            <>
+              <dt className="text-zinc-500 dark:text-zinc-400">{skip ? "Details" : "Error"}</dt>
+              <dd className={`break-words ${skip ? "text-zinc-600 dark:text-zinc-300" : "text-red-600 dark:text-red-400"}`}>
+                {message}
+              </dd>
+            </>
+          )}
+        </dl>
+      </section>
+      {run.run_id && <RunCheckResults modelId={modelId} runId={run.run_id} blocked={blocked} />}
+    </>
   )
 }
 
@@ -391,7 +427,7 @@ function SqlSection({
       heading = "Current SQL"
       sql = state.history.current.sql_text
       if (label === "now" && !startedAt && !showCurrent) {
-        note = "The refresh loop did not say when this rebuild started, so this is the model's SQL as it is now."
+        note = "It did not say when this rebuild started, so this is the model's SQL as it is now."
       }
     } else if (resolved.kind === "unknown") {
       heading = "Current SQL"

@@ -45,6 +45,23 @@ package workers
 //
 // Sibling census, same invariant, other service:
 // backend-temporal-adapter/internal/workflows/stage_completed_status_test.go
+//
+// STAGE_FAILED is held to the same rule (TestStageFailedNeverClaimsRunTerminalStatus).
+// A worker's failed task is not a failed run: the temporal-adapter decides what
+// happens next — park the run in the connection-fix wait, replan, or retry the
+// activity — and writes the run-terminal status itself when it gives up
+// (UpdatePipelineStatusActivity, deferred in nl_pipeline_v2_workflow.go). On
+// prod 2026-10-05, execution 3ba9c192 (the #1405 deploy check) emitted
+//
+//	STAGE_FAILED     | executor | failed           | 09:28:16.916  <- this bug
+//	PIPELINE_WAITING |          | waiting_for_user |   ~40-180 ms later
+//
+// so pipeline_progress.status read "failed" for a run that was waiting for a
+// setting and later completed — post-deploy regression check 2a. The stage
+// itself still reads failed: the stage state comes from the event type
+// (progress_events.go stateForEventType: STAGE_FAILED -> "failed"), not from
+// Status. infra_preflight.go's emitProgress already sent "processing" for its
+// STAGE_FAILED; the executor and intent workers sent "failed".
 
 import (
 	"go/ast"
@@ -76,6 +93,22 @@ var nonTerminalEventStatus = map[string]bool{
 }
 
 func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
+	assertStageEventStatusNonTerminal(t, "STAGE_COMPLETED",
+		"Use \"processing\" like the other STAGE_COMPLETED sites, and let PIPELINE_COMPLETED\n"+
+			"    carry the terminal status.")
+}
+
+func TestStageFailedNeverClaimsRunTerminalStatus(t *testing.T) {
+	assertStageEventStatusNonTerminal(t, "STAGE_FAILED",
+		"A failed task is not a failed run: the workflow may still repair, replan or retry,\n"+
+			"    and writes \"failed\" itself when it gives up. Use \"processing\"; the stage still\n"+
+			"    reads failed (stateForEventType derives it from the event type).")
+}
+
+// assertStageEventStatusNonTerminal checks every `EventType: <eventType>`
+// composite literal in this package publishes a non-terminal Status.
+func assertStageEventStatusNonTerminal(t *testing.T, eventType, remedy string) {
+	t.Helper()
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
@@ -84,14 +117,14 @@ func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
 		t.Fatalf("parse workers package: %v", err)
 	}
 
-	found := 0    // STAGE_COMPLETED composite literals anywhere in the package
+	found := 0    // eventType composite literals anywhere in the package
 	asserted := 0 // ...of those, the ones this test reached a verdict on
 
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			// Pass 1: count every site, including any outside a function body.
 			ast.Inspect(file, func(n ast.Node) bool {
-				if cl, ok := n.(*ast.CompositeLit); ok && isStageCompletedLit(cl) {
+				if cl, ok := n.(*ast.CompositeLit); ok && isStageEventLit(cl, eventType) {
 					found++
 				}
 				return true
@@ -107,7 +140,7 @@ func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
 
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
 					cl, ok := n.(*ast.CompositeLit)
-					if !ok || !isStageCompletedLit(cl) {
+					if !ok || !isStageEventLit(cl, eventType) {
 						return true
 					}
 					asserted++
@@ -115,18 +148,18 @@ func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
 
 					expr := fieldValueOf(cl, "Status")
 					if expr == nil {
-						t.Errorf("%s: STAGE_COMPLETED has no Status field — the zero "+
-							"value \"\" is published as the pipeline status.", pos)
+						t.Errorf("%s: %s has no Status field — the zero "+
+							"value \"\" is published as the pipeline status.", pos, eventType)
 						return true
 					}
 
 					statuses, ok := resolveStringValues(expr, assigns)
 					if !ok {
-						t.Errorf("%s: STAGE_COMPLETED Status is an expression this census "+
+						t.Errorf("%s: %s Status is an expression this census "+
 							"cannot resolve (%T). Use a string literal, or a local variable "+
 							"assigned only string literals — an unreadable site is an "+
 							"unguarded one, which is how this same bug survived in the "+
-							"temporal-adapter.", pos, expr)
+							"temporal-adapter.", pos, eventType, expr)
 						return true
 					}
 					for _, status := range statuses {
@@ -134,12 +167,11 @@ func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
 							continue
 						}
 						t.Errorf(
-							"%s: STAGE_COMPLETED publishes Status:%q, which is run-terminal.\n"+
+							"%s: %s publishes Status:%q, which is run-terminal.\n"+
 								"    ProgressEvent.Status is the PIPELINE status and the projector writes it\n"+
 								"    verbatim into pipeline_progress.status (event_projector.go:320), so this\n"+
-								"    marks the whole run finished mid-flight. Use \"processing\" like the other\n"+
-								"    STAGE_COMPLETED sites, and let PIPELINE_COMPLETED carry the terminal status.",
-							pos, status)
+								"    marks the whole run finished mid-flight. %s",
+							pos, eventType, status, remedy)
 					}
 					return true
 				})
@@ -151,25 +183,25 @@ func TestStageCompletedNeverClaimsRunTerminalStatus(t *testing.T) {
 	// (renamed field, changed literal), this test would go green while
 	// asserting nothing.
 	if found == 0 {
-		t.Fatal("census matched no STAGE_COMPLETED emit sites — the scan is broken, not the code")
+		t.Fatalf("census matched no %s emit sites — the scan is broken, not the code", eventType)
 	}
 	// And against a partially-passing one, which is worse: it looks exhaustive.
 	if asserted != found {
-		t.Fatalf("found %d STAGE_COMPLETED sites but reached a verdict on only %d — "+
+		t.Fatalf("found %d %s sites but reached a verdict on only %d — "+
 			"%d site(s) sit outside any function body and went unchecked",
-			found, asserted, found-asserted)
+			found, eventType, asserted, found-asserted)
 	}
-	t.Logf("checked %d STAGE_COMPLETED site(s)", asserted)
+	t.Logf("checked %d %s site(s)", asserted, eventType)
 }
 
-// isStageCompletedLit reports whether cl has EventType: "STAGE_COMPLETED".
-func isStageCompletedLit(cl *ast.CompositeLit) bool {
+// isStageEventLit reports whether cl has the string literal EventType: eventType.
+func isStageEventLit(cl *ast.CompositeLit, eventType string) bool {
 	lit, ok := fieldValueOf(cl, "EventType").(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
 		return false
 	}
 	v, err := strconv.Unquote(lit.Value)
-	return err == nil && v == "STAGE_COMPLETED"
+	return err == nil && v == eventType
 }
 
 // fieldValueOf returns the value expression of the named keyed field, or nil.

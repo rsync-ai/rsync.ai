@@ -1,3 +1,6 @@
+import { readFileSync, readdirSync } from "node:fs"
+import { join } from "node:path"
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 // instrumentation.ts re-exports Sentry's request hook and register() loads the
@@ -10,23 +13,21 @@ import { frontendStartupProblems, register } from "@/instrumentation"
 import { GET as healthGET } from "@/app/api/health/route"
 
 const GATEWAY_URL_VALUE = "http://unit-test-gateway.internal:8080"
-const ORCHESTRATOR_URL_VALUE = "http://unit-test-orchestrator.internal:8080"
 const SECRET_VALUE = "unit-test-internal-secret-frontend-startup"
 
-const SETTINGS = ["API_GATEWAY_INTERNAL_URL", "ORCHESTRATOR_INTERNAL_URL", "INTERNAL_SERVICE_SECRET"] as const
+const SETTINGS = ["API_GATEWAY_INTERNAL_URL", "INTERNAL_SERVICE_SECRET"] as const
 
 function productionEnv(overrides: Record<string, string | undefined> = {}) {
   return {
     NODE_ENV: "production",
     API_GATEWAY_INTERNAL_URL: GATEWAY_URL_VALUE,
-    ORCHESTRATOR_INTERNAL_URL: ORCHESTRATOR_URL_VALUE,
     INTERNAL_SERVICE_SECRET: SECRET_VALUE,
     ...overrides,
   }
 }
 
 function expectNoValueLeak(text: string) {
-  for (const value of [GATEWAY_URL_VALUE, ORCHESTRATOR_URL_VALUE, SECRET_VALUE]) {
+  for (const value of [GATEWAY_URL_VALUE, SECRET_VALUE]) {
     expect(text).not.toContain(value)
   }
 }
@@ -38,12 +39,8 @@ describe("frontendStartupProblems", () => {
         consequence: ["http://localhost:5001", "explorer queries", "only works when the gateway runs on the same host"],
         remediation: ["Set it to the gateway's in-network address, for example http://api-gateway:8080."],
       },
-      ORCHESTRATOR_INTERNAL_URL: {
-        consequence: ["http://localhost:8081", "pipeline statistics", "only works when the orchestrator runs on the same host"],
-        remediation: ["Set it to the orchestrator's in-network address, for example http://orchestrator:8080."],
-      },
       INTERNAL_SERVICE_SECRET: {
-        consequence: ["pipeline statistics", "ENVIRONMENT=production"],
+        consequence: ["refuses api-gateway's requests", "chart step fails", "goes without its PDF"],
         remediation: [
           "same INTERNAL_SERVICE_SECRET as api-gateway, orchestrator and temporal-adapter",
           "openssl rand -hex 32",
@@ -82,8 +79,8 @@ describe("frontendStartupProblems", () => {
   })
 
   it("is quiet outside production, where the localhost defaults are intended (control)", () => {
-    // Same missing settings that produce three problems under production.
-    expect(frontendStartupProblems({ NODE_ENV: "production" })).toHaveLength(3)
+    // Same missing settings that produce two problems under production.
+    expect(frontendStartupProblems({ NODE_ENV: "production" })).toHaveLength(2)
     expect(frontendStartupProblems({ NODE_ENV: "development" })).toEqual([])
     expect(frontendStartupProblems({ NODE_ENV: "test" })).toEqual([])
     expect(frontendStartupProblems({})).toEqual([])
@@ -122,7 +119,7 @@ describe("register() startup log", () => {
   })
 
   it("logs each problem's full message, so the log says what breaks and what to do", async () => {
-    const env = productionEnv({ NEXT_RUNTIME: "nodejs", API_GATEWAY_INTERNAL_URL: "", ORCHESTRATOR_INTERNAL_URL: "" })
+    const env = productionEnv({ NEXT_RUNTIME: "nodejs", API_GATEWAY_INTERNAL_URL: "", INTERNAL_SERVICE_SECRET: "" })
     const expected = frontendStartupProblems(env).map((p) => `Startup check: ${p.message}`)
     expect(expected).toHaveLength(2)
     stubEnv(env as Record<string, string>)
@@ -140,7 +137,7 @@ describe("register() startup log", () => {
   })
 
   it("does not run the check in the edge runtime, which has no server settings", async () => {
-    stubEnv({ NODE_ENV: "production", NEXT_RUNTIME: "edge", API_GATEWAY_INTERNAL_URL: "", ORCHESTRATOR_INTERNAL_URL: "", INTERNAL_SERVICE_SECRET: "" })
+    stubEnv({ NODE_ENV: "production", NEXT_RUNTIME: "edge", API_GATEWAY_INTERNAL_URL: "", INTERNAL_SERVICE_SECRET: "" })
     await register()
     expect(startupLines()).toEqual([])
   })
@@ -168,7 +165,6 @@ describe("/api/health missingSettings", () => {
   it("lists missing setting names but never the secret or any value", async () => {
     vi.stubEnv("NODE_ENV", "production")
     vi.stubEnv("API_GATEWAY_INTERNAL_URL", "")
-    vi.stubEnv("ORCHESTRATOR_INTERNAL_URL", ORCHESTRATOR_URL_VALUE)
     vi.stubEnv("INTERNAL_SERVICE_SECRET", "")
     const { status, body, text } = await environmentCheck()
     expect(body.checks.environment.missingSettings).toEqual(["API_GATEWAY_INTERNAL_URL"])
@@ -182,7 +178,6 @@ describe("/api/health missingSettings", () => {
   it("lists nothing when every setting is present (control)", async () => {
     vi.stubEnv("NODE_ENV", "production")
     vi.stubEnv("API_GATEWAY_INTERNAL_URL", GATEWAY_URL_VALUE)
-    vi.stubEnv("ORCHESTRATOR_INTERNAL_URL", ORCHESTRATOR_URL_VALUE)
     vi.stubEnv("INTERNAL_SERVICE_SECRET", SECRET_VALUE)
     const { body } = await environmentCheck()
     expect(body.checks.environment.missingSettings).toEqual([])
@@ -191,31 +186,56 @@ describe("/api/health missingSettings", () => {
   function stubAllMissing(nodeEnv: string) {
     vi.stubEnv("NODE_ENV", nodeEnv)
     vi.stubEnv("API_GATEWAY_INTERNAL_URL", "")
-    vi.stubEnv("ORCHESTRATOR_INTERNAL_URL", "")
     vi.stubEnv("INTERNAL_SERVICE_SECRET", "")
   }
 
-  it("lists a missing ORCHESTRATOR_INTERNAL_URL", async () => {
+  it("does not ask for ORCHESTRATOR_INTERNAL_URL, which the frontend no longer reads", async () => {
     vi.stubEnv("NODE_ENV", "production")
     vi.stubEnv("API_GATEWAY_INTERNAL_URL", GATEWAY_URL_VALUE)
     vi.stubEnv("ORCHESTRATOR_INTERNAL_URL", "")
     vi.stubEnv("INTERNAL_SERVICE_SECRET", SECRET_VALUE)
     const { body, text } = await environmentCheck()
-    expect(body.checks.environment.missingSettings).toEqual(["ORCHESTRATOR_INTERNAL_URL"])
-    expectNoValueLeak(text)
+    expect(body.checks.environment.missingSettings).toEqual([])
+    expect(text).not.toContain("ORCHESTRATOR_INTERNAL_URL")
   })
 
   it("lists nothing outside production, where the localhost defaults are intended", async () => {
     // Control: the same missing settings are listed on a production server.
     stubAllMissing("production")
-    expect((await environmentCheck()).body.checks.environment.missingSettings).toEqual([
-      "API_GATEWAY_INTERNAL_URL",
-      "ORCHESTRATOR_INTERNAL_URL",
-    ])
+    expect((await environmentCheck()).body.checks.environment.missingSettings).toEqual(["API_GATEWAY_INTERNAL_URL"])
     for (const nodeEnv of ["development", "test"]) {
       vi.unstubAllEnvs()
       stubAllMissing(nodeEnv)
       expect((await environmentCheck()).body.checks.environment.missingSettings).toEqual([])
     }
+  })
+})
+
+// A setting the check names must still be read by the frontend: otherwise the
+// startup log and /api/health ask the operator for something that changes
+// nothing. ORCHESTRATOR_INTERNAL_URL stayed checked after its only reader went
+// (#1210, 2026-09-25), so every compose file kept setting it.
+describe("every setting the check names", () => {
+  const FRONTEND = process.cwd()
+  const CHECK = "src/instrumentation.ts"
+
+  function sources(dir: string): string[] {
+    return readdirSync(join(FRONTEND, dir), { withFileTypes: true }).flatMap((entry) => {
+      const path = `${dir}/${entry.name}`
+      if (entry.isDirectory()) return entry.name === "__tests__" ? [] : sources(path)
+      return /\.(ts|tsx|mjs|js)$/.test(entry.name) && path !== CHECK ? [path] : []
+    })
+  }
+
+  it("is read by the frontend outside the check", () => {
+    const checked = [...readFileSync(join(FRONTEND, CHECK), "utf8").matchAll(/\bunset\("([A-Z0-9_]+)"\)/g)].map((m) => m[1])
+    expect(checked).toEqual([...SETTINGS])
+    const files = [...sources("src"), ...readdirSync(FRONTEND).filter((f) => /^(next|sentry\.[a-z]+)\.config\.(ts|mjs|js)$/.test(f))]
+    expect(files.length).toBeGreaterThan(100)
+    const code = files.map((f) => readFileSync(join(FRONTEND, f), "utf8"))
+    const unread = checked.filter(
+      (name) => !code.some((text) => new RegExp(`process\\.env(\\.${name}\\b|\\[["']${name}["']\\])`).test(text)),
+    )
+    expect(unread, "checked at startup, but nothing in the frontend reads it").toEqual([])
   })
 })

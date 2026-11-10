@@ -108,3 +108,53 @@ func exactJSONInt(v interface{}) (int64, bool) {
 	}
 	return int64(f), true
 }
+
+// sourceHasMore reports that the connector says rows follow this page, at the
+// top level or under `stats`. A REST connector reads a bounded number of pages
+// (and seconds) per export call, so its batch comes back SHORT while the table
+// goes on; read as end-of-table, a 1,250-row ClickUp list stopped at 1,000 and
+// the run reported completed. Database connectors set it only on a full batch,
+// which never ends the table anyway.
+func sourceHasMore(res map[string]interface{}) bool {
+	if v, ok := res["has_more"].(bool); ok && v {
+		return true
+	}
+	if st, ok := res["stats"].(map[string]interface{}); ok {
+		if v, ok := st["has_more"].(bool); ok && v {
+			return true
+		}
+	}
+	return false
+}
+
+// pageEndsTable: a short page ends the table unless the connector says more
+// rows follow.
+func pageEndsTable(sourceRows, batchSize int, moreFollows bool) bool {
+	return sourceRows < batchSize && !moreFollows
+}
+
+// sourceWarnings is the connector's own account of rows it may have left
+// unread without failing (`warnings`: paging its spec does not document, a
+// "more rows" flag with no cursor). Non-string entries are dropped.
+func sourceWarnings(res map[string]interface{}) []string {
+	raw, _ := res["warnings"].([]interface{})
+	var out []string
+	for _, w := range raw {
+		if s, ok := w.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
+// addSourceWarning records a warning once per table; it reports whether the
+// warning is new (a connector repeats the same one on every export call).
+func addSourceWarning(byTable map[string][]string, table, warning string) bool {
+	for _, prev := range byTable[table] {
+		if prev == warning {
+			return false
+		}
+	}
+	byTable[table] = append(byTable[table], warning)
+	return true
+}

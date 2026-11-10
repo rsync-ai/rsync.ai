@@ -184,6 +184,7 @@ func TestGetPipelineTransforms_MemberAllowed(t *testing.T) {
 			"id", "pipeline_id", "transform_type", "transform_order",
 			"transform_config", "enabled", "created_at", "updated_at",
 		}))
+	mock.ExpectQuery(sourceShapeRe).WithArgs(idorPipelineID).WillReturnRows(sourceShapeRows("postgresql", false))
 
 	r := wsScopeRouter(http.MethodGet, "/api/v1/transforms/pipeline/:pipeline_id", h.GetPipelineTransforms)
 	w := httptest.NewRecorder()

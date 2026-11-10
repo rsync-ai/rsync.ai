@@ -5,7 +5,7 @@ E2E: SQL Server (Azure SQL) -> Postgres CDC via the PRODUCT pipeline API.
 Env-GATED: skips cleanly unless SS_LIVE_HOST is set, because SQL Server CDC needs a
 real SQL Server / Azure SQL instance with the SQL Agent (or Azure's internal CDC
 scheduler) — there is no local SQL Server in the e2e stack. Mirrors the model used
-by api-gateway/internal/handlers/explorer_sqlserver_live_test.go (skip w/o SS_LIVE_HOST).
+by shared/go/sqlexec/sqlserver_live_test.go (skip w/o SS_LIVE_HOST).
 
 When SS_LIVE_HOST is set it drives the real product path against the running stack:
   POST /connections (sqlserver source + postgres dest) -> POST /pipelines (cdc) -> /run

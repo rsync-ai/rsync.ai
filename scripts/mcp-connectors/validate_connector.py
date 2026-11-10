@@ -69,7 +69,7 @@ def _find_connector(name: str) -> Optional[Path]:
 # AUTHORITY: shared/mcp-connectors/tests/test_tool_surface_conformance.py — this copy is
 # pinned to it by tests/test_validate_connector_script_finds_connectors.py, which fails if
 # the two sets drift.
-NON_SUBCLASS_CONNECTORS = {"debezium", "minio", "sample-data"}
+NON_SUBCLASS_CONNECTORS = {"debezium", "minio", "nse-india", "sample-data"}
 
 
 class ConnectorValidator:

@@ -41,7 +41,7 @@ const (
 	pgHealPipelineID  = "bbbbbbbb-0000-4000-8000-000000000003"
 	// Deliberately NOT a UUID, and deliberately carried on a row whose
 	// component_type IS 'cdc_pipeline'. This is not a hypothetical: the WAL
-	// watchdog writes exactly this shape — cdc_wal_watchdog.go:305-307 falls back
+	// watchdog writes exactly this shape — cdc_wal_watchdog.go:572-576 falls back
 	// to the replication slot name when the slot has no pipeline attached — so
 	// filtering on component_type is not enough to make `component_id::uuid` safe.
 	pgHealOrphanSlotComponentID = "rsync_slot_orphan_probe"

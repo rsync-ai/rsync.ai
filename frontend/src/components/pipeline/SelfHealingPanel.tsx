@@ -51,7 +51,7 @@ import {
   type HealerActivity,
   type PipelineRunEvent,
 } from "@/lib/pipeline/eventNormalizer"
-import { formatAbsoluteTime } from "@/lib/utils"
+import { formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
 
 /** Matches the healer's own PollInterval; there is nothing faster to see. */
 const POLL_MS = 60_000
@@ -107,16 +107,6 @@ const VERDICT_LABELS: Record<string, string> = {
 function label(map: Record<string, string>, key?: string): string {
   if (!key) return "—"
   return map[key] || key.replace(/_/g, " ")
-}
-
-function timeAgo(iso: string): string {
-  const t = new Date(iso).getTime()
-  if (!Number.isFinite(t)) return ""
-  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000))
-  if (secs < 60) return `${secs}s ago`
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`
-  return `${Math.floor(secs / 86400)}d ago`
 }
 
 /**
@@ -228,7 +218,7 @@ function ActivityRow({ a }: { a: HealerActivity }) {
             {a.kind === "decision" && typeof a.confidence === "number" && (
               <span className={`text-xs ${band.cls}`}>{band.text}</span>
             )}
-            <span className="text-xs text-gray-400 dark:text-gray-500">{timeAgo(a.timestamp)}</span>
+            <span className="text-xs text-gray-400 dark:text-gray-500">{formatRelativeTime(a.timestamp, { seconds: true, empty: "" })}</span>
           </div>
 
           {a.rationale && (

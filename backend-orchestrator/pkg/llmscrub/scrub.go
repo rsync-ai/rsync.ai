@@ -24,7 +24,7 @@ const redacted = "[redacted]"
 
 // redactionMarkers are every token Scrub can leave behind. Kept next to the
 // substitutions that emit them so ContainsRedaction cannot fall out of step.
-var redactionMarkers = []string{redacted, "[num-redacted]", "[email-redacted]", "[ip-redacted]"}
+var redactionMarkers = []string{redacted, "[num-redacted]", "[email-redacted]", "[ip-redacted]", "[host-redacted]"}
 
 // ContainsRedaction reports whether s carries a marker this package writes.
 //
@@ -55,8 +55,9 @@ var (
 	// Column names (group 1) are schema metadata and kept; values are masked.
 	// One nesting level of parentheses inside the value is tolerated.
 	reKeyDetail = regexp.MustCompile(`(?i)(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)`)
-	// Credentials embedded in URLs: scheme://user:pass@host
-	reURLCred = regexp.MustCompile(`(\w+://)[^/\s:@]+:[^/\s@]*@`)
+	// Credentials embedded in URLs: scheme://user:pass@host. The user name may
+	// be empty (redis://:pass@host); requiring one left that password in clear.
+	reURLCred = regexp.MustCompile(`(\w+://)[^/\s:@]*:[^/\s@]*@`)
 	// HTTP credential headers: "Authorization: Bearer <token>". Must run before
 	// reKVSensitive, whose \S+ would otherwise consume only the word "Bearer"
 	// and leave the token itself in the text.
@@ -118,7 +119,11 @@ var (
 	// just written and appended another `'[redacted]` to it, corrupting text that
 	// was already correctly redacted (and eating the diagnostic tail after it).
 	// Replacements are not rescanned, so one pass cannot do that to itself.
-	reQuotedLiteral = regexp.MustCompile(`(?s)(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|$)`)
+	//
+	// `\\?$`: a cut can also land right after a backslash ('john\\), where
+	// `\\.` has nothing left to pair with; without it the literal matched
+	// nowhere and went through whole.
+	reQuotedLiteral = regexp.MustCompile(`(?s)(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\\?$)`)
 	// Email addresses appearing outside quotes.
 	reEmail = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
 	// IPv4 addresses — client/host IPs are personal data under GDPR and are not
@@ -126,8 +131,30 @@ var (
 	// (8.0.32) and ISO dates don't match; a 4-part dotted-quad is an accepted
 	// loss. MUST stay lockstep with Python masking._SCRUB_PATTERNS.
 	reIPv4 = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b`)
+	// A host name, in the places error text puts one: `lookup X`, `dial tcp X`,
+	// libpq's `host name "X"`, `host "X"` and `server at "X"`. A bare dotted name
+	// has the same shape as schema.table, which a diagnosis needs, so the name is
+	// taken only after one of these words, and only when it has a dot: `lookup
+	// postgres` (a compose service) and the prose `lookup failed:` stay. `_` is
+	// allowed for SRV names (_mongodb._tcp.cluster0…). Runs after reIPv4, so an
+	// address is already [ip-redacted] and is not matched here.
+	reHostInErrorText = regexp.MustCompile(`(?i)(\blookup\s+|\bdial\s+(?:tcp|udp)[46]?\s+|\bhost(?:\s+name)?\s+"|\bserver\s+at\s+")[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+`)
 	// Long base64-ish blobs (tokens, keys). 40+ chars keeps 32-hex trace ids.
 	reBase64 = regexp.MustCompile(`\b[A-Za-z0-9+/]{40,}={0,2}\b`)
+	// A URL, or else a long base64-ish blob (reBase64). Read as one blob, a
+	// long URL path became `…HubSpot-public-api-spec-[redacted].json`, while a
+	// key in a short query value went through untouched. A URL goes to
+	// scrubURL instead. The scheme is capped at 32 characters so a long dotted
+	// run cannot make Python's backtracking engine quadratic.
+	reURLOrBase64 = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s'"<>]+)|\b[A-Za-z0-9+/]{40,}={0,2}\b`)
+	// Inside a URL path: a 40+ blob with no `/` (the path's own slashes are
+	// not part of a token), and any 20+ run of letters AND digits
+	// (redactMixedToken): a sheet id, a webhook secret, a bot token.
+	reURLPathBlob = regexp.MustCompile(`[A-Za-z0-9+]{40,}={0,2}`)
+	reURLToken    = regexp.MustCompile(`[A-Za-z0-9_\-]{20,}`)
+	// The value of a credential-named query or fragment parameter: ?key=,
+	// &X-Amz-Signature=, &X-Amz-Credential=, ?code=, #access_token=.
+	reURLQueryCred = regexp.MustCompile(`(?i)([?&;#][A-Za-z0-9_.\-]*(?:key|sig|signature|secret|token|password|passwd|pwd|auth|credential|code)=)[^&#\s'"<>]*`)
 	// Dashed SSN / US-phone shapes (ISO dates \d{4}-\d{2}-\d{2} don't match —
 	// timestamps must survive for diagnosis).
 	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
@@ -157,11 +184,57 @@ func Scrub(s string) string {
 	s = reQuotedLiteral.ReplaceAllString(s, "${1}'"+redacted+"'")
 	s = reEmail.ReplaceAllString(s, "[email-redacted]")
 	s = reIPv4.ReplaceAllString(s, "[ip-redacted]")
-	s = reBase64.ReplaceAllString(s, redacted)
+	s = reHostInErrorText.ReplaceAllString(s, "${1}[host-redacted]")
+	s = reURLOrBase64.ReplaceAllStringFunc(s, scrubURLOrBlob)
 	s = reSSN.ReplaceAllString(s, "[num-redacted]")
 	s = rePhone.ReplaceAllString(s, "[num-redacted]")
 	s = reLongDigits.ReplaceAllString(s, "[num-redacted]")
 	return s
+}
+
+// scrubURLOrBlob takes one reURLOrBase64 match. Only the URL branch can
+// contain "://" (the blob branch has no colon).
+func scrubURLOrBlob(m string) string {
+	if !strings.Contains(m, "://") {
+		return redacted
+	}
+	return scrubURL(m)
+}
+
+// scrubURL keeps a URL readable and takes what in it can be a secret: a
+// blob in scheme://authority, token-shaped path segments, and credential
+// query parameters and blobs in the query or fragment. Userinfo was already
+// taken by reURLCred.
+func scrubURL(u string) string {
+	start := strings.Index(u, "://") + 3
+	end := len(u)
+	if i := strings.IndexAny(u[start:], "/?#"); i >= 0 {
+		end = start + i
+	}
+	head, path, query := u[:end], u[end:], ""
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path, query = path[:i], path[i:]
+	}
+	head = reBase64.ReplaceAllString(head, redacted)
+	path = reURLPathBlob.ReplaceAllString(path, redacted)
+	path = reURLToken.ReplaceAllStringFunc(path, redactMixedToken)
+	query = reURLQueryCred.ReplaceAllString(query, "${1}"+redacted)
+	query = reBase64.ReplaceAllString(query, redacted)
+	query = reURLToken.ReplaceAllStringFunc(query, redactMixedToken)
+	return head + path + query
+}
+
+// redactMixedToken redacts a reURLToken run that holds a letter and a digit.
+// A word run like HubSpot-public-api-spec-collection has no digit and stays.
+func redactMixedToken(t string) string {
+	if strings.ContainsAny(t, "0123456789") && strings.IndexFunc(t, isASCIILetter) >= 0 {
+		return redacted
+	}
+	return t
+}
+
+func isASCIILetter(r rune) bool {
+	return ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z')
 }
 
 // ScrubMax scrubs and then truncates to at most max runes (0 or negative

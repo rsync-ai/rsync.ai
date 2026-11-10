@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 
+	"api-gateway/internal/config"
 	db "api-gateway/internal/db"
 	"api-gateway/internal/security"
 )
@@ -162,6 +163,13 @@ func CreateWorkspace(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	if config.SingleWorkspace() {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "single_workspace_mode",
+			"message": "This install has one workspace. Invite people to it instead.",
+		})
 		return
 	}
 
@@ -668,6 +676,19 @@ func DeleteWorkspace(c *gin.Context) {
 	}
 	if isPersonal {
 		c.JSON(http.StatusConflict, gin.H{"error": "personal workspaces cannot be deleted"})
+		return
+	}
+	// Nor is the install workspace: single-workspace mode cannot create another.
+	isInstall, err := isInstallWorkspace(database, workspaceID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+	if isInstall {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "install_workspace",
+			"message": "This install's workspace cannot be deleted.",
+		})
 		return
 	}
 

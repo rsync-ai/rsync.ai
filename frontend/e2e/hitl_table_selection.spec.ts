@@ -24,8 +24,8 @@ async function ensureLoggedIn(page: Page) {
   }
   await page.getByRole('button', { name: /Sign in/i }).click()
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 15000 })
-  // Sidebar nav entry (label was updated as part of PRD alignment).
-  await expect(page.locator('a:has-text("Agentic Data Pipeline")')).toBeVisible({ timeout: 30000 })
+  // A sidebar row every signed-in user sees: the app shell is up.
+  await expect(page.getByRole('navigation').getByRole('link', { name: 'Pipelines', exact: true })).toBeVisible({ timeout: 30000 })
 }
 
 type HitlTablesPayload = {

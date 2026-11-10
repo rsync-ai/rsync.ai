@@ -28,9 +28,8 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
-import { formatAbsoluteTime } from "@/lib/utils"
-import { formatAbsoluteTime as scheduleFormatAbsoluteTime } from "@/components/explorer/scheduleTime"
-import { LocalDateTime } from "@/components/ui/local-date-time"
+import { formatAbsoluteTime, viewerTimeZone } from "@/lib/utils"
+import { LocalDateTime, ViewerTimeZone } from "@/components/ui/local-date-time"
 import { TableStatisticsPanel } from "@/components/pipeline/TableStatisticsPanel"
 
 const TS = "2026-08-05T10:00:00Z"
@@ -62,10 +61,6 @@ function cellUnder(heading: string, rowIndex = 0): string {
 }
 
 describe("#23 — one shared absolute-time formatter", () => {
-  it("scheduleTime re-exports the lib/utils formatter rather than keeping its own copy", () => {
-    expect(scheduleFormatAbsoluteTime).toBe(formatAbsoluteTime)
-  })
-
   it("formats in the viewer's zone and names the zone", () => {
     const s = formatAbsoluteTime(TS)
     expect(s).toMatch(KOLKATA_TIME)
@@ -161,9 +156,46 @@ describe("#23 — <LocalDateTime> (the pipeline page's Created)", () => {
   // component instead of a server-side formatter.
   it("is what the pipeline page renders for Created", () => {
     const page = readFileSync(resolve(__dirname, "../app/(dashboard)/pipelines/[id]/page.tsx"), "utf8")
-    const created = page.slice(page.indexOf(">Created<"), page.indexOf(">Last Updated<"))
+    // Launch review PR2: Created moved from a card under the tabs into the header's subtitle.
+    const created = page.slice(page.indexOf("· Created"), page.indexOf("· Updated"))
     expect(created.length).toBeGreaterThan(0)
     expect(created).toContain("<LocalDateTime value={pipeline.createdAt}")
     expect(created).not.toMatch(/format\w*\(pipeline\.createdAt/)
+  })
+})
+
+describe("a page that names the zone once (the Runs list)", () => {
+  it("leaves the zone off each time and names the viewer's zone by name, not offset", () => {
+    // Not "GMT+5:30": a list spans daylight-saving changes in zones that have them.
+    expect(formatAbsoluteTime(TS, { zone: false })).toMatch(KOLKATA_TIME)
+    expect(formatAbsoluteTime(TS, { zone: false })).not.toMatch(KOLKATA_ZONE)
+    expect(viewerTimeZone()).toBe("India Standard Time")
+
+    render(
+      <p>
+        <LocalDateTime value={TS} zone={false} />
+        <ViewerTimeZone />
+      </p>,
+    )
+    const time = document.querySelector("time")!
+    expect(time.textContent).toMatch(KOLKATA_TIME)
+    expect(time.textContent).not.toMatch(KOLKATA_ZONE)
+    expect(time.getAttribute("dateTime")).toBe("2026-08-05T10:00:00.000Z")
+    expect(screen.getByText(/Times in India Standard Time\./)).toBeInTheDocument()
+
+    // UTC's general name would read "GMT+00:00".
+    process.env.TZ = "UTC"
+    expect(viewerTimeZone()).toBe("UTC")
+  })
+
+  it("before hydration shows the UTC time labelled UTC, and names no zone it is not in", () => {
+    const html = renderToString(
+      <p>
+        <LocalDateTime value={TS} zone={false} />
+        <ViewerTimeZone />
+      </p>,
+    )
+    expect(html).toContain("2026-08-05 10:00 UTC")
+    expect(html).not.toContain("Times in")
   })
 })

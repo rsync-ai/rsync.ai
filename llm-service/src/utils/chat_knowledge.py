@@ -145,10 +145,3 @@ class ChatKnowledge:
         
         # No match found - should use OpenAI
         return None
-    
-    def should_use_local(self, user_message: str) -> bool:
-        """
-        Determine if this question can be answered locally.
-        """
-        return self.get_response(user_message) is not None
-

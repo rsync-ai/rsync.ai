@@ -6,6 +6,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
+	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 )
 
 // Bounds for ensurePlatformTopicsWithRetry at startup: five attempts with a doubling
@@ -27,8 +30,12 @@ const (
 // accepted the metadata connection but is still electing a controller, which rejects
 // CreateTopics for a few seconds after a cold start.
 //
-// It never fails startup: a topic that still cannot be created is logged, and the
-// services that use it surface their own produce or consume error.
+// An ACL refusal (kafka.IsAuthorizationError) ends the loop at once: the broker
+// refuses the same create on every attempt, so retrying would only delay startup.
+//
+// It never fails startup: a topic that still cannot be created is logged (see
+// logPlatformTopicsFailure), and the services that use it surface their own produce or
+// consume error.
 func ensurePlatformTopicsWithRetry(
 	ctx context.Context,
 	ensure func(context.Context) error,
@@ -45,6 +52,9 @@ func ensurePlatformTopicsWithRetry(
 		if err = ensure(ctx); err == nil {
 			return nil
 		}
+		if kafka.IsAuthorizationError(err) {
+			return fmt.Errorf("ensure platform topics: %w", err)
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("ensure platform topics: %w (stopped: %v)", err, ctxErr)
 		}
@@ -60,4 +70,21 @@ func ensurePlatformTopicsWithRetry(
 		wait *= 2
 	}
 	return fmt.Errorf("ensure platform topics after %d attempts: %w", attempts, err)
+}
+
+// logPlatformTopicsFailure logs what ensurePlatformTopicsWithRetry returned. An ACL
+// refusal is an Error naming the grant: it is a deployment mistake that stops every
+// pipeline (docs/deployment/kafka-acls.md §5), not a slow broker. Anything else stays
+// a Warn.
+func logPlatformTopicsFailure(err error) {
+	if kafka.IsAuthorizationError(err) {
+		scope := "the cluster"
+		if prefix := kafkaclient.TopicPrefix(); prefix != "" {
+			scope = fmt.Sprintf("topic prefix %q", prefix)
+		}
+		log.WithError(err).Errorf("❌ Kafka refused to create the platform topics: the Kafka user rsync.ai connects as is not allowed to create topics. "+
+			"No pipeline can run until it is granted Create on %s (docs/deployment/kafka-acls.md §5)", scope)
+		return
+	}
+	log.WithError(err).Warn("⚠️  Failed to ensure platform topics")
 }

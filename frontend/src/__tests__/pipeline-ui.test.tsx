@@ -13,7 +13,7 @@ import { describe, it, test, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import '@testing-library/jest-dom'
-import { PipelineAccordionView, type PipelineState } from '@/components/chat/PipelineAccordionView'
+import { PipelineAccordionView, describePlannedStep, type PipelineState } from '@/components/chat/PipelineAccordionView'
 import { extractErrorMessage } from '@/lib/pipeline/errorUtils'
 
 describe('Pipeline UI Reliability', () => {
@@ -254,12 +254,64 @@ describe('Pipeline UI Reliability', () => {
       expect(screen.getByText('75%')).toBeInTheDocument()
     })
 
-    // NOTE: a former test asserted the executor stage rendered generic metadata
-    // (current_table, tables_completed, ...) as humanized key-value pairs. The
-    // component intentionally no longer dumps raw metadata — it renders curated,
-    // human-readable stage messages instead (e.g. "Preparing…").
-    // The generic key-value rendering no longer exists, so that test was removed
-    // rather than asserting behavior the component does not have.
+    // A planned graph step carried its node kind and config into the panel as raw
+    // "Node Kind" / "Node Config" JSON rows (prod, 2026-09-30); a user cannot read
+    // either. The step is described in one sentence and neither key is printed.
+    it('describes a planned graph step in words, never as raw node config', () => {
+      const state: PipelineState = {
+        pipeline_id: 'test-123',
+        status: 'processing',
+        current_stage: 'extract_mongo',
+        execution_plan: {
+          stages: [
+            {
+              id: 'extract_mongo',
+              display_name: 'Extract matches',
+              status: 'running',
+              metadata: {
+                node_kind: 'source',
+                node_config: { connector_type: 'mongodb', collection: 'matches' },
+                requires_hitl: true,
+                hitl_prompt: 'Select the tables',
+              },
+            },
+          ],
+        },
+        progress: { percent: 10 },
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }
+
+      render(<PipelineAccordionView state={state} />)
+
+      expect(screen.getByText('Reads matches from MongoDB.')).toBeInTheDocument()
+      for (const raw of ['Node Kind', 'Node Config', 'Requires Hitl', 'Hitl Prompt', '"connector_type"']) {
+        expect(screen.queryByText(new RegExp(raw))).not.toBeInTheDocument()
+      }
+    })
+  })
+
+  describe('describePlannedStep', () => {
+    const step = (node_kind: string, node_config?: Record<string, unknown>) => ({ node_kind, node_config })
+
+    test.each([
+      ['source with a picked list', step('source', { connector_type: 'postgresql', selected_tables: ['public.users', 'public.orders'] }), 'Reads public.users, public.orders from PostgreSQL.'],
+      ['source with nothing picked yet', step('source', { connector_type: 'mongodb' }), 'Reads the tables you select from MongoDB.'],
+      ['source connector from the pipeline', step('source', {}), 'Reads the tables you select from MySQL.'],
+      ['destination', step('destination', { connector_type: 'gcs' }), 'Writes the data to Google Cloud Storage.'],
+      ['destination connector from the pipeline', step('destination'), 'Writes the data to BigQuery.'],
+      ['transform', step('transform', { transforms: [{}, {}] }), 'Transforms the data (2 steps).'],
+      ['wait', step('wait', { wait_seconds: 90 }), 'Waits 1m 30s before the next step.'],
+      ['notification', step('notification', { channel: 'slack' }), 'Sends a notification to slack.'],
+      ['merge', step('merge'), 'Joins the branches back together.'],
+    ])('%s', (_name, metadata, want) => {
+      expect(describePlannedStep(metadata, { source: 'mysql', destination: 'bigquery' })).toBe(want)
+    })
+
+    it('says nothing for a stage that is not a graph step', () => {
+      expect(describePlannedStep({ rows_synced: 10 })).toBeNull()
+      expect(describePlannedStep(undefined)).toBeNull()
+    })
   })
 
   describe('PipelineAccordionView - Legacy Fallback', () => {

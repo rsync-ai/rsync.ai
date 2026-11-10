@@ -22,9 +22,11 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
   usePathname: () => "/admin/settings",
 }))
-vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
-vi.mock("@/lib/api/admin", () => ({
-  adminGetSettings: vi.fn(),
+vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn(), authPost: vi.fn(), redirectToLogout: vi.fn() }))
+// The read goes through the real adminGetSettings → adminRead, over the mocked
+// authFetch; only the write is stubbed.
+vi.mock("@/lib/api/admin", async (orig) => ({
+  ...(await orig<typeof import("@/lib/api/admin")>()),
   adminUpdateSettings: vi.fn(),
 }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
@@ -35,8 +37,10 @@ function res(status: number, body: unknown) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    statusText: "",
     headers: { get: () => null },
     json: async () => body,
+    text: async () => JSON.stringify(body),
   } as unknown as Response
 }
 

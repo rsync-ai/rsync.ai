@@ -72,14 +72,7 @@ func hybridSourceConnID(task ExecutorTask) string {
 // via CDC; for upsert destinations that overlap is idempotent, but for append-only it
 // would duplicate history rows — so the hybrid path refuses append-only (deferred).
 func hybridDestAppendOnly(task ExecutorTask) bool {
-	if task.Destination == nil || task.Destination.Config == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(task.Destination.Config["cdc_write_mode"])) {
-	case "append", "append_only", "append-only", "history", "insert":
-		return true
-	}
-	return false
+	return task.Destination != nil && CDCAppendOnlyDestination(task.Destination.Config)
 }
 
 // hybridBackfillMarkerType is the cdc_resources resource_type recorded once the

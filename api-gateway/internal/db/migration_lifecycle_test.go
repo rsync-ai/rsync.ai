@@ -221,13 +221,7 @@ func loadMigrations(t *testing.T) []migrationFile {
 	if err != nil {
 		t.Fatalf("cannot read migrations directory %s: %v", dir, err)
 	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names) // the order Migrate() applies them in
+	names := migrationFileNames(entries) // the files, and the order, Migrate() applies
 	files := make([]migrationFile, 0, len(names))
 	for _, n := range names {
 		b, err := os.ReadFile(filepath.Join(dir, n))

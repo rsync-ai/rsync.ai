@@ -160,13 +160,13 @@ describe("connections list — last test error", () => {
     gateway({ last_test_status: "success", last_test_error: "", last_tested_at: minutesAgo(30) }, { success: false, error: ERR })
     const user = userEvent.setup()
     render(<ConnectionsPage />)
-    await screen.findByText("Connected")
+    await screen.findByText(/^Connected/)
 
     await user.click(screen.getByRole("button", { name: "Actions for Orders Postgres" }))
     await user.click(await screen.findByRole("menuitem", { name: /test connection/i }))
 
     expect(await screen.findByText("Test failed")).toBeInTheDocument()
-    expect(screen.queryByText("Connected")).toBeNull()
+    expect(screen.queryByText(/^Connected/)).toBeNull()
     expect(screen.getByTestId("connection-last-test-error")).toHaveTextContent(ERR)
   })
 
@@ -177,8 +177,7 @@ describe("connections list — last test error", () => {
     render(<ConnectionsPage />)
     await screen.findByText("Orders Postgres")
 
-    expect(screen.getByText("PostgreSQL connection")).toBeInTheDocument()
-    expect(screen.getByText("Type: PostgreSQL")).toBeInTheDocument()
-    expect(screen.queryByText(/postgresql connection|Type: postgresql/)).toBeNull()
+    expect(screen.getByText("PostgreSQL")).toBeInTheDocument()
+    expect(screen.queryByText(/postgresql/)).toBeNull()
   })
 })

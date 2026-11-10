@@ -141,6 +141,25 @@ describe("WorkspaceGeneralSettings — rename", () => {
   })
 })
 
+describe("WorkspaceGeneralSettings — workspace ID", () => {
+  // Found 2026-10-11: the accuracy eval needs the workspace ID
+  // (RSYNC_EVAL_WORKSPACE_ID), and the app showed it nowhere. Every role sees
+  // the whole ID and can copy it.
+  it.each(["viewer", "member", "admin", "owner"])("the %s role sees the whole workspace ID and can copy it", async (role) => {
+    const ID = "6f0d3c2a-9b1e-4c7d-8a55-0e2f4b6c8d10"
+    const writeText = vi.fn(() => Promise.resolve())
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } })
+    routeFetch()
+    renderGeneral({ currentRole: role, workspaceId: ID })
+    const button = await screen.findByRole("button", { name: `Copy workspace ID ${ID}` })
+    expect(button).toHaveTextContent(ID)
+    expect(screen.getByText(/X-Workspace-ID header/)).toBeInTheDocument()
+    fireEvent.click(button)
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(ID))
+    vi.unstubAllGlobals()
+  })
+})
+
 describe("WorkspaceGeneralSettings — leave", () => {
   it("a member can leave: confirms, DELETEs self membership, then navigates home", async () => {
     setActiveWorkspaceId("ws-1")
@@ -184,7 +203,7 @@ describe("WorkspaceGeneralSettings — leave", () => {
 })
 
 describe("WorkspaceGeneralSettings — role (#56)", () => {
-  it("does not print the role again: the settings page banner above the tabs owns it", async () => {
+  it("does not print the role again: the role badge beside the page title owns it", async () => {
     routeFetch()
     renderGeneral({ currentRole: "admin" })
     await screen.findByLabelText(/workspace name/i)

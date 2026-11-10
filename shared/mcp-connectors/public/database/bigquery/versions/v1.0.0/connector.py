@@ -194,6 +194,14 @@ class BigqueryMCPServer(DestinationLoadMixin, BaseMCPConnector):
         params = params or {}
         return self._warehouse_adapter.merge(self._get_config(params), params)
 
+    def execute(self, params: Dict = None) -> Dict[str, Any]:
+        """Run exactly one statement verbatim (models DDL/DML) — see the adapter."""
+        err = self._require_adapter()
+        if err:
+            return err
+        params = params or {}
+        return self._warehouse_adapter.execute(self._get_config(params), params)
+
     # =========================================================================
     # CAPABILITIES
     # =========================================================================
@@ -219,6 +227,7 @@ class BigqueryMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 {"name": "import_data", "type": "destination", "method": "import_data"},
                 {"name": "load", "type": "destination", "method": "load"},
                 {"name": "merge", "type": "destination", "method": "merge"},
+                {"name": "execute", "type": "destination", "method": "execute"},
             ],
         }
 
@@ -249,7 +258,13 @@ def create_http_app():
 
     @app.post("/mcp")
     async def mcp(request: dict):
-        return server.handle_request(request)
+        # Every tool call blocks on a BigQuery job (a model's statement can run
+        # for minutes), so it runs on a worker thread: one slow call must not
+        # stall /health or other pipelines' calls on the event loop. The shared
+        # server is safe here — the adapter is stateless and no tool reads
+        # per-call state off the server.
+        import asyncio
+        return await asyncio.to_thread(server.handle_request, request)
 
     @app.post("/invoke/{tool_name}")
     async def invoke(tool_name: str, params: dict = {}):
@@ -295,6 +310,11 @@ def create_http_app():
     @app.post("/import_data")
     async def import_data(params: dict = {}):
         return server.import_data(params)
+
+    @app.post("/execute")
+    async def execute(params: dict = {}):
+        import asyncio
+        return await asyncio.to_thread(server.execute, params)
 
     return app
 

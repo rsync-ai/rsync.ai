@@ -1,0 +1,48 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "map",
+    "description": "Customers by State",
+    "map": "us_states",
+    "region": {
+      "label": "State"
+    },
+    "value": {
+      "label": "Customers",
+      "format": "integer"
+    },
+    "color": "series-1"
+  },
+  "rows": [
+    {
+      "region": "US-CA",
+      "value": 900
+    },
+    {
+      "region": "US-TX",
+      "value": 700
+    },
+    {
+      "region": "US-NY",
+      "value": 500
+    },
+    {
+      "region": "US-FL",
+      "value": 350
+    },
+    {
+      "region": "US-AK",
+      "value": 200
+    },
+    {
+      "region": "US-HI",
+      "value": 100
+    },
+    {
+      "region": "US-WA",
+      "value": 60
+    }
+  ],
+  "series": [],
+  "notes": []
+}

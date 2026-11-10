@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.temporal.io/sdk/activity"
 )
@@ -65,16 +67,22 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 	// under CDC sentinel supervision, but the Temporal execution record is done.
 	if status == "streaming_active" {
 		if executionID != "" {
-			if _, err := db.ExecContext(ctx, `
+			res, err := db.ExecContext(ctx, `
 				UPDATE executions
 				SET status    = 'completed',
 				    end_time  = NOW()
 				WHERE id = $1 AND status = 'running'
-			`, executionID); err != nil {
+			`, executionID)
+			if err != nil {
 				logger.Warn("streaming_active: failed to close execution row (ignored)",
 					"execution_id", executionID, "error", err.Error())
 			} else {
 				logger.Info("streaming_active: execution row closed", "execution_id", executionID)
+				// Only a run nothing stopped first: a Stop or Cancel that reached
+				// this run's row has already closed it, and its stream stays closed.
+				if n, _ := res.RowsAffected(); n > 0 && pipelineID != "" && pipelineID != executionID {
+					reopenCDCStreamRow(ctx, db, pipelineID)
+				}
 			}
 		}
 
@@ -132,7 +140,11 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 	// may be missing") than for an ordinary failure, and a string match on the
 	// reason prefix would break the moment the reason text is reworded.
 	silentDrop := false
-	if status == "completed" && executionID != "" {
+	// A Stop that got to the execution row first makes the postflight moot, and
+	// its settle wait is what held the overwrite of the stop back by a minute.
+	// Only a shortcut: the read inside the transaction below decides.
+	stoppedFirst := status == "completed" && executionStoppedFirst(ctx, db, executionID)
+	if status == "completed" && executionID != "" && !stoppedFirst {
 		// The stats rows this check reads arrive asynchronously (sink → events topic →
 		// projector) and can trail the workflow's completion by seconds, so judge them
 		// only once they have settled — otherwise a table whose final stats are still
@@ -164,6 +176,15 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 		errParam = nil
 	}
 
+	// A run replaced by a newer one still records its own execution, but the
+	// pipeline row belongs to the newer run (run_superseded.go). Asked before the
+	// tx: a failing statement inside it would abort the whole terminal write.
+	superseded := runSuperseded(ctx, db, executionID)
+	if superseded {
+		logger.Info("A newer run owns the pipeline; leaving the pipeline row to it",
+			"pipeline_id", pipelineID, "execution_id", executionID, "status", status)
+	}
+
 	// Only set completed_at when terminal.
 	isTerminal := status == "completed" || status == "failed" || status == "stopped"
 	if isTerminal {
@@ -185,34 +206,64 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 			}
 		}()
 
-		res, err := tx.ExecContext(ctx, `
-			UPDATE pipelines
-			SET status = $2,
-			    updated_at = NOW(),
-			    completed_at = NOW(),
-			    error_message = $3
-			WHERE id = $1
-		`, pipelineID, status, errParam)
-		if err != nil {
-			return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to update pipeline terminal status: %w", err)
+		// StopPipeline records a stop straight into executions and pipelines. A
+		// run past the point a cancel could reach still ends here, and wrote
+		// completed or failed over the stop (KI-STOP-RACING-COMPLETION-
+		// OVERWRITTEN). Read under a lock, in this transaction, so the answer
+		// holds until the commit: a Stop that lands after it finds no running
+		// execution to cancel, and the run stands as it ended. An unreadable
+		// row is not guessed at; the write rolls back and the activity retries.
+		keptStop := false
+		if (status == "completed" || status == "failed") && isExecutionUUID(executionID) {
+			var current sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT status FROM executions WHERE id = $1 FOR UPDATE`, executionID).Scan(&current)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to read the execution row before the terminal write: %w", err)
+			case current.String == "cancelled":
+				logger.Info("The user stopped this run before it ended; recording the stop",
+					"pipeline_id", pipelineID, "execution_id", executionID, "ended_as", status)
+				keptStop = true
+				status, errorMessage, errParam, silentDrop = "stopped", "", nil, false
+			}
 		}
-		pipelineRows, pipelineRowsErr := res.RowsAffected()
+
+		var pipelineRows int64
+		var pipelineRowsErr error
+		if !superseded {
+			res, err := tx.ExecContext(ctx, `
+				UPDATE pipelines
+				SET status = $2,
+				    updated_at = NOW(),
+				    completed_at = NOW(),
+				    error_message = $3
+				WHERE id = $1
+			`, pipelineID, status, errParam)
+			if err != nil {
+				return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to update pipeline terminal status: %w", err)
+			}
+			pipelineRows, pipelineRowsErr = res.RowsAffected()
+		}
 
 		// Keep executions table in sync as well (best-effort within the tx).
 		// This prevents the pipelines list from showing "running" due to a stale executions.status.
-		if executionID != "" {
+		// A kept stop leaves the row as the Stop wrote it, end time included.
+		if executionID != "" && !keptStop {
 			execStatus := status
 			if status == "stopped" {
 				// The rest of the system uses "cancelled" for execution terminal stops.
 				execStatus = "cancelled"
 			}
+			// A stop carries no message of its own, so a cancel keeps the reason
+			// already recorded ("Cancelled by user", "Replaced by run …").
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE executions
 				SET status = $2,
 				    end_time = NOW(),
-				    error_message = $3
+				    error_message = CASE WHEN $4 THEN COALESCE($3, error_message) ELSE $3 END
 				WHERE id = $1
-			`, executionID, execStatus, errParam); err != nil {
+			`, executionID, execStatus, errParam, execStatus == "cancelled"); err != nil {
 				// Stay best-effort: log + roll back so we don't half-commit
 				// the pipelines row without the executions row.
 				logger.Warn("Failed to update executions terminal status (rolling back tx)",
@@ -265,15 +316,24 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 		// executor's own failure sites are the wrong place — so it is where the
 		// Slack/email alert is raised. Deliberately after Commit and deliberately
 		// unable to fail: a broker outage must not turn a durably recorded failure
-		// into a retried activity.
-		emitTerminalRunNotification(pipelineID, executionID, status, errorMessage, silentDrop)
-
-		if pipelineRowsErr == nil && pipelineRows == 0 {
-			logger.Warn("No pipeline row updated (pipeline not found?)", "pipeline_id", pipelineID, "status", status)
-		} else if pipelineRowsErr == nil {
-			logger.Info("Pipeline row updated", "pipeline_id", pipelineID, "status", status, "rows_affected", pipelineRows)
+		// into a retried activity. A run stopped because a newer one replaced it is
+		// not news to anyone.
+		if !(superseded && status == "stopped") {
+			emitTerminalRunNotification(pipelineID, executionID, status, errorMessage, silentDrop)
 		}
 
+		if !superseded {
+			if pipelineRowsErr == nil && pipelineRows == 0 {
+				logger.Warn("No pipeline row updated (pipeline not found?)", "pipeline_id", pipelineID, "status", status)
+			} else if pipelineRowsErr == nil {
+				logger.Info("Pipeline row updated", "pipeline_id", pipelineID, "status", status, "rows_affected", pipelineRows)
+			}
+		}
+
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
+	}
+
+	if superseded {
 		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 	}
 
@@ -311,16 +371,81 @@ func writePipelineStatus(ctx context.Context, pipelineID string, executionID str
 	return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 }
 
+// reopenCDCStreamRowSQL puts a CDC pipeline's stream row back to running, as a
+// first start leaves it. The guards keep it to that one row (id = pipeline id)
+// and to a pipeline still marked running: Stop writes pipelines.status
+// 'stopped' before it closes the executions, so a Stop racing this reopen
+// either blocks it or closes the reopened row again.
+const reopenCDCStreamRowSQL = `
+	UPDATE executions
+	SET status        = 'running',
+	    start_time    = NOW(),
+	    end_time      = NULL,
+	    error_message = NULL
+	WHERE id = $1 AND pipeline_id = $1 AND status <> 'running'
+	  AND EXISTS (SELECT 1 FROM pipelines WHERE id = $1 AND status = 'running')`
+
+// reopenCDCStreamRow reopens the stream row when a CDC run reaches the streaming
+// handoff. The sink keeps one long-lived executions row per CDC pipeline
+// (id = pipeline id, trigger_source 'cdc') that its counters and audit rows
+// hang off, and only inserts it when it is missing. Stop and Cancel close it
+// with every other open execution, and nothing opened it again, so after Stop
+// then Resume the pipeline streamed under a row that read 'cancelled'. A run
+// reaching the handoff is the stream coming back. It does nothing when the row
+// does not exist yet: the sink creates it on its first write. Best-effort, like
+// the rest of the handoff.
+func reopenCDCStreamRow(ctx context.Context, db *sql.DB, pipelineID string) {
+	if !isExecutionUUID(pipelineID) {
+		return
+	}
+	res, err := db.ExecContext(ctx, reopenCDCStreamRowSQL, pipelineID)
+	if err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).
+			Warn("streaming_active: failed to reopen the CDC stream row (ignored)")
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.WithField("pipeline_id", pipelineID).Info("streaming_active: CDC stream row reopened")
+	}
+}
+
+// isExecutionUUID reports whether id can be looked up in executions.id, a uuid
+// column: anything else makes PostgreSQL error the statement.
+func isExecutionUUID(id string) bool {
+	_, err := uuid.Parse(id)
+	return err == nil
+}
+
+// executionStoppedFirst reports whether a Stop has already recorded itself on
+// the execution row. Fails open: any error reads as "not stopped".
+func executionStoppedFirst(ctx context.Context, db *sql.DB, executionID string) bool {
+	if db == nil || !isExecutionUUID(executionID) {
+		return false
+	}
+	var current sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT status FROM executions WHERE id = $1`, executionID).Scan(&current); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.WithError(err).WithField("execution_id", executionID).
+				Warn("could not read the execution row before the postflight; running it")
+		}
+		return false
+	}
+	return current.String == "cancelled"
+}
+
 // statsSettleGrace bounds how long the postflight waits for this execution's table
 // stats to settle before judging them anyway, and statsSettleInterval is the re-read
 // cadence. The sink sends a table's final stats when it handles that table's EOF
 // marker, and the projector writes them a moment later — on prod the last one trailed
 // the workflow's completion by ~2s — so a healthy run settles within a poll or two and
-// only a run with a genuinely missing or stuck table waits out the grace. Vars, not
-// consts, so tests can shrink them.
+// only a run with a genuinely missing or stuck table waits out the grace.
+// statsFirstRowWindow is how long a run the sink carried may show no stats row at all
+// before the postflight stops waiting for its first one (capped by the grace). Vars,
+// not consts, so tests can shrink them.
 var (
 	statsSettleGrace    = 60 * time.Second
 	statsSettleInterval = 2 * time.Second
+	statsFirstRowWindow = 10 * time.Second
 )
 
 // awaitTableStatsSettled waits until every stats row this execution has reported is
@@ -329,13 +454,44 @@ var (
 // whatever has arrived either way, so a table still missing after the grace is failed
 // exactly as before. heartbeat runs between polls — the activity's heartbeat timeout
 // is shorter than the grace.
+//
+// A fast run can reach this before the projector has written any row, and judging an
+// empty stats table passes whatever the run dropped. So a run the sink carried waits
+// up to statsFirstRowWindow for its first row; a run it did not carry emits no stats
+// and does not wait.
 func awaitTableStatsSettled(ctx context.Context, db *sql.DB, executionID string, heartbeat func()) bool {
 	if db == nil || executionID == "" {
 		return true
 	}
+	var firstRowDeadline time.Time
+	if sinkCarriedExecution(ctx, db, executionID) {
+		window := statsFirstRowWindow
+		if window > statsSettleGrace {
+			window = statsSettleGrace
+		}
+		firstRowDeadline = time.Now().Add(window)
+	}
 	return waitUntilSettled(ctx, func(ctx context.Context) (bool, error) {
-		return tableStatsSettled(ctx, db, executionID)
+		return tableStatsSettled(ctx, db, executionID, time.Now().Before(firstRowDeadline))
 	}, heartbeat, statsSettleGrace, statsSettleInterval)
+}
+
+// sinkCarriedExecution reports whether the kafka sink acked any batch for this
+// execution — the up-front sign that its TABLE_STATS rows are on the way. A failed
+// probe reads as carried: waiting costs at most the first-row window, while not
+// waiting can pass a run on an empty stats table.
+func sinkCarriedExecution(ctx context.Context, db *sql.DB, executionID string) bool {
+	if !isExecutionUUID(executionID) {
+		return false
+	}
+	var carried bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pipeline_batch_acks WHERE execution_id = $1)
+	`, executionID).Scan(&carried); err != nil {
+		log.Warnf("postflight: sink ack probe failed (waiting for the first stats row anyway): %v", err)
+		return true
+	}
+	return carried
 }
 
 // waitUntilSettled polls probe until it reports settled, the grace elapses, the
@@ -368,9 +524,10 @@ func waitUntilSettled(ctx context.Context, probe func(context.Context) (bool, er
 }
 
 // tableStatsSettled reports whether this execution's stats are final. A run with no
-// stats rows at all counts as settled: postflightSilentDropCheck judges nothing for it
-// (the stats path isn't live for that run), so there is nothing to wait for.
-func tableStatsSettled(ctx context.Context, db *sql.DB, executionID string) (bool, error) {
+// stats rows at all counts as settled unless awaitingFirstRow: postflightSilentDropCheck
+// judges nothing for it (the stats path isn't live for that run), so there is nothing to
+// wait for once the first-row window has passed.
+func tableStatsSettled(ctx context.Context, db *sql.DB, executionID string, awaitingFirstRow bool) (bool, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			COALESCE(qualified_name, table_name) AS tbl,
@@ -403,7 +560,7 @@ func tableStatsSettled(ctx context.Context, db *sql.DB, executionID string) (boo
 		return false, err
 	}
 	if len(reported) == 0 {
-		return true, nil
+		return !awaitingFirstRow, nil
 	}
 	if running {
 		return false, nil
@@ -551,18 +708,27 @@ func postflightSilentDropCheck(ctx context.Context, db *sql.DB, executionID stri
 //
 // Matching is case-insensitive and accepts either form: a selection of "public.orders"
 // matches a stats row reported as "orders", and vice versa.
+//
+// A selected table with a pending drop_table decision is not judged: the run left it
+// out on purpose while the user decides (orchestrator withoutTablesAwaitingDrop), and
+// failing the run for it would bury that question under a silent-drop failure.
 func missingSelectedTables(ctx context.Context, db *sql.DB, executionID string, reported map[string]bool) []string {
 	if db == nil || executionID == "" || len(reported) == 0 {
 		return nil
 	}
 
-	var raw string
+	var raw, awaitingRaw string
 	if err := db.QueryRowContext(ctx, `
-		SELECT COALESCE(p.config->'selected_tables', '[]'::jsonb)::text
+		SELECT COALESCE(p.config->'selected_tables', '[]'::jsonb)::text,
+			COALESCE((
+				SELECT jsonb_agg(a.table_name)
+				FROM schema_change_approvals a
+				WHERE a.pipeline_id = p.id AND a.change_type = 'drop_table' AND a.status = 'pending'
+			), '[]'::jsonb)::text
 		FROM executions e
 		JOIN pipelines p ON p.id = e.pipeline_id
 		WHERE e.id = $1
-	`, executionID).Scan(&raw); err != nil {
+	`, executionID).Scan(&raw, &awaitingRaw); err != nil {
 		if err != sql.ErrNoRows {
 			log.Warnf("missingSelectedTables: selection query failed (ignored): %v", err)
 		}
@@ -576,6 +742,9 @@ func missingSelectedTables(ctx context.Context, db *sql.DB, executionID string, 
 		log.Warnf("missingSelectedTables: selected_tables is not a string array (ignored): %v", err)
 		return nil
 	}
+	var awaitingDrop []string
+	_ = json.Unmarshal([]byte(awaitingRaw), &awaitingDrop)
+	selected = selectionWithoutTablesAwaitingDrop(selected, awaitingDrop)
 	if len(selected) == 0 {
 		return nil
 	}
@@ -590,6 +759,41 @@ func missingSelectedTables(ctx context.Context, db *sql.DB, executionID string, 
 		return nil
 	}
 	return missing
+}
+
+// selectionWithoutTablesAwaitingDrop removes from a table selection the tables whose
+// drop waits for a decision. A selected name matches a pending table exactly, or by
+// bare name when one side carries no schema — the orchestrator's rule for leaving
+// them out of the run — case-insensitively. Pure.
+func selectionWithoutTablesAwaitingDrop(selected, awaitingDrop []string) []string {
+	if len(awaitingDrop) == 0 {
+		return selected
+	}
+	bare := func(n string) string {
+		if i := strings.LastIndex(n, "."); i >= 0 {
+			return n[i+1:]
+		}
+		return n
+	}
+	awaits := func(sel string) bool {
+		for _, key := range awaitingDrop {
+			key = strings.ToLower(strings.TrimSpace(key))
+			if sel == key ||
+				(!strings.Contains(sel, ".") && sel == bare(key)) ||
+				(!strings.Contains(key, ".") && bare(sel) == key) {
+				return true
+			}
+		}
+		return false
+	}
+	kept := make([]string, 0, len(selected))
+	for _, sel := range selected {
+		if awaits(strings.ToLower(strings.TrimSpace(sel))) {
+			continue
+		}
+		kept = append(kept, sel)
+	}
+	return kept
 }
 
 // diffSelectedAgainstReported splits a table selection into the names that produced no

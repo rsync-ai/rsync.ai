@@ -83,7 +83,10 @@ func (e *ReSnapshotExecutor) Run(ctx context.Context, sig diagnose.Signal) error
 	}
 
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/recover", base, sig.PipelineID)
+	// operator and reason are required by the endpoint (CDCRecoverRequest); a body
+	// without either is refused 400 before any guard runs.
 	body, _ := json.Marshal(map[string]interface{}{
+		"operator":      "healer",
 		"snapshot_mode": snapshotModeRecovery,
 		"triggered_by":  "healer",
 		"reason":        "cdc_position_lost",

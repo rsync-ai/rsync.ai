@@ -33,10 +33,11 @@ include these incremental-sync params (all optional):
 | `cursor`           | opaque              | Existing pagination resumption token. Untouched by incremental.         |
 | `incremental_field`| string (optional)   | Hint from the user; connector picks its own default when absent.        |
 | `since_cursor`     | opaque (optional)   | The PK high-water mark as of the **start of the delta window**. DB sources only — see §5. Do NOT confuse with `cursor`. |
+| `incremental_lag_seconds` | number (optional) | DB sources only: how far behind the database clock a sweep's watermark is held (default 5; `0` turns the hold off). Also read from the connection config. See §5. |
 
 The executor emits all four `since` aliases with the same value
 (see `exportReq.Params["since"]` in `executeBatchDataTransfer`,
-[backend-orchestrator/internal/agents/executor/executor.go:4421-4436](../../backend-orchestrator/internal/agents/executor/executor.go)).
+[backend-orchestrator/internal/agents/executor/executor.go](../../backend-orchestrator/internal/agents/executor/executor.go)).
 Pick the one whose name matches your source's native API and ignore the
 others.
 
@@ -49,15 +50,19 @@ others.
 | `columns`        | list of strings       | Existing.                                                          |
 | `row_count`      | int                   | Existing.                                                          |
 | `has_more`       | bool                  | Existing.                                                          |
-| `next_cursor`    | opaque (optional)     | Existing pagination cursor.                                        |
-| **`stats.watermark`** | `{field, value}` | **NEW.** `field` is a stable string (e.g. `"last_modified"`). `value` is the max of the row-updated-at column observed across this batch, ISO-8601. |
+| `next_cursor`    | opaque (optional)     | Existing pagination cursor. A DB source sends a scalar for a one-column key, a list for a composite key (with `cursor_columns`), or `{"locator": …}` for a row address (§6). |
+| `paging_mode`    | string (optional)     | `keyset`, `locator` or `offset`. `offset` tells the executor to step the offset and drop any cursor it held. |
+| **`stats.watermark`** | `{field, value[, snapshot]}` | **NEW.** `field` is a stable string (e.g. `"last_modified"`). `value` is the max of the row-updated-at column observed across this batch, ISO-8601. A DB source's first page of a sweep reports the table's max read *before* the page instead, with `snapshot: true` (§5). |
 | `max_watermark`  | ISO-8601 (optional)   | Same as `stats.watermark.value`, surfaced flat for client tools/tests. The executor only reads `stats.watermark`. |
 
-The executor reads `stats.watermark` from the export response and
-writes it to `pipeline_checkpoints.position.watermark` along with a
-derived `mode` ([`executeBatchDataTransfer` in
-backend-orchestrator/internal/agents/executor/executor.go:4532
-and 4817-4850](../../backend-orchestrator/internal/agents/executor/executor.go)).
+The executor folds each page's `stats.watermark` into the one it keeps
+for the sweep (`foldSweepWatermark`,
+[batch_sweep_watermark.go](../../backend-orchestrator/internal/agents/executor/batch_sweep_watermark.go)):
+a `snapshot` is kept for the whole sweep, anything else folds to the max
+over the pages and never below the `since` the sweep started with. It
+writes the kept value to `pipeline_checkpoints.position.watermark` along
+with a derived `mode` (`checkpointPosition["watermark"]` in
+[`executeBatchDataTransfer`](../../backend-orchestrator/internal/agents/executor/executor.go)).
 On the next run the per-table checkpoint READ translates that mode +
 watermark.value into the `incrementalSince` variable, which becomes
 the `since` param.
@@ -78,6 +83,7 @@ the `since` param.
 | 0 rows returned & `since` was present               | Return `stats.watermark.value = since`. (Don't clear the checkpoint just because nothing changed.)                             |
 | 0 rows returned & no `since`                        | Omit `stats.watermark` entirely. Lets the executor keep its current checkpoint state.                                          |
 | Multi-page batch within one export() call           | `value` must be the max across ALL pages, not just the last.                                                                   |
+| DB source, first page of a sweep (no `cursor`, offset 0) | Read `max(<field>)` (above `since` when given) **before** the page and report it with `snapshot: true` (§5). If that read fails, report the page max as usual. |
 | Resource has no updated-at concept (e.g. a singleton) | Omit `stats.watermark`. Executor preserves prior checkpoint state for this resource.                                           |
 | `variables.query` (or equivalent) already set       | Combine with AND. Don't overwrite the user's existing filter.                                                                  |
 
@@ -140,14 +146,124 @@ was sent. The two rules are independent:
 - *report* `stats.watermark` → whenever the column exists.
 
 A table with no `updated_at` still emits nothing and correctly stays on
-the keyset path. Executor side, see
-[executor.go:4288-4350](../../backend-orchestrator/internal/agents/executor/executor.go)
-(checkpoint read) and
-[executor.go:4817-4850](../../backend-orchestrator/internal/agents/executor/executor.go)
-(checkpoint write). Reference implementation:
-[postgresql `connector.py`](public/postgresql/versions/v1.0.0/connector.py)
-(delta predicate ~2655-2700, watermark emission ~2745-2780). Tests:
+the keyset path. Executor side, see `executeBatchDataTransfer` in
+[executor.go](../../backend-orchestrator/internal/agents/executor/executor.go)
+(the checkpoint read that sets `incrementalSince`, and the checkpoint
+write at `checkpointPosition["watermark"]`). Reference implementation:
+`export()` in [postgresql `connector.py`](public/postgresql/versions/v1.0.0/connector.py)
+(the `delta_parts` predicate and the `watermark_col` emission). Tests:
 `tests/test_db_incremental_delta_predicate.py`.
+
+**The sweep's watermark is read before its first page.** A sweep pages by
+key, but `since` is a timestamp, and the two are not ordered together. If
+row 1 is read on page 1 and updated at 10:04 while the sweep is still
+reading, and page 3 then reads a row updated at 10:05, a watermark of
+10:05 puts row 1's update below the next sweep's `since`, and it is lost
+for good (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS, cause 3). So on a sweep's
+first page (no `cursor`, offset 0) the database connectors read
+`MAX(<field>)` (above `since`, when given) **before** the page query and
+report that as the watermark with `snapshot: true`. Every row updated
+after the read is above it, whatever its key; the executor keeps the
+snapshot for the whole sweep, including a half resumed from a checkpoint
+(`seedSweepWatermark`).
+
+- **Late commits.** A transaction can stamp `updated_at` before the read
+  and commit after it. When the snapshot is within
+  `incremental_lag_seconds` (default 5) of the database clock, it is held
+  back to `now - lag`: the same query reads the server's UTC and session
+  clocks, and aware values are compared with the first, naive ones with
+  the second. A transaction that commits more than the lag after it
+  stamped its row can still be missed.
+- **Duplicates, not gaps.** Rows updated during a sweep are read again by
+  the next one, and so are rows inside the lag window. Delivery is
+  at-least-once; destinations that upsert by key absorb it. An idle table
+  still converges to empty sweeps.
+- **Cost.** One `MAX()` per sweep, over the rows above `since` (an index
+  on the field makes it a lookup), plus a `WHERE 1 = 0` probe for the
+  column's real spelling.
+- **Fallback.** If either read fails, the connector rolls the failed
+  statement back and reports the page max. The executor then folds page
+  maxima and never moves the watermark backwards, which is what it did
+  before the snapshot existed.
+
+The block that does this (`_watermark_snapshot`, `_hold_back_watermark`,
+`_incremental_lag_seconds`) sits between `# BEGIN/END watermark snapshot
+block` markers, identical in `connector_database.py.j2` and the
+PostgreSQL, MySQL, Oracle and SQL Server connectors. Tests:
+`tests/test_db_watermark_snapshot.py`.
+
+### 6. Paging a DB sweep — a stable order, one shared module
+
+Each page is its own query on its own connection, so nothing holds a
+snapshot between pages. A page therefore starts where the last one ended
+only if the order is total and survives writes between the queries.
+[`public/sql_paging.py`](public/sql_paging.py) picks the most stable
+order a table offers, in this order:
+
+1. a caller-named `cursor_column`;
+2. the primary key — every column of it, compared as a row value on
+   PostgreSQL and expanded (`a >= ? AND (a > ? OR b > ?)`, index-friendly) elsewhere; the
+   same comparison is the `pk > :since_cursor` leg of §5;
+3. the narrowest unique index whose columns are all NOT NULL;
+4. the row's address: PostgreSQL `ctid` on a plain table, Oracle `ROWID`
+   on a heap table, SQLite `rowid`;
+5. `ORDER BY` every orderable column, with OFFSET — a row deleted
+   mid-sweep can shift one row past a page boundary;
+6. plain OFFSET, the old behaviour, when nothing above can be read.
+
+Catalog reads come from views a SELECT-only user can see. A failed read
+is rolled back and the next step is tried; it never fails the export.
+With no key (steps 4-6) there is no `since_cursor` to place, so the §5
+delta is dropped and the sweep re-reads the table: extra rows are
+recoverable, missing ones are not.
+
+**Adding a database.** The `connector_database.py.j2` template and the
+PostgreSQL, MySQL, Oracle and SQL Server connectors make the same
+`read_page` call and choose a dialect by the connection's driver module
+(`dialect_for`). A driver the
+module does not know gets `GENERIC`, which pages exactly as exports did
+before. Stable paging for a new database is one call in `sql_paging.py`:
+
+```python
+register(Dialect(name="mydb", quote='"', paramstyle="qmark",
+                 page_syntax="limit", discover=_discover_mydb), "mydb_driver")
+```
+
+`_discover_mydb(ctx)` returns a plan or `None`; usually it is
+`ctx.first(ctx.nominated_plan, <key query>, <ordered columns>)`, and
+`ctx.first` rolls back a step that raises and tries the next. The module
+docstring has the details; `_discover_sqlserver` is a short example. The
+connector's Dockerfile ships the module beside the connector
+(`COPY --from=shared sql_paging.py /app/sql_paging.py`); a generated
+connector's Dockerfile already does. Tests: `tests/test_batch_paging_stable_order.py`.
+
+**Warehouses.** Snowflake, Databricks, Redshift, ClickHouse and BigQuery
+enforce no primary or unique key, so their dialects trust none: a sweep
+takes step 5 above, ordered by the named `cursor_column` first, then (on
+ClickHouse) the table's sorting key when it is plain columns, then every
+column the engine can order. Where the engine can read a table as of a
+past point, the sweep's first page takes that point and every later page
+reads at it, so the offsets count rows of one fixed table:
+
+| Engine | Point | Page source |
+|---|---|---|
+| Snowflake | `CURRENT_TIMESTAMP()` in epoch ms | `AT(TIMESTAMP => TO_TIMESTAMP_LTZ(<ms>, 3))` |
+| Databricks | latest Delta version (`DESCRIBE HISTORY`) | `VERSION AS OF <v>` |
+| BigQuery | `CURRENT_TIMESTAMP()` in epoch ms | `FOR SYSTEM_TIME AS OF TIMESTAMP_MILLIS(<ms>)` |
+
+Those pages report `paging_mode: "snapshot"` and, on a full page,
+`next_cursor` `{"snapshot": <point>, "offset": <n>}`, which the executor
+hands back as `cursor` and never takes for a key high-water. A point the
+engine refuses (a view, an external table, past retention) is dropped:
+on the first page the sweep steps OFFSET as `paging_mode: "offset"`; on a
+later page it goes on unpinned from the cursor's offset. Redshift and
+ClickHouse have no point to take, so a row deleted mid-sweep can shift
+one row past a page boundary. A cursor of any other shape re-reads the
+sweep from the top: rows twice, never none. Every page is a full sort,
+and none of these exports reads `since` yet, so every run re-reads the
+table. BigQuery and ClickHouse clients are not DB-API; `QueryCursor`
+wraps a `run(sql, params)` function so they page through the same
+`export_page`. Tests: `tests/test_warehouse_batch_paging.py`.
 
 ## Per-source filter-syntax reference
 
@@ -183,6 +299,8 @@ source:
 | `oracle`                     | v1.0.0         | Same shape as Postgres. Bind syntax `:1`-style; `ROWNUM`/`OFFSET … FETCH` paging.                                                                                          |
 | `sqlserver`                  | v1.0.0         | Same shape as Postgres. Note the server class in `connector.py` is (historically) named `MysqlMCPServer` — that is a copy-paste artifact, not a wiring error. |
 | `stripe` (dir is `public/stripe`, **not** `stripe-rest`) | v1.0.0 (partial, **one claim unverified**) | `customers/charges/invoices/payment_intents` carry `supports_incremental: True` and `incremental_param: "created[gte]"`; `subscriptions/products/prices/payment_methods` are honestly `False` until Stripe's `Event` polling path lands (4 True / 4 False, `connector.py:534-695`). **Caveat:** `export()` forwards the executor's ISO-8601 `since` to that param verbatim (`connector.py:1407-1409`) and there is no epoch conversion anywhere in the file — Stripe's `created[gte]` takes **epoch seconds**, so the filter is likely ignored. An earlier revision of this table claimed a `_to_stripe_epoch` helper did the conversion; **no such helper exists.** Not fixed in #724 — proving it needs a live Stripe key. |
+| `nse-india`                  | v1.0.0 (run locally on real NSE, 2026-11-04) | 7 walks: six by day on `trade_date` (`bhavcopy_daily`, `bhavcopy_history`, `delivery_daily`, `index_daily`, `participant_oi_daily`, `participant_vol_daily`) and `corporate_actions` by year on `ex_date` (the current year is read again each run, so its watermark stops at the last finished year). The 5 snapshot tables are a full refresh each run. One file per calendar day, so `since` is a date: the walk resumes the day after it; with no `since`, or one that is not a date, it starts at the table's first day (`connector.py:1002`). A call that runs out of time under the shared ~1 req/s pace returns an empty page and the table resumes next run, so a first backfill takes many runs (each one is cut at the executor's 30-minute wait and marked failed; the checkpoints keep what it loaded). The connection has no settings. A page holds at most 5 days that have a file (30 for the small files) and skips days without one, because the executor ends a table at the first page with no rows. A day whose file repeats an earlier day's data counts as a day with no file. `stats.watermark` is the last day emitted **in full** (a day split across pages counts once its last row is out; a day with no file never counts), floored at `since` so an empty page echoes it (`connector.py:1517`). Pages by `next_cursor` = `YYYY-MM-DD:<rows already sent from that day>` (`connector.py:1514`); an `offset` without a cursor is refused (`connector.py:1432`). |
+| `upstox`                     | v1.0.0 (offline fake only, **not run on Upstox**) | `historical_candle` only (`incremental_field: timestamp`): the path's two dates are the window — `from_date` = the run's `since`, `to_date` = today (UTC); with no `since`, the last 365 days (`base_connector.py date_range_params`). A `from_date` in the connection config never moves it. One window per run, no chunking. `user_profile` and `market_holidays` are a full refresh each run. |
 | `hubspot-rest-v3`            | v1.0.0 — **runtime-generated, not in this repo** | No `hubspot` directory exists under `shared/mcp-connectors/`; the only artifact is the prod image `mcp-hubspot-rest-v3:v1.0.0` (see BACKLOG `F-RUNTIMEGEN-HARDEN`). The previously-recorded behavior — all resources `supports_incremental: False` because HubSpot's GET listing endpoints silently ignore `updated_since`, with real incremental needing `POST /crm/v3/objects/{type}/search` + `filterGroups[].filters[]` (`hs_lastmodifieddate`, `GTE`, `<epoch_ms>`) — **cannot be verified from this tree.** Treat it as a note, not a citation. |
 | `salesforce-rest`            | pending (no connector yet) | SOQL `WHERE LastModifiedDate >= …`.                                      |
 | `notion-rest`                | pending        | Database query filter on "Last edited time".                                         |

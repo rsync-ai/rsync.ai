@@ -130,6 +130,15 @@ func TestRulePrecedence_SafetyCriticalOrdering(t *testing.T) {
 		// the (earlier) rate_limit rule and not the network rule.
 		{"HTTP 429 Too Many Requests; connection reset by peer",
 			ActionBackoffRetry, CategoryRateLimit, "rate_limit precedence over transient"},
+		// A quota with no rate-limit signal is a full destination: escalated,
+		// never retried, even when a transient word rides along.
+		{"insert failed: quota exceeded; connection reset by peer",
+			ActionEscalate, CategoryDestCapacity, "bare quota beats rate_limit and transient"},
+		{"you are over your space quota; too many requests",
+			ActionEscalate, CategoryDestCapacity, "a storage phrase beats rate_limit"},
+		// A quota that carries a 429 is a rate limit.
+		{"googleapi: Error 429: Quota exceeded for quota metric 'Read requests'",
+			ActionBackoffRetry, CategoryRateLimit, "a 429 quota is a rate limit"},
 	}
 	for _, c := range cases {
 		got := d.Diagnose(Signal{ErrorMessage: c.msg})

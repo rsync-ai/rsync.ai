@@ -15,6 +15,8 @@ COPY shared/go/naming /build/shared/go/naming
 COPY shared/go/kafkaclient /build/shared/go/kafkaclient
 COPY shared/go/pgdriver /build/shared/go/pgdriver
 COPY shared/go/memlimit /build/shared/go/memlimit
+COPY shared/go/workflowdef /build/shared/go/workflowdef
+COPY shared/go/sqlexec /build/shared/go/sqlexec
 
 # The replace directive in api-gateway/go.mod points at ../backend-orchestrator,
 # so `go mod download` needs that module's go.mod/go.sum to resolve the build
@@ -72,6 +74,9 @@ COPY --from=builder --chown=appuser:appgroup /build/api-gateway/migrations ./mig
 # The binary this stage received is the one the builder built, byte for byte.
 COPY --from=builder /build/api-gateway/bin/server.sha256 /tmp/
 RUN sha256sum -c /tmp/server.sha256 && rm /tmp/server.sha256
+
+# The licence attributions for what this image ships.
+COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 USER appuser
 

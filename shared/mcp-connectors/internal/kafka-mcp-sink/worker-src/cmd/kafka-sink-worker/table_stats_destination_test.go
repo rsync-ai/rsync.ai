@@ -81,7 +81,7 @@ func TestTableStatsOmitDestinationWhenTheSinkCannotNameOne(t *testing.T) {
 
 	for name, table := range map[string]map[string]interface{}{
 		"cdc":   statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0, 0)),
-		"batch": statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8)),
+		"batch": statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8, noFileCount)),
 	} {
 		for _, k := range []string{"destination_schema", "destination_qualified_name"} {
 			if v, present := table[k]; present {
@@ -146,7 +146,7 @@ func TestBatchAndCDCTableStatsAgreeOnTableIdentity(t *testing.T) {
 		{PipelineID: "p", ExecutionID: "e", Table: "orders", DestNamespace: "warehouse"}, // bare + destination
 	} {
 		cdc := statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0, 0))
-		batch := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8))
+		batch := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8, noFileCount))
 		if !reflect.DeepEqual(cdc, batch) {
 			t.Errorf("table identity diverges for %q: cdc=%#v batch=%#v", sm.Table, cdc, batch)
 		}
@@ -245,13 +245,13 @@ func TestBatchTableStatsLabelWithSourceTable(t *testing.T) {
 	if sm.Table != "demo.matches" {
 		t.Errorf("sm.Table = %q, want the destination identifier untouched", sm.Table)
 	}
-	table := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 3, 3, 10))
+	table := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 3, 3, 10, noFileCount))
 	if table["qualified_name"] != "datingapp.matches" || table["schema"] != "datingapp" || table["name"] != "matches" {
 		t.Errorf("table identity = %#v, want datingapp.matches", table)
 	}
 
 	// No source_table (CDC, older executors): unchanged, keyed on Table.
-	legacy := statsTable(t, buildTableStatsEvent(&SinkMessage{PipelineID: "p", ExecutionID: "e", Table: "demo.matches"}, "batch", "completed", 1, 1, 1))
+	legacy := statsTable(t, buildTableStatsEvent(&SinkMessage{PipelineID: "p", ExecutionID: "e", Table: "demo.matches"}, "batch", "completed", 1, 1, 1, noFileCount))
 	if legacy["qualified_name"] != "demo.matches" {
 		t.Errorf("legacy qualified_name = %v, want demo.matches", legacy["qualified_name"])
 	}

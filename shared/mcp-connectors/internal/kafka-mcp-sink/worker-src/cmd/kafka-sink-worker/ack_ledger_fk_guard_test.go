@@ -1,20 +1,19 @@
 package main
 
-// Regression coverage for KI-CDC-ACKLEDGER-FK-MISMATCH.
+// Regression coverage for KI-CDC-ACKLEDGER-FK-MISMATCH, and the fake database the
+// CDC counter tests share.
 //
 // CDC keys its stats by execution_id == pipeline_id (a stable streaming counter
-// bucket, set in parseCDCMessage), but pipeline_batch_acks.execution_id carries a
-// real FK to executions(id) (fk_batch_acks_execution, migration 043:68-69). No
-// executions row with id = pipeline_id exists for a normal CDC pipeline, so every
-// ack INSERT failed with 23503 and pipeline_batch_acks stayed permanently empty
-// for CDC — per-batch log noise forever, and any future audit view reading that
-// table would show zero acks while data was actually flowing.
+// bucket, set in parseCDCMessage), but the tables that hang off an execution carry a
+// real FK to executions(id). No executions row with id = pipeline_id exists for a
+// normal CDC pipeline, so every such write failed with 23503. The ack ledger was the
+// first to hit it; transform_execution_logs and the run events still reference the
+// row now that CDC writes no per-event acks.
 //
-// The fix reuses the guard the sibling transform-log path already relies on:
-// pre-insert the synthetic executions row before the ack write. These tests pin
-// the three properties that make it correct rather than merely present — the
-// guard runs BEFORE the acks, runs ONCE per flush, and refuses to write garbage
-// ids.
+// The fix pre-inserts the synthetic executions row before the flush's first write.
+// These tests pin the three properties that make it correct rather than merely
+// present — the guard runs BEFORE the counter write, runs ONCE per flush, and
+// refuses to write garbage ids.
 //
 // Uses a minimal in-process database/sql driver (no live Postgres, no new module
 // dependency), like negative_ack_test.go — but this one records EVERY query, not
@@ -32,111 +31,179 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
+// legacyAck is a per-event CDC row in pipeline_batch_acks, as sinks before
+// KI-CDC-ACK-LEDGER-UNBOUNDED wrote them.
+type legacyAck struct {
+	table, op, topic  string
+	partition, offset int64
+	failed            bool // last_error set: a negative ack, which never landed
+}
+
+// fakePGError carries a PostgreSQL SQLSTATE the way pgconn.PgError does.
+type fakePGError struct{ code string }
+
+func (e fakePGError) Error() string    { return "ERROR: fake (SQLSTATE " + e.code + ")" }
+func (e fakePGError) SQLState() string { return e.code }
+
 // ackFKConn records every query in order. Implementing driver.ExecerContext and
 // driver.QueryerContext routes db.ExecContext / db.QueryContext straight here,
 // bypassing Prepare.
 //
-// It also stands in for the ledger's unique key: an ack INSERT adds only keys it
-// has not seen, and RETURNING / RowsAffected report just those, the way
-// ON CONFLICT DO NOTHING does in Postgres (including a key repeated inside one
-// statement, which is added once).
+// It also stands in for cdc_counter_totals (a counter upsert adds to totals) and
+// cdc_offset_floors (it keeps the max), and answers the seed reads from those plus
+// any legacy per-event rows, the way the UNION ALL in the seed queries does.
 type ackFKConn struct {
 	mu      sync.Mutex
 	queries []string
-	// failAcks makes the pipeline_batch_acks INSERTs fail the way the FK
-	// violation used to, so a test can prove the guard still runs first and the
-	// error is still returned (non-fatal at the call site).
-	failAcks error
-	// ledger holds the acked keys and each one's cdc_op.
-	ledger map[cdcAckKey]string
-	// strayKey, when set, is returned by every batch ack INSERT on top of the
-	// rows it really added.
-	strayKey *cdcAckKey
-	// seedRows, when set, answers the counter seed query instead of the ledger.
+	// failCounts fails the counter upsert; with failCountsTimes > 0 only that
+	// many times, so a retry can succeed.
+	failCounts      error
+	failCountsTimes int
+	countFails      int
+	// missingTables answers every statement naming cdc_counter_totals or
+	// cdc_offset_floors with 42P01, as a database without migration 146 does.
+	missingTables bool
+	totals        map[cdcTotalKey]int64
+	floors        map[cdcFloorRowKey]int64
+	legacy        []legacyAck
+	// seedRows, when set, answers the counter seed instead of the stored rows.
 	seedRows [][]driver.Value
-	// failSeed fails the seed query; seedRowsErr fails it after its rows were read.
+	// failSeed fails both seed reads; seedRowsErr fails the counter seed after
+	// its rows were read.
 	failSeed    error
 	seedRowsErr error
 	seedArgs    []driver.NamedValue
+	// watermarks holds each cdc_table_watermarks upsert's bind args, in order;
+	// failWatermarks fails those upserts the way a database without migration 137 does.
+	watermarks     [][]driver.NamedValue
+	failWatermarks error
+	// transformLogs holds each transform_execution_logs upsert's bind args, in order.
+	transformLogs [][]driver.NamedValue
 }
 
 func (c *ackFKConn) Prepare(string) (driver.Stmt, error) { return nil, io.EOF }
 func (c *ackFKConn) Close() error                        { return nil }
 func (c *ackFKConn) Begin() (driver.Tx, error)           { return nil, io.EOF }
 
+func namesCounterTables(q string) bool {
+	return strings.Contains(q, "cdc_counter_totals") || strings.Contains(q, "cdc_offset_floors")
+}
+
 func (c *ackFKConn) ExecContext(_ context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queries = append(c.queries, q)
-	if !strings.Contains(q, "pipeline_batch_acks") {
+	switch {
+	case strings.Contains(q, "transform_execution_logs"):
+		c.transformLogs = append(c.transformLogs, args)
+		return driver.RowsAffected(1), nil
+	case strings.Contains(q, "cdc_table_watermarks"):
+		if c.failWatermarks != nil {
+			return nil, c.failWatermarks
+		}
+		c.watermarks = append(c.watermarks, args)
+		return driver.RowsAffected(int64(len(args) / cdcWatermarkCols)), nil
+	case namesCounterTables(q):
+		if c.missingTables {
+			return nil, fakePGError{code: "42P01"}
+		}
+		if c.failCounts != nil && (c.failCountsTimes == 0 || c.countFails < c.failCountsTimes) {
+			c.countFails++
+			return nil, c.failCounts
+		}
+		c.applyCountsLocked(q, args)
 		return driver.RowsAffected(1), nil
 	}
-	if c.failAcks != nil {
-		return nil, c.failAcks
+	return driver.RowsAffected(1), nil
+}
+
+// applyCountsLocked applies a buildCDCCountsUpsert statement: 5 bind args per
+// totals row, then 6 per floors row. The totals rows are the placeholders before
+// the floors INSERT.
+func (c *ackFKConn) applyCountsLocked(q string, args []driver.NamedValue) {
+	if c.totals == nil {
+		c.totals = map[cdcTotalKey]int64{}
 	}
-	return driver.RowsAffected(int64(len(c.addAcksLocked(args)))), nil
+	if c.floors == nil {
+		c.floors = map[cdcFloorRowKey]int64{}
+	}
+	nTotals := strings.Count(q[:strings.Index(q, "INSERT INTO cdc_offset_floors")], "$")
+	str := func(i int) string { return args[i].Value.(string) }
+	num := func(i int) int64 { return args[i].Value.(int64) }
+	for b := 0; b+5 <= nTotals; b += 5 {
+		c.totals[cdcTotalKey{str(b), str(b + 1), str(b + 2), str(b + 3)}] += num(b + 4)
+	}
+	for b := nTotals; b+6 <= len(args); b += 6 {
+		k := cdcFloorRowKey{str(b), str(b + 1), cdcFloorKey{table: str(b + 2), topic: str(b + 3), partition: num(b + 4)}}
+		if cur, ok := c.floors[k]; !ok || num(b+5) > cur {
+			c.floors[k] = num(b + 5)
+		}
+	}
 }
 
 func (c *ackFKConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queries = append(c.queries, q)
-	switch {
-	case strings.Contains(q, "INSERT INTO pipeline_batch_acks"):
-		if c.failAcks != nil {
-			return nil, c.failAcks
-		}
-		added := c.addAcksLocked(args)
-		if c.strayKey != nil {
-			added = append(added, *c.strayKey)
-		}
-		rows := &ackFKRows{cols: []string{"table_name", "kafka_topic", "kafka_partition", "kafka_offset"}}
-		for _, k := range added {
-			rows.vals = append(rows.vals, []driver.Value{k.table, k.topic, k.partition, k.offset})
-		}
-		return rows, nil
-	case strings.Contains(q, "FROM pipeline_batch_acks"):
-		c.seedArgs = args
-		if c.failSeed != nil {
-			return nil, c.failSeed
-		}
-		rows := &ackFKRows{cols: []string{"table_name", "op", "count"}, vals: c.seedRows, err: c.seedRowsErr}
-		if rows.vals == nil {
-			counts := map[[2]string]int64{}
-			for k, op := range c.ledger {
-				counts[[2]string{k.table, op}]++
-			}
-			for tk, n := range counts {
-				rows.vals = append(rows.vals, []driver.Value{tk[0], tk[1], n})
-			}
-		}
-		return rows, nil
+	if !strings.Contains(q, "FROM pipeline_batch_acks") {
+		return nil, io.EOF
 	}
-	return nil, io.EOF
-}
+	c.seedArgs = args
+	if c.failSeed != nil {
+		return nil, c.failSeed
+	}
+	if c.missingTables && namesCounterTables(q) {
+		return nil, fakePGError{code: "42P01"}
+	}
+	pid, eid := args[0].Value.(string), args[1].Value.(string)
+	withStored := namesCounterTables(q)
 
-// addAcksLocked applies an ack INSERT's rows (16 bind args each, the column order
-// of buildCDCAckInserts and persistCDCAckToPostgres) and returns the keys it added.
-func (c *ackFKConn) addAcksLocked(args []driver.NamedValue) []cdcAckKey {
-	if c.ledger == nil {
-		c.ledger = map[cdcAckKey]string{}
-	}
-	var added []cdcAckKey
-	for base := 0; base+pgAckLedgerCols <= len(args); base += pgAckLedgerCols {
-		k := cdcAckKey{
-			table:     args[base+2].Value.(string),
-			topic:     args[base+8].Value.(string),
-			partition: args[base+9].Value.(int64),
-			offset:    args[base+10].Value.(int64),
+	if strings.Contains(q, "last_error IS NULL") { // the counter seed
+		rows := &ackFKRows{cols: []string{"table_name", "op", "n"}, vals: c.seedRows, err: c.seedRowsErr}
+		if rows.vals != nil {
+			return rows, nil
 		}
-		if _, seen := c.ledger[k]; seen {
-			continue
+		sums := map[[2]string]int64{}
+		if withStored {
+			for k, n := range c.totals {
+				if k.pipelineID == pid && k.executionID == eid {
+					sums[[2]string{k.table, k.op}] += n
+				}
+			}
 		}
-		op, _ := args[base+11].Value.(string)
-		c.ledger[k] = strings.ToLower(strings.TrimSpace(op))
-		added = append(added, k)
+		for _, a := range c.legacy {
+			if !a.failed {
+				sums[[2]string{a.table, a.op}]++
+			}
+		}
+		for k, n := range sums {
+			rows.vals = append(rows.vals, []driver.Value{k[0], k[1], n})
+		}
+		return rows, nil
 	}
-	return added
+
+	// The floor seed.
+	maxes := map[cdcFloorKey]int64{}
+	keep := func(k cdcFloorKey, o int64) {
+		if cur, ok := maxes[k]; !ok || o > cur {
+			maxes[k] = o
+		}
+	}
+	if withStored {
+		for k, o := range c.floors {
+			if k.pipelineID == pid && k.executionID == eid {
+				keep(k.cdcFloorKey, o)
+			}
+		}
+	}
+	for _, a := range c.legacy {
+		keep(cdcFloorKey{table: a.table, topic: a.topic, partition: a.partition}, a.offset)
+	}
+	rows := &ackFKRows{cols: []string{"table_name", "kafka_topic", "kafka_partition", "max"}}
+	for k, o := range maxes {
+		rows.vals = append(rows.vals, []driver.Value{k.table, k.topic, k.partition, o})
+	}
+	return rows, nil
 }
 
 type ackFKRows struct {
@@ -160,12 +227,32 @@ func (r *ackFKRows) Next(dest []driver.Value) error {
 	return nil
 }
 
+func (c *ackFKConn) watermarkUpserts() [][]driver.NamedValue {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]driver.NamedValue(nil), c.watermarks...)
+}
+
 func (c *ackFKConn) recorded() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]string, len(c.queries))
 	copy(out, c.queries)
 	return out
+}
+
+// storedTotal and storedFloor read one stored row (0, false when absent).
+func (c *ackFKConn) storedTotal(table, op string) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.totals[cdcTotalKey{ackFKPipelineID, ackFKExecID, table, op}]
+}
+
+func (c *ackFKConn) storedFloor(table, topic string, partition int64) (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	o, ok := c.floors[cdcFloorRowKey{ackFKPipelineID, ackFKExecID, cdcFloorKey{table: table, topic: topic, partition: partition}}]
+	return o, ok
 }
 
 // ackFKDriver hands out ackFKActiveConn. sql.Register is process-global and
@@ -227,42 +314,38 @@ func countMatching(queries []string, needle string) int {
 	return n
 }
 
-// TestPersistCDCAcksBatch_EnsuresExecutionRowBeforeAckInsert is the core guard:
-// the synthetic executions row must be written BEFORE the first
-// pipeline_batch_acks INSERT. Order is the whole fix — a guard that ran after
-// the acks would leave the FK violation exactly as it was.
-func TestPersistCDCAcksBatch_EnsuresExecutionRowBeforeAckInsert(t *testing.T) {
+// TestPersistCDCCounts_EnsuresExecutionRowBeforeCounterWrite is the core guard:
+// the synthetic executions row must be written BEFORE the flush's counter write.
+// Order is the whole fix — a guard that ran after would leave the FK violation of
+// the rows that reference it exactly as it was.
+func TestPersistCDCCounts_EnsuresExecutionRowBeforeCounterWrite(t *testing.T) {
 	conn := &ackFKConn{}
 	db := newAckFKDB(t, conn)
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 3)
-	if _, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
-		t.Fatalf("persistCDCAcksBatch: %v", err)
+	if _, err := persistCDCCounts(context.Background(), db, sms, msgs); err != nil {
+		t.Fatalf("persistCDCCounts: %v", err)
 	}
 
 	queries := conn.recorded()
-	if len(queries) < 2 {
-		t.Fatalf("expected an executions guard plus at least one ack insert, got %d query/queries: %v", len(queries), queries)
-	}
-
-	execIdx, ackIdx := -1, -1
+	execIdx, countIdx := -1, -1
 	for i, q := range queries {
 		if execIdx == -1 && strings.Contains(q, "INSERT INTO executions") {
 			execIdx = i
 		}
-		if ackIdx == -1 && strings.Contains(q, "pipeline_batch_acks") {
-			ackIdx = i
+		if countIdx == -1 && namesCounterTables(q) {
+			countIdx = i
 		}
 	}
 	if execIdx == -1 {
 		t.Fatalf("no INSERT INTO executions guard was issued — the FK violation is unfixed: %v", queries)
 	}
-	if ackIdx == -1 {
-		t.Fatalf("no pipeline_batch_acks insert was issued: %v", queries)
+	if countIdx == -1 {
+		t.Fatalf("no counter write was issued: %v", queries)
 	}
-	if execIdx > ackIdx {
-		t.Fatalf("executions guard ran at %d, AFTER the ack insert at %d — ordering is the fix", execIdx, ackIdx)
+	if execIdx > countIdx {
+		t.Fatalf("executions guard ran at %d, AFTER the counter write at %d — ordering is the fix", execIdx, countIdx)
 	}
 	// The guard must be idempotent: a redelivered flush re-runs it.
 	if !strings.Contains(queries[execIdx], "ON CONFLICT (id) DO NOTHING") {
@@ -270,17 +353,17 @@ func TestPersistCDCAcksBatch_EnsuresExecutionRowBeforeAckInsert(t *testing.T) {
 	}
 }
 
-// TestPersistCDCAcksBatch_EnsuresExecutionRowOncePerFlush pins the "once per
-// flush, not once per message" property. CDC flushes are hot — one extra INSERT
-// per message would add a write per change event for the life of every stream.
-func TestPersistCDCAcksBatch_EnsuresExecutionRowOncePerFlush(t *testing.T) {
+// TestPersistCDCCounts_EnsuresExecutionRowOncePerFlush pins the "once per flush,
+// not once per message" property. CDC flushes are hot — one extra INSERT per
+// message would add a write per change event for the life of every stream.
+func TestPersistCDCCounts_EnsuresExecutionRowOncePerFlush(t *testing.T) {
 	conn := &ackFKConn{}
 	db := newAckFKDB(t, conn)
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 25)
-	if _, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
-		t.Fatalf("persistCDCAcksBatch: %v", err)
+	if _, err := persistCDCCounts(context.Background(), db, sms, msgs); err != nil {
+		t.Fatalf("persistCDCCounts: %v", err)
 	}
 
 	if got := countMatching(conn.recorded(), "INSERT INTO executions"); got != 1 {
@@ -337,44 +420,41 @@ func TestEnsureExecutionRowForCDCAudit_RefusesNonUUIDIdentifiers(t *testing.T) {
 	})
 }
 
-// TestPersistCDCAcksBatch_StaysBestEffortWhenAcksStillFail keeps the severity
-// contract intact: this ledger is explicitly an audit trail for CDC (real
-// exactly-once lives in _rsync_cdc_offsets, committed with the data write). If
-// the ack INSERT still fails for some other reason, the guard must still have
-// run and the error must be RETURNED (the caller logs it non-fatally) rather
-// than panicking or being swallowed here.
-func TestPersistCDCAcksBatch_StaysBestEffortWhenAcksStillFail(t *testing.T) {
-	conn := &ackFKConn{failAcks: io.ErrUnexpectedEOF}
+// TestPersistCDCCounts_StaysBestEffortWhenTheWriteFails keeps the severity
+// contract intact: the counters are bookkeeping (real exactly-once lives in
+// _rsync_cdc_offsets, committed with the data write). If the counter write fails
+// for good, the guard must still have run, every message must still count, and the
+// error must be RETURNED (the caller logs it non-fatally) rather than panicking or
+// being swallowed here.
+func TestPersistCDCCounts_StaysBestEffortWhenTheWriteFails(t *testing.T) {
+	conn := &ackFKConn{failCounts: io.ErrUnexpectedEOF}
 	db := newAckFKDB(t, conn)
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 2)
-	counted, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest")
+	counted, err := persistCDCCounts(context.Background(), db, sms, msgs)
 	if err == nil {
-		t.Fatal("expected the ack insert error to be returned so the caller can log it")
+		t.Fatal("expected the counter write error to be returned so the caller can log it")
 	}
-	// The ledger could not say which rows were new, so every row still counts.
-	for i, ok := range counted {
-		if !ok {
-			t.Fatalf("message %d not counted after a failed ack write; counters must keep moving: %v", i, counted)
-		}
+	if !equalBools(counted, []bool{true, true}) {
+		t.Fatalf("counted = %v after a failed write; the live counters must keep moving", counted)
 	}
 	if got := countMatching(conn.recorded(), "INSERT INTO executions"); got != 1 {
-		t.Fatalf("guard must run even when the ack write fails, got %d executions inserts", got)
+		t.Fatalf("guard must run even when the counter write fails, got %d executions inserts", got)
 	}
 }
 
-// TestPersistCDCAcksBatch_NoMessagesIsANoOp guards the empty-flush path: with
-// nothing to ack there is nothing to anchor, so the guard must not create a
-// synthetic executions row (which would otherwise appear for pipelines that
-// never streamed a single event).
-func TestPersistCDCAcksBatch_NoMessagesIsANoOp(t *testing.T) {
+// TestPersistCDCCounts_NoMessagesIsANoOp guards the empty-flush path: with nothing
+// to count there is nothing to anchor, so the guard must not create a synthetic
+// executions row (which would otherwise appear for pipelines that never streamed a
+// single event).
+func TestPersistCDCCounts_NoMessagesIsANoOp(t *testing.T) {
 	conn := &ackFKConn{}
 	db := newAckFKDB(t, conn)
 	defer db.Close()
 
-	if _, err := persistCDCAcksBatch(context.Background(), db, nil, nil, "dest"); err != nil {
-		t.Fatalf("persistCDCAcksBatch(nil): %v", err)
+	if _, err := persistCDCCounts(context.Background(), db, nil, nil); err != nil {
+		t.Fatalf("persistCDCCounts(nil): %v", err)
 	}
 	if got := conn.recorded(); len(got) != 0 {
 		t.Fatalf("expected no queries for an empty flush, got %v", got)

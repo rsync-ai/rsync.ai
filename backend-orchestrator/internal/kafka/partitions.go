@@ -49,7 +49,8 @@ func readPartitionPolicyFromEnv() int32 {
 	return int32(parsePositiveEnv(EnvCDCTopicPartitions, os.Getenv(EnvCDCTopicPartitions)))
 }
 
-// partitionsForCluster is the partition count for a CDC data topic on this cluster.
+// partitionsFor is the partition count for a CDC data topic: the requested count
+// when a caller chose one, else derived from the cluster's broker count.
 //
 // One partition means one broker leads the topic and takes 100% of its produce and
 // fetch traffic, however many brokers the customer added. That is the load-balancing
@@ -58,15 +59,9 @@ func readPartitionPolicyFromEnv() int32 {
 // The shape mirrors replicationPolicy.forCluster on purpose — 1 on a single broker,
 // min(3, brokers) beyond that — because the two numbers answer the same question
 // ("how much of this cluster can this topic actually use?") and a reader who has
-// learned one should not have to learn the other.
-func partitionsForCluster(brokerCount int) int32 {
-	return partitionsFor(partitionDefaults(), brokerCount)
-}
-
-// partitionsFor is partitionsForCluster against a requested count a caller chose,
-// rather than the process-wide one. Split out for the same reason applyTo is: the
-// derivation can then be tested without racing a sync.Once that whichever test ran
-// first has already tripped.
+// learned one should not have to learn the other. The requested count is a
+// parameter rather than read here so the derivation can be tested without racing
+// a sync.Once that whichever test ran first has already tripped.
 func partitionsFor(requested int32, brokerCount int) int32 {
 	if requested > 0 {
 		return requested
@@ -98,8 +93,9 @@ type CDCTopicShape struct {
 // ok exists so that callers do not have to guess. Guessing is worse than not acting:
 // the fallback for an unknown cluster is RF=1, and on a managed broker whose default
 // min.insync.replicas is 2 (MSK's, and most others') an RF=1 topic is born
-// permanently unwritable. A caller that cannot see the cluster should leave topic
-// creation exactly as it was rather than publish a confident wrong number.
+// permanently unwritable. A caller that cannot see the cluster must not start
+// creating topics rather than publish a confident wrong number: the CDC start
+// refuses (executor cdcTopicShapeFor).
 func (m *Manager) CDCTopicShapeForCluster() (CDCTopicShape, bool) {
 	if !m.connected || m.client == nil {
 		return CDCTopicShape{}, false

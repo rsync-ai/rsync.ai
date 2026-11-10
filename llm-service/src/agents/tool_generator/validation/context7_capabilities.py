@@ -86,12 +86,6 @@ def _norm_path(path: str) -> str:
     return p
 
 
-def _method_set(method: Optional[str]) -> Set[str]:
-    if not method:
-        return set()
-    return {method.strip().upper()}
-
-
 def _expected_methods_from_resource(resource: Any) -> Set[str]:
     expected: Set[str] = set()
     # spec.ResourceConfig fields (pydantic) are not guaranteed to exist across versions, so use getattr defensively.

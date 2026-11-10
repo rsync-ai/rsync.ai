@@ -21,6 +21,9 @@
  * "ago") under every group, and spent a bordered box per group on a list that is
  * mostly zeros. It now names the role first, measures once in the header, and
  * folds the per-table lag away unless something is behind.
+ *
+ * The load's state chip and a failed load's reason are the page header's
+ * (PipelineHealthHeader, on every tab); the card only says when the load ran.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -40,6 +43,7 @@ import {
   computeRatePerMin,
   offsetMovedSince,
 } from "@/components/pipeline/MonitorTab"
+import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 
 function res(status: number, body: unknown) {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response
@@ -194,33 +198,46 @@ describe("CDC Flow card", () => {
     stats = () => snapshotOnly({ total_tables: 5, tables_running: 2, tables_degraded: 1, tables_waiting_for_data: 2 })
     render(<MonitorTab pipelineId="p1" />)
     const card = await findLoadedFlowCard()
-    expect(within(card).getByText("Tables degraded")).toBeInTheDocument()
+    expect(within(card).getByText("Tables with rows not written")).toBeInTheDocument()
     expect(within(card).getByText("Tables with no data yet")).toBeInTheDocument()
     expect(within(card).queryByText("Tables completed")).toBeNull()
     expect(within(card).queryByText("Tables running")).toBeNull()
   })
 
-  // DMS-style: the card says where the pipeline is before it gives the counts.
-  it("says the load completed and replication is ongoing, with when it finished", async () => {
+  // DMS-style: the page says where the pipeline is before it gives the counts.
+  // The header says it, once; the card adds only when the load finished.
+  it("the header says the load completed and replication is ongoing; the card says when", async () => {
     runtimeLoad = {
       status: "completed", mode: "blocking", tables_total: 3, tables_done: 3, reloading_tables: 0,
       started_at: "2026-09-25T09:00:00Z", completed_at: "2026-09-25T09:30:00Z",
     }
-    render(<MonitorTab pipelineId="p1" />)
+    render(
+      <>
+        <PipelineHealthHeader pipelineId="p1" />
+        <MonitorTab pipelineId="p1" />
+      </>
+    )
+    expect(await screen.findByTestId("pipeline-load-status")).toHaveTextContent("Load completed, replication ongoing")
     const line = await screen.findByTestId("flow-load-status")
-    expect(line).toHaveTextContent("Load completed, replication ongoing")
-    expect(line).toHaveTextContent(/finished/i)
+    expect(line).toHaveTextContent(/^Full load finished/)
+    expect(screen.getAllByText(/Load completed, replication ongoing/)).toHaveLength(1)
   })
 
-  it("shows why a load failed, in words on the card", async () => {
+  it("a failed load's reason is said once, in the header", async () => {
+    const reason = "the batch historical load failed and CDC was not started"
     runtimeLoad = {
       status: "failed", mode: "blocking", tables_total: 3, tables_done: 1, reloading_tables: 0,
-      started_at: "2026-09-25T09:00:00Z", last_error: "the batch historical load failed and CDC was not started",
+      started_at: "2026-09-25T09:00:00Z", last_error: reason,
     }
-    render(<MonitorTab pipelineId="p1" />)
-    const line = await screen.findByTestId("flow-load-status")
-    expect(line).toHaveTextContent("Full load failed")
-    expect(line).toHaveTextContent("the batch historical load failed and CDC was not started")
+    render(
+      <>
+        <PipelineHealthHeader pipelineId="p1" />
+        <MonitorTab pipelineId="p1" />
+      </>
+    )
+    expect(await screen.findByTestId("pipeline-load-reason")).toHaveTextContent(reason)
+    expect(await screen.findByTestId("flow-load-status")).toHaveTextContent(/^Full load started/)
+    expect(screen.getAllByText(new RegExp(reason))).toHaveLength(1)
   })
 
   it("claims nothing about a load that was never recorded", async () => {
@@ -239,6 +256,35 @@ describe("CDC Flow card", () => {
 })
 
 describe("Rate now", () => {
+  it("loads as a skeleton named for a screen reader, not a line of text", async () => {
+    authFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/runtime") ? res(200, RUNTIME(mode)) : new Promise(() => {}),
+    )
+    render(<MonitorTab pipelineId="p1" />)
+    const card = await screen.findByTestId("flow-card")
+    expect(within(card).getByRole("status")).toHaveTextContent("Loading throughput…")
+    expect(within(card).queryByTestId("throughput-rate")).toBeNull()
+  })
+
+  // The rate is a minute's average; the sparkline is how it moved while the page
+  // was open, one point per reading once there is a rate to plot.
+  it("draws the written rate as a line, from the second rate on, captioned since this page opened", async () => {
+    vi.useFakeTimers()
+    let applied = 16_909
+    stats = () => snapshotOnly({ total_applied_snapshot_rows: (applied += 100) })
+    render(<MonitorTab pipelineId="p1" />)
+    await tick(0)
+    await tick(5000)
+    await tick(5000)
+    expect(screen.queryByTestId("throughput-trend")).toBeNull()
+
+    await tick(5000)
+    const trend = screen.getByTestId("throughput-trend")
+    expect(within(trend).getByTestId("sparkline")).toBeInTheDocument()
+    expect(trend).toHaveTextContent("Written per minute, since this page opened")
+  })
+
+
   // Two rows of "0 / min" said one thing twice; a measured standstill on both
   // sides is one line. It still has to reach a reading: "measuring…" forever was
   // the #1203 bug.

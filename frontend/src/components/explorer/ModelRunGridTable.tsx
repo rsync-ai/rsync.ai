@@ -4,33 +4,39 @@
 // duration as a bar on top, each row a drawn model or pipeline, and in each cell what that
 // node did for the run. Which run belongs in which cell is decided in modelRunGrid.ts.
 
-import { Check, Minus, X } from "lucide-react"
+import { Ban, Check, Minus, X } from "lucide-react"
 
-import { cn } from "@/lib/utils"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
-import { formatDuration } from "@/components/explorer/scheduledModel"
+import { cn, formatAbsoluteTime } from "@/lib/utils"
+import { formatDurationOrDash } from "@/lib/duration"
 import { barHeightPercent, longestRunMs } from "@/components/explorer/RunDurationChart"
 import { isWaitingSkip, runDurationMs, skipLabel, type LineageNodeView, type LineageRun } from "@/components/explorer/modelLineage"
 import { cellRun, type RunGrid, type RunGridCell, type RunGridColumn } from "@/components/explorer/modelRunGrid"
+import { isCheckBlocked } from "@/components/explorer/modelChecks"
 import type { RunSelection } from "@/components/explorer/ModelRunPanel"
 
 const BAR_CLASS: Record<string, string> = {
   succeeded: "bg-emerald-500",
   failed: "bg-red-500",
-  skipped: "bg-amber-400",
+  // Grey like a skip on every other page; a dark glyph, since white on light grey is unreadable.
+  skipped: "bg-zinc-300 dark:bg-zinc-600 text-zinc-600 dark:text-zinc-200",
 }
 
 const CELL_BASE = "flex h-5 w-5 items-center justify-center rounded-sm"
+const BLOCKED_CELL = "bg-red-700 text-white"
 
 function runCellClass(r: LineageRun): string {
   if (isWaitingSkip(r)) return "border-2 border-amber-400 bg-transparent text-amber-600"
-  return cn(BAR_CLASS[r.status] ?? "bg-zinc-400", "text-white")
+  // Darker than a failure, so a table a check held back reads apart from a broken build.
+  if (isCheckBlocked(r)) return BLOCKED_CELL
+  return cn("text-white", BAR_CLASS[r.status] ?? "bg-zinc-400")
 }
 
 function RunGlyph({ run }: { run: LineageRun }) {
   // Shapes as well as colours, so the grid does not depend on telling red from green.
   if (isWaitingSkip(run)) return null
   if (run.status === "succeeded") return <Check className="h-3 w-3" strokeWidth={3} aria-hidden />
+  // A check held the table back: the live table is the last good one, not a broken build.
+  if (isCheckBlocked(run)) return <Ban className="h-3 w-3" strokeWidth={3} aria-hidden />
   if (run.status === "failed") return <X className="h-3 w-3" strokeWidth={3} aria-hidden />
   if (run.status === "skipped") return <Minus className="h-3 w-3" strokeWidth={3} aria-hidden />
   return null
@@ -40,9 +46,10 @@ function RunGlyph({ run }: { run: LineageRun }) {
 export function describeGridRun(r: LineageRun): string {
   const parts: string[] = []
   if (r.status === "skipped") parts.push(skipLabel(r))
+  else if (isCheckBlocked(r)) parts.push("blocked by a data check")
   else {
     const took = runDurationMs(r)
-    parts.push(took === null ? r.status : `${r.status} in ${formatDuration(took)}`)
+    parts.push(took === null ? r.status : `${r.status} in ${formatDurationOrDash(took)}`)
   }
   if (r.started_at && !Number.isNaN(Date.parse(r.started_at))) parts.push(`started ${formatAbsoluteTime(r.started_at)}`)
   return parts.join(", ")
@@ -64,7 +71,7 @@ const PLAIN_CELL: Record<Exclude<RunGridCell["kind"], "run" | "waiting">, { clas
   none: { className: "border border-dashed border-zinc-300 dark:border-zinc-600", glyph: "" },
   not_loaded: { className: "bg-zinc-100 text-zinc-400 dark:bg-zinc-800", glyph: "…" },
   hidden: { className: "bg-zinc-200 text-zinc-500 dark:bg-zinc-700 dark:text-zinc-400", glyph: "" },
-  unknown: { className: "bg-zinc-100 text-zinc-500 dark:text-zinc-400 dark:bg-zinc-800", glyph: "?" },
+  unknown: { className: "bg-zinc-100 text-zinc-600 dark:text-zinc-400 dark:bg-zinc-800", glyph: "?" },
   unlinked: { className: "bg-zinc-100 text-zinc-400 dark:bg-zinc-800", glyph: "–" },
 }
 
@@ -98,6 +105,12 @@ export function ModelRunGridTable({
     return r?.started_at && !Number.isNaN(Date.parse(r.started_at)) ? formatAbsoluteTime(r.started_at) : null
   }
   const kinds = new Set(grid.rows.flatMap((row) => row.cells.map((c) => c.kind)))
+  const blocked = grid.rows.some((row) =>
+    row.cells.some((c) => {
+      const r = cellRun(c)
+      return !!r && isCheckBlocked(r)
+    }),
+  )
 
   return (
     <section className="border-t px-4 py-3 dark:border-zinc-800" aria-labelledby="model-run-grid-heading">
@@ -183,7 +196,7 @@ export function ModelRunGridTable({
           {grid.olderRuns && " · Older runs are on the Runs tab."}
         </p>
       )}
-      <GridLegend kinds={kinds} />
+      <GridLegend kinds={kinds} blocked={blocked} />
     </section>
   )
 }
@@ -269,17 +282,30 @@ function GridCell({
   )
 }
 
-function GridLegend({ kinds }: { kinds: Set<RunGridCell["kind"]> }) {
+function GridLegend({ kinds, blocked }: { kinds: Set<RunGridCell["kind"]>; blocked: boolean }) {
   const items: { key: string; swatch: React.ReactNode; label: string }[] = [
     { key: "succeeded", swatch: <span className={cn(CELL_BASE, "h-3 w-3 bg-emerald-500")} />, label: "Succeeded" },
     { key: "failed", swatch: <span className={cn(CELL_BASE, "h-3 w-3 bg-red-500")} />, label: "Failed" },
-    { key: "skipped", swatch: <span className={cn(CELL_BASE, "h-3 w-3 bg-amber-400")} />, label: "Skipped" },
+    { key: "skipped", swatch: <span className={cn(CELL_BASE, "h-3 w-3 bg-zinc-300 dark:bg-zinc-600")} />, label: "Skipped" },
+  ]
+  if (blocked) {
+    items.push({
+      key: "blocked",
+      swatch: (
+        <span className={cn(CELL_BASE, "h-3 w-3", BLOCKED_CELL)}>
+          <Ban className="h-2 w-2" strokeWidth={3} />
+        </span>
+      ),
+      label: "Blocked by a data check",
+    })
+  }
+  items.push(
     {
       key: "waiting",
       swatch: <span className={cn(CELL_BASE, "h-3 w-3 border-2 border-amber-400")} />,
       label: "Waiting for other upstreams",
     },
-  ]
+  )
   for (const k of ["running", "woke", "none", "not_loaded", "hidden", "unknown", "unlinked"] as const) {
     if (!kinds.has(k)) continue
     items.push({

@@ -792,6 +792,14 @@ func TestSinkStopMatchesTheTextItsSourcesWrite(t *testing.T) {
 	if !strings.Contains(string(src), `"error": f"`+sinkWorkerNotFound+`: {base}"`) {
 		t.Errorf("kafka-mcp-sink %s stop_sink no longer answers %q for a missing worker", latest.CurrentVersion, sinkWorkerNotFound)
 	}
+	// The reaper's conditional stop: the key it sends and the answer it reads as "a
+	// newer run owns this worker, keep it".
+	if !strings.Contains(string(src), `"`+sinkStopOnlyIfExecutionKey+`"`) {
+		t.Errorf("kafka-mcp-sink %s stop_sink no longer reads %q", latest.CurrentVersion, sinkStopOnlyIfExecutionKey)
+	}
+	if !strings.Contains(string(src), `"error": f"`+sinkWorkerNotOwner+`: `) {
+		t.Errorf("kafka-mcp-sink %s stop_sink no longer answers %q for a worker a newer run owns", latest.CurrentVersion, sinkWorkerNotOwner)
+	}
 }
 
 // A slow manifest read must end with the resolve budget, on both the unique-id path and
@@ -850,7 +858,7 @@ func TestCDCCleanupSlowManifestReadEndsWithTheResolveBudget(t *testing.T) {
 }
 
 // runningSinkStops counts the goroutines still inside a stop_sink call started by
-// stopSinkWorker.
+// stopSinkWorker (its goroutine lives in stopSinkWorkerOwnedBy).
 func runningSinkStops() int {
 	buf := make([]byte, 1<<16)
 	for {
@@ -863,7 +871,7 @@ func runningSinkStops() int {
 	}
 	count := 0
 	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, "handlers.stopSinkWorker.func") {
+		if strings.Contains(g, "handlers.stopSinkWorkerOwnedBy.func") {
 			count++
 		}
 	}

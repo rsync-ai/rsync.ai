@@ -110,7 +110,7 @@ func TestCDCObjectFlushStampsOffsetMetadata(t *testing.T) {
 		DestinationConfig: map[string]interface{}{"bucket": "lake", "path_prefix": "demo"}}
 	b := &cdcObjectBatcher{
 		cfg: cfg, destType: "gcs", destCfg: cfg.DestinationConfig,
-		params: cdcBatchingParams{enabled: true}, reader: reader, hw: newHighWaterTracker(),
+		params: cdcBatchingParams{enabled: true}, gate: newCommitGate(reader.CommitMessages, newHighWaterTracker()),
 		httpClient: &http.Client{Transport: rt}, eventsWriter: ew, metrics: &Metrics{},
 		cdcInserts: &sync.Map{}, cdcUpdates: &sync.Map{}, cdcDeletes: &sync.Map{}, cdcBytes: &sync.Map{},
 		batches: map[string]*cdcObjectBatch{},

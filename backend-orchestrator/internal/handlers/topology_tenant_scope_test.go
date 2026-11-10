@@ -63,7 +63,7 @@ func TestTopicPipelineID8(t *testing.T) {
 		"payments.transactions",
 		"",
 		// The planner names its CDC topic after the CONNECTION, not a pipeline
-		// (llm-service/src/agents/planner/strategies.py:650) — there is no id8
+		// (llm-service/src/agents/planner/strategies.py:597) — there is no id8
 		// in it to authorize against.
 		"rsync.cdc.acme-prod-postgres",
 		// Near-misses that must not be mistaken for an id8.
@@ -264,7 +264,7 @@ func TestRequireTopicPipelineScope(t *testing.T) {
 		c.Set("auth_internal", true)
 
 		h := &TopologyHandler{db: db}
-		// The planner POSTs here with X-Internal-Secret (strategies.py:766) and
+		// The planner POSTs here with X-Internal-Secret (strategies.py:713) and
 		// has already applied its own gate.
 		if !h.requireTopicPipelineScope(c, "rsync.agent.control.results") {
 			t.Fatal("a trusted internal caller was refused")

@@ -132,7 +132,7 @@ func TestKeylessCDCRow_WarehouseMergeNeverGuessesTheKey(t *testing.T) {
 	cfg := &WorkerConfig{PipelineID: ackFKPipelineID, SinkMode: "cdc", DestinationConnector: "bigquery", DestinationConfig: map[string]interface{}{}}
 	log := &callLog{}
 	_, _, err := writeCDCToDestination(context.Background(), &http.Client{Transport: log}, cfg,
-		&DDLSupport{Enabled: false, resolved: true}, msgs[0], sms[0], "upsert")
+		&DDLSupport{Enabled: false, resolved: true}, msgs[0], sms[0], "upsert", msgs[0].Offset)
 	if err == nil || !strings.Contains(err.Error(), "primary_keys") {
 		t.Errorf("keyless warehouse merge: err=%v, calls=%+v — want a missing-primary-keys refusal, not a merge on a guessed `id`", err, log.writes())
 	}
@@ -142,7 +142,7 @@ func TestKeylessCDCRow_WarehouseMergeNeverGuessesTheKey(t *testing.T) {
 	sms[0].KeyFields = []string{"order_id"}
 	log = &callLog{}
 	if _, _, err := writeCDCToDestination(context.Background(), &http.Client{Transport: log}, cfg,
-		&DDLSupport{Enabled: false, resolved: true}, msgs[0], sms[0], "upsert"); err != nil {
+		&DDLSupport{Enabled: false, resolved: true}, msgs[0], sms[0], "upsert", msgs[0].Offset); err != nil {
 		t.Fatalf("keyed warehouse merge: %v", err)
 	}
 	w := log.writes()

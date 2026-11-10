@@ -8,7 +8,7 @@ package storage
 // slugify, sanitizePathPart, timePartitionSegment, cdcObjectPath, cdcObjectKey,
 // cdcPipelineSegment, cdcPipelineRootPrefix, fileExt, tablePrefix, partKey, manifestKey,
 // successKey, plus the batch writer's inline normalization). They deliberately do NOT
-// reuse KeyBuilder / Slugify / SanitizePath in keybuilder.go, whose rules differ from
+// reuse Slugify / SanitizePath in keybuilder.go, whose rules differ from
 // the worker's. The LayoutV2* functions are the agreed next layout.
 //
 // Both are pinned by shared/object_layout_golden.json, which the worker's
