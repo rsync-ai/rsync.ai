@@ -6,7 +6,8 @@ go 1.26.0
 // (2026-10-08) clears GO-2026-6607 (crypto/tls),
 // which no Go 1.25 release fixes (BACKLOG F-GO-1.26-TOOLCHAIN-MOVE).
 // go1.26.10 (2026-10-22) clears GO-2026-6809 (crypto/x509).
-toolchain go1.26.10
+// go1.26.11 (2026-11-10) clears GO-2026-6859 (net/http).
+toolchain go1.26.11
 
 require github.com/jackc/pgx/v5 v5.10.0
 

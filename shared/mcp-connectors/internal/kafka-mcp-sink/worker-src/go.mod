@@ -9,7 +9,8 @@ go 1.26.0
 // 1.25 builder refuse the module instead of shipping the unpatched stdlib
 // (the Dockerfile's golang:1.26-alpine runs with GOTOOLCHAIN=local).
 // go1.26.10 (2026-10-22) clears GO-2026-6809 (crypto/x509).
-toolchain go1.26.10
+// go1.26.11 (2026-11-10) clears GO-2026-6859 (net/http).
+toolchain go1.26.11
 
 require (
 	github.com/rsync-ai/shared/kafkaclient v0.0.0
@@ -40,7 +41,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.32.4 // indirect
 	github.com/aws/smithy-go v1.22.0 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
 	github.com/rsync-ai/shared/memlimit v0.0.0
 	github.com/rsync-ai/shared/pgdriver v0.0.0

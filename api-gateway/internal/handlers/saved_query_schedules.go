@@ -3270,7 +3270,8 @@ func loadSavedQuerySchedule(c *gin.Context, database *sql.DB, savedQueryID strin
 
 // createTemporalModelSchedule registers the schedule with Temporal. Same policies as
 // the pipeline version: SKIP overlap so a slow rebuild is never stacked on itself, and
-// a 1-minute catchup window so a brief worker outage does not replay a backlog.
+// scheduleCatchupWindow, so a fire missed while the host slept or Temporal was down
+// still runs once when it is back (SKIP drops the rest of the backlog).
 func createTemporalModelSchedule(ctx context.Context, scheduleID, savedQueryID, scheduleType string, spec ScheduleSpec) error {
 	scheduleSpec := client.ScheduleSpec{}
 	switch scheduleType {
@@ -3316,7 +3317,7 @@ func createTemporalModelSchedule(ctx context.Context, scheduleID, savedQueryID, 
 			WorkflowRunTimeout: modelRunTimeout + 15*time.Minute,
 		},
 		Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
-		CatchupWindow: 1 * time.Minute,
+		CatchupWindow: scheduleCatchupWindow,
 		Paused:        false,
 	})
 	return err

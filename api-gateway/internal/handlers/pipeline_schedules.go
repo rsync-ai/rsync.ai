@@ -966,6 +966,32 @@ func validateScheduleSpec(scheduleType string, spec ScheduleSpec) error {
 // Temporal Schedule Operations
 // ============================================================================
 
+// scheduleCatchupWindow is how late a pipeline or model schedule may still take
+// a fire it missed: the machine slept, or Temporal or the worker was down, at
+// the fire time. Within it the fire runs once when Temporal is back; SKIP
+// overlap drops the rest of a backlog, so a long outage still costs one run.
+// It was 1 minute, which dropped a nightly fire whenever the host slept
+// through it. Edits and the startup reconcile widen schedules made with the
+// old window (withScheduleCatchupWindow, ReconcileScheduleCatchupWindows).
+const scheduleCatchupWindow = 24 * time.Hour
+
+// withScheduleCatchupWindow returns a copy of p whose catch-up window is at
+// least scheduleCatchupWindow, the rest unchanged. It only ever widens: zero
+// is Temporal's default (a year) and is left alone, as is any wider window.
+func withScheduleCatchupWindow(p *client.SchedulePolicies) *client.SchedulePolicies {
+	if p == nil {
+		return &client.SchedulePolicies{
+			Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+			CatchupWindow: scheduleCatchupWindow,
+		}
+	}
+	out := *p
+	if out.CatchupWindow != 0 && out.CatchupWindow < scheduleCatchupWindow {
+		out.CatchupWindow = scheduleCatchupWindow
+	}
+	return &out
+}
+
 func createTemporalSchedule(ctx context.Context, scheduleID, pipelineID, scheduleType string, spec ScheduleSpec) error {
 	scheduleSpec := client.ScheduleSpec{}
 
@@ -997,7 +1023,7 @@ func createTemporalSchedule(ctx context.Context, scheduleID, pipelineID, schedul
 			WorkflowRunTimeout: 5 * time.Minute,
 		},
 		Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
-		CatchupWindow: 1 * time.Minute,
+		CatchupWindow: scheduleCatchupWindow,
 		Paused:        false,
 	})
 
@@ -1100,8 +1126,10 @@ func updateTemporalSchedule(ctx context.Context, scheduleID, pipelineID, schedul
 				Schedule: &client.Schedule{
 					Spec:   &scheduleSpec,
 					Action: input.Description.Schedule.Action, // Keep same action
-					Policy: input.Description.Schedule.Policy, // Keep same policy
-					State:  input.Description.Schedule.State,  // Keep same state
+					// Keep the same policy, but widen a catch-up window left from
+					// before scheduleCatchupWindow: an edit must not carry it forward.
+					Policy: withScheduleCatchupWindow(input.Description.Schedule.Policy),
+					State:  input.Description.Schedule.State, // Keep same state
 				},
 			}, nil
 		},

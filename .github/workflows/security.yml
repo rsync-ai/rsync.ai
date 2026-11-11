@@ -245,11 +245,11 @@ jobs:
           cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       # Reachability-based: only fails when the vulnerable symbol is actually
       # called. Each module is analyzed with GOTOOLCHAIN=<its toolchain>+auto,
-      # the toolchain its go.mod pins (go1.26.10 for all seven modules), so the
+      # the toolchain its go.mod pins (go1.26.11 for all seven modules), so the
       # stdlib analyzed is the PATCHED one the Docker base ships. A NEW stdlib
       # CVE surfaces here until the pin is bumped.
       # A module with no `toolchain` line runs on setup-go's toolchain (`local`,
-      # the go1.26.10 api-gateway pins), as ci.yml's Go job does. Its `go` line
+      # the go1.26.11 api-gateway pins), as ci.yml's Go job does. Its `go` line
       # is NOT a toolchain name: `go 1.23` gives `go1.23`, which go refuses
       # ("go1.23 is a language version but not a toolchain version"), and this
       # step used to build exactly that name. No module on the list has hit it,

@@ -14,10 +14,11 @@ go 1.26.0
 // 6609-6613, 6617 (net/http); golang.org/x/net v0.60.0 closes the x/net half
 // of 6603, 6610-6612 and 6617. Go 1.25 has no release with these fixes.
 // go1.26.10 (2026-10-22) clears GO-2026-6809 (crypto/x509).
-// go1.26.10 is the latest 1.26 patch. The golang:1.26-alpine Docker base
+// go1.26.11 (2026-11-10) clears GO-2026-6859 (net/http).
+// go1.26.11 is the latest 1.26 patch. The golang:1.26-alpine Docker base
 // floats to it; this makes the guarantee explicit for `go test` / govulncheck
 // outside the container.
-toolchain go1.26.10
+toolchain go1.26.11
 
 require (
 	github.com/IBM/sarama v1.61.1
@@ -78,7 +79,7 @@ require (
 	github.com/jcmturner/gofork v1.7.6 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect

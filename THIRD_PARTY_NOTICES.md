@@ -19,7 +19,7 @@ connector matrix, and connector images built at runtime, do not carry it yet.
 > release tree and commit the result. A blocking [`Licenses`](.github/workflows/licenses.yml)
 > CI check independently fails any PR that introduces a new GPL / AGPL / SSPL / BUSL dependency.
 
-_Inventory: 136 Go module@version rows, 27 Python packages, 50 frontend (npm) direct
+_Inventory: 135 Go module@version rows, 27 Python packages, 50 frontend (npm) direct
 production dependencies, 1 bundled font, 1 bundled set of map shapes._
 
 > **Provenance, honestly.** The Go table was rebuilt on 2026-08-25 directly from
@@ -64,7 +64,7 @@ must remain separable and replaceable.
 
 ## License distribution (shipped surface)
 
-- **Go** (136 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 23; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
+- **Go** (135 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 22; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
 - **Python** (27 packages): Apache-2.0 x 9; MIT x 7; BSD-3-Clause x 6; Apache-2.0 OR BSD-3-Clause x 2; LGPL-3.0-or-later x 1; MIT-0 x 1; UPL-1.0 OR Apache-2.0 x 1
 - **Frontend** (50 direct prod deps): MIT x 42; Apache-2.0 x 3; ISC x 3; EPL-2.0 x 1 (elected); MPL-2.0 x 1; plus the bundled Inter font, OFL-1.1, and Natural Earth's map shapes, public domain
 
@@ -142,8 +142,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/jcmturner/gofork](https://github.com/jcmturner/gofork) | v1.7.6 | BSD-3-Clause |
 | [github.com/jcmturner/gokrb5/v8](https://github.com/jcmturner/gokrb5) | v8.4.4 | Apache-2.0 |
 | [github.com/jcmturner/rpc/v2](https://github.com/jcmturner/rpc) | v2.0.3 | Apache-2.0 |
-| [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.19.1 | BSD-3-Clause |
-| [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.20.1 | BSD-3-Clause |
+| [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.20.2 | BSD-3-Clause |
 | [github.com/leodido/go-urn](https://github.com/leodido/go-urn) | v1.5.0 | MIT |
 | [github.com/linkedin/goavro/v2](https://github.com/linkedin/goavro) | v2.15.0 | Apache-2.0 |
 | [github.com/mattn/go-isatty](https://github.com/mattn/go-isatty) | v0.0.20 | MIT |

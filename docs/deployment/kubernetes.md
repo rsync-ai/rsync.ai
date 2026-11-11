@@ -85,7 +85,7 @@ with fresh secrets and empty volumes.
 | `RSYNC_INGRESS_CLASS`, `RSYNC_TLS_SECRET` | cluster default, none | Ingress class; an existing `kubernetes.io/tls` Secret (URLs become `https`) |
 | `RSYNC_CONNECTORS` | `postgresql,mysql,mongodb,aws-s3,gcs` | Which connector pods to run |
 | `RSYNC_DEMO` | `true` | The sample-data try-it path |
-| `RSYNC_NAMESPACE`, `RSYNC_RELEASE` | `rsync`, `rsync` | Where it installs |
+| `RSYNC_NAMESPACE`, `RSYNC_RELEASE` | `rsync-ai`, `rsync-ai` | Where it installs. An upgrade of an earlier install that used `rsync`, `rsync` keeps that name. |
 | `RSYNC_STORAGE_CLASS` | cluster default | Required only when the cluster has no default |
 | `RSYNC_IMAGE_REGISTRY`, `RSYNC_IMAGE_TAG`, `RSYNC_IMAGE_PULL_SECRET` | `ghcr.io/rsync-ai`, chart version, none | Mirror or private registry |
 | `RSYNC_KUBE_CONTEXT` | current context | Target a specific cluster |

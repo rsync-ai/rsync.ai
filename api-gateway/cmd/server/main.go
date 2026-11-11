@@ -699,6 +699,11 @@ func main() {
 	// lost — retrying in the background until Temporal answers.
 	handlers.ReconcileWorkflowSchedules(appCtx)
 
+	// Pipeline and model schedules made before the 24-hour catch-up window kept
+	// their 1-minute one, which drops a fire the host slept through. This widens
+	// them once, in the background until Temporal answers; wide ones are only read.
+	handlers.ReconcileScheduleCatchupWindows(appCtx)
+
 	// Initialize OAuth, Schema Registry, and Auth handlers
 	oauthHandler := handlers.NewOAuthHandler(db.GetDB())
 	schemaHandler := handlers.NewSchemaRegistryHandler()

@@ -10,7 +10,8 @@ go 1.26.0
 // makes a 1.25 builder refuse the module; the golang:1.26 Docker base floats to
 // this patch. Docker-daemon CVEs stay in .govulncheck-allow.txt (fix is N/A there).
 // go1.26.10 (2026-10-22) clears GO-2026-6809 (crypto/x509).
-toolchain go1.26.10
+// go1.26.11 (2026-11-10) clears GO-2026-6859 (net/http).
+toolchain go1.26.11
 
 require (
 	github.com/docker/docker v28.5.2+incompatible
