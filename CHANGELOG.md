@@ -56,6 +56,15 @@ connector generator is the one part that stays out.
   chart set `RSYNC_LLM_SAMPLE_ROWS_ALLOWED=false`, which api-gateway and llm-service both
   enforce, and the setting is hidden in the UI. No row value reaches an LLM.
 
+### 🐛 Fixed
+- **A scheduled pipeline or model that came due while the host was asleep or down now runs
+  once when the host is back,** if that is within 24 hours. Before, a fire missed by more
+  than a minute was dropped. Schedules made earlier get the wider window at startup.
+
+### 🔒 Security
+- `klauspost/compress` v1.20.2 in the Kafka sink worker (GO-2026-6865), and the Go modules
+  now name toolchain go1.26.11 (GO-2026-6859).
+
 ## [0.1.8] - 2026-10-02
 
 Everything since v0.1.7.

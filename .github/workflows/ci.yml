@@ -369,7 +369,7 @@ jobs:
       # to ubuntu-latest, where that tool cache is exactly what the action is
       # built to write — so the action is now the right way to pin 3.11, and
       # the bare `python3` below resolves to it.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: env.RUN == '1'
         with:
           python-version: '3.11'
@@ -834,7 +834,7 @@ jobs:
             echo '::notice title=e2e/_support unit tests skipped::no path this job filters on changed'
             echo '`e2e/_support unit tests` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: env.RUN == '1'
         with:
           python-version: '3.11'
