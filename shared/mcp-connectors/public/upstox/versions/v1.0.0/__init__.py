@@ -1,1 +1,0 @@
-"""Upstox MCP Connector"""

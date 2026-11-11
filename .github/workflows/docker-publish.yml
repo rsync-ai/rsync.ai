@@ -8,8 +8,8 @@ on:
   # at release time, not per commit: cut a v*.*.* tag or run the workflow
   # manually to publish.
   #
-  # That budget got tighter, not looser: a release now builds 35 images (the 13
-  # hand-listed below plus the 22 discovered connectors), so restoring a push
+  # That budget got tighter, not looser: a release now builds 34 images (the 13
+  # hand-listed below plus the 21 discovered connectors), so restoring a push
   # trigger would exhaust the month faster than the incident this comment
   # records. Both numbers are transcribed, so they are pinned to what they
   # describe by llm-service/tests/test_shipped_images_are_publishable.py

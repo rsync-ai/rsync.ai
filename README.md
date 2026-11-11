@@ -4,7 +4,7 @@
 [![License: source-available](https://img.shields.io/badge/license-source--available-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
 [![Deploy: Helm](https://img.shields.io/badge/deploy-Helm%20chart-0F1689?logo=helm&logoColor=white)](#kubernetes)
-[![Connectors](https://img.shields.io/badge/connectors-22-16a34a)](docs/connectors/reference.md)
+[![Connectors](https://img.shields.io/badge/connectors-21-16a34a)](docs/connectors/reference.md)
 [![Docs](https://img.shields.io/badge/docs-read%20the%20guides-64748b)](docs/README.md)
 
 > **Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled
@@ -48,7 +48,7 @@ others, or build a competing product from it. The [full summary is below](#licen
   it has been verified.
   → [Data Explorer](docs/explorer/README.md) ·
   [Lineage and observability](docs/solutions/data-lineage-and-pipeline-observability.md)
-- **Versioned MCP connectors.** Each of the 22 connectors runs as its own versioned
+- **Versioned MCP connectors.** Each of the 21 connectors runs as its own versioned
   container, so you can upgrade or pin one without touching the rest.
   → [Connector reference](docs/connectors/reference.md)
 
@@ -91,7 +91,7 @@ the middle: get the data moving *and* keep it modelled, on hardware you control.
 | **Airflow / n8n** | General orchestration and automation, enormously flexible | A pipeline is a first-class object with row counts, lineage and CDC built in, rather than something you assemble from operators or nodes. |
 
 **Where it is honestly weaker.** There is no managed option — every install is yours to run.
-The catalogue is 22 connectors, not hundreds. Data checks are new and shallow next to dbt's
+The catalogue is 21 connectors, not hundreds. Data checks are new and shallow next to dbt's
 tests, and a failing check holds a table back only on Postgres, Redshift, MySQL, SQL Server and
 Oracle (and a ClickHouse table's first build); on Snowflake, BigQuery and Databricks it can only
 warn. And the Kubernetes path is younger than the Docker one (see [Project status](#project-status)). If
@@ -311,7 +311,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 
 ## Connectors
 
-**22 connectors ship in the box** — every one is a source, 16 are also destinations, and
+**21 connectors ship in the box** — every one is a source, 16 are also destinations, and
 five support change data capture. Each runs as its own versioned container, so you can
 upgrade or pin one without touching the rest.
 
@@ -321,7 +321,7 @@ upgrade or pin one without touching the rest.
 | **Data warehouse** | Snowflake, Google BigQuery, Databricks | — |
 | **Document** | MongoDB | MongoDB |
 | **Object storage** | AWS S3, Google Cloud Storage, Azure Blob Storage | — |
-| **APIs** | Stripe, Shopify, GitHub, Notion, Google Sheets, NSE India, Upstox | — |
+| **APIs** | Stripe, Shopify, GitHub, Notion, Google Sheets, NSE India | — |
 | **Demo and reference** | Sample Data (credential-free demo source), Widgets-GraphQL (GraphQL example) | — |
 
 The [connector reference](docs/connectors/reference.md) is generated from the connector

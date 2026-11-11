@@ -101,7 +101,7 @@ SETTLE_TIMEOUT_S="${RSYNC_SETTLE_TIMEOUT_S:-90}"
 # (connectors.sampleData). A guard (test_install_k8s_defaults_work.py) compares
 # this list with the tree, so a new connector cannot ship without being
 # installable here.
-KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 nse-india:v1.0.0 oracle:v1.0.0 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 upstox:v1.0.0 widgets-graphql:v1.0.0"
+KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 nse-india:v1.0.0 oracle:v1.0.0 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 widgets-graphql:v1.0.0"
 # Enough for the two documented paths (PG -> Mongo CDC, and object storage) plus
 # MySQL, which is the third most asked-for source. ~0.5 GiB of requests.
 DEFAULT_CONNECTORS="postgresql,mysql,mongodb,aws-s3,gcs"

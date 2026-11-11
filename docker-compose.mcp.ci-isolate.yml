@@ -39,8 +39,6 @@ services:
     container_name: ${STACK_PREFIX:-rsync-ai}-sqlserver-v1-0-0-mcp
   stripe-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-stripe-v1-0-0-mcp
-  upstox-v1-0-0-mcp:
-    container_name: ${STACK_PREFIX:-rsync-ai}-upstox-v1-0-0-mcp
   widgets-graphql-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-widgets-graphql-v1-0-0-mcp
 networks:
