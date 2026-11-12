@@ -128,13 +128,6 @@ func GetFeatures() *FeatureFlags {
 
 // Helper functions
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
 func getBoolEnv(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		boolVal, err := strconv.ParseBool(value)
