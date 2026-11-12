@@ -12,12 +12,14 @@ document or docs page when you type the URL. It uses the same tools as the
 [agent gateway](agent-gateway.md#tools), which lists each one with the role it needs, run as
 you: it sees what you can see in your active workspace, and nothing more.
 
-## Turn it on
+## On by default
 
-The assistant is off by default. While it is off, its routes do not exist, the header
-shows no **Ask rsync.ai** button, and Admin → Settings shows no **AI models** card.
+The assistant is on by default: `GET /api/v1/features` reports `"assistant": true`,
+which is what the UI reads, and the header shows an **Ask rsync.ai** button.
 
-Set `RSYNC_ASSISTANT_ENABLED=true` on the `api-gateway` service and restart it:
+To turn it off, set `RSYNC_ASSISTANT_ENABLED=false` on the `api-gateway` service and
+restart it. While it is off, its routes do not exist, the header shows no **Ask rsync.ai**
+button, and Admin → Settings shows no **AI models** card.
 
 - **Docker Compose** (every bundled compose file passes it through): add the line to
   the `.env` file compose reads, then recreate `api-gateway`.
@@ -25,13 +27,11 @@ Set `RSYNC_ASSISTANT_ENABLED=true` on the `api-gateway` service and restart it:
 
 ```yaml
 extraEnv:
-  RSYNC_ASSISTANT_ENABLED: "true"
+  RSYNC_ASSISTANT_ENABLED: "false"
 ```
 
-`GET /api/v1/features` then reports `"assistant": true`, which is what the UI reads.
-
-The assistant then needs at least one model key (next section). With none, the panel
-says that an admin can add one.
+While it is on, the assistant needs at least one model key (next section). With none,
+the panel says that an admin can add one.
 
 ## Give it a model
 

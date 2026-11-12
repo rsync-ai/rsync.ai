@@ -12,6 +12,8 @@ All notable changes to rsync.ai are documented in this file.
 Changes since the last release. They move under a version heading when that version
 is tagged.
 
+## [0.2.0] - 2026-11-12
+
 Everything since v0.1.8. The whole product now ships in this repository and is free to run
 for your own business under the same license, limited to one workspace per install. The AI
 connector generator is the one part that stays out.

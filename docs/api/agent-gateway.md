@@ -14,12 +14,14 @@ and `plan_workflow` drafts a report or data alert, each of which a person checks
 turns on in rsync.ai. No tool runs, creates, edits or deletes a pipeline or a
 connection.
 
-## Turn it on
+## On by default
 
-The gateway is off by default. While it is off, the MCP route and the agent token
-routes do not exist, and Settings shows no agent section.
+The gateway is on by default: `GET /api/v1/features` reports `"agent_gateway": true`,
+which is what the UI reads.
 
-Set `RSYNC_AGENT_GATEWAY_ENABLED=true` on the `api-gateway` service and restart it:
+To turn it off, set `RSYNC_AGENT_GATEWAY_ENABLED=false` on the `api-gateway` service and
+restart it. While it is off, the MCP route and the agent token routes do not exist, and
+Settings shows no agent section.
 
 - **Docker Compose** (every bundled compose file passes it through): add the line to
   the `.env` file compose reads, or export it in the shell that runs compose, then
@@ -28,11 +30,8 @@ Set `RSYNC_AGENT_GATEWAY_ENABLED=true` on the `api-gateway` service and restart 
 
 ```yaml
 extraEnv:
-  RSYNC_AGENT_GATEWAY_ENABLED: "true"
+  RSYNC_AGENT_GATEWAY_ENABLED: "false"
 ```
-
-`GET /api/v1/features` then reports `"agent_gateway": true`, which is what the UI
-reads.
 
 ## Make a token
 
