@@ -552,7 +552,7 @@ jobs:
       # later skip. Gated like every step after the RUN decision: an ungated
       # setup step runs on PRs the job has nothing to do for
       # (test_ci_inline_change_filters.py).
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         if: env.RUN == '1'
       - name: helm is present (eight chart cases skip silently without it)
         if: env.RUN == '1'

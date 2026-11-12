@@ -135,7 +135,7 @@ jobs:
       # step below already reasons about `bash`: a probe that returns 0 for
       # everything is the shape that goes green having checked nothing, and a
       # skip is the silent version of the same thing.
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
       - name: helm is present (a chart render case skips silently without it)
         run: helm version --short
       - name: Guards whose subject IS markdown
