@@ -484,6 +484,80 @@ func TestListNotifications_DBError_Returns500(t *testing.T) {
 // the expectation regexp requires the outer join AND the NULL branch, so it
 // stops matching the moment someone rewrites either back to an inner join.
 
+// A model's alert (a data check, migration 138) has no pipeline either, but it is not
+// about the whole install: it belongs to the model's workspace. Each query must keep it
+// out of the instance arm and admit it only through the model's own workspace, or a
+// data check's alert would ring in every workspace its owner belongs to.
+var modelAlertScopeRe = `EXISTS \(SELECT 1 FROM saved_queries sq WHERE sq\.id::text = n\.metadata->>'saved_query_id' AND sq\.workspace_id = \$2\)`
+
+// A workflow run's alert (workflow_run_alert.go) is the same: no pipeline, but it
+// belongs to the workflow's workspace, so it is kept out of the instance arm and
+// admitted only through the workflow.
+var (
+	instanceArmRe        = `\(n\.pipeline_id IS NULL AND n\.metadata->>'saved_query_id' IS NULL AND n\.metadata->>'workflow_id' IS NULL\)`
+	workflowAlertScopeRe = `EXISTS \(SELECT 1 FROM workflows wf WHERE wf\.id::text = n\.metadata->>'workflow_id' AND wf\.workspace_id = \$2\)`
+)
+
+// All three bell queries must agree, or the bell shows an alert it cannot count or
+// clear. Each is matched against the instance arm without workflow alerts and the
+// workflow's own workspace arm.
+func TestNotifications_WorkflowAlertShowsOnlyInItsWorkspace(t *testing.T) {
+	scope := instanceArmRe + `[\s\S]*` + modelAlertScopeRe + `[\s\S]*OR ` + workflowAlertScopeRe
+	queries := []struct {
+		name string
+		run  func(t *testing.T, mock sqlmock.Sqlmock)
+	}{
+		{"list", func(t *testing.T, mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*`+scope).
+				WithArgs(notifTestUser, notifTestWorkspace, notificationListLimit).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"id", "pipeline_id", "type", "severity", "title", "message", "action_url",
+					"pipeline_name", "impact", "action_label", "error_code", "raw_type",
+					"source_topic", "read_at", "created_at",
+				}))
+			mock.ExpectQuery(`SELECT COUNT\(\*\)[\s\S]*`+scope).
+				WithArgs(notifTestUser, notifTestWorkspace).
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+			r := newNotifRouter("GET", "/api/v1/notifications", ListNotifications, notifTestUser)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/notifications", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+		}},
+		{"unread count", func(t *testing.T, mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(`SELECT COUNT\(\*\)[\s\S]*`+scope).
+				WithArgs(notifTestUser, notifTestWorkspace).
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+			r := newNotifRouter("GET", "/api/v1/notifications/unread-count", GetUnreadNotificationCount, notifTestUser)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/notifications/unread-count", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+		}},
+		{"mark all read", func(t *testing.T, mock sqlmock.Sqlmock) {
+			mock.ExpectExec(`UPDATE pipeline_notifications n[\s\S]*`+scope).
+				WithArgs(notifTestUser, notifTestWorkspace).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			r := newNotifRouter("POST", "/api/v1/notifications/mark-all-read", MarkAllNotificationsRead, notifTestUser)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/notifications/mark-all-read", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+		}},
+	}
+	if len(queries) == 0 {
+		t.Fatal("no bell queries")
+	}
+	for _, q := range queries {
+		t.Run(q.name, func(t *testing.T) {
+			withNotificationsDB(t, func(mock sqlmock.Sqlmock) { q.run(t, mock) })
+		})
+	}
+}
+
 // The NULL pipeline_id must survive projection too. Notification.PipelineID is
 // a plain string, so the handler coalesces a NULL pipeline_id to the empty
 // string; without that, rows.Scan errors on the NULL and the row is skipped by
@@ -495,7 +569,7 @@ func TestListNotifications_DBError_Returns500(t *testing.T) {
 // that, so the row it feeds the scanner is the row Postgres would hand it.
 func TestListNotifications_InstanceAlertIsVisible(t *testing.T) {
 	withNotificationsDB(t, func(mock sqlmock.Sqlmock) {
-		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*n\.pipeline_id IS NULL OR p\.workspace_id = \$2`).
+		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*`+instanceArmRe+`[\s\S]*OR p\.workspace_id = \$2[\s\S]*`+modelAlertScopeRe).
 			WithArgs(notifTestUser, notifTestWorkspace, notificationListLimit).
 			WillReturnRows(sqlmock.NewRows([]string{
 				"id", "pipeline_id", "type", "severity", "title", "message", "action_url",
@@ -507,7 +581,7 @@ func TestListNotifications_InstanceAlertIsVisible(t *testing.T) {
 				"", "Pipelines on this connector version are failing more often.",
 				"Review connector health", "RSYNC_CONNECTOR_VERSION_REGRESSION",
 				"connector_version_regression", "rsync.notifications", nil, time.Now()))
-		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*n\.pipeline_id IS NULL OR p\.workspace_id = \$2`).
+		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*`+instanceArmRe+`[\s\S]*OR p\.workspace_id = \$2[\s\S]*`+modelAlertScopeRe).
 			WithArgs(notifTestUser, notifTestWorkspace).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 
@@ -539,7 +613,7 @@ func TestListNotifications_InstanceAlertIsVisible(t *testing.T) {
 
 func TestGetUnreadNotificationCount_CountsInstanceAlerts(t *testing.T) {
 	withNotificationsDB(t, func(mock sqlmock.Sqlmock) {
-		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*n\.pipeline_id IS NULL OR p\.workspace_id = \$2`).
+		mock.ExpectQuery(`LEFT JOIN pipelines p ON p\.id = n\.pipeline_id[\s\S]*`+instanceArmRe+`[\s\S]*OR p\.workspace_id = \$2[\s\S]*`+modelAlertScopeRe).
 			WithArgs(notifTestUser, notifTestWorkspace).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
 
@@ -566,7 +640,7 @@ func TestGetUnreadNotificationCount_CountsInstanceAlerts(t *testing.T) {
 // UPDATE cannot reach stays unread forever and no amount of clicking clears it.
 func TestMarkAllNotificationsRead_ClearsInstanceAlerts(t *testing.T) {
 	withNotificationsDB(t, func(mock sqlmock.Sqlmock) {
-		mock.ExpectExec(`n\.pipeline_id IS NULL[\s\S]*EXISTS \(SELECT 1 FROM pipelines p WHERE p\.id = n\.pipeline_id AND p\.workspace_id = \$2\)`).
+		mock.ExpectExec(instanceArmRe+`[\s\S]*EXISTS \(SELECT 1 FROM pipelines p WHERE p\.id = n\.pipeline_id AND p\.workspace_id = \$2\)[\s\S]*`+modelAlertScopeRe).
 			WithArgs(notifTestUser, notifTestWorkspace).
 			WillReturnResult(sqlmock.NewResult(0, 2))
 

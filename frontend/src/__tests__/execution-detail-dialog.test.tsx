@@ -110,7 +110,25 @@ describe("F-287 — the dialog reads the execution instead of re-rendering the r
 
     render(<ExecutionDetailDialog execution={row()} pipelineId="20912e3b" onClose={() => {}} />)
 
-    expect(await screen.findByText("Scheduled")).toBeInTheDocument()
+    expect(await screen.findByText("Schedule")).toBeInTheDocument()
+  })
+
+  // The badge said "Manual" for every run that was not scheduled, so a CDC or
+  // batch run read as one somebody started. It says the trigger in the Runs
+  // page's words (activityTriggerLabel).
+  it.each([
+    ["cdc", "CDC"],
+    ["batch", "Batch"],
+    ["manual", "Manual"],
+  ])("labels a %s run as %s", async (trigger, label) => {
+    respondWith({
+      detail: row({ trigger_source: trigger }),
+      stats: { tables: [], summary: null, total: 0 },
+    })
+
+    render(<ExecutionDetailDialog execution={row()} pipelineId="20912e3b" onClose={() => {}} />)
+
+    expect(await screen.findByText(label)).toBeInTheDocument()
   })
 })
 
@@ -329,7 +347,7 @@ describe("F-287 follow-up — a section reports its own fetch, never someone els
 describe("the dialog can be dismissed without knowing the Escape key exists", () => {
   it("offers a close control that calls onClose", async () => {
     // Reported from the live prod dialog: "there is no cancel X showing on top
-    // right". Escape and backdrop-click already worked — the affordance did not
+    // right". Escape already worked — the affordance did not
     // exist, so nothing on screen said so.
     respondWith({ detail: row(), stats: { tables: [], summary: null, total: 0 } })
     const onClose = vi.fn()

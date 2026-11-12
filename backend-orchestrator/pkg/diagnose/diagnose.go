@@ -149,11 +149,13 @@ func New() *RuleBasedDiagnoser { return &RuleBasedDiagnoser{} }
 // error whose underlying cause is "connection reset by peer"); source order
 // alone decides the winner, so the ordering is load-bearing and safety-
 // critical. In particular the higher-priority rules must stay above the
-// lower-priority ones: silent-drop → mongo-cdc-mask block (escalate) → auth → rate-limit → lost-stream-position
+// lower-priority ones: silent-drop (reads the sink's error first) →
+// auth → destination full/quota (escalate)
+// → rate-limit → lost-stream-position
 // (re-snapshot) → CDC provisioning (escalate) → mask-column (user-config) →
 // schema-drift → workflow-gone (orchestration) → swept-zombie (orchestration)
 // → non-retryable (escalate) → transient network (backoff-retry) →
-// dest-capacity → user-config → unknown. Moving the transient/network rule
+// out-of-memory (escalate) → user-config → unknown. Moving the transient/network rule
 // above CDC provisioning would let a provisioning failure be retried forever
 // instead of escalated; moving it above the non-retryable guard would let a
 // failure the executor already declared deterministic be retried because it
@@ -166,6 +168,33 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 	// it's a connector bug or auth/scope misconfig. Drill further by
 	// inspecting error_message and SourceRowCount.
 	if signal.ExecutorStatus == "silent_drop_detected" || signal.ExecutorStatus == "silent_partial_drop_detected" {
+		// Read the sink's error first (silent_drop_check.go appends it as
+		// "; sink error: …"). A full destination or a refused credential is not
+		// a connector bug, and the fix is the user's, not a regenerated
+		// connector. Only causes whose action does not re-run the export are
+		// taken: a transient cause keeps the silent-drop answer, because a re-run
+		// re-exports into a destination that may already hold the rows.
+		if cause := sinkErrorCause(low); cause != "" {
+			inner := d.Diagnose(Signal{ErrorMessage: cause})
+			switch inner.Category {
+			case CategoryDestCapacity, CategoryAuthExpired, CategoryAuthScope, CategoryUserConfig:
+				inner.Rationale = "rows did not land; the destination's error names the cause: " + inner.Rationale
+				return inner
+			}
+			// The destination answered and refused the rows: a client error on the
+			// record, or a resource it cannot write. The connector delivered them and
+			// read the answer, so a regenerated connector fixes nothing — the run's
+			// target or the rows' fields are the user's to change. The rationale does
+			// not quote the cause: an API's refusal can echo the row it refused.
+			if matchesAny(cause, destRefusalMarkers) {
+				return Diagnosis{
+					Category:        CategoryUserConfig,
+					SuggestedAction: ActionRequestUserConfig,
+					Confidence:      0.75,
+					Rationale:       "rows did not land; the destination refused them (a client error on the record, or a resource it cannot write) — point the run at a writable resource or supply the fields it requires",
+				}
+			}
+		}
 		if signal.SourceRowCount > 0 && signal.WrittenRows == 0 {
 			return Diagnosis{
 				Category:        CategoryConnectorBug,
@@ -201,21 +230,6 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 			SuggestedAction: ActionEscalate,
 			Confidence:      0.55,
 			Rationale:       "silent drop detected without clear cause; needs human inspection",
-		}
-	}
-
-	// MongoDB CDC/streaming refused because the pipeline carries an enabled mask
-	// (executor mongoCDCMaskBlockError, KI-MONGO-CDC-MASK-SILENT-NOOP). A privacy
-	// block: a retry refuses identically, and only a human can drop the mask or
-	// switch the pipeline to batch. Checked ahead of the keyword rules because the
-	// message carries user-named columns, which must not steer it to auth or
-	// transient retry.
-	if strings.Contains(low, "ki-mongo-cdc-mask-silent-noop") {
-		return Diagnosis{
-			Category:        CategoryUserConfig,
-			SuggestedAction: ActionEscalate,
-			Confidence:      0.9,
-			Rationale:       "MongoDB CDC run refused: an enabled mask transform cannot be applied to MongoDB CDC yet, so the run would land unmasked PII — a human must remove the mask or switch the pipeline to batch",
 		}
 	}
 
@@ -260,8 +274,25 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 		}
 	}
 
-	// Rate limits.
-	if matchesAny(low, []string{"http 429", "rate limit", "too many requests", "throttled", "quota exceeded"}) {
+	// Destination out of space, ahead of the rate-limit rule because both can
+	// say "quota". A storage phrase, or a "quota exceeded" with no rate-limit
+	// signal, does not clear by waiting, so it is escalated, not retried (an
+	// unneeded escalation is recoverable, a retry loop is not). Google's
+	// "Quota exceeded for quota metric … (status 429)" carries a 429 and stays
+	// a rate limit.
+	if matchesAny(low, destinationFullMarkers) ||
+		(strings.Contains(low, "quota exceeded") && !matchesAny(low, rateLimitMarkers)) {
+		return Diagnosis{
+			Category:        CategoryDestCapacity,
+			SuggestedAction: ActionEscalate,
+			Confidence:      0.95,
+			Rationale:       "destination is out of space or over its quota — free space or raise the quota",
+		}
+	}
+
+	// Rate limits. A status code counts with "status"/"http"/"error" before it:
+	// a REST connector reports "Request failed with status 429".
+	if matchesAny(low, rateLimitMarkers) {
 		return Diagnosis{
 			Category:        CategoryRateLimit,
 			SuggestedAction: ActionBackoffRetry,
@@ -546,11 +577,9 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 		}
 	}
 
-	// Destination capacity / quota.
-	if matchesAny(low, []string{
-		"out of memory", "disk full", "no space left",
-		"quota exceeded for", "storage full",
-	}) {
+	// Destination capacity. Storage and quota phrases are matched above the
+	// rate-limit rule (destinationFullMarkers).
+	if matchesAny(low, []string{"out of memory"}) {
 		return Diagnosis{
 			Category:        CategoryDestCapacity,
 			SuggestedAction: ActionEscalate,
@@ -559,10 +588,12 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 		}
 	}
 
-	// User config — missing required fields the connector flagged.
+	// User config — missing required fields the connector flagged, or a run aimed
+	// at a destination resource that takes no writes (executor dest_writable_check.go).
 	if matchesAny(low, []string{
 		"required field", "missing required",
 		"invalid configuration", "config validation failed",
+		"is not writable", "are not writable",
 	}) {
 		return Diagnosis{
 			Category:        CategoryUserConfig,
@@ -579,6 +610,39 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 		Confidence:      0.3,
 		Rationale:       "no rule matched; human inspection required",
 	}
+}
+
+// destinationFullMarkers: the destination has no room left. "you are over
+// your space quota" is MongoDB Atlas's free-tier refusal.
+var destinationFullMarkers = []string{
+	"over your space quota", "storage quota", "disk full", "no space left", "storage full",
+}
+
+// destRefusalMarkers: a destination's answer refusing the rows themselves — a
+// generated connector's "N of M rows refused" (connector.py.j2 _write_refusal),
+// its "is not writable", or an API's client error on the record. 401/403 are
+// auth and 429 a rate limit; the rules for those run first.
+var destRefusalMarkers = []string{
+	"rows refused", "is not writable",
+	"http 400", "http 404", "http 409", "http 422",
+	"status 400", "status 404", "status 409", "status 422",
+}
+
+// rateLimitMarkers: an explicit rate-limit signal.
+var rateLimitMarkers = []string{
+	"http 429", "status 429", "error 429",
+	"rate limit", "too many requests", "throttled",
+}
+
+// sinkErrorCause returns the sink's own error quoted at the end of a
+// silent-drop reason, or "".
+func sinkErrorCause(low string) string {
+	const marker = "sink error:"
+	i := strings.LastIndex(low, marker)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(low[i+len(marker):])
 }
 
 func matchesAny(haystack string, needles []string) bool {

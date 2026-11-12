@@ -9,10 +9,9 @@
  * and for a masking rule that is the difference between "masking is off" and
  * "the operator believes masking is off on both lanes".
  *
- * The other invariant: disabling a mask is guarded. `enabled = TRUE` is what
- * the Mongo CDC fail-closed check loads (nl_transforms_gate.go:584), so
- * switching a mask off removes it from the runtime AND from the check that
- * would have refused the run.
+ * The other invariant: disabling a mask is guarded. Only enabled rows are
+ * applied at run time, so switching a mask off means the next run copies
+ * those columns in the clear.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"

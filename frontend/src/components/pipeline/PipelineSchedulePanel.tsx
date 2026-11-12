@@ -3,6 +3,7 @@
 import { useMemo, useRef, useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
@@ -29,17 +30,18 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
-import { Clock, Play, Pause, Trash2, Plus, Calendar, Pencil, Loader2, AlertTriangle } from "lucide-react"
+import { Clock, Play, Pause, Trash2, Plus, CalendarClock, Pencil, Loader2, AlertTriangle } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch, authFetchOrThrow } from "@/lib/api/auth-fetch"
-import { classifyError } from "@/lib/utils/error-handling"
+import { classifyError, withErrorDetails } from "@/lib/utils/error-handling"
+import { timeZoneChoices } from "@/lib/timezones"
 import { toast } from "sonner"
 import {
+  emitPipelineScheduleCreate,
   onPipelineScheduleCreate,
   onPipelineSchedulesChanged,
   emitPipelineSchedulesChanged,
 } from "@/lib/events/scheduleCreate"
-import type { ApiErrorBody } from "@/lib/api/types"
 
 type TriggerStatus = "active" | "paused"
 type ScheduleType = "cron" | "interval"
@@ -168,17 +170,21 @@ async function createPipelineSchedule(pipelineId: string, scheduleType: string, 
   })
 
   if (!response.ok) {
-    const err = await response.json().catch(() => null)
-    throw new Error((err as ApiErrorBody)?.error || "Failed to create schedule")
+    throw new Error(await serverReason(response))
   }
 
   return (await response.json().catch(() => null)) as Schedule | null
 }
 
+/**
+ * The pipeline page's one "Create schedule" dialog, mounted outside the tabs. The
+ * schedule panel's empty state opens it (emitPipelineScheduleCreate), and so does
+ * the ?createSchedule=1 deep link.
+ */
 export function PipelineScheduleCreateDialogLauncher({ pipelineId }: { pipelineId: string }) {
   const [open, setOpen] = useState(false)
 
-  // Open schedule dialog immediately from header action (no navigation).
+  // Open the dialog where the request was made (no navigation).
   useEffect(() => {
     return onPipelineScheduleCreate((pid) => {
       if (pid !== pipelineId) return
@@ -207,15 +213,20 @@ export function PipelineScheduleCreateDialogLauncher({ pipelineId }: { pipelineI
       toast.success("Schedule created successfully")
       setOpen(false)
 
-      // If user chose "Paused", create then pause immediately (best effort).
+      // If user chose "Paused", create then pause immediately.
       if (created?.schedule_id && spec?.__desired_status === "paused") {
         try {
-          await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/schedules/${created.schedule_id}/pause`, {
+          await authFetchOrThrow(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/schedules/${created.schedule_id}/pause`, {
             method: "PATCH",
             body: JSON.stringify({ reason: "Paused on creation" }),
           })
         } catch (e) {
-          console.warn("Schedule created but failed to pause:", e)
+          // Not cosmetic: the user asked for a PAUSED schedule and got an
+          // ACTIVE one. Swallowing this means the pipeline runs on a cadence
+          // nobody agreed to, and the success toast above already fired.
+          toast.error("Schedule created, but it is ACTIVE — pausing it failed", {
+            description: classifyError(e, "general").message,
+          })
         }
       }
 
@@ -223,13 +234,13 @@ export function PipelineScheduleCreateDialogLauncher({ pipelineId }: { pipelineI
       // rather than the transient active-then-paused one.
       emitPipelineSchedulesChanged(pipelineId)
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Failed to create schedule")
+      toast.error("Failed to create schedule", { description: classifyError(e, "general").message })
       console.error(e)
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={setOpen} closeOnOutsideClick={false}>
       {/* Keep a stable client boundary even when closed */}
       <div className="hidden" aria-hidden />
       <CreateScheduleDialog mode="create" onSubmit={handleCreateSchedule} onCancel={() => setOpen(false)} />
@@ -250,14 +261,15 @@ export function PipelineScheduleCreateDialogLauncher({ pipelineId }: { pipelineI
 export async function serverReason(response: Response): Promise<string> {
   const body = (await response.json().catch(() => null)) as Record<string, unknown> | null
   const raw = body?.error ?? body?.message ?? body?.detail
-  const text = typeof raw === "string" ? raw.trim() : ""
+  // A gin binding failure answers {error: "Invalid request", details: <the
+  // field that failed>}; the label alone names nothing to fix.
+  const text = withErrorDetails(typeof raw === "string" ? raw : "", body?.details)
   return text || `The server answered ${response.status}.`
 }
 
 export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps) {
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [loading, setLoading] = useState(true)
-  const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [showEditDialog, setShowEditDialog] = useState(false)
   const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null)
   const [highlightScheduleId, setHighlightScheduleId] = useState<string | null>(null)
@@ -269,12 +281,10 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
     fetchSchedules()
   }, [pipelineId])
 
-  // Schedules are also mutated outside this panel — the header's "Create schedule"
-  // action renders its own dialog (PipelineScheduleCreateDialogLauncher). That path had
-  // no way to tell us anything changed, so creating from the header left this panel
-  // reading "No schedules configured" until a hard reload, while deleting from the
-  // panel's own trash icon refreshed instantly. Same state, two answers, depending on
-  // which button you used.
+  // Schedules are also created outside this panel — by the page's one create dialog
+  // (PipelineScheduleCreateDialogLauncher). That path once had no way to tell us anything
+  // changed, so a new schedule left this panel reading "No schedule" until a hard reload,
+  // while deleting from the panel's own trash icon refreshed instantly.
   useEffect(() => {
     return onPipelineSchedulesChanged((pid) => {
       if (pid !== pipelineId) return
@@ -319,40 +329,12 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
       setLoadError(null)
     } catch (error) {
       // A failed read used to leave `schedules` empty, which renders "No
-      // schedules configured" plus a Create Schedule button — so the user's
+      // schedule" plus a Create schedule button — so the user's
       // next move is to create a second schedule for a pipeline that already
       // has one, and the backend's one-per-pipeline rule rejects it.
       setLoadError(classifyError(error, "pipeline.load").message)
     } finally {
       setLoading(false)
-    }
-  }
-
-  const handleCreateSchedule = async (scheduleType: string, spec: any) => {
-    try {
-      const created = await createPipelineSchedule(pipelineId, scheduleType, spec)
-        toast.success("Schedule created successfully")
-        setShowCreateDialog(false)
-        // If user chose "Paused", create then pause immediately.
-        if (created?.schedule_id && spec?.__desired_status === "paused") {
-          try {
-            await authFetchOrThrow(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/schedules/${created.schedule_id}/pause`, {
-              method: "PATCH",
-              body: JSON.stringify({ reason: "Paused on creation" }),
-            })
-          } catch (e) {
-            // Not cosmetic: the user asked for a PAUSED schedule and got an
-            // ACTIVE one. Swallowing this means the pipeline runs on a cadence
-            // nobody agreed to, and the success toast above already fired.
-            toast.error("Schedule created, but it is ACTIVE — pausing it failed", {
-              description: classifyError(e, "general").message,
-            })
-          }
-        }
-        refreshSchedules()
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to create schedule")
-      console.error(error)
     }
   }
 
@@ -401,8 +383,7 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
         setEditingSchedule(null)
         refreshSchedules()
       } else {
-        const error = await response.json().catch(() => ({}))
-        toast.error(error.error || "Failed to update schedule")
+        toast.error("Failed to update schedule", { description: await serverReason(response) })
       }
     } catch (error) {
       toast.error("Failed to update schedule")
@@ -520,97 +501,96 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
     }
   }
 
+  const editDialog = showEditDialog && editingSchedule && (
+    <Dialog open={showEditDialog} onOpenChange={setShowEditDialog} closeOnOutsideClick={false}>
+      <CreateScheduleDialog
+        mode="edit"
+        initialSchedule={editingSchedule}
+        onSubmit={(scheduleType, spec) => handleUpdateSchedule(editingSchedule.schedule_id, scheduleType, spec)}
+        onCancel={() => {
+          setShowEditDialog(false)
+          setEditingSchedule(null)
+        }}
+      />
+    </Dialog>
+  )
+
+  // No schedule, a failed read and loading are each one framed line; a schedule
+  // is its own card under a heading, so no card sits inside another.
+  const frame =
+    "flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 bg-white px-4 py-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-950"
+
   if (loading) {
-    return <div className="text-sm text-muted-foreground">Loading schedules...</div>
+    return (
+      <div className={frame} role="status" aria-label="Loading schedule">
+        <Skeleton className="h-8 w-8 rounded-full" />
+        <Skeleton className="h-4 w-48" />
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div id="schedules" ref={schedulesSectionRef} className={`${frame} scroll-mt-24`} role="alert">
+        <AlertTriangle className="h-5 w-5 shrink-0 text-red-500" aria-hidden />
+        <p className="min-w-0 flex-1 text-sm text-red-700 dark:text-red-400">
+          Could not load schedules — {loadError}
+          <span className="block text-xs text-muted-foreground">
+            This is not the same as having none; the existing schedule may still be active.
+          </span>
+        </p>
+        <Button size="sm" variant="outline" onClick={fetchSchedules}>
+          Retry
+        </Button>
+      </div>
+    )
+  }
+
+  if (schedules.length === 0) {
+    // Only one schedule per pipeline (backend-enforced), so Create shows only here.
+    return (
+      <div id="schedules" ref={schedulesSectionRef} className={`${frame} scroll-mt-24`}>
+        <span
+          aria-hidden
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
+        >
+          <CalendarClock className="h-4 w-4" />
+        </span>
+        <p className="min-w-0 flex-1 text-sm">
+          <span className="font-medium text-zinc-900 dark:text-zinc-100">No schedule</span>
+          <span className="text-zinc-500 dark:text-zinc-400"> · Runs only when started.</span>
+        </p>
+        <Button size="sm" onClick={() => emitPipelineScheduleCreate(pipelineId)}>
+          <Plus className="mr-2 h-4 w-4" />
+          Create schedule
+        </Button>
+      </div>
+    )
   }
 
   return (
-    <div id="schedules" ref={schedulesSectionRef} className="space-y-4 scroll-mt-24">
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-lg font-semibold">Pipeline Schedules</h3>
-          <p className="text-sm text-muted-foreground">Automate pipeline executions with recurring schedules</p>
-        </div>
-        {/* Only one schedule per pipeline (backend-enforced). If a schedule exists, show Edit/Pause/Delete on the card.
-            Hidden while the list is unknown: offering Create on top of a failed
-            read invites a duplicate the backend will reject. */}
-        {schedules.length === 0 && !loadError && (
-          <Button size="sm" onClick={() => setShowCreateDialog(true)}>
-            <Plus className="mr-2 h-4 w-4" />
-            Create Schedule
-          </Button>
-        )}
-        {showCreateDialog && (
-          <Dialog open={showCreateDialog} onOpenChange={setShowCreateDialog}>
-            <CreateScheduleDialog
-              mode="create"
-              onSubmit={handleCreateSchedule}
-              onCancel={() => setShowCreateDialog(false)}
-            />
-          </Dialog>
-        )}
-        {showEditDialog && editingSchedule && (
-          <Dialog open={showEditDialog} onOpenChange={setShowEditDialog}>
-            <CreateScheduleDialog
-              mode="edit"
-              initialSchedule={editingSchedule}
-              onSubmit={(scheduleType, spec) => handleUpdateSchedule(editingSchedule.schedule_id, scheduleType, spec)}
-              onCancel={() => {
-                setShowEditDialog(false)
-                setEditingSchedule(null)
-              }}
-            />
-          </Dialog>
-        )}
+    <div id="schedules" ref={schedulesSectionRef} className="space-y-3 scroll-mt-24">
+      <div>
+        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Schedule</h3>
+        <p className="text-xs text-muted-foreground">Runs this pipeline on a recurring schedule</p>
       </div>
-
-      {loadError ? (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12 gap-3">
-            <AlertTriangle className="h-10 w-10 text-red-500" />
-            <p className="text-sm text-center text-red-700 dark:text-red-400">
-              Could not load schedules — {loadError}
-              <br />
-              <span className="text-muted-foreground">
-                This is not the same as having none; the existing schedule may still be active.
-              </span>
-            </p>
-            <Button size="sm" variant="outline" onClick={fetchSchedules}>
-              Retry
-            </Button>
-          </CardContent>
-        </Card>
-      ) : schedules.length === 0 ? (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <Calendar className="h-12 w-12 text-muted-foreground mb-4" />
-            <p className="text-sm text-muted-foreground text-center">
-              No schedules configured
-              <br />
-              Create a schedule to run this pipeline automatically
-            </p>
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="space-y-3">
-          {schedules.map((schedule) => (
-            <ScheduleCard
-              key={schedule.schedule_id}
-              schedule={schedule}
-              highlight={highlightScheduleId === schedule.schedule_id}
-              busy={busyScheduleId === schedule.schedule_id}
-              onEdit={() => {
-                setEditingSchedule(schedule)
-                setShowEditDialog(true)
-              }}
-              onPause={() => handlePauseSchedule(schedule.schedule_id)}
-              onResume={() => handleResumeSchedule(schedule.schedule_id)}
-              onTrigger={() => handleTriggerSchedule(schedule.schedule_id)}
-              onDelete={() => handleDeleteSchedule(schedule.schedule_id)}
-            />
-          ))}
-        </div>
-      )}
+      {editDialog}
+      {schedules.map((schedule) => (
+        <ScheduleCard
+          key={schedule.schedule_id}
+          schedule={schedule}
+          highlight={highlightScheduleId === schedule.schedule_id}
+          busy={busyScheduleId === schedule.schedule_id}
+          onEdit={() => {
+            setEditingSchedule(schedule)
+            setShowEditDialog(true)
+          }}
+          onPause={() => handlePauseSchedule(schedule.schedule_id)}
+          onResume={() => handleResumeSchedule(schedule.schedule_id)}
+          onTrigger={() => handleTriggerSchedule(schedule.schedule_id)}
+          onDelete={() => handleDeleteSchedule(schedule.schedule_id)}
+        />
+      ))}
     </div>
   )
 }
@@ -672,7 +652,7 @@ function ScheduleCard({ schedule, highlight, busy, onEdit, onPause, onResume, on
             <Button size="sm" variant="outline" onClick={onEdit} title="Edit trigger" disabled={busy}>
               <span className="inline-flex items-center gap-2">
                 <Pencil className="h-3 w-3" />
-                <span className="hidden sm:inline">Edit trigger</span>
+                <span className="hidden @md:inline">Edit trigger</span>
               </span>
             </Button>
             <Button size="sm" variant="outline" onClick={onTrigger} title="Trigger now" disabled={busy}>
@@ -770,30 +750,8 @@ function CreateScheduleDialog({ mode = "create", initialSchedule, onSubmit, onCa
   const [simpleMinute, setSimpleMinute] = useState("00")
   const [showCronSyntax, setShowCronSyntax] = useState(false)
 
-  // Full timezone list (IANA) with graceful fallback.
-  const timezones = useMemo(() => {
-    try {
-      // Modern browsers (Chrome/Edge/Firefox): returns IANA tz names
-      const list = (Intl as any).supportedValuesOf?.("timeZone") as string[] | undefined
-      if (Array.isArray(list) && list.length > 0) {
-        return [...list].sort((a, b) => a.localeCompare(b))
-      }
-    } catch {
-      // ignore
-    }
-    // Fallback: minimal set (should almost never be used on desktop Chrome)
-    return [
-      "UTC",
-      "America/New_York",
-      "America/Chicago",
-      "America/Denver",
-      "America/Los_Angeles",
-      "Europe/London",
-      "Europe/Paris",
-      "Asia/Tokyo",
-      "Asia/Shanghai",
-    ]
-  }, [])
+  // The browser's IANA list, plus UTC and the zone in the field, which it may lack (lib/timezones.ts).
+  const timezones = useMemo(() => timeZoneChoices(timezone), [timezone])
 
   const timezoneOptions = useMemo(() => {
     const now = new Date()
@@ -895,9 +853,9 @@ function CreateScheduleDialog({ mode = "create", initialSchedule, onSubmit, onCa
         </div>
 
         <div className="space-y-2">
-          <Label>Trigger type</Label>
+          <Label htmlFor="schedule-trigger-type">Trigger type</Label>
           <Select value={scheduleType} onValueChange={(v) => setScheduleType(v as ScheduleType)}>
-            <SelectTrigger>
+            <SelectTrigger id="schedule-trigger-type">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1042,9 +1000,9 @@ function CreateScheduleDialog({ mode = "create", initialSchedule, onSubmit, onCa
         )}
 
         <div className="space-y-2">
-          <Label>Timezone</Label>
+          <Label htmlFor="schedule-timezone">Timezone</Label>
           <Select value={timezone} onValueChange={setTimezone}>
-            <SelectTrigger>
+            <SelectTrigger id="schedule-timezone">
               <SelectValue placeholder="UTC" />
             </SelectTrigger>
             <SelectContent className="max-h-72">

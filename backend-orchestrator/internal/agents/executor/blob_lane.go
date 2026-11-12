@@ -40,7 +40,7 @@ const maxBlobPages = 100000
 const blobExportPageLimit = 200
 
 // bundledMinIOEndpoint is the compose stack's MinIO service
-// (docker-compose.yml:675, :717, :917 all default MINIO_ENDPOINT_URL to it). It
+// (docker-compose.yml:676, :717, :917 all default MINIO_ENDPOINT_URL to it). It
 // is the discriminator for whether the well-known minioadmin credentials are a
 // sensible default or an active hazard -- see buildStagingConfig.
 //
@@ -123,7 +123,7 @@ func (a *Agent) buildStagingConfig() map[string]interface{} {
 	//
 	// Against the bundled MinIO the old defaults are kept: they are that
 	// deployment's real credentials, and compose sets them explicitly anyway
-	// (docker-compose.yml:917-922), so this branch only covers a stack that set
+	// (docker-compose.yml:918-923), so this branch only covers a stack that set
 	// neither. (KI-CHART-ORCHESTRATOR-LOSES-OBJECTSTORAGE-ENV.)
 	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY_ID"))
 	secretKey := strings.TrimSpace(os.Getenv("MINIO_SECRET_ACCESS_KEY"))
@@ -377,38 +377,9 @@ func (a *Agent) executeBlobDataTransfer(ctx context.Context, task ExecutorTask, 
 		if executionID == "" {
 			log.Warnf("⚠️ blob lane dispatched %d objects but execution_id is empty — ack-ledger reconciliation bypassed; destination landing unverifiable", totalBlobs)
 		} else {
-			// received (SUM(rows_read)) is ignored here: every blob is a distinct
-			// object written once, so there is no benign upsert/dedup undercount to
-			// disambiguate — a blob shortfall is already surfaced as unverified below.
-			landed, _, ackRows, sinkErr := a.reconcileLandedRows(ctx, task.PipelineID, executionID, totalBlobs, batchAckReconcileDeadline())
-			switch {
-			case landed == 0 && ackRows > 0:
-				// POSITIVE evidence: the sink wrote acks summing to 0 landed. Acks are
-				// written only AFTER a successful dest write (fail-closed ledger), so
-				// this means the destination genuinely dropped everything.
-				reason := fmt.Sprintf("destination silently dropped all blobs: dispatched %d, ack ledger confirmed 0 landed across %d ack batches (execution %s)", totalBlobs, ackRows, executionID)
-				if strings.TrimSpace(sinkErr) != "" {
-					reason += fmt.Sprintf("; sink error: %s", sinkErr)
-				}
-				log.Warnf("🚨 blob silent drop detected (ack-ledger evidence): %s", reason)
-				return ExecutorResponse{
-					TaskID: task.TaskID, PipelineID: task.PipelineID,
-					Status: "silent_drop_detected", Error: reason, Result: result,
-				}
-			case landed == 0 && ackRows == 0:
-				// ABSENCE of evidence (ledger lag / unavailable) — ambiguous, never a
-				// hard fail (the sink retries the ack forever). Surface as unverified.
-				log.Warnf("⚠️ blob lane: dispatched %d objects but found 0 ack batches within the deadline (execution %s) — ledger lag/unavailable; marking unverified_completion", totalBlobs, executionID)
-				status = "unverified_completion"
-			case landed < totalBlobs:
-				// Partial landing. Unlike rows (upsert/dedup can legitimately
-				// undercount), every blob is a distinct object written once, so a
-				// shortfall is meaningful — surface as unverified rather than success.
-				log.Warnf("⚠️ blob lane: dispatched %d objects but ack ledger shows %d landed (execution %s)", totalBlobs, landed, executionID)
-				result["blobs_landed"] = landed
-				status = "unverified_completion"
-			default:
-				log.Infof("✅ Blob transfer verified: %d/%d objects landed for %s", landed, totalBlobs, task.PipelineID)
+			var failed *ExecutorResponse
+			if status, failed = a.verifyBlobLanding(ctx, task, executionID, totalBlobs, result, batchAckReconcileDeadline()); failed != nil {
+				return *failed
 			}
 		}
 	}
@@ -422,6 +393,53 @@ func (a *Agent) executeBlobDataTransfer(ctx context.Context, task ExecutorTask, 
 		KafkaTopic:    kafkaTopic,
 		Result:        result,
 	}
+}
+
+// verifyBlobLanding reconciles a blob run against the ack ledger. It returns the
+// run's status, or the response to end the run with when the ledger shows a drop
+// or the run's context ended before the sink confirmed every object.
+// result gains blobs_landed on a partial landing.
+func (a *Agent) verifyBlobLanding(ctx context.Context, task ExecutorTask, executionID string, totalBlobs int64, result map[string]interface{}, deadline time.Duration) (string, *ExecutorResponse) {
+	// received (SUM(rows_read)) is ignored here: every blob is a distinct
+	// object written once, so there is no benign upsert/dedup undercount to
+	// disambiguate — a blob shortfall is already surfaced as unverified below.
+	landed, _, ackRows, sinkErr := a.reconcileLandedRows(ctx, task.PipelineID, executionID, totalBlobs, deadline)
+	if landingCheckCutShort(ctx, landed, totalBlobs, sinkErr) {
+		// The run ended while it waited for the sink: not a ledger lag, no verdict.
+		failed := landingCutShortResponse(task, landingCutShortReason(ctx, landed, totalBlobs, "objects"))
+		failed.Result = result
+		return "", &failed
+	}
+	switch {
+	case landed == 0 && ackRows > 0:
+		// POSITIVE evidence: the sink wrote acks summing to 0 landed. Acks are
+		// written only AFTER a successful dest write (fail-closed ledger), so
+		// this means the destination genuinely dropped everything.
+		reason := allLostReason("blobs", totalBlobs, ackRows, executionID, sinkErr)
+		if strings.TrimSpace(sinkErr) != "" {
+			reason += fmt.Sprintf("; sink error: %s", sinkErr)
+		}
+		log.Warnf("🚨 blob silent drop detected (ack-ledger evidence): %s", reason)
+		return "", &ExecutorResponse{
+			TaskID: task.TaskID, PipelineID: task.PipelineID,
+			Status: "silent_drop_detected", Error: reason, Result: result,
+		}
+	case landed == 0 && ackRows == 0:
+		// ABSENCE of evidence (ledger lag / unavailable) — ambiguous, never a
+		// hard fail (the sink retries the ack forever). Surface as unverified.
+		log.Warnf("⚠️ blob lane: dispatched %d objects but found 0 ack batches within the deadline (execution %s) — ledger lag/unavailable; marking unverified_completion", totalBlobs, executionID)
+		return "unverified_completion", nil
+	case landed < totalBlobs:
+		// Partial landing. Unlike rows (upsert/dedup can legitimately
+		// undercount), every blob is a distinct object written once, so a
+		// shortfall is meaningful — surface as unverified rather than success.
+		log.Warnf("⚠️ blob lane: dispatched %d objects but ack ledger shows %d landed (execution %s)", totalBlobs, landed, executionID)
+		result["blobs_landed"] = landed
+		return "unverified_completion", nil
+	default:
+		log.Infof("✅ Blob transfer verified: %d/%d objects landed for %s", landed, totalBlobs, task.PipelineID)
+	}
+	return "success", nil
 }
 
 func blobFailure(task ExecutorTask, msg string) ExecutorResponse {

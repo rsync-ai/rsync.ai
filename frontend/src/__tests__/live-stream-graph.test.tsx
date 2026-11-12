@@ -180,4 +180,50 @@ describe("buildLiveStreamStages", () => {
     expect(stages.live_destination.status).toBe("failed")
     expect(stages.live_destination.result_summary).toContain("no MCP server registered")
   })
+
+  // The dependency probe sweeps running pipelines only (workers/dependency_probe.go),
+  // so a paused or stopped pipeline's verdicts are whatever the last running probe
+  // saw — usually healthy. The KYC pipeline on prod read "Active" while stopped.
+  describe("a pipeline that is not running", () => {
+    const parked = (phase: "paused" | "stopped") =>
+      byId(
+        buildLiveStreamStages(
+          {
+            ...runtime({ sink_lag_messages: 0, sink_committed_moving: false, last_event_at: new Date().toISOString() }, [
+              dep("debezium_task", "healthy"),
+              dep("kafka_sink_worker", "healthy"),
+            ]),
+            phase,
+          },
+          null,
+          {},
+        ),
+      )
+
+    it("does not call a stopped pipeline's capture active", () => {
+      const stages = parked("stopped")
+      expect(stages.live_source.status).toBe("stopped")
+      expect(stages.live_source.result_summary).toBe("the pipeline is stopped — no changes are being captured")
+    })
+
+    // Stop parks the connector AND stops the sink workers (cdc_stop.go), so no node
+    // is moving — and none of them is finished either.
+    it("does not call a stopped pipeline's sink up to date or writing", () => {
+      const stages = parked("stopped")
+      expect(stages.live_kafka.status).toBe("stopped")
+      expect(stages.live_kafka.result_summary).toBe("nothing waiting")
+      expect(stages.live_destination.status).toBe("stopped")
+      expect(stages.live_destination.result_summary).toBe("the pipeline is stopped — nothing is being written")
+    })
+
+    // Pause parks only the connector; the sink keeps draining what was captured
+    // before it, so Kafka and the destination keep their own readings.
+    it("pauses only the source node of a paused pipeline", () => {
+      const stages = parked("paused")
+      expect(stages.live_source.status).toBe("paused")
+      expect(stages.live_source.result_summary).toBe("the pipeline is paused — no changes are captured until it resumes")
+      expect(stages.live_kafka.status).toBe("complete")
+      expect(stages.live_destination.status).toBe("complete")
+    })
+  })
 })

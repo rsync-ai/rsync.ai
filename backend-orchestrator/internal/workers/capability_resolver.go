@@ -881,12 +881,11 @@ func (w *CapabilityResolverWorker) workspaceIDForPipeline(ctx context.Context, p
 	if w.db == nil || pipelineID == "" {
 		return ""
 	}
-	var workspaceID sql.NullString
-	err := w.db.QueryRowContext(ctx, `SELECT workspace_id FROM pipelines WHERE id = $1`, pipelineID).Scan(&workspaceID)
+	workspaceID, err := pipelineWorkspaceID(ctx, w.db, pipelineID)
 	if err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).
 			Warn("⚠️  Could not read workspace_id for pipeline; skipping workspace resolution")
 		return ""
 	}
-	return workspaceID.String
+	return workspaceID
 }

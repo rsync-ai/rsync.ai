@@ -1,14 +1,14 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { PageHeader } from "@/components/layout/PageHeader"
 import { AdminNav } from "@/components/admin/AdminNav"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { adminRead, type AdminReadFailure } from "@/lib/api/admin"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 
 type PipelinesResponse = {
   data: Array<{
@@ -32,9 +32,8 @@ export default function AdminPipelinesPage() {
 
   const [data, setData] = useState<PipelinesResponse | null>(null)
   const [loading, setLoading] = useState(true)
-  const [status, setStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
+  const latest = useRef(0)
 
   const queryString = useMemo(() => {
     const params = new URLSearchParams()
@@ -45,43 +44,15 @@ export default function AdminPipelinesPage() {
   }, [limit, offset, q])
 
   async function load() {
+    const request = ++latest.current
     setLoading(true)
-    setError(null)
-    setStatus(null)
-    setRetryAfter(null)
-
-    const res = await authFetch(`/api/v1/admin/pipelines?${queryString}`, { method: "GET" }).catch(() => null)
-    if (!res) {
-      setError("Network error")
-      setLoading(false)
-      return
-    }
-
-    if (res.status === 401) {
-      window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`
-      return
-    }
-    if (res.status === 403) {
-      setStatus(403)
-      setLoading(false)
-      return
-    }
-    if (res.status === 429) {
-      setStatus(429)
-      const ra = parseInt(res.headers.get("Retry-After") || "", 10)
-      setRetryAfter(Number.isFinite(ra) ? ra : null)
-      setLoading(false)
-      return
-    }
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "")
-      setError(txt || `HTTP ${res.status}`)
-      setLoading(false)
-      return
-    }
-
-    const json = (await res.json().catch(() => null)) as PipelinesResponse | null
-    setData(json)
+    setFailure(null)
+    const r = await adminRead<PipelinesResponse>(`/api/v1/admin/pipelines?${queryString}`)
+    // Typing sends a read per keystroke; an older one answering late must not
+    // replace the newer one's rows.
+    if (request !== latest.current) return
+    if (r.ok) setData(r.data)
+    else setFailure(r)
     setLoading(false)
   }
 
@@ -94,12 +65,12 @@ export default function AdminPipelinesPage() {
   const canNext = !!data && offset + limit < (data.total || 0)
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Pipelines across all users" />
       <AdminNav />
 
       <Card className="p-4">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-3 @md:flex-row @md:items-center @md:justify-between">
           <form
             className="flex w-full max-w-xl items-center gap-2"
             onSubmit={(e) => {
@@ -130,20 +101,8 @@ export default function AdminPipelinesPage() {
 
       {loading ? (
         <LoadingState />
-      ) : status === 403 ? (
-        <AccessDeniedState />
-      ) : status === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
-      ) : error ? (
-        <Card className="border border-red-200 bg-red-50 p-4 dark:border-red-900/40 dark:bg-red-950/20">
-          <div className="font-semibold text-red-800 dark:text-red-200">Failed to load</div>
-          <div className="mt-1 text-sm text-red-700 dark:text-red-300">{error}</div>
-          <div className="mt-3">
-            <Button variant="outline" onClick={load}>
-              Retry
-            </Button>
-          </div>
-        </Card>
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : !data ? (
         <LoadingState label="No data" />
       ) : (

@@ -17,6 +17,9 @@ services:
       # Use an explicit build context to avoid resolving relative to the root docker-compose.yml.
       context: ./shared/internal/infra/kafka-connect
       dockerfile: Dockerfile
+      additional_contexts:
+        # THIRD_PARTY_NOTICES.md for `COPY --from=legal`; `.` is the project root, as above
+        legal: .
     container_name: kafka-connect
     depends_on:
       - kafka
@@ -103,6 +106,7 @@ services:
       # Producer/Consumer settings for reliability
       CONNECT_PRODUCER_ACKS: "all"
       CONNECT_PRODUCER_RETRIES: 10
+      CONNECT_PRODUCER_COMPRESSION_TYPE: ${KAFKA_CONNECT_COMPRESSION_TYPE:-lz4}
       CONNECT_PRODUCER_RETRY_BACKOFF_MS: 100
       CONNECT_CONSUMER_AUTO_OFFSET_RESET: "earliest"
       

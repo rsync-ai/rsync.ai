@@ -33,6 +33,8 @@ COPY --from=shared canonical_types.py /app/canonical_types.py
 
 # Scope filter for server-level connections (no database named), same context.
 COPY --from=shared namespace_filter.py /app/namespace_filter.py
+# Stable batch paging, shipped the same way (sql_paging.py).
+COPY --from=shared sql_paging.py /app/sql_paging.py
 
 # Resolve runtime imports to the shared base_connector (fix once, apply everywhere)
 RUN if [ -f /app/base_connector.py ]; then \

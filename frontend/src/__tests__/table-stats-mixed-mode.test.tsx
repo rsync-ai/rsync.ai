@@ -29,6 +29,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { render, screen, waitFor } from "@testing-library/react"
 import "@testing-library/jest-dom"
+import { cardFact, cardValue } from "./statCards"
 
 const authFetch = vi.fn()
 vi.mock("@/lib/api/auth-fetch", () => ({
@@ -243,17 +244,6 @@ const CDC_COUNT_HEADINGS = [
   "Applied Total",
 ]
 
-/** Value shown under a summary-card label (the grid of summary figures). */
-function summaryValue(label: string): string {
-  const grid = document.querySelector("div.grid")
-  if (!grid) throw new Error("no summary grid")
-  const labels = Array.from(grid.querySelectorAll(":scope > div > div:first-child")).filter(
-    (el) => (el.textContent || "").trim() === label,
-  )
-  if (labels.length !== 1) throw new Error(`want one summary label "${label}", found ${labels.length}`)
-  return (labels[0].nextElementSibling?.textContent || "").trim()
-}
-
 describe("#21 — a CDC table with nothing captured reads 'No data yet', not Running and 0", () => {
   it("labels the waiting row and its count cells 'No data yet', beside a live row that keeps its numbers", async () => {
     authFetch.mockResolvedValue(
@@ -294,9 +284,10 @@ describe("#21 — a CDC table with nothing captured reads 'No data yet', not Run
     expect(cellUnder("Dropped", 0)).toBe("0")
 
     // Summary: the waiting table is counted as such, and the totals are real.
-    expect(summaryValue("Running")).toBe("1")
-    expect(summaryValue("No data yet")).toBe("1")
-    expect(summaryValue("Captured Inserts")).toBe("40")
+    expect(cardFact("Tables", "running")).toBe("1")
+    expect(cardFact("Tables", "no data yet")).toBe("1")
+    expect(cardFact("Changes captured", "inserts")).toBe("40")
+    expect(cardFact("Changes applied", "inserts")).toBe("40")
 
     // F-281 still holds with the new cells.
     const { headerCells, bodyRowCells } = columnCounts()
@@ -328,17 +319,12 @@ describe("#21 — a CDC table with nothing captured reads 'No data yet', not Run
     render(<TableStatisticsPanel pipelineId="p1" />)
     await waitFor(() => expect(screen.getByText(/audit/)).toBeInTheDocument())
 
-    for (const label of [
-      "Captured Inserts",
-      "Captured Updates",
-      "Captured Deletes",
-      "Applied Inserts",
-      "Applied Updates",
-      "Applied Deletes",
-    ]) {
-      expect(summaryValue(label)).toBe("No data yet")
+    // The CDC cards say so instead of a measured 0, and list no 0 counts under it.
+    for (const card of ["Changes captured", "Changes applied"]) {
+      expect(cardValue(card)).toBe("No data yet")
+      for (const label of ["inserts", "updates", "deletes"]) expect(cardFact(card, label)).toBeNull()
     }
-    expect(summaryValue("Running")).toBe("0")
+    expect(cardFact("Tables", "running")).toBe("0")
     expect(cellUnder("Status")).toBe("No data yet")
   })
 

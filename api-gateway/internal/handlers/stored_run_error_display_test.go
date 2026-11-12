@@ -75,7 +75,7 @@ func TestListSavedQuerySchedules_ScrubsAStoredLastRunError(t *testing.T) {
 		wsScopeUser, time.Now(), time.Now(),
 		nil, "",
 		nil, "",
-		upstreamPolicyAll}
+		upstreamPolicyAll, ""}
 	mock.ExpectQuery(`FROM saved_query_schedules s`).
 		WillReturnRows(sqlmock.NewRows(scheduledSummaryColumns).AddRow(row...))
 	mock.ExpectQuery(`FROM saved_query_schedule_upstreams u`).
@@ -96,7 +96,7 @@ func savedQueryRowsWithLastRunError(lastRunError string) *sqlmock.Rows {
 			"SELECT 1", "", "read", "workspace",
 			wsScopeUser, wsScopeUser, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
 			"table", "public.daily_mrr", "failed", lastRunError,
-			"", "", nil, "postgresql", nil)
+			"", "", nil, "postgresql", nil, "")
 }
 
 func TestListSavedQueries_ScrubsAStoredLastRunError(t *testing.T) {

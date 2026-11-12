@@ -1,0 +1,12 @@
+-- 131_workflow_run_definition.sql
+-- The definition a workflow run started with (docs/internal/workflows-design.md).
+--
+-- A workflow can now be edited (PUT /api/v1/workflows/:id). A run copies its
+-- workflow's definition when it is inserted and runs that copy, so an edit
+-- saved while a run is queued or running does not change the run half way,
+-- and the run history can say which runs ran an earlier version.
+--
+-- NULL on runs inserted before this migration: they ran the workflow's
+-- definition of the time, which was never edited, so the reader falls back
+-- to workflows.definition.
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS definition JSONB;

@@ -340,7 +340,7 @@ func (m *PostgreSQLManager) CleanupResources(ctx context.Context, pipelineID str
 // row whose pipeline was deleted (pipeline_id NULL via ON DELETE SET NULL). It
 // is idempotent and is meant to be called periodically by the CDC reconciler.
 // Returns the number of slots dropped. A 'stopped' pipeline's slot is kept — it
-// is the position Start resumes from (see ReapSlotsUnderWALPressure).
+// is the position Start resumes from — even under WAL pressure.
 //
 // This is what guarantees a slot is never permanently leaked even if the
 // synchronous pre-delete cleanup did not run (orchestrator down, network flake,
@@ -354,13 +354,12 @@ func (m *PostgreSQLManager) ReapOrphanedSlots(ctx context.Context) (int, error) 
 	return m.dropSlotResources(ctx, slots), nil
 }
 
-// ReapSlotsUnderWALPressure drops the named slots when their pipeline is deleted
-// or 'stopped'. The WAL watchdog calls it only with slots it measured past the
-// CRITICAL retained-WAL threshold: a stopped pipeline's slot is otherwise kept
-// as its resume position, but it still pins WAL on the source, and a full source
-// disk is worse than a pipeline that must be reloaded. Slots of running or
-// paused pipelines are never dropped, whatever their name.
-func (m *PostgreSQLManager) ReapSlotsUnderWALPressure(ctx context.Context, slotNames []string) (int, error) {
+// ReapNamedOrphanedSlots is ReapOrphanedSlots limited to the named slots. The WAL
+// watchdog calls it for slots it measured past the CRITICAL retained-WAL threshold,
+// so a deleted pipeline's slot goes now rather than on the reconciler's next pass.
+// It re-selects through GetReapableSlots, so the slot of any pipeline that still
+// exists — stopped, paused, running — is never dropped, whatever its name.
+func (m *PostgreSQLManager) ReapNamedOrphanedSlots(ctx context.Context, slotNames []string) (int, error) {
 	if len(slotNames) == 0 {
 		return 0, nil
 	}
@@ -368,7 +367,7 @@ func (m *PostgreSQLManager) ReapSlotsUnderWALPressure(ctx context.Context, slotN
 	for _, n := range slotNames {
 		want[n] = true
 	}
-	slots, err := GetWALPressureReapableSlots(ctx, m.db)
+	slots, err := GetReapableSlots(ctx, m.db)
 	if err != nil {
 		return 0, err
 	}
@@ -427,6 +426,10 @@ func (m *PostgreSQLManager) ReapOrphanedPublications(ctx context.Context) (int, 
 	if err != nil {
 		return 0, err
 	}
+	return m.dropPublicationResources(ctx, pubs), nil
+}
+
+func (m *PostgreSQLManager) dropPublicationResources(ctx context.Context, pubs []CDCResource) int {
 	dropped := 0
 	for _, resource := range pubs {
 		cfg, err := m.getDecryptedConnectionConfig(ctx, resource.ConnectionID)
@@ -453,7 +456,45 @@ func (m *PostgreSQLManager) ReapOrphanedPublications(ctx context.Context) (int, 
 			log.WithError(err).WithField("publication", resource.ResourceName).Warn("reaper: failed to mark publication deleted")
 		}
 	}
-	return dropped, nil
+	return dropped
+}
+
+// ReleaseConnectionObjects is the reconciler's slot and publication reap, now and
+// for one connection. A forced connection delete calls it first: the delete
+// cascades away the cdc_resources rows the reconciler finds these objects
+// through, and the connection's credentials with them, so this is the last chance
+// to drop them for the user. It re-selects through GetReapableSlots and
+// GetReapablePublications, so an object of a pipeline that still exists is never
+// dropped. Returns the number dropped; one that could not be dropped stays
+// recorded, and the caller reads the ledger again to see what is left.
+func (m *PostgreSQLManager) ReleaseConnectionObjects(ctx context.Context, connectionID string) (int, error) {
+	slots, err := GetReapableSlots(ctx, m.db)
+	if err != nil {
+		return 0, err
+	}
+	pubs, err := GetReapablePublications(ctx, m.db)
+	if err != nil {
+		return 0, err
+	}
+	// Slots first, as the reconciler does.
+	dropped := m.dropSlotResources(ctx, resourcesOfConnection(slots, connectionID))
+	return dropped + m.dropPublicationResources(ctx, resourcesOfConnection(pubs, connectionID)), nil
+}
+
+// resourcesOfConnection keeps the resources created on one connection's source.
+// An empty id keeps nothing, never everything.
+func resourcesOfConnection(resources []CDCResource, connectionID string) []CDCResource {
+	id := strings.ToLower(strings.TrimSpace(connectionID))
+	out := []CDCResource{}
+	if id == "" {
+		return out
+	}
+	for _, r := range resources {
+		if strings.ToLower(strings.TrimSpace(r.ConnectionID)) == id {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func derefStr(s *string) string {

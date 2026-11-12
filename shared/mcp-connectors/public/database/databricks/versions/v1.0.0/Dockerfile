@@ -30,6 +30,8 @@ COPY . /app/
 # build context (shared/mcp-connectors/public) exactly like warehouse_adapters.py.
 # The `shared` named context is provided unconditionally by mcp_generate_compose.py.
 COPY --from=shared canonical_types.py /app/canonical_types.py
+# Stable batch paging, shipped the same way (sql_paging.py).
+COPY --from=shared sql_paging.py /app/sql_paging.py
 
 # Resolve runtime imports to the shared base_connector (fix once, apply everywhere)
 RUN if [ -f /app/base_connector.py ]; then \

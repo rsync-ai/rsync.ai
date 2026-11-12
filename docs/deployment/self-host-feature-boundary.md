@@ -29,7 +29,11 @@ Everything the product is for. These are on by default in
 | Schema drift detection | `RSYNC_SCHEMA_DRIFT_ENABLED`, off by default in both editions |
 | CDC self-heal / sentinel | detection always on; the two autonomy flags default off in both editions |
 | Data explorer + NL→SQL | raw SQL needs nothing; NL→SQL needs an LLM provider — see section B |
-| Workspaces, members, roles, invites | **ships and functions.** Not withheld, but self-host is not tested against multi-tenant use — treat it as single-team |
+| SQL models, lineage, charts, dashboards, workflows, alerts | no flag; on in every edition |
+| Ask rsync.ai (the in-app assistant) | on by default (`RSYNC_ASSISTANT_ENABLED`); needs a model key — see section B. It never sends a row value to the model on a self-hosted install — see the last section |
+| MCP agent gateway (`/api/agent/v1/mcp`, agent tokens) | on by default (`RSYNC_AGENT_GATEWAY_ENABLED`) |
+| Connector generation from an uploaded OpenAPI 3.x or Swagger 2.0 spec | no model and no outbound request — see below |
+| Workspaces, members, roles, invites | **one workspace per install** (`RSYNC_SINGLE_WORKSPACE`): the first sign-up owns it, later users join it by invite, and a second workspace is refused — see the last section |
 | Direct SQL queries | unlimited and **not metered** in any edition |
 | Unlimited pipelines | see the quota section below |
 | Bring-your-own Postgres | `docker-compose.byo-postgres.yml`, full TLS (`POSTGRES_TLS_ENABLED`, `SQL_TLS_CA_FILE`) |
@@ -42,6 +46,7 @@ Nothing here is disabled. The stack needs a value only you can provide.
 
 | Capability | You supply | Where |
 |---|---|---|
+| Ask rsync.ai | a Claude, ChatGPT or Gemini key | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` on `llm-service`, or **Admin > Settings > AI models**, where a key overrides the environment's. With none, Ask answers `model_not_configured` (`api-gateway/internal/assistant/http.go:112`) |
 | LLM features (explorer, NL→SQL, planner) | an API key, **or** a local model — optional: with neither, these features answer `Set up an LLM first` and the rest of the stack works | `LLM_PROVIDER` (default `openai`; `none` to run without one), `AZURE_OPENAI_ENDPOINT`, `GROQ_API_KEY` with `LLM_PROVIDER=groq`, `OPENAI_BASE_URL` for Vertex AI or another OpenAI-compatible endpoint, or `docker-compose.ollama.yml` with `LLM_PROVIDER=ollama` for a fully offline stack. Order: [which LLM is used](self-hosting.md#which-llm-is-used) |
 | OAuth connectors (Google, GitHub, Slack, Salesforce, HubSpot) | **your own** client ID + secret, registered with that vendor | `${GOOGLE_CLIENT_ID:-}` etc. in `docker-compose.quickstart.yml` — all default empty, so the stack starts without them |
 | Outbound email (invites, notifications) | SMTP or Resend credentials | unset in quickstart; invites render a URL but do not send |
@@ -58,28 +63,28 @@ service's own operational plumbing.
 
 | Absent | Why | Decided at |
 |---|---|---|
-| **Connector *generation*** (build a new connector from an OpenAPI/GraphQL spec) | the generator package is stripped from the image | `llm-service/oss-strip-list.txt` |
-| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:41-47` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
+| **AI connector generation** (a connector from a docs URL, API prose or a GraphQL schema) | the agentic generator is stripped from the image; generating from an uploaded OpenAPI spec stays | `llm-service/oss-strip-list.txt` |
+| Monitoring UI's Infrastructure and Traces tabs | Infrastructure is an admin view of the platform's own workers across every workspace; Traces needs an observability backend, and this repo ships none | `features.go:85-88` — Infrastructure defaults `false`; Traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production`. The pipeline page's Overview tiles stay on (`:70`) |
 | OpenTelemetry export and log shipping (`fluent-bit`) | neither default stack runs a collector or a log shipper, so `OTEL_ENABLED` defaults to `false` and `docker logs` is the log path; point `OTEL_EXPORTER_OTLP_ENDPOINT` at your own collector and set `OTEL_ENABLED=true` to export | `docker-compose.yml`, `docker-compose.quickstart.yml` |
 | Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | services quickstart omits |
-| Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
-| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1148` |
+| Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:59-63` |
+| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1520` |
 | The Usage panel (`/usage`, `/admin/usage`) | it reports plan, quota and trial numbers that a deployment enforcing no plans does not have; the flag defaults to whatever billing does, so it switches itself off | `features.go` → `resolveUsagePanel()`; set `FEATURE_USAGE_PANEL=true` to show it anyway |
 
 ### Connector generation: what exactly is missing
 
-This matters because two docs used to point at an endpoint that is not in the image.
+Only the AI half. Generating from an uploaded spec works.
 
 In a self-hosted stack the container named `tool-generator` runs a **different program**:
 `ghcr.io/rsync-ai/connector-lifecycle` with entrypoint `python -m src.lifecycle.main`,
-not `src.agents.tool_generator.service`. It serves exactly three routes:
+not `src.agents.tool_generator.service`. It serves these routes:
 
 | Route | Self-hosted |
 |---|---|
 | `GET /health` | ✅ |
 | `GET /version` | ✅ |
 | `POST /v1/deploy` (build + start a connector container) | ✅ — requires `X-Internal-Secret` |
-| `POST /v1/generate` | ❌ **not present** |
+| `POST /v1/generate` | ✅ deterministic: an OpenAPI 3.x or Swagger 2.0 document in, a connector out, with no model call and no outbound request. A spec URL, docs, GraphQL or a discovery session is refused with a 400 that says why (`llm-service/src/lifecycle/scaffold_routes.py`) |
 
 `POST /v1/deploy` is deliberately kept: the Go data plane calls it on every self-heal and
 just-in-time connector build, so stripping it would break CDC recovery. Only the
@@ -88,16 +93,18 @@ just-in-time connector build, so stripping it would break CDC recovery. Only the
 builder. It ships self-hosted too.)
 
 The api-gateway route `POST /api/v1/connectors/generate`
-(`api-gateway/cmd/server/main.go:947`) **does** exist self-hosted — same image, no edition
-gate — but it proxies to a service that no longer serves that path. Adding a connector
-self-hosted means writing it by hand: see the
+(`api-gateway/cmd/server/main.go:1209`) proxies to it, so the **/connectors/generate** page takes
+an uploaded spec. Ask rsync.ai's `generate_connector` tool, which generates from a URL, refuses on
+this image with `upload_spec_required` and points at that page
+(`api-gateway/internal/handlers/connector_generations.go:190-192`). For an API with no OpenAPI
+spec, write the connector by hand: see the
 [connector developer guide](../connectors/developer-guide.md).
 
 ## Quotas and limits
 
 **Self-hosted, every quota is off.** Two independent reasons, either sufficient:
 
-1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1148` →
+1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1520` →
    `billingEnforced()` returns false → `resolvePlanQuota` returns `unlimitedQuota`
    (`billingEnforced()` at `plan_quota.go:70`, the early return at `:84`).
 2. Even with billing on, `loadPlans` reads the `plans` table; when it is empty the code
@@ -147,6 +154,32 @@ Worth stating, because the usual assumption runs the other way:
 | `RSYNC_TRUST_CLOUDFLARE` | on (runs behind Cloudflare) | `false` |
 | `ENVIRONMENT` | `development` in the base compose | `production` |
 | Internal connectors | selectable | blocked |
+| `RSYNC_LLM_SAMPLE_ROWS_ALLOWED` | unset: Ask rsync.ai may send up to 5 sample rows once an admin approves the model and the workspace owner turns them on | **`false`**: no row value reaches a model, and the switches are hidden |
+| `RSYNC_SINGLE_WORKSPACE` | unset: every user gets a personal workspace and may create more | **`true`**: one workspace for the install; a second is refused |
+| Sign-up after the first user | `open` unless an admin changes it | **`invite_only`** unless an admin changes it |
+
+**Sample rows.** The self-host compose sets `RSYNC_LLM_SAMPLE_ROWS_ALLOWED: "false"` on both
+containers that check it, `api-gateway` and `llm-service` (`docker-compose.quickstart.yml:893`,
+`:1532`); the Helm chart sets it from one value, `generation.llm.sampleRowsAllowed: false`. With it
+off, api-gateway answers 403 `sample_rows_disabled` to the switches and llm-service's egress guard
+sends no row whatever the stored approvals say. Turning it on is an operator decision made in the
+install's configuration; what a model then receives is listed in
+[llm-egress.md](../security/llm-egress.md).
+
+**One workspace.** The self-host compose sets `RSYNC_SINGLE_WORKSPACE: "true"` on `api-gateway`
+(`docker-compose.quickstart.yml:1535`); the Helm chart sets it from `apiGateway.singleWorkspace`
+(`values.yaml:609`), and a chart with that value removed still renders `true`. The first person
+to sign up becomes the platform admin and owns the install workspace. After that, sign-up is
+invite-only until an admin changes Registration in admin settings: an instance invite (which
+joins the install workspace) or a workspace invite (which joins the workspace it names) lets a
+new user in. A user who signs up
+while registration is open, with no invite, joins as a viewer. Creating a second workspace
+answers 403 `single_workspace_mode`; deleting the install workspace, or the user who owns it,
+answers 409. An install upgraded from a release without this keeps every workspace its users
+already have; new users join the earliest admin's oldest team workspace (or a new one, if that
+admin owns none). How the gateway picks and
+guards the install workspace:
+[multi-tenancy.md § Single-workspace mode](../architecture/multi-tenancy.md#11-single-workspace-mode-self-host).
 
 ## See also
 

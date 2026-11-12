@@ -151,7 +151,8 @@ ok "docker reachable; $CONTAINER not present (safe to proceed)"
 
 # ── build the OSS lifecycle image ────────────────────────────────────────────────────────
 say "BUILD (Dockerfile.oss -> $IMG)"
-docker build -f "$CTX/Dockerfile.oss" -t "$IMG" "$CTX" || { echo "build failed"; exit 1; }
+# `legal` = the repo root, for Dockerfile.oss's `COPY --from=legal THIRD_PARTY_NOTICES.md`.
+docker build --build-context legal="$ROOT" -f "$CTX/Dockerfile.oss" -t "$IMG" "$CTX" || { echo "build failed"; exit 1; }
 
 # ── seed a throwaway mcp_connectors volume with ONE connector + its shared deps ───────────
 # Mirrors Dockerfile.seed's allowlist, scoped to just $CONNECTOR: the connector root, the

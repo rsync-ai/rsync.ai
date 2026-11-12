@@ -94,6 +94,13 @@ describe("GenericConnectorForm — a failed save", () => {
     await waitFor(() => expect(banner).toHaveFocus())
   })
 
+  it("shows the reason the server put in `details`, not only its label", async () => {
+    // connections.go CreateConnection: the label alone named nothing to fix.
+    renderSavingInto(gatewayError(400, { error: "Invalid oauth_token_id", details: "oauth token not found" }))
+    const banner = await screen.findByRole("alert")
+    expect(banner).toHaveTextContent("Invalid oauth_token_id: oauth token not found")
+  })
+
   it("shows a 5xx's own sentence", async () => {
     renderSavingInto(
       gatewayError(500, { error: "encrypt_credentials_failed", message: "Failed to encrypt credentials" }),

@@ -238,7 +238,7 @@ describe("Header workspace switcher", () => {
       setActiveWorkspaceId("ws-b")
     })
 
-    await waitFor(() => expect(replaceMock).toHaveBeenCalledWith("/executions"))
+    await waitFor(() => expect(replaceMock).toHaveBeenCalledWith("/runs"))
   })
 
   it("clears the active selection when the resolved workspace list is empty (no tombstone)", async () => {

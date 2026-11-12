@@ -350,7 +350,7 @@ func TestUpdateConnection_ChangedConfigPassingTestRecordsSuccess(t *testing.T) {
 	expectEditPreamble(t, mock)
 
 	cfg := &decryptedConfigArg{}
-	mock.ExpectExec(`UPDATE connections SET config = \$1, last_tested_at = \$2, last_test_status = \$3, last_test_error = \$4, updated_at = \$5 WHERE id = \$6 AND workspace_id = \$7`).
+	mock.ExpectExec(`UPDATE connections SET config = \$1, last_tested_at = \$2, last_test_status = \$3, last_test_error = \$4, last_table_check = NULL, updated_at = \$5 WHERE id = \$6 AND workspace_id = \$7`).
 		WithArgs(cfg, sqlmock.AnyArg(), "success", nil, sqlmock.AnyArg(), wsScopeConnection, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -385,7 +385,7 @@ func TestUpdateConnection_ForceSaveClearsStaleVerdict(t *testing.T) {
 	mock.MatchExpectationsInOrder(false)
 	expectEditPreamble(t, mock)
 
-	mock.ExpectExec(`UPDATE connections SET config = \$1, last_tested_at = \$2, last_test_status = \$3, last_test_error = \$4, updated_at = \$5 WHERE id = \$6 AND workspace_id = \$7`).
+	mock.ExpectExec(`UPDATE connections SET config = \$1, last_tested_at = \$2, last_test_status = \$3, last_test_error = \$4, last_table_check = NULL, updated_at = \$5 WHERE id = \$6 AND workspace_id = \$7`).
 		WithArgs(sqlmock.AnyArg(), nil, nil, nil, sqlmock.AnyArg(), wsScopeConnection, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 

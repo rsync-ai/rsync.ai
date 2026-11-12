@@ -34,16 +34,6 @@ MIN_SUPPORTED_VERSION = "0.9"
 # VERSION COMPATIBILITY
 # =============================================================================
 
-def parse_version(ver: str) -> Tuple[int, int]:
-    """Parse version string to (major, minor) tuple"""
-    try:
-        parts = ver.split('.')
-        major = int(parts[0]) if parts else 1
-        minor = int(parts[1]) if len(parts) > 1 else 0
-        return (major, minor)
-    except (ValueError, IndexError):
-        return (1, 0)
-
 
 def is_compatible_version(spec_version: Optional[str]) -> bool:
     """
@@ -389,53 +379,3 @@ def _get_migration_path(from_ver: str, to_ver: str) -> List[Tuple[str, str]]:
         path.append((version_order[i], version_order[i + 1]))
     
     return path
-
-
-# =============================================================================
-# VALIDATION
-# =============================================================================
-
-def validate_spec_version(spec: Dict[str, Any]) -> List[str]:
-    """
-    Validate spec version and return any warnings/issues.
-    
-    Returns:
-        List of warning messages (empty if valid)
-    """
-    warnings = []
-    
-    spec_version = spec.get('spec_version')
-    
-    if not spec_version:
-        warnings.append("Missing spec_version field - assuming legacy spec")
-    elif not is_compatible_version(spec_version):
-        warnings.append(f"Spec version {spec_version} may not be fully compatible")
-    elif requires_migration(spec_version):
-        warnings.append(f"Spec version {spec_version} will be migrated to {SPEC_VERSION}")
-    
-    return warnings
-
-
-# =============================================================================
-# EXPORT SPEC TO YAML/JSON
-# =============================================================================
-
-def export_spec_to_dict(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Export spec to a clean dict suitable for YAML/JSON serialization.
-    
-    Ensures spec_version is included.
-    """
-    result = copy.deepcopy(spec)
-    result['spec_version'] = SPEC_VERSION
-    return result
-
-
-def get_spec_version_info() -> Dict[str, Any]:
-    """Get information about current and supported versions"""
-    return {
-        'current_version': SPEC_VERSION,
-        'min_supported_version': MIN_SUPPORTED_VERSION,
-        'available_migrations': list(_migrations.keys()),
-    }
-

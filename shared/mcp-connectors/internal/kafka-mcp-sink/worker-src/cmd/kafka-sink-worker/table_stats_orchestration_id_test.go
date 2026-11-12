@@ -86,7 +86,7 @@ func TestBatchTableStatsNeverCarriesTheOrchestrationID(t *testing.T) {
 		OrchestrationExecutionID: "7f3d9c21-0000-4000-8000-0000000000aa",
 		Table:                    "public.orders",
 	}
-	meta := buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8)["metadata"].(map[string]interface{})
+	meta := buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8, noFileCount)["metadata"].(map[string]interface{})
 	if v, present := meta["orchestration_execution_id"]; present {
 		t.Errorf("batch stats carry orchestration_execution_id = %#v; execution_id already IS "+
 			"that id on this lane", v)

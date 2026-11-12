@@ -65,7 +65,7 @@ describe("activeWorkspaceCookieHeader", () => {
 
 // The cookie PAIR (name=value) is the merge-friendly form, used by callers that
 // already build their own Cookie header (the explorer proxy routes forward
-// `Cookie: session_token=...` and must append the selection without clobbering).
+// `Cookie: auth_token=...` and must append the selection without clobbering).
 describe("activeWorkspaceCookiePair", () => {
   it("returns null when no active workspace cookie is set", () => {
     expect(activeWorkspaceCookiePair(cookieStore({}))).toBeNull()

@@ -18,7 +18,7 @@ VERSION: 1.0.0
 """
 
 from enum import Enum
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Literal, Optional, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 import re
 
@@ -73,34 +73,6 @@ class Protocol(str, Enum):
     GRAPHQL = "graphql"
     OPENAPI = "openapi"   # OpenAPI/Swagger-described REST (deterministic spec)
     AUTO = "auto"         # Detector decides; never persists to a generated spec
-
-
-class ConnectorSource(str, Enum):
-    """Who built the connector. Immutable signal of trust origin.
-
-    Distinct from `lifecycle` (which is computed from runtime evidence).
-    Mirrors the two-axis model used by Fivetran (Native/Lite/Partner/SDK) and
-    Airbyte (Airbyte/Enterprise/Marketplace/Custom).
-    """
-    BUILT_IN = "built_in"      # Hand-authored in this repo; we maintain it.
-    GENERATED = "generated"    # Tool-generator output from vendor_apis.yaml.
-    PARTNER = "partner"        # Third-party contributed (reserved).
-    CUSTOM = "custom"          # User-supplied via wizard (reserved).
-
-
-class LifecycleStage(str, Enum):
-    """Connector maturity. **Computed at read time** from real execution
-    evidence (the `executions` table + the connector_validation_log written
-    by the executor); not set statically in metadata.json so it can't rot.
-
-    Promotion ladder mirrors Airbyte's Alpha→Beta→GA + Fivetran's
-    Preview→Beta→GA. Promotion criteria are objective (see CAPABILITIES.md
-    "Connector lifecycle" section).
-    """
-    DRAFT = "draft"        # Exists; never run against real vendor API.
-    PREVIEW = "preview"    # test_connection passed once.
-    BETA = "beta"          # test_connection + discover_schema + export all observed.
-    GA = "ga"              # ≥1 pipeline execution success; no failures last 7d.
 
 
 class GraphQLOperationType(str, Enum):
@@ -210,10 +182,6 @@ class OperationConfig(BaseModel):
     def method_name(self) -> str:
         """Get the Python method name for this operation"""
         return self.name
-    
-    def get_required_params(self) -> List[ParameterDefinition]:
-        """Get list of required parameters"""
-        return [p for p in self.parameters if p.required]
 
 
 class SupportedAuthMethod(BaseModel):
@@ -477,7 +445,9 @@ class AuthConfig(BaseModel):
             "every non-oauth method this connector declares. Set it where the generator "
             "DELIBERATELY leaves every credential field optional -- the api_saas "
             "'API token now, OAuth later' path in architect.py, which downgrades "
-            "access_token/api_key to optional and enforces one-of in validate_config. "
+            "access_token/api_key to optional and enforces one-of in validate_config, "
+            "and the spec-first REST path when the document does not require the "
+            "credential on every call (architect_rest._gate_auth_credentials). "
             "Without it that connector ships metadata whose form gate can never engage "
             "and whose contract test cannot tell the choice from an accident."
         ),
@@ -572,7 +542,15 @@ class ResourceConfig(BaseModel):
     pagination_param: str = Field(default="offset", description="Pagination parameter name")
     limit_param: str = Field(default="limit", description="Limit parameter name")
     max_page_size: int = Field(default=100, description="Maximum items per page")
-    
+    page_start: int = Field(
+        default=1,
+        description="Number of the first page for 'page' pagination: 0 for zero-based APIs (ClickUp 'starts at 0'), else 1. Read from the spec's page param.",
+    )
+    paging_undocumented: bool = Field(
+        default=False,
+        description="The spec documents no paging for this list (no page/offset/cursor param, no next-cursor field). The runtime probes offset and page after page one and puts a warning on the run when neither works, instead of silently reading one page.",
+    )
+
     # Incremental sync support
     supports_incremental: bool = Field(default=False, description="Whether resource supports incremental filtering")
     incremental_param: str = Field(default="updated_since", description="Query param for timestamp filter")
@@ -595,6 +573,22 @@ class ResourceConfig(BaseModel):
     record_is_object: bool = Field(
         default=False,
         description="True when the 2xx response body IS a single record (a lone entity like Twilio /Balance.json or Jira /myself, with no records array). Tells the runtime to wrap the object as a one-row list instead of yielding 0 rows.",
+    )
+    date_range: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Two date path params that are the window to read, {start, end, format} (Upstox .../{to_date}/{from_date}). The runtime fills them: start from the run's since (the last 365 days on a first run), end today. Neither is a connection setting.",
+    )
+    record_columns: Optional[List[str]] = Field(
+        default=None,
+        description="Column names for rows sent as positional arrays ([ts, open, high, ...]), from OpenAPI 3.1 prefixItems titles, else field_1..N. The runtime zips each row into an object.",
+    )
+    stamp_params: Optional[List[str]] = Field(
+        default=None,
+        description="Path settings copied onto every row (the instrument a candle belongs to), because they are part of the row's key but not in the response.",
+    )
+    primary_keys: Optional[List[str]] = Field(
+        default=None,
+        description="The record schema's own composite key, x-primary-key: [a, b].",
     )
 
     @field_validator('endpoint')
@@ -659,6 +653,13 @@ class ConfigField(BaseModel):
     ui_help_text: Optional[str] = Field(
         default=None,
         description="Additional help text for UI"
+    )
+    ui_tier: Optional[Literal["basic", "advanced"]] = Field(
+        default=None,
+        description=(
+            "Connection form placement: 'basic' shows an optional field up front, "
+            "'advanced' puts it under Advanced settings; unset = by required"
+        ),
     )
     sensitive: Optional[bool] = Field(
         default=None,
@@ -1064,11 +1065,7 @@ class ConnectorSpec(BaseModel):
         pre-start required-config gate. See module-level ``build_config_aliases``."""
         methods = self.auth.supported_methods if self.auth else []
         return build_config_aliases(methods, self.config_fields)
-    
-    def get_operations_by_type(self, op_type: OperationType) -> List[OperationConfig]:
-        """Get operations filtered by type"""
-        return [op for op in self.operations if op.type == op_type]
-    
+
     def to_metadata_dict(self) -> Dict[str, Any]:
         """Convert to metadata.json format"""
         # Canonical connector id is kebab-case (used by UI/API/planner).

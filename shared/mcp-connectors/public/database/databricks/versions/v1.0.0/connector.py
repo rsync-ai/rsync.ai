@@ -67,6 +67,18 @@ except ImportError:  # pragma: no cover - dev/test path
         os.path.dirname(__file__), "..", "..", "..", "..")))
     from canonical_types import canonical_to_ddl  # noqa: E402
 
+# Stable batch paging (KI-WAREHOUSE-BATCH-PAGING-UNORDERED), shipped the same
+# way: `COPY --from=shared sql_paging.py`.
+try:
+    import sql_paging  # noqa: E402
+except ImportError:  # pragma: no cover - dev/test path
+    sys.path.insert(0, os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..")))
+    try:
+        import sql_paging  # noqa: E402
+    except ImportError:
+        sql_paging = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -437,8 +449,12 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return {"success": False, "error": f"Listing namespaces failed: {e}"}
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
-        """Optimized paginated read (keyset preferred, offset fallback, verbatim
-        query single-page). Returns paging_mode/has_more/next_cursor/truncated."""
+        """One page of a table, or a verbatim query as a single page.
+
+        A table pages through ``sql_paging``: Databricks never enforces a
+        primary key, so a sweep orders by every orderable column
+        (``cursor_column`` first) and pins its pages to one Delta version
+        (KI-WAREHOUSE-BATCH-PAGING-UNORDERED)."""
         params = params or {}
         config = self._get_config(params)
         table = (params.get("table") or params.get("object") or "").strip()
@@ -456,36 +472,17 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
         raw_cursor = str(raw_cursor).strip()
         cursor_column = ""
         if raw_cursor:
-            # keyset correctness also requires cursor_column be UNIQUE; a
-            # non-unique column can skip rows sharing a boundary value across a
-            # page. Callers pass a unique/primary key here (hence the alias).
             cursor_column = self._safe_identifier(raw_cursor)
             if cursor_column is None:
                 return {"success": False,
                         "error": f"Unsafe cursor_column identifier: {raw_cursor!r}"}
-        cursor_value = params.get("cursor_value")
 
         if not table and not raw_query:
             return {"success": False, "error": "Missing 'table' (or 'query') parameter"}
-
-        sql_params: Optional[List[Any]] = None
-        offset = 0
-        if raw_query:
-            paging_mode, sql = "query", raw_query
-        elif cursor_column:
-            paging_mode = "keyset"
-            fq = self._qualify_table(config, table)
-            where = ""
-            if cursor_value is not None:
-                where = f"WHERE `{cursor_column}` > ? "
-                sql_params = [cursor_value]
-            sql = (f"SELECT * FROM {fq} {where}"
-                   f"ORDER BY `{cursor_column}` ASC LIMIT {limit}")
-        else:
-            paging_mode = "offset"
-            offset = int(params.get("offset", 0) or 0)
-            fq = self._qualify_table(config, table)
-            sql = f"SELECT * FROM {fq} LIMIT {limit} OFFSET {offset}"
+        if not raw_query and sql_paging is None:
+            return {"success": False,
+                    "error": "sql_paging.py is missing from this connector image; rebuild it"}
+        fq = self._qualify_table(config, table) if not raw_query else ""
 
         try:
             conn = self._connect(config)
@@ -493,10 +490,11 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return {"success": False, "error": str(e)}
         try:
             cur = conn.cursor()
-            if sql_params is not None:
-                cur.execute(sql, sql_params)
-            else:
-                cur.execute(sql)
+            if not raw_query:
+                return sql_paging.export_page(conn, cur, sql_paging.DATABRICKS, fq, fq, params,
+                                              limit=limit, nominated=cursor_column or None,
+                                              to_dict=self._row_to_dict)
+            cur.execute(raw_query)
             rows = cur.fetchall()
             desc = getattr(cur, "description", None)
             data = [self._row_to_dict(r, desc) for r in rows]
@@ -505,35 +503,15 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
         finally:
             self._safe_close(conn)
 
-        full_page = len(data) == limit
-        truncated = (paging_mode == "query") and full_page
-        has_more = (paging_mode != "query") and full_page
-        next_cursor = None
-        # Offset mode MUST leave next_cursor=None. The executor advances `offset`
-        # itself only when the connector returns no cursor (executor.go:
-        # `if cursor == nil { offset += ... }`). Emitting str(offset+limit) here
-        # makes the executor treat offset paging as keyset — it never advances
-        # offset, re-reads page 1, trips the non-advancing-cursor guard, and
-        # silently truncates keyless tables at `limit`. Matches the postgresql
-        # connector + connector_database.py.j2 (keyset-only next_cursor).
-        if has_more and paging_mode == "keyset":
-            next_cursor = data[-1].get(cursor_column) if data else None
-            if next_cursor is None:
-                # Full page but the cursor column is absent from the rows —
-                # can't emit a resumable cursor; fail loud rather than
-                # silently truncate or restart from the top next call.
-                return {"success": False,
-                        "error": (f"keyset cursor column '{cursor_column}' "
-                                  "missing from result rows; cannot continue")}
-
+        # A verbatim query is one page; a full one may have been cut short.
         return {
             "success": True,
             "data": data,
             "total_records": len(data),
-            "paging_mode": paging_mode,
-            "has_more": has_more,
-            "next_cursor": next_cursor,
-            "truncated": truncated,
+            "paging_mode": "query",
+            "has_more": False,
+            "next_cursor": None,
+            "truncated": len(data) == limit,
         }
 
     # =========================================================================

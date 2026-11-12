@@ -268,6 +268,17 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 		RepairAttempts: map[string]int{},
 	}
 
+	// Registered before the first activity, so the gateway can ask about a pause at
+	// any point the run could be in one (see HITLWaitQuery).
+	ctx, hitlTracker := withHITLWaitTracker(ctx)
+	if err := workflow.SetQueryHandler(ctx, HITLWaitQuery, func() (HITLWaitState, error) {
+		return hitlWaitStateOf(state, hitlTracker), nil
+	}); err != nil {
+		// Logged, not returned: the gateway falls back to pipeline_progress when the
+		// query fails, so an unanswerable query costs precision, not the run.
+		logger.Error("could not register the hitl_wait query handler", "execution_id", input.ExecutionID, "error", err)
+	}
+
 	paused := false
 	cancelled := false
 
@@ -701,8 +712,8 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 									"attempt", validationAttempts)
 
 								// Store connection IDs
-								state.SourceConnectionID = connectionPayload.SourceConnectionID
-								state.DestinationConnectionID = connectionPayload.DestinationConnectionID
+								state.SourceConnectionID, state.DestinationConnectionID = resumedConnectionIDs(
+									state.SourceConnectionID, state.DestinationConnectionID, connectionPayload)
 
 								// Validate connections (Phase C3)
 								err := workflow.ExecuteActivity(ctx, ConnectionValidatorActivityV2, input, state).Get(ctx, nil)
@@ -926,6 +937,7 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 						genReq := GenerateConnectorRequest{
 							CorrelationID: fmt.Sprintf("%s-%s", input.PipelineID, input.ExecutionID),
 							ConnectorType: missing.Type,
+							WorkspaceID:   input.WorkspaceID,
 						}
 						genErr := workflow.ExecuteActivity(genCtx, GenerateConnectorActivityV2, genReq).Get(genCtx, &genResult)
 						if genErr != nil || !genResult.Success {
@@ -1138,8 +1150,8 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 					return errors.New(msg)
 				}
 
-				state.SourceConnectionID = connectionPayload.SourceConnectionID
-				state.DestinationConnectionID = connectionPayload.DestinationConnectionID
+				state.SourceConnectionID, state.DestinationConnectionID = resumedConnectionIDs(
+					state.SourceConnectionID, state.DestinationConnectionID, connectionPayload)
 
 				// Validate connections via existing validator agent.
 				if err := awaitIfPaused(); err != nil {
@@ -1320,6 +1332,18 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 		return err
 	}
 
+	// runCtx is what the transfer's own activities run under. Under
+	// executorHonoursCancelVersion it is childCtx, so the user's cancel reaches
+	// the executor or DAG node that is running; before it, the root ctx.
+	honoursCancel := workflow.GetVersion(ctx, executorHonoursCancelVersion, workflow.DefaultVersion, 1) != workflow.DefaultVersion
+	runCtx := ctx
+	if honoursCancel {
+		runCtx = childCtx
+	}
+	// stoppedDuringRun reports a cancel that landed while the transfer ran. The
+	// run then ends as stopped: nil, and the deferred updater writes "stopped".
+	stoppedDuringRun := func() bool { return honoursCancel && cancelled }
+
 	// Check if the plan contains a workflow graph (DAG execution mode)
 	if HasWorkflowGraph(state.CachedPlan) {
 		// DAG Execution Path
@@ -1354,16 +1378,22 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 		}
 
 		// Create and run the DAG scheduler
-		scheduler := NewDAGScheduler(ctx, graph, state, input)
+		scheduler := NewDAGScheduler(runCtx, graph, state, input)
 		if err := scheduler.Execute(); err != nil {
+			if stoppedDuringRun() {
+				return nil
+			}
 			_ = state.Transition(StateFailed, workflow.Now(ctx), fmt.Sprintf("DAG execution failed: %v", err))
 			return err
 		}
+		if stoppedDuringRun() {
+			return nil
+		}
 
 		// DAG completed successfully — unless the postflight says otherwise.
-		if written, failed := finalizeBeforeCompletedEvent(ctx, input, state); written {
+		if written, ended := finalizeBeforeCompletedEvent(ctx, input, state); written {
 			terminalStatusWritten = true
-			if failed {
+			if ended {
 				return nil
 			}
 		}
@@ -1372,6 +1402,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 			"is_dag":         true,
 		})
 		if err := state.Transition(StateCompleted, workflow.Now(ctx), "DAG pipeline completed successfully"); err != nil {
+			if stoppedDuringRun() {
+				// The cancel landed after the terminal write recorded the run.
+				return nil
+			}
 			return err
 		}
 
@@ -1411,7 +1445,7 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 			MaximumAttempts:    3,
 		},
 	}
-	execCtx := workflow.WithActivityOptions(ctx, execOpts)
+	execCtx := workflow.WithActivityOptions(runCtx, execOpts)
 
 	var executionResult map[string]interface{}
 	var err error
@@ -1501,39 +1535,8 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 
 	// Shared helper: enter connection configuration wait + validate on resume.
 	waitForConnectionFixAndValidate := func(waitDetails map[string]interface{}) error {
-		if waitDetails == nil {
-			waitDetails = map[string]interface{}{}
-		}
-		// Add UX hints so the frontend can render the connection configurator reliably.
-		waitDetails["request_type"] = "connection_config"
-		waitDetails["action_needed"] = "connection_config"
-		waitDetails["button_text"] = "Configure connections"
-		waitDetails["source_connection_id"] = state.SourceConnectionID
-		waitDetails["destination_connection_id"] = state.DestinationConnectionID
-
-		// Provide connector type hints if available.
-		if _, ok := waitDetails["source_type"]; !ok {
-			if state.CachedIntent != nil {
-				if v, ok := state.CachedIntent["source_type"].(string); ok && v != "" {
-					waitDetails["source_type"] = v
-				} else if nested, ok := state.CachedIntent["intent"].(map[string]interface{}); ok {
-					if v, ok := nested["source_type"].(string); ok && v != "" {
-						waitDetails["source_type"] = v
-					}
-				}
-			}
-		}
-		if _, ok := waitDetails["destination_type"]; !ok {
-			if state.CachedIntent != nil {
-				if v, ok := state.CachedIntent["destination_type"].(string); ok && v != "" {
-					waitDetails["destination_type"] = v
-				} else if nested, ok := state.CachedIntent["intent"].(map[string]interface{}); ok {
-					if v, ok := nested["destination_type"].(string); ok && v != "" {
-						waitDetails["destination_type"] = v
-					}
-				}
-			}
-		}
+		// UX hints for the connection configurator, and the setting to fix.
+		waitDetails = connectionFixWaitDetails(waitDetails, state)
 
 		// Enter wait state.
 		if err := state.Transition(StateWaitingForConnectionConfiguration, workflow.Now(ctx), "Waiting for connection fix (executor recovery)"); err != nil {
@@ -1563,8 +1566,8 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 				_ = state.Transition(StateFailed, workflow.Now(ctx), msg)
 				return errors.New(msg)
 			}
-			state.SourceConnectionID = connectionPayload.SourceConnectionID
-			state.DestinationConnectionID = connectionPayload.DestinationConnectionID
+			state.SourceConnectionID, state.DestinationConnectionID = resumedConnectionIDs(
+				state.SourceConnectionID, state.DestinationConnectionID, connectionPayload)
 			input.SourceConnectionID = state.SourceConnectionID
 			input.DestinationConnectionID = state.DestinationConnectionID
 
@@ -1630,7 +1633,7 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 			// deterministic, so calling them here is replay-safe.
 			nativeOpts := execOpts
 			nativeOpts.TaskQueue = ExecutorTaskQueue
-			nativeCtx := workflow.WithActivityOptions(ctx, nativeOpts)
+			nativeCtx := workflow.WithActivityOptions(runCtx, nativeOpts)
 			tID, tParent, tState := traceContextFromInput(input)
 			taskMap := buildExecutorTaskMap(input, state, tID, tParent, tState)
 			var nr ExecutorNativeResult
@@ -1650,6 +1653,11 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 			}
 		} else {
 			err = workflow.ExecuteActivity(execCtx, ExecutorActivityV2, input, state).Get(execCtx, &executionResult)
+		}
+		// A cancel that landed as the executor finished still ends the run as
+		// stopped: the Stop has already recorded it.
+		if stoppedDuringRun() {
+			return nil
 		}
 		if err == nil {
 			break
@@ -1896,6 +1904,7 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 						}
 						// Fall through to approval gate if validation still reports drift.
 						plan = validation.RepairPlan
+						plan.Reason = validation.Reason
 					} else {
 						// Auto-apply failed; require approval / manual intervention.
 						plan.RequiresApproval = true
@@ -1904,7 +1913,20 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 					}
 				}
 
-				// Approval gate (either risky plan or auto-apply failed / not supported).
+				// Nothing can approve a schema change (schemaApprovalFailsFastVersion), so a
+				// plan the run will not apply ends it now, saying what to apply by hand.
+				if workflow.GetVersion(ctx, schemaApprovalFailsFastVersion, workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+					msg := schemaRepairNeedsAPersonMessage(activityErr.Message, plan)
+					emitRepairEvent("REPAIR_FAILED", map[string]interface{}{"kind": "schema_approval", "reason": msg})
+					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
+						"error_message": msg,
+						"proposed_ddl":  plan.DDL,
+					})
+					_ = state.Transition(StateFailed, workflow.Now(ctx), msg)
+					return errors.New(msg)
+				}
+
+				// Approval gate, kept for runs recorded before schemaApprovalFailsFastVersion.
 				if terr := state.Transition(StateWaitingForApproval, workflow.Now(ctx), "Approval required (schema drift)"); terr != nil {
 					return terr
 				}
@@ -2111,11 +2133,14 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 	// ==========================================================================
 	// COMPLETION
 	// ==========================================================================
+	if stoppedDuringRun() {
+		return nil
+	}
 	// Record the run and let the postflight silent-drop guard judge it BEFORE
 	// PIPELINE_COMPLETED goes out (KI-SILENTDROP-COMPLETED-EVENT).
-	if written, failed := finalizeBeforeCompletedEvent(ctx, input, state); written {
+	if written, ended := finalizeBeforeCompletedEvent(ctx, input, state); written {
 		terminalStatusWritten = true
-		if failed {
+		if ended {
 			return nil
 		}
 	}
@@ -2123,6 +2148,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 		"execution_plan": state.ExecutionPlan,
 	}))
 	if err := state.Transition(StateCompleted, workflow.Now(ctx), "Pipeline completed successfully"); err != nil {
+		if stoppedDuringRun() {
+			// The cancel landed after the terminal write recorded the run.
+			return nil
+		}
 		return err
 	}
 
@@ -2229,6 +2258,14 @@ func recoveryEndedByCancel(ctx workflow.Context, cancelled bool) bool {
 // lands while the park is being announced has already cleared state.WaitReason,
 // and reading its TimeoutAt for the call would panic.
 func awaitHITLSignal(ctx, cancelCtx workflow.Context, ch workflow.ReceiveChannel, valuePtr interface{}, deadline time.Time) bool {
+	// Tell the hitl_wait query that this run is listening, for exactly as long as it
+	// is. A return that never blocks flips it back before any query can run.
+	if tracker := hitlWaitTrackerFrom(ctx); tracker != nil {
+		tracker.receiveSeq++
+		tracker.receiving = true
+		defer func() { tracker.receiving = false }()
+	}
+
 	if workflow.GetVersion(ctx, hitlWaitTimeoutVersion, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		ch.Receive(ctx, valuePtr)
 		return true
@@ -2301,41 +2338,7 @@ func emitPipelineWaitingEvent(ctx workflow.Context, pipelineID, executionID, sta
 		"execution_plan": plan,
 	})
 
-	// Extract user-friendly description based on blocking type
-	description := "Waiting for user input"
-	switch blockingType {
-	case "connection_config":
-		// Build a sentence like "Select a MySQL source and a PostgreSQL
-		// destination connection to continue." instead of dumping the raw
-		// Go map literal `[map[connector_type:mysql direction:source] ...]`.
-		description = formatMissingConnectionsDescription(details["missing_connections"])
-	case "connector_generation":
-		description = "Connector generation required"
-		// missing_connectors can be []interface{} or []string depending on producer
-		switch v := details["missing_connectors"].(type) {
-		case []interface{}:
-			if len(v) > 0 {
-				description = fmt.Sprintf("Connector generation required for %v", v)
-			}
-		case []string:
-			if len(v) > 0 {
-				description = fmt.Sprintf("Connector generation required for %v", v)
-			}
-		}
-	case "table_selection":
-		description = "Table selection required"
-		// available_tables can be []interface{} or []map[string]interface{}
-		switch v := details["available_tables"].(type) {
-		case []interface{}:
-			if len(v) > 0 {
-				description = fmt.Sprintf("Select table(s) to sync (%d available)", len(v))
-			}
-		case []map[string]interface{}:
-			if len(v) > 0 {
-				description = fmt.Sprintf("Select table(s) to sync (%d available)", len(v))
-			}
-		}
-	}
+	description := waitingEventDescription(blockingType, details)
 
 	// Build V2-compliant event
 	event := map[string]interface{}{
@@ -2460,6 +2463,54 @@ func emitStageEvent(ctx workflow.Context, pipelineID, executionID, stage, eventT
 	return nil
 }
 
+// waitingEventDescription is the user-facing line of a PIPELINE_WAITING event,
+// by blocking type. A table-selection wait — the batch path's, or a DAG node
+// wait whose details say action_needed=table_selection — says why it paused
+// with the executor's reason, falling back to a table count.
+func waitingEventDescription(blockingType string, details map[string]interface{}) string {
+	if action, _ := details["action_needed"].(string); blockingType == "node_input" && action == "table_selection" {
+		blockingType = "table_selection"
+	}
+	description := "Waiting for user input"
+	switch blockingType {
+	case "connection_config":
+		// Build a sentence like "Select a MySQL source and a PostgreSQL
+		// destination connection to continue." instead of dumping the raw
+		// Go map literal `[map[connector_type:mysql direction:source] ...]`.
+		description = formatMissingConnectionsDescription(details["missing_connections"])
+	case "connector_generation":
+		description = "Connector generation required"
+		// missing_connectors can be []interface{} or []string depending on producer
+		switch v := details["missing_connectors"].(type) {
+		case []interface{}:
+			if len(v) > 0 {
+				description = fmt.Sprintf("Connector generation required for %v", v)
+			}
+		case []string:
+			if len(v) > 0 {
+				description = fmt.Sprintf("Connector generation required for %v", v)
+			}
+		}
+	case "table_selection":
+		if reason, _ := details["reason"].(string); strings.TrimSpace(reason) != "" {
+			return strings.TrimSpace(reason)
+		}
+		description = "Table selection required"
+		// available_tables can be []interface{} or []map[string]interface{}
+		switch v := details["available_tables"].(type) {
+		case []interface{}:
+			if len(v) > 0 {
+				description = fmt.Sprintf("Select table(s) to sync (%d available)", len(v))
+			}
+		case []map[string]interface{}:
+			if len(v) > 0 {
+				description = fmt.Sprintf("Select table(s) to sync (%d available)", len(v))
+			}
+		}
+	}
+	return description
+}
+
 // formatMissingConnectionsDescription turns the missing-connections payload
 // (a slice of structs/maps with `connector_type` + `direction`) into a human
 // sentence the chat surface can show without exposing Go map syntax.
@@ -2483,6 +2534,7 @@ func formatMissingConnectionsDescription(raw interface{}) string {
 	}
 
 	parts := make([]string, 0, len(items))
+	fixes := make([]string, 0, len(items))
 	for _, it := range items {
 		m, ok := it.(map[string]interface{})
 		if !ok {
@@ -2511,6 +2563,15 @@ func formatMissingConnectionsDescription(raw interface{}) string {
 		case "aws-s3", "s3":
 			ctDisplay = "S3"
 		}
+		// The executor named the setting it could not find (connectionFixWaitDetails).
+		if fields, _ := m["missing_fields"].([]interface{}); len(fields) > 0 {
+			names := make([]string, 0, len(fields))
+			for _, f := range fields {
+				names = append(names, fmt.Sprint(f))
+			}
+			fixes = append(fixes, "set "+strings.Join(names, ", ")+" on the "+strings.TrimSpace(ctDisplay+" "+dir)+" connection")
+			continue
+		}
 		switch strings.ToLower(dir) {
 		case "source":
 			parts = append(parts, "a "+ctDisplay+" source")
@@ -2521,6 +2582,9 @@ func formatMissingConnectionsDescription(raw interface{}) string {
 		}
 	}
 
+	if len(fixes) > 0 {
+		return "A required setting is missing: " + strings.Join(fixes, " and ") + ", then resume the run."
+	}
 	switch len(parts) {
 	case 0:
 		return "Connection configuration required"
@@ -2673,13 +2737,67 @@ func updateExecutionPlanForWaiting(plan *workflowtypes.ExecutionPlan, stageID st
 // sequence, so histories recorded before this marker keep the old order.
 const completedEventAfterPostflightVersion = "completed-event-after-postflight"
 
+// schemaApprovalFailsFastVersion gates ending a run at once when a schema drift
+// needs a person, instead of parking it on the "approval_given" signal. Nothing
+// sends that signal (the gateway signals a pipeline run only through
+// signalPipelineWorkflowWithFallback, and never with it), so every such park
+// waited out its 24h deadline behind an Approve button that could not exist.
+// Versioned because the park records a state update and a PIPELINE_WAITING event
+// before its timer; a run parked under the old code replays into the park and
+// still ends at its deadline.
+const schemaApprovalFailsFastVersion = "schema-approval-fails-fast"
+
+// schemaRepairNeedsAPersonMessage is how such a run fails: what the executor
+// reported, why rsync.ai did not change the destination, and the DDL it would
+// have run, so the user can apply it and run the pipeline again.
+func schemaRepairNeedsAPersonMessage(detected string, plan SchemaRepairPlan) string {
+	var b strings.Builder
+	b.WriteString("The destination's schema no longer matches the source")
+	if d := strings.TrimSpace(detected); d != "" {
+		b.WriteString(" (" + d + ")")
+	}
+	b.WriteString(", and rsync.ai will not change it on its own")
+	if why := strings.TrimSuffix(strings.TrimSpace(plan.Reason), "."); why != "" {
+		b.WriteString(": " + why)
+	}
+	b.WriteString(".")
+	if len(plan.Changes) > 0 {
+		cols := make([]string, 0, len(plan.Changes))
+		for _, c := range plan.Changes {
+			cols = append(cols, fmt.Sprintf("%s.%s (%s)", c.Table, c.Column, c.Type))
+		}
+		b.WriteString(" Missing from the destination: " + strings.Join(cols, ", ") + ".")
+	}
+	if len(plan.DDL) > 0 {
+		b.WriteString(" Run this on the destination, then run the pipeline again: " + strings.Join(plan.DDL, "; "))
+	} else {
+		b.WriteString(" Bring the destination table in line with the source, then run the pipeline again.")
+	}
+	return b.String()
+}
+
+// executorHonoursCancelVersion gates running the transfer's activities (the
+// executor, and DAG nodes) under childCtx, so the user's cancel reaches them
+// (KI-STOP-DOES-NOT-REACH-RUNNING-TRANSFER). They ran under the root ctx: the
+// cancel set StateCancelled, the transfer ran to the end, the finalize write
+// recorded it completed, and the move to COMPLETED failed the workflow. A
+// cancel reaching a running activity adds a RequestCancelActivityTask command,
+// so histories recorded before this marker keep the root ctx.
+const executorHonoursCancelVersion = "executor-honours-cancel"
+
 // finalizeBeforeCompletedEvent writes the terminal status of a run the workflow
-// believes completed and reports whether it was written and whether the postflight
-// failed it. On failed it has already emitted PIPELINE_FAILED and moved the state
-// to StateFailed; the caller must return without emitting PIPELINE_COMPLETED.
+// believes completed and reports whether it was written and whether the run
+// ended other than completed. The terminal write ends it two ways:
+//   - the postflight failed it: PIPELINE_FAILED is emitted and the state moves
+//     to StateFailed;
+//   - a Stop got to the execution row first (KI-STOP-RACING-COMPLETION-
+//     OVERWRITTEN): the write recorded the stop and sent its alert, and the
+//     state moves to StateCancelled.
+//
+// On ended the caller must return without emitting PIPELINE_COMPLETED.
 // written=false (old history, or the activity itself failed) leaves the caller on
 // the old path: emit completed, and the deferred updater writes the status.
-func finalizeBeforeCompletedEvent(ctx workflow.Context, input NLPipelineWorkflowV2Input, state *WorkflowState) (written bool, failed bool) {
+func finalizeBeforeCompletedEvent(ctx workflow.Context, input NLPipelineWorkflowV2Input, state *WorkflowState) (written bool, ended bool) {
 	if workflow.GetVersion(ctx, completedEventAfterPostflightVersion, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		return false, false
 	}
@@ -2687,6 +2805,12 @@ func finalizeBeforeCompletedEvent(ctx workflow.Context, input NLPipelineWorkflow
 	if err := workflow.ExecuteActivity(ctx, FinalizeCompletedRunActivity, input.PipelineID, input.ExecutionID).Get(ctx, &outcome); err != nil {
 		workflow.GetLogger(ctx).Warn("Finalizing the completed run failed; falling back to the deferred status write", "error", err)
 		return false, false
+	}
+	if outcome.Status == "stopped" {
+		if state.CurrentState != StateCancelled {
+			_ = state.Transition(StateCancelled, workflow.Now(ctx), "Stopped by user")
+		}
+		return true, true
 	}
 	if outcome.Status != "failed" {
 		return true, false

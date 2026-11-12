@@ -8,10 +8,12 @@ import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
-import { Loader2, Table as TableIcon, Database, CheckCircle2, Eye, ChevronDown, ChevronUp, Sparkles } from "lucide-react"
+import { Loader2, Table as TableIcon, Database, CheckCircle2, Eye, ChevronUp, Sparkles } from "lucide-react"
 
-import { resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
+import { isStaleHITLAnswer, resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
+import { notifyStaleHITLAnswer } from "@/lib/pipeline/staleHitlAnswer"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 import { metadataErrorMessage, truncatedTableTotal } from "@/lib/api/connections"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { kindMeta, validateNamespace, namespaceKindForType, defaultNamespaceForTypes, isLayoutV2Destination, validatePipelinePrefix } from "@/lib/pipeline/destinationNamespace"
@@ -60,13 +62,11 @@ export function normalizeSuggestedTables(input: unknown): SuggestedTable[] {
   return out.slice(0, 10)
 }
 
-// Minimum ranker confidence for a table to be AI pre-checked. Mirrors the Data
-// Explorer's HITLTablePicker gate (>= 0.85).
+// Minimum ranker confidence for a table to be AI pre-checked.
 export const AUTO_SELECT_MIN_CONFIDENCE = 0.85
 
 // computeAutoPreselectKeys decides which AI-suggested table keys to pre-check on
-// park. Mirrors HITLTablePicker's gate, generalized to multi-select: a key
-// qualifies only when the ranker is confident about it (>= threshold). The
+// park: a key qualifies only when the ranker is confident about it (>= threshold). The
 // ranker is prompted "top N of N", so with a handful of tables it often returns
 // them ALL at similar confidence — pre-checking that whole set silently syncs
 // unintended tables (the reported bug). So if the confident set is not a strict
@@ -94,9 +94,11 @@ function TablePreviewPanel({ connectionId, tableName }: { connectionId: string; 
     setLoading(true)
     setError(null)
     authFetch(`${API_ENDPOINTS.CONNECTIONS.GET(connectionId)}/sample?table=${encodeURIComponent(tableName)}&limit=5`, { cache: "no-store" })
-      .then((r) => {
+      .then(async (r) => {
         if (r.status === 429) throw new Error("Rate limited — try again in a moment")
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        // The gateway's label says sampling failed; `details` says why (the
+        // connector's own error), and a bare "HTTP 502" said neither.
+        if (!r.ok) throw new Error(await readResponseErrorMessage(r, "Preview"))
         return r.json()
       })
       .then((data) => {
@@ -1122,6 +1124,13 @@ export function PipelineTableSelector(props: {
         await onTablesSelected(toSend, destCfg)
         onClose()
       } catch (e: any) {
+        // This dialog outlived its step (answered in another tab, or the run ended):
+        // close it and say so — a retry here cannot succeed.
+        if (isStaleHITLAnswer(e)) {
+          notifyStaleHITLAnswer(e)
+          onClose()
+          return
+        }
         // A keyless table is refused with its name: keep the structure so the
         // banner can list the tables to fix in the source.
         setError(e instanceof TableEditError ? e : String(e?.message || e || "Failed to process table selection"))
@@ -1143,6 +1152,12 @@ export function PipelineTableSelector(props: {
       // Close modal immediately (optimistic: signal is async, backend will process in ~1-3s)
       onClose()
     } catch (e: any) {
+      if (isStaleHITLAnswer(e)) {
+        notifyStaleHITLAnswer(e)
+        setSubmitting(false)
+        onClose()
+        return
+      }
       // On error, show it to user and keep modal open
       setError(String(e?.message || e || "Failed to resume pipeline"))
       setSubmitting(false)
@@ -1168,7 +1183,7 @@ export function PipelineTableSelector(props: {
   }
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => (!open ? onClose() : null)}>
+    <Dialog open={isOpen} onOpenChange={(open) => (!open ? onClose() : null)} closeOnOutsideClick={false}>
       <DialogContent className="max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
@@ -1377,7 +1392,7 @@ export function PipelineTableSelector(props: {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
               <Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search tables…" />
               <Select value={schemaFilter} onValueChange={setSchemaFilter}>
-                <SelectTrigger>
+                <SelectTrigger aria-label="Filter by namespace">
                   <SelectValue placeholder="All namespaces" />
                 </SelectTrigger>
                 <SelectContent>
@@ -1513,7 +1528,7 @@ export function PipelineTableSelector(props: {
           {error && (
             <div
               role="alert"
-              className="text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-3"
+              className="text-sm text-red-700 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-3"
             >
               {error instanceof TableEditError ? (
                 <>

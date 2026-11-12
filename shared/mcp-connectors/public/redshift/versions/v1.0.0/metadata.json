@@ -66,7 +66,25 @@
       "sslmode": {"type": "string", "description": "psycopg2 sslmode (Redshift requires TLS)", "default": "require"},
       "iam_role": {"type": "string", "description": "IAM role ARN for COPY-from-S3 (dormant in v1.0.0)"},
       "s3_bucket": {"type": "string", "description": "S3 staging bucket for COPY-from-S3 (dormant in v1.0.0)"},
-      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"}
+      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["host", "port", "database", "user", "password"]
   },
@@ -82,7 +100,25 @@
       "sslmode": {"type": "string", "description": "psycopg2 sslmode (Redshift requires TLS)", "default": "require"},
       "iam_role": {"type": "string", "description": "IAM role ARN for COPY-from-S3 (dormant in v1.0.0)"},
       "s3_bucket": {"type": "string", "description": "S3 staging bucket for COPY-from-S3 (dormant in v1.0.0)"},
-      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"}
+      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["host", "port", "database", "user", "password"]
   },

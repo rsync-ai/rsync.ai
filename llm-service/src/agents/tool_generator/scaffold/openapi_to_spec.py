@@ -51,9 +51,19 @@ _PAGINATION_SIGNALS: Tuple[Tuple[str, str], ...] = (
 _LIMIT_PARAM_CANDIDATES = ("limit", "per_page", "page_size", "pagesize", "count", "max_results", "top")
 
 # Query params that filter by a modification timestamp, enabling incremental sync.
+# Only update-time names: a `created_since` or `start_time` filter never returns
+# an edit. The same rule as `utils/openapi_discovery.py` (`_INCREMENTAL_PARAMS`,
+# `_INCREMENTAL_PARAM_RE`), copied because this module stays stdlib-only;
+# `test_scaffold_openapi_conversion.py` fails if the two drift.
 _INCREMENTAL_PARAM_CANDIDATES = (
-    "updated_since", "updated_after", "modified_since", "since", "start_time",
-    "updated_at_min", "created_since", "if_modified_since",
+    "updated_since", "updated_after", "modified_since", "modified_after",
+    "updated_at_min", "last_modified_since", "since",
+)
+# The same filter named any other way: an update-time stem, then a lower-bound
+# operator last (`date_updated_gt`, `updatedAfter`, `updated_at[gte]`), matched on
+# the name lowercased with separators and brackets dropped.
+_INCREMENTAL_PARAM_RE = re.compile(
+    r"[a-z]*(?:updated|modified|changed)(?:at|on|date|time)?(?:gte|gt|after|since|from|min)"
 )
 
 # Response envelope keys that commonly hold the record array.
@@ -293,6 +303,9 @@ def _detect_incremental(query_params: List[str]) -> Dict[str, Any]:
     for candidate in _INCREMENTAL_PARAM_CANDIDATES:
         if candidate in lowered:
             return {"supports_incremental": True, "incremental_param": lowered[candidate]}
+    for name in lowered:
+        if _INCREMENTAL_PARAM_RE.fullmatch(re.sub(r"[^a-z0-9]", "", name)):
+            return {"supports_incremental": True, "incremental_param": lowered[name]}
     return {}
 
 

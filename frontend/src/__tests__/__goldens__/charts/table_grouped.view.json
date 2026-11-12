@@ -1,0 +1,26 @@
+{
+  "kind": "table",
+  "head": [
+    "region",
+    "day",
+    "Sum of amount"
+  ],
+  "body": [
+    [
+      "US",
+      "2026-10-01",
+      "900"
+    ],
+    [
+      "EU",
+      "2026-10-01",
+      "450.8"
+    ]
+  ],
+  "numeric": [
+    false,
+    false,
+    true
+  ],
+  "notes": []
+}

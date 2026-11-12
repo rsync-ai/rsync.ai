@@ -28,7 +28,7 @@
 - `NEXT_PUBLIC_API_URL`
 - `NEXT_PUBLIC_WS_URL`
 - `API_GATEWAY_INTERNAL_URL` (SSR)
-- `ORCHESTRATOR_INTERNAL_URL` (SSR)
+- `INTERNAL_SERVICE_SECRET` (server-only: api-gateway sends it to the chart PNG / dashboard PDF routes)
 - `NEXTAUTH_URL`
 - `NEXT_PUBLIC_OTEL_ENDPOINT` (optional)
 

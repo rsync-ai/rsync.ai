@@ -35,18 +35,6 @@ const (
 	perTableMemBudgetBytes = 384 * 1024 * 1024 // ~384 MiB
 )
 
-// computeTableConcurrency is the pure, testable core of the sizing decision.
-//
-// Given the detected CPU count, the memory limit in bytes (0 = unknown/unlimited),
-// and an explicit operator override (0 = none), it returns the worker-pool size
-// (before the per-run table-count clamp applied by the caller). The override always
-// wins so ops can pin a value; otherwise the size is CPU-scaled, clamped to
-// [min,max], and further capped by the memory budget.
-func computeTableConcurrency(numCPU int, memLimitBytes int64, override int) int {
-	size, _ := decideTableConcurrency(numCPU, memLimitBytes, override)
-	return size
-}
-
 // Binding-constraint labels for the sizing decision. These are log strings, not
 // control flow — see decideTableConcurrency for why they exist at all.
 const (
@@ -65,8 +53,6 @@ const (
 // strictly serial and has nothing in the logs to explain it. Reporting the
 // binding constraint turns "concurrency=1" from an unexplained number into a
 // diagnosis that names the knob to turn (raise mem_limit, or pin the override).
-//
-// Callers that only need the number use computeTableConcurrency.
 func decideTableConcurrency(numCPU int, memLimitBytes int64, override int) (int, string) {
 	if override > 0 {
 		return override, concurrencyBoundByOverride

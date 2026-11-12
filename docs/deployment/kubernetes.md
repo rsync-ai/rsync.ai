@@ -85,7 +85,7 @@ with fresh secrets and empty volumes.
 | `RSYNC_INGRESS_CLASS`, `RSYNC_TLS_SECRET` | cluster default, none | Ingress class; an existing `kubernetes.io/tls` Secret (URLs become `https`) |
 | `RSYNC_CONNECTORS` | `postgresql,mysql,mongodb,aws-s3,gcs` | Which connector pods to run |
 | `RSYNC_DEMO` | `true` | The sample-data try-it path |
-| `RSYNC_NAMESPACE`, `RSYNC_RELEASE` | `rsync`, `rsync` | Where it installs |
+| `RSYNC_NAMESPACE`, `RSYNC_RELEASE` | `rsync-ai`, `rsync-ai` | Where it installs. An upgrade of an earlier install that used `rsync`, `rsync` keeps that name. |
 | `RSYNC_STORAGE_CLASS` | cluster default | Required only when the cluster has no default |
 | `RSYNC_IMAGE_REGISTRY`, `RSYNC_IMAGE_TAG`, `RSYNC_IMAGE_PULL_SECRET` | `ghcr.io/rsync-ai`, chart version, none | Mirror or private registry |
 | `RSYNC_KUBE_CONTEXT` | current context | Target a specific cluster |
@@ -258,6 +258,8 @@ secrets:
   postgresPassword: "<openssl rand -hex 24>"
   minioAccessKey: "<openssl rand -base64 16>"
   minioSecretKey: "<openssl rand -base64 24>"
+  blobStagingAccessKey: "<openssl rand -hex 16>"
+  blobStagingSecretKey: "<openssl rand -base64 32>"
 frontend:
   apiUrl: https://api.example.com      # the address the BROWSER calls
   publicUrl: https://app.example.com   # NextAuth builds callback URLs from it

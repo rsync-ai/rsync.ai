@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"go/scanner"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -234,6 +236,39 @@ func gatewayMigrationObjects(t *testing.T) []migrationObject {
 	return out
 }
 
+var wordRe = regexp.MustCompile(`\w+`)
+
+// codeWords is every word in a Go file's identifiers and string literals. Comments
+// are left out: a comment names things the code never queries, and the word
+// "workflows" in a path to the temporal adapter's package once tied cdcstats to the
+// gateway's workflows table (migration 130).
+func codeWords(t *testing.T, src string) map[string]bool {
+	t.Helper()
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var s scanner.Scanner
+	s.Init(fset.AddFile(src, fset.Base(), len(b)), b, nil, 0) // mode 0 skips comments
+	words := map[string]bool{}
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			break
+		}
+		if tok == token.IDENT || tok == token.STRING || tok == token.CHAR {
+			for _, w := range wordRe.FindAllString(lit, -1) {
+				words[w] = true
+			}
+		}
+	}
+	if s.ErrorCount > 0 {
+		t.Fatalf("%s: %d scan errors", src, s.ErrorCount)
+	}
+	return words
+}
+
 // The class this guards: a boot worker queries a table or column that a gateway
 // migration NEWER than every bootSchema entry creates. The wait then returns
 // before that migration lands and the worker's first tick fails -- the heal
@@ -289,17 +324,9 @@ func TestBootSchemaIsAsNewAsWhatTheBootWorkersRead(t *testing.T) {
 		}
 	}
 
-	identifier := regexp.MustCompile(`\w+`)
 	needed, neededBy := 0, ""
 	for _, src := range sources {
-		b, err := os.ReadFile(src)
-		if err != nil {
-			t.Fatal(err)
-		}
-		names := map[string]bool{}
-		for _, w := range identifier.FindAllString(string(b), -1) {
-			names[w] = true
-		}
+		names := codeWords(t, src)
 		for _, o := range objs {
 			// A column counts only where its table is named in the same file, so a
 			// common name (workspace_id) does not tie a worker to an unrelated table.

@@ -1,6 +1,7 @@
 package security
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -134,5 +135,88 @@ func TestRedactString_DSNWithInlineCredentialsNeverLeaksThePassword(t *testing.T
 	got := redactString(in)
 	if strings.Contains(got, "hunter2") {
 		t.Fatalf("DSN password survived redaction\n   in: %q\n  out: %q", in, got)
+	}
+}
+
+// KI-REDACTION-SQL-VERB-PROSE-RESIDUAL: a field whose producer declares it SQL
+// is redacted by rule, not by the shape-and-keyword guess free text gets. The
+// adapter's PIPELINE_WAITING approval card carries the schema-repair DDL twice
+// (nl_pipeline_v2_workflow.go: `proposed_ddl`, and `repair_plan.ddl` from the
+// SchemaRepairPlan struct), built at nl_pipeline_v2_activities.go as
+// `ALTER TABLE "<s>"."<t>" ADD COLUMN IF NOT EXISTS "<col>" <type>`.
+func TestRedactMap_DeclaredSQLFieldIsRedactedByRuleNotByGuess(t *testing.T) {
+	cases := []struct {
+		name string
+		in   map[string]interface{}
+		path []string // where the value lands in the output
+		want interface{}
+	}{
+		// The guess replaced the whole statement because a column NAME contains
+		// "token": the approver's DDL became a placeholder, and no value was
+		// ever in it.
+		{
+			"ddl naming a token column stays readable",
+			map[string]interface{}{"proposed_ddl": []interface{}{
+				`ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS "api_token" text`,
+			}},
+			[]string{"proposed_ddl"},
+			[]interface{}{`ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS "api_token" text`},
+		},
+		// Nested: SchemaRepairPlan.DDL arrives as repair_plan.ddl.
+		{
+			"repair_plan.ddl is declared too",
+			map[string]interface{}{"repair_plan": map[string]interface{}{"ddl": []interface{}{
+				`ALTER TABLE "public"."sessions" ADD COLUMN IF NOT EXISTS "refresh_tok" text`,
+			}}},
+			[]string{"repair_plan", "ddl"},
+			[]interface{}{`ALTER TABLE "public"."sessions" ADD COLUMN IF NOT EXISTS "refresh_tok" text`},
+		},
+		// The guess let a literal VALUE through whenever no keyword from its
+		// short list was present: here an email address.
+		{
+			"a literal value never survives a declared field",
+			map[string]interface{}{"sql": `UPDATE users SET email = 'ana@example.com' WHERE id = 7`},
+			[]string{"sql"},
+			`UPDATE users SET email = '********' WHERE id = 7`,
+		},
+		// And it let through any statement outside its six shapes.
+		{
+			"a statement the shape guess does not know is still masked",
+			map[string]interface{}{"ddl": `CREATE USER etl WITH PASSWORD 'hunter2'`},
+			[]string{"ddl"},
+			`CREATE USER etl WITH PASSWORD '********'`,
+		},
+		{
+			"dollar quotes, comments and an unterminated literal",
+			map[string]interface{}{"ddl_applied": "SELECT $$sk-live-1$$ -- token sk-live-2\n/* sk-live-3 */ 'sk-live-4"},
+			[]string{"ddl_applied"},
+			"SELECT $$********$$ -- ********\n/* ******** */ '********'",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got interface{} = RedactMap(tc.in)
+			for _, k := range tc.path {
+				got = got.(map[string]interface{})[k]
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("declared SQL field\n  got: %#v\n want: %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The bound: a key outside the declared list keeps the free-text backstop, and
+// a sensitive key still wins over a declared one.
+func TestRedactMap_UndeclaredTextKeepsTheBackstop(t *testing.T) {
+	out := RedactMap(map[string]interface{}{
+		"error_message": "DELETE FROM sessions WHERE token = 'abc'",
+		"sql_password":  "SELECT 1",
+	})
+	if got := out["error_message"]; got != sqlPlaceholder {
+		t.Fatalf("free-text backstop changed: %q", got)
+	}
+	if got := out["sql_password"]; got != MaskedValue {
+		t.Fatalf("sensitive key no longer wins: %q", got)
 	}
 }

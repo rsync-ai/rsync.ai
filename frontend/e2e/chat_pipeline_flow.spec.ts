@@ -39,7 +39,7 @@ test.describe("Chat-first pipeline flow", () => {
       await mysqlPostgresBtn.click()
     } else {
       // Fallback: use the home input form
-      const chatInput = page.getByPlaceholder(/sync mysql to s3|describe what data/i).first()
+      const chatInput = page.getByLabel('Describe your pipeline')
       await expect(chatInput).toBeVisible({ timeout: 10000 })
       await chatInput.fill("sync mysql to postgresql")
       await page.keyboard.press("Enter")

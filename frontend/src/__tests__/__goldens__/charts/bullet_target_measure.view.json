@@ -1,0 +1,24 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "bullet",
+    "description": "Revenue against Goal",
+    "value": {
+      "label": "Revenue",
+      "format": "decimal"
+    },
+    "target": {
+      "label": "Goal",
+      "format": "decimal"
+    },
+    "color": "series-1"
+  },
+  "rows": [
+    {
+      "value": 1070,
+      "target": 950
+    }
+  ],
+  "series": [],
+  "notes": []
+}

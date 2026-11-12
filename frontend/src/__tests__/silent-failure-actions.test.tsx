@@ -37,7 +37,7 @@ import { authFetchOrThrow } from "@/lib/api/auth-fetch"
 import { classifyError } from "@/lib/utils/error-handling"
 import { toast } from "sonner"
 import { SchemaEvolutionPanel } from "@/components/pipeline/SchemaEvolutionPanel"
-import { PipelineExecutionStatusBadge } from "@/components/pipeline/PipelineExecutionStatusBadge"
+import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 import { SchemaDriftBadge } from "@/components/pipeline/SchemaDriftBadge"
 
 const mockAuthFetch = vi.fn()
@@ -165,48 +165,58 @@ describe("polling badges must stop asserting once the read fails (F-242)", () =>
   beforeEach(() => vi.clearAllMocks())
   afterEach(() => vi.useRealTimers())
 
-  /** Route by URL: the status badge also drives usePipelineRuntime. */
-  function routeStatus(stateResponse: () => Response) {
+  /**
+   * The page's status pill is the health header's: /runtime's phase, with /state
+   * for a finished batch run or one waiting on the user. `fails` picks which
+   * reads start answering 403.
+   */
+  function routeStatus(fails: () => "none" | "runtime" | "both") {
     mockAuthFetch.mockImplementation(async (url: string) => {
-      if (String(url).includes("/runtime")) return okJson({ pipeline_id: "p1", mode: "batch" })
-      return stateResponse()
+      const isRuntime = String(url).includes("/runtime")
+      const f = fails()
+      if (f === "both" || (f === "runtime" && isRuntime)) return forbidden("session expired")
+      if (isRuntime) return okJson({ pipeline_id: "p1", mode: "batch", phase: "syncing", health: "healthy" })
+      return okJson({ status: "running" })
     })
   }
 
-  it("THE REGRESSION: a status badge whose refresh starts 403-ing must not keep claiming 'Running'", async () => {
-    let failing = false
-    routeStatus(() => (failing ? forbidden("session expired") : okJson({ status: "running" })))
+  for (const fails of ["both", "runtime"] as const) {
+    it(`THE REGRESSION: the status pill must not keep claiming 'Syncing' once ${fails === "both" ? "its reads start" : "the /runtime read starts"} 403-ing`, async () => {
+      let failing = false
+      routeStatus(() => (failing ? fails : "none"))
 
-    // Fake timers must be installed BEFORE render: the badge registers its 4 s
-    // `window.setInterval` on mount, and switching to fake timers afterwards
-    // does not take over an already-scheduled real one — the poll then never
-    // fires and the test fails for a reason that has nothing to do with the bug.
-    // For the same reason `findBy*`/`waitFor` are avoided from here on: they
-    // schedule their own timers and would never resolve.
-    vi.useFakeTimers()
-    render(<PipelineExecutionStatusBadge pipelineId="p1" />)
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0)
+      // Fake timers must be installed BEFORE render: the polls register their
+      // `window.setInterval` on mount, and switching to fake timers afterwards
+      // does not take over an already-scheduled real one — the poll then never
+      // fires and the test fails for a reason that has nothing to do with the bug.
+      // For the same reason `findBy*`/`waitFor` are avoided from here on: they
+      // schedule their own timers and would never resolve.
+      vi.useFakeTimers()
+      render(<PipelineHealthHeader pipelineId="p1" />)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText("Syncing")).toBeInTheDocument()
+      expect(screen.queryByTitle(/out of date/i)).not.toBeInTheDocument()
+
+      // Now the reads start failing; past both polls (4 s /state, 5 s /runtime).
+      failing = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_100)
+      })
+
+      // Not asserting "the pipeline stopped" — only that the pill no longer
+      // presents a stale value as a live one.
+      expect(screen.getByTitle(/out of date/i)).toHaveTextContent("Syncing")
     })
-    expect(screen.getByText("Running")).toBeInTheDocument()
+  }
 
-    // Now the reads start failing.
-    failing = true
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(4_100)
-    })
+  it("positive control: while the reads succeed the pill carries no staleness marker", async () => {
+    routeStatus(() => "none")
 
-    // Not asserting "the pipeline stopped" — only that the pill no longer
-    // presents a stale value as a live one.
-    expect(screen.getByTitle(/out of date/i)).toBeInTheDocument()
-  })
+    render(<PipelineHealthHeader pipelineId="p1" />)
 
-  it("positive control: while the reads succeed the badge carries no staleness marker", async () => {
-    routeStatus(() => okJson({ status: "running" }))
-
-    render(<PipelineExecutionStatusBadge pipelineId="p1" />)
-
-    expect(await screen.findByText("Running")).toBeInTheDocument()
+    expect(await screen.findByText("Syncing")).toBeInTheDocument()
     expect(screen.queryByTitle(/out of date/i)).not.toBeInTheDocument()
   })
 

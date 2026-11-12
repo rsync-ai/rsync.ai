@@ -74,8 +74,8 @@ export function formatDuration(ms: number | null | undefined): string {
  * callers render into a table cell where a dash is the honest empty.
  */
 export function formatDurationBetween(
-  start?: string | null,
-  end?: string | null,
+  start?: string | Date | null,
+  end?: string | Date | null,
   nowMs: number = Date.now(),
 ): string {
   if (!start) return "—"

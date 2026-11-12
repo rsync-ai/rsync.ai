@@ -19,7 +19,7 @@ import {
   HelpCircle,
 } from 'lucide-react'
 import type { StageExecution, StageStatus } from '@/lib/pipeline/stageDefinitions'
-import { formatDuration } from '@/components/pipeline/dagHelpers'
+import { formatDuration } from '@/lib/duration'
 import { cn } from '@/lib/utils'
 import { LocalDateTime } from '@/components/ui/local-date-time'
 
@@ -156,7 +156,7 @@ export function StageTimeline({ stages, currentStageKey, className, title }: Sta
 
                     {/* Error message for failed stage */}
                     {stage.status === 'failed' && stage.attempts.length > 0 && (
-                      <div className="text-xs text-red-600 dark:text-red-400 mt-1 p-2 bg-red-50 dark:bg-red-950/50 rounded">
+                      <div className="text-xs text-red-700 dark:text-red-400 mt-1 p-2 bg-red-50 dark:bg-red-950/50 rounded">
                         {stage.attempts[stage.attempts.length - 1].error || 'Stage failed'}
                       </div>
                     )}

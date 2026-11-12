@@ -11,18 +11,41 @@ export const MAX_PERSISTED_MESSAGES = 50
 
 const SESSION_TTL_MS = 30 * 60 * 1000 // 30 minutes
 
+export interface PersistedChatState<TMessage> {
+  messages: TMessage[]
+  activeIntent: string
+  /** The pipeline this chat started, so coming back to /chat shows it again. */
+  pipelineId: string
+}
+
+function readStoredPipelineId(): string {
+  try {
+    const raw = window.localStorage.getItem(workspaceScopedKey(CHAT_UI_STATE_KEY))
+    if (!raw) return ""
+    const id = (JSON.parse(raw) as Record<string, unknown>)?.["pipelineId"]
+    return typeof id === "string" ? id : ""
+  } catch {
+    return ""
+  }
+}
+
 export function useChatPersistence<TMessage>() {
+  // `pipelineId` left out keeps the one stored: the chat saves its messages on every
+  // change, and once as it opens, before it has restored anything. Only
+  // clearPersistedState (Start new) forgets the pipeline.
   const persistUiState = useCallback(
-    (next: { messages: TMessage[]; activeIntent: string }) => {
+    (next: { messages: TMessage[]; activeIntent: string; pipelineId?: string }) => {
       if (typeof window === "undefined") return
       try {
         const trimmed = next.messages.slice(-MAX_PERSISTED_MESSAGES)
+        const pipelineId = next.pipelineId ?? readStoredPipelineId()
         window.localStorage.setItem(
           workspaceScopedKey(CHAT_UI_STATE_KEY),
           JSON.stringify({
             v: 1,
             messages: trimmed,
             activeIntent: next.activeIntent,
+            ...(pipelineId ? { pipelineId } : {}),
             updatedAt: new Date().toISOString(),
           })
         )
@@ -33,13 +56,14 @@ export function useChatPersistence<TMessage>() {
     []
   )
 
-  const loadPersistedUiState = useCallback((): { messages: TMessage[]; activeIntent: string } => {
-    if (typeof window === "undefined") return { messages: [], activeIntent: "" }
+  const loadPersistedUiState = useCallback((): PersistedChatState<TMessage> => {
+    const empty = { messages: [], activeIntent: "", pipelineId: "" }
+    if (typeof window === "undefined") return empty
     try {
       dropLegacyUnscopedValue(CHAT_UI_STATE_KEY)
       const key = workspaceScopedKey(CHAT_UI_STATE_KEY)
       const raw = window.localStorage.getItem(key)
-      if (!raw) return { messages: [], activeIntent: "" }
+      if (!raw) return empty
       const parsed = JSON.parse(raw) as Record<string, unknown>
       const rawUpdatedAt = parsed?.["updatedAt"]
       const updatedAt =
@@ -48,19 +72,22 @@ export function useChatPersistence<TMessage>() {
           : 0
       if (updatedAt && Date.now() - updatedAt > SESSION_TTL_MS) {
         window.localStorage.removeItem(key)
-        return { messages: [], activeIntent: "" }
+        return empty
       }
       const persistedMessages = Array.isArray(parsed?.["messages"])
         ? (parsed["messages"] as TMessage[])
         : []
       const persistedActiveIntent =
         typeof parsed?.["activeIntent"] === "string" ? (parsed["activeIntent"] as string) : ""
+      const persistedPipelineId =
+        typeof parsed?.["pipelineId"] === "string" ? (parsed["pipelineId"] as string) : ""
       return {
         messages: persistedMessages.slice(-MAX_PERSISTED_MESSAGES),
         activeIntent: persistedActiveIntent,
+        pipelineId: persistedPipelineId,
       }
     } catch {
-      return { messages: [], activeIntent: "" }
+      return empty
     }
   }, [])
 

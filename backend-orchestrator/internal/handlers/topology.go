@@ -231,7 +231,7 @@ var pipelineID8Pattern = regexp.MustCompile(`^[0-9a-fA-F]{8}$`)
 // ok=false means the name is not pipeline-scoped: a shared control topic
 // (pii.scan.*, rsync.notifications), a Kafka Connect internal (_rsync-connect-offsets), or
 // the planner's per-CONNECTION CDC topic ("cdc.<connection-name>",
-// llm-service/src/agents/planner/strategies.py:650), which carries no pipeline
+// llm-service/src/agents/planner/strategies.py:597), which carries no pipeline
 // id at all. Those are platform infrastructure rather than one tenant's data,
 // so the gates below refuse them for user principals instead of guessing an
 // owner.
@@ -346,7 +346,7 @@ func readableTopicID8s(db *sql.DB, authUser string) (map[string]bool, error) {
 // requireTopicPipelineScope gates a MUTATING topology action (create, delete,
 // repartition) on the caller's workspace role in the pipeline whose data the
 // topic carries. Trusted internal callers pass through exactly as in
-// cdc_authz.go — the planner's POST /topics (strategies.py:766) and api-gateway
+// cdc_authz.go — the planner's POST /topics (strategies.py:713) and api-gateway
 // have already applied their own gates.
 //
 // Writes the response and aborts on every failure, so the handler must return.

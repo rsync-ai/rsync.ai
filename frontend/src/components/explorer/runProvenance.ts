@@ -6,6 +6,8 @@
  * (migration 104); nothing resolves an id itself.
  */
 
+import { activityTriggerLabel } from "@/lib/api/activity"
+
 export type UpstreamPolicy = "any" | "all"
 
 /** The provenance half of a saved_query_runs row, as GET /explorer/saved/:id/runs returns it. */
@@ -40,18 +42,24 @@ export function describeUpstreamSet(
   return `After any of ${names.join(", ")} runs`
 }
 
-/** "manual", "scheduled", or "after orders_daily (depth 2, 3 coalesced)". */
+/**
+ * The trigger in the Runs page's words (activityTriggerLabel): "Manual", "Schedule",
+ * "After orders_daily (one rebuild for 3 upstream runs)", or "By the workflow nightly"
+ * for a run a workflow's refresh model step asked for.
+ */
 export function describeRunOrigin(r: RunProvenanceFields): string {
-  if (r.trigger_source !== "triggered") return r.trigger_source
-  if (!r.upstream_kind) return "triggered"
+  if (r.trigger_source !== "triggered" || !r.upstream_kind) return activityTriggerLabel(r.trigger_source)
   // A missing name is a producer deleted since, or a private model of someone else's.
-  const who = r.upstream_name?.trim() || (r.upstream_kind === "pipeline" ? "a pipeline" : "a model")
-  const details: string[] = []
-  // Depth 1 is the ordinary case and says nothing; deeper tells the reader this run is
-  // the tail of a chain, and which row to walk back to.
-  if ((r.trigger_depth ?? 0) > 1) details.push(`depth ${r.trigger_depth}`)
-  if ((r.coalesced_count ?? 0) > 1) details.push(`${r.coalesced_count} coalesced`)
-  return details.length ? `after ${who} (${details.join(", ")})` : `after ${who}`
+  const name = r.upstream_name?.trim()
+  const who = name || (r.upstream_kind === "pipeline" ? "a pipeline" : r.upstream_kind === "workflow" ? "a workflow" : "a model")
+  // No "depth 2" or "coalesced": a chain's depth and the merged triggers are the
+  // scheduler's words. The upstream it names is the row to walk back to either way.
+  // A workflow asked for this run; it did not run after the workflow finished.
+  const byWorkflow = r.upstream_kind === "workflow"
+  const n = r.coalesced_count ?? 0
+  const merged = n > 1 ? ` (one rebuild for ${n} ${byWorkflow ? "requests" : "upstream runs"})` : ""
+  const head = byWorkflow ? `By ${name ? `the workflow ${name}` : who}` : `After ${who}`
+  return head + merged
 }
 
 const SKIP_REASON_TEXT: Record<string, string> = {
@@ -59,6 +67,8 @@ const SKIP_REASON_TEXT: Record<string, string> = {
   upstream_skipped: "not rebuilt: a model above it did not rebuild",
   chain_depth_exceeded: "not rebuilt: the rebuild chain reached its hop limit",
   waiting_on_upstreams: "not rebuilt yet: waiting for every upstream",
+  trigger_lost: "not rebuilt: its trigger could not be delivered",
+  upstream_check_failed: "not rebuilt: a data check held its upstream's table back",
 }
 
 /**
@@ -66,7 +76,26 @@ const SKIP_REASON_TEXT: Record<string, string> = {
  * reason from a newer gateway is shown verbatim rather than dropped: a skip with no
  * explanation is exactly what these rows exist to stop.
  */
-export function describeSkipReason(r: { skip_reason?: string }): string | null {
+export function describeSkipReason(r: { skip_reason?: string; upstream_name?: string; error?: string }): string | null {
   if (!r.skip_reason) return null
+  // The model a check held back is the one to open; its name is on the row when the
+  // reader may see it (a deleted or private upstream has none).
+  const upstream = r.upstream_name?.trim()
+  if (r.skip_reason === "upstream_check_failed" && upstream) {
+    return `not rebuilt: ${upstream} was blocked by a data check`
+  }
+  // A fan-in's message says how many upstreams it still waits on
+  // (saved_query_schedules.go): say the wait once, with the count.
+  const message = r.error?.trim()
+  if (r.skip_reason === "waiting_on_upstreams" && message?.startsWith("waiting on ")) {
+    return `not rebuilt yet: ${message}`
+  }
   return SKIP_REASON_TEXT[r.skip_reason] ?? `not rebuilt: ${r.skip_reason}`
+}
+
+/** A run's message, or null when it is empty or its skip sentence already says it. */
+export function runMessage(r: { skip_reason?: string; upstream_name?: string; error?: string }): string | null {
+  const message = r.error?.trim()
+  if (!message) return null
+  return describeSkipReason(r)?.includes(message) ? null : message
 }

@@ -1,0 +1,113 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "pie",
+    "description": "Sum of amount by country",
+    "slices": {
+      "field": "s",
+      "label": "country",
+      "values": [
+        {
+          "key": "s0",
+          "label": "United States",
+          "color": "series-6"
+        },
+        {
+          "key": "s1",
+          "label": "Germany",
+          "color": "series-5"
+        },
+        {
+          "key": "s2",
+          "label": "India",
+          "color": "series-3"
+        },
+        {
+          "key": "s3",
+          "label": "Brazil",
+          "color": "series-1"
+        },
+        {
+          "key": "s4",
+          "label": "Japan",
+          "color": "series-4"
+        },
+        {
+          "key": "s5",
+          "label": "France",
+          "color": "series-2"
+        },
+        {
+          "key": "other",
+          "label": "Other",
+          "color": "other"
+        }
+      ]
+    },
+    "value": {
+      "field": "v",
+      "label": "Sum of amount",
+      "format": "compact"
+    }
+  },
+  "rows": [
+    {
+      "s": "s0",
+      "v": 52000
+    },
+    {
+      "s": "s1",
+      "v": 31000
+    },
+    {
+      "s": "s2",
+      "v": 24000
+    },
+    {
+      "s": "s3",
+      "v": 18000
+    },
+    {
+      "s": "s4",
+      "v": 15000
+    },
+    {
+      "s": "s5",
+      "v": 9000
+    },
+    {
+      "s": "other",
+      "v": 11000
+    }
+  ],
+  "series": [
+    {
+      "value": "United States",
+      "color": "series-6"
+    },
+    {
+      "value": "Germany",
+      "color": "series-5"
+    },
+    {
+      "value": "India",
+      "color": "series-3"
+    },
+    {
+      "value": "Brazil",
+      "color": "series-1"
+    },
+    {
+      "value": "Japan",
+      "color": "series-4"
+    },
+    {
+      "value": "France",
+      "color": "series-2"
+    }
+  ],
+  "notes": [
+    "3 more slices are drawn as Other.",
+    "1 slice is zero or below, so it is not drawn."
+  ]
+}

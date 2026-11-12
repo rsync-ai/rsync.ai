@@ -593,7 +593,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
         </Card>
       )}
 
-      <Dialog open={inviteOpen} onOpenChange={setInviteOpen}>
+      <Dialog open={inviteOpen} onOpenChange={setInviteOpen} closeOnOutsideClick={false}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">

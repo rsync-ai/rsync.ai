@@ -190,11 +190,10 @@ GUARDS = [
     # names, not an omission.
     "test_insecure_token_endpoint_rule_is_one_rule.py",
     # Enrolled 2026-09-22 with the paid-layer boundary. Both guard the same
-    # boundary from opposite ends: one that no surviving file names a path into
-    # the private tree, one that no published image name can be written by the
-    # paid service. (The tree is named by neither comment on purpose: this file
-    # ships public, and the first of those two guards is what refuses a path
-    # spelled out here -- it caught this very comment on the first run.) Their subjects are scripts/flip/excludes.txt,
+    # boundary from opposite ends: one that no surviving file depends on the
+    # paid code (retargeted 2026-09-28, when that code moved to its own
+    # repository), one that no published image name can be written by the
+    # paid service. Their subjects are scripts/flip/excludes.txt,
     # .github/workflows/docker-publish.yml, deploy/helm/rsync-ai/values.yaml and
     # every tracked docker-compose*.yml -- all four already covered by
     # `scripts/flip/**`, `.github/workflows/**`, `deploy/helm/**` and the compose
@@ -220,6 +219,50 @@ GUARDS = [
     # `.github/workflows/**`; the script was not, so the filter gained it in the
     # same change.
     "test_fix_pr_must_change_a_test.py",
+    # Enrolled 2026-09-28 with the publish guard (KI-BOTH-REPOS-PUBLISH-THE-SAME-IMAGE-NAMES).
+    # Its subjects are every file under .github/workflows/, covered by
+    # `.github/workflows/**`. Listed for the reason every entry above gives.
+    "test_only_the_public_repo_publishes_images.py",
+    # Enrolled 2026-09-28 with the self-host "Running (0)" fix. Its subjects are
+    # docker-compose.quickstart.yml and api-gateway/internal/handlers/tools.go,
+    # covered by `docker-compose*.yml` and `api-gateway/**`, so the filter needed
+    # no change. Listed for the reason every entry above gives.
+    "test_quickstart_gateway_can_see_its_connectors.py",
+    # Enrolled 2026-09-30 with the workflow node-kind runtime fix. Its subjects
+    # are shared/workflow_node_kinds_golden.json and the DAG planner prompt; the
+    # golden was new, so the `llm` filter gained it in the same change (the
+    # prompt is under `llm-service/**`). Listed for the reason every entry above
+    # gives.
+    "test_dag_planner_runnable_kinds.py",
+    # Enrolled 2026-10-01, closing KI-CI-FILTER-EXCLUDES-GUARDS-OWN-SUBJECTS.
+    # The KI named this guard's two subjects as the actionable residue. Both
+    # turned out covered: pii.go by `api-gateway/**`, and the page because
+    # doc-links.yml's unfiltered Doc guards job runs this guard on every PR.
+    # Enrolled so a later move of it out of that job cannot silently uncover
+    # the page.
+    "test_pii_policies_are_not_advertised_as_enforced.py",
+    # Enrolled 2026-10-01 with the same census. Its subject is
+    # frontend/src/lib/api/discovery.ts, which it read through a LLM_DIR/".."
+    # join this file could not see. The guard now joins from REPO_ROOT and the
+    # `llm` filter gained the path.
+    "test_public_generate_route.py",
+    # Enrolled 2026-10-01 with the a11y upload fix. Its subject is ci.yml,
+    # covered by `.github/workflows/**`. Listed for the reason every entry
+    # above gives.
+    "test_ci_report_uploads_only_on_failure.py",
+    # Enrolled 2026-10-07 with Ask rsync.ai's eval (T1 of the assistant token
+    # design). Their subjects are new files outside `llm-service/**` --
+    # shared/assistant_step_usage_golden.json and scripts/assistant_eval*.py/.json
+    # -- so the `llm` filter gained all three in the same change.
+    "test_assistant_step_usage_golden.py",
+    "test_assistant_eval.py",
+    # Enrolled 2026-11-03 with the self-host LLM posture. Its subjects are the
+    # three compose files, covered by `docker-compose*.yml`, and the chart it
+    # renders with `helm template` (values.yaml, templates/apps/api-gateway.yaml
+    # and generation.yaml), covered by `deploy/helm/**` -- built from path
+    # segments, so this census sees only the compose files. Listed for the
+    # reason every entry above gives.
+    "test_self_host_flags_reach_compose_and_chart.py",
 ]
 
 
@@ -366,6 +409,11 @@ def _subjects_of(guard):
                 raw.add("/".join(rest))
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             v = node.value
+            # A literal with no letter or digit names no file. The regex
+            # fragment ".*" in test_public_generate_route.py globbed to every
+            # dotfile at the repo root and made eight of them its "subjects".
+            if not any(c.isalnum() for c in v):
+                continue
             if "/" in v or v.startswith(".") or v.endswith((".yml", ".yaml", ".sh", ".md", ".txt")):
                 raw.add(v)
 

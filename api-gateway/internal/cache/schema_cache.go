@@ -99,11 +99,6 @@ func (c *SchemaCache) Invalidate(ctx context.Context, connectionID string) error
 	return nil
 }
 
-// Close closes the Redis client
-func (c *SchemaCache) Close() error {
-	return c.client.Close()
-}
-
 // GetClient returns the underlying Redis client for reuse
 func (c *SchemaCache) GetClient() *redis.Client {
 	return c.client

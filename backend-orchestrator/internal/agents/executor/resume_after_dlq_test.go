@@ -63,6 +63,9 @@ func TestRewindAfterLostBatchesTellsTheUserWhatResumeDoes(t *testing.T) {
 	}
 	defer db.Close()
 	mock.ExpectBegin()
+	mock.ExpectExec(`^SAVEPOINT record_rewound_tables$`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO pipeline_run_rewinds`).WithArgs("p1", "e1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`^RELEASE SAVEPOINT record_rewound_tables$`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`UPDATE pipeline_checkpoints`).WithArgs("p1", "e1").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM pipeline_checkpoints`).WithArgs("p1", "e1").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()

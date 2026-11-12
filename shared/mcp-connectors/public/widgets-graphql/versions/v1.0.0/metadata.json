@@ -21,6 +21,7 @@
   "supports_ddl": false,
   "auto_create_destination_tables": false,
   "spec_version": "1.1",
+  "source": "generated",
   "generated_at": "2026-07-05T15:47:52.925352",
   "status": "active",  "quality_tier": "silver",  "default_headers": {},
   "header_config_keys": [],

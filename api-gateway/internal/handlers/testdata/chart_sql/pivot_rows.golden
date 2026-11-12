@@ -1,0 +1,99 @@
+# settings: {"version":2,"type":"pivot","roles":{"rows":[{"column":"region"}],"measure":[{"aggregate":"sum","column":"amount"}]}}
+
+-- postgres
+SELECT p."region", p."amount", p."rsync_total_r1"
+FROM (
+SELECT src."region" AS "region", SUM(src."amount") AS "amount", GROUPING(src."region") AS "rsync_total_r1"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY GROUPING SETS ((src."region"), ())
+) p
+ORDER BY p."rsync_total_r1" DESC, p."region" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT p.`region`, p.`amount`, p.`rsync_total_r1`
+FROM (
+SELECT src.`region` AS `region`, SUM(src.`amount`) AS `amount`, 0 AS `rsync_total_r1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`
+UNION ALL
+SELECT NULL AS `region`, SUM(src.`amount`) AS `amount`, 1 AS `rsync_total_r1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+) p
+ORDER BY p.`rsync_total_r1` DESC, p.`region` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) p.[region], p.[amount], p.[rsync_total_r1]
+FROM (
+SELECT src.[region] AS [region], SUM(src.[amount]) AS [amount], GROUPING(src.[region]) AS [rsync_total_r1]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY GROUPING SETS ((src.[region]), ())
+) p
+ORDER BY p.[rsync_total_r1] DESC, p.[region] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT p.`region`, p.`amount`, p.`rsync_total_r1`
+FROM (
+SELECT src.`region` AS `region`, SUM(src.`amount`) AS `amount`, GROUPING(src.`region`) AS `rsync_total_r1`
+FROM `gold`.`orders` src
+GROUP BY GROUPING SETS ((src.`region`), ())
+) p
+ORDER BY p.`rsync_total_r1` DESC, p.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT p."REGION", p."AMOUNT", p."RSYNC_TOTAL_R1"
+FROM (
+SELECT src."REGION" AS "REGION", SUM(src."AMOUNT") AS "AMOUNT", GROUPING(src."REGION") AS "RSYNC_TOTAL_R1"
+FROM "GOLD"."ORDERS" src
+GROUP BY GROUPING SETS ((src."REGION"), ())
+) p
+ORDER BY p."RSYNC_TOTAL_R1" DESC, p."REGION" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT p.`region`, p.`amount`, p.`rsync_total_r1`
+FROM (
+SELECT src.`region` AS `region`, SUM(src.`amount`) AS `amount`, GROUPING(src.`region`) AS `rsync_total_r1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY GROUPING SETS ((src.`region`), ())
+) p
+ORDER BY p.`rsync_total_r1` DESC, p.`region` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT p.`region`, p.`amount`, p.`rsync_total_r1`
+FROM (
+SELECT src.`region` AS `region`, SUM(src.`amount`) AS `amount`, GROUPING(src.`region`) AS `rsync_total_r1`
+FROM `gold`.`orders` src
+GROUP BY GROUPING SETS ((src.`region`), ())
+) p
+ORDER BY p.`rsync_total_r1` DESC, p.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT p."REGION", p."AMOUNT", p."RSYNC_TOTAL_R1"
+FROM (
+SELECT src."REGION" AS "REGION", SUM(src."AMOUNT") AS "AMOUNT", GROUPING(src."REGION") AS "RSYNC_TOTAL_R1"
+FROM "GOLD"."ORDERS" src
+GROUP BY GROUPING SETS ((src."REGION"), ())
+) p
+ORDER BY p."RSYNC_TOTAL_R1" DESC, p."REGION" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

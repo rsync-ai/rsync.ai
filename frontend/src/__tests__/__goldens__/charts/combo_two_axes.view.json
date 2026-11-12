@@ -1,0 +1,71 @@
+{
+  "kind": "echart",
+  "settings": {
+    "description": "Revenue and Orders by day",
+    "x": {
+      "field": "x",
+      "label": "day",
+      "categories": [
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-04"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "compact",
+      "title": "Revenue"
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Revenue",
+          "color": "series-1",
+          "value": "v",
+          "format": "compact"
+        },
+        {
+          "key": "2",
+          "label": "Orders",
+          "color": "series-2",
+          "value": "v2",
+          "mark": "line",
+          "axis": "right",
+          "format": "integer"
+        }
+      ]
+    },
+    "y2": {
+      "format": "integer",
+      "title": "Orders"
+    },
+    "type": "bar",
+    "stacked": false
+  },
+  "rows": [
+    {
+      "x": "2026-10-01",
+      "v": 12000,
+      "v2": 40
+    },
+    {
+      "x": "2026-10-02",
+      "v": 15500,
+      "v2": 49
+    },
+    {
+      "x": "2026-10-03",
+      "v": 19000,
+      "v2": 58
+    },
+    {
+      "x": "2026-10-04",
+      "v": 22500,
+      "v2": 67
+    }
+  ],
+  "series": [],
+  "notes": []
+}

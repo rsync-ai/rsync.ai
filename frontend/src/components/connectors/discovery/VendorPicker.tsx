@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Check, ChevronDown, Search, Sparkles } from "lucide-react"
+import { Check, Search, Sparkles } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { listVendors, type Vendor, type VendorApi } from "@/lib/api/discovery"
 
@@ -160,7 +160,7 @@ export function VendorPicker({
           <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
             {vendor.display_name} has {vendor.apis.length} APIs — pick one
           </label>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <div className="grid grid-cols-1 @xl:grid-cols-2 gap-2">
             {vendor.apis.map((api) => (
               <VariantCard
                 key={api.id}

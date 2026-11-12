@@ -11,10 +11,12 @@ import { useTheme } from "next-themes"
 import {
   Handle,
   MiniMap,
+  Panel,
   Position,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
+  ViewportPortal,
   type Edge,
   type EdgeTypes,
   type Node,
@@ -23,7 +25,7 @@ import {
   type ReactFlowInstance,
   type XYPosition,
 } from "@xyflow/react"
-import { Expand, Loader2, Lock, LockOpen, Minus, Plus, RotateCcw } from "lucide-react"
+import { Expand, Loader2, Lock, LockOpen, MapIcon, Minus, Plus, RotateCcw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
@@ -99,10 +101,19 @@ export function nodeHandles(width: number, top: number) {
   ]
 }
 
-/** The colours edges are drawn in: a neutral line, and one that stands out. */
-export function useEdgeColors(): { stroke: string; accent: string } {
+/**
+ * The colours edges are drawn in: a neutral line, and one that stands out. The Lineage
+ * page's refresh view adds two: a link that wakes the model it ends at, and one that
+ * does not.
+ */
+export function useEdgeColors(): { stroke: string; accent: string; wake: string; stale: string } {
   const dark = useTheme().resolvedTheme === "dark"
-  return { stroke: dark ? "#a1a1aa" : "#71717a", accent: dark ? "#60a5fa" : "#2563eb" }
+  return {
+    stroke: dark ? "#a1a1aa" : "#71717a",
+    accent: dark ? "#60a5fa" : "#2563eb",
+    wake: dark ? "#a78bfa" : "#7c3aed",
+    stale: dark ? "#fbbf24" : "#d97706",
+  }
 }
 
 export function LegendLine({ dash, color = "currentColor", label }: { dash?: string; color?: string; label: string }) {
@@ -146,6 +157,10 @@ export interface LineageFlowCanvasProps<N extends Node> {
    * grew neighbours, the view fits the whole drawing if that is readable.
    */
   anchor?: string | null
+  /** Drawn in the drawing's own coordinates, over it, so it moves and zooms with the cards. Keep it off them. */
+  overlay?: ReactNode
+  /** A click on the canvas that is not on a card. */
+  onPaneClick?: () => void
 }
 
 /**
@@ -216,6 +231,8 @@ function CanvasFrame<N extends Node>({
   minimapColor,
   pending = false,
   anchor = null,
+  overlay,
+  onPaneClick,
   fill = false,
   onExpand,
 }: LineageFlowCanvasProps<N> & { fill?: boolean; onExpand?: () => void }) {
@@ -224,6 +241,8 @@ function CanvasFrame<N extends Node>({
   const wrapperRef = useRef<HTMLDivElement>(null)
   const [size, setSize] = useState<{ width: number; height: number } | null>(null)
   const [locked, setLocked] = useState(true)
+  // The reader can put the overview map away when it covers cards, and bring it back.
+  const [mapShown, setMapShown] = useState(true)
   // Cards the reader moved, for this layout only: the next one puts every card in its place.
   const [moved, setMoved] = useState<{ layoutKey: string; at: ReadonlyMap<string, XYPosition> }>({
     layoutKey,
@@ -333,6 +352,7 @@ function CanvasFrame<N extends Node>({
           onInit={onInit}
           onNodesChange={onNodesChange}
           onNodeClick={(_, n) => onNodeClick(n.id)}
+          onPaneClick={onPaneClick}
           colorMode={dark ? "dark" : "light"}
           nodesDraggable={!locked}
           nodesConnectable={false}
@@ -347,14 +367,25 @@ function CanvasFrame<N extends Node>({
           maxZoom={1.5}
           proOptions={{ hideAttribution: true }}
         >
-          {overview && (
-            <MiniMap<N>
-              pannable
-              zoomable
-              nodeColor={minimapColor}
-              nodeBorderRadius={4}
-              className="!bg-white dark:!bg-zinc-900"
-            />
+          {overlay && <ViewportPortal>{overlay}</ViewportPortal>}
+          {/* Framed and captioned, so it reads as a map of the drawing and not as part of it. */}
+          {overview && mapShown && (
+            <Panel
+              position="bottom-right"
+              data-overview-map
+              className="overflow-hidden rounded-lg border border-zinc-300 bg-white shadow-md dark:border-zinc-700 dark:bg-zinc-900"
+            >
+              <div className="select-none border-b border-zinc-200 px-2 py-1 text-[11px] font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">
+                Overview
+              </div>
+              <MiniMap<N>
+                pannable
+                zoomable
+                nodeColor={minimapColor}
+                nodeBorderRadius={4}
+                className="!static !m-0 !bg-white dark:!bg-zinc-900"
+              />
+            </Panel>
           )}
         </ReactFlow>
       </div>
@@ -374,6 +405,19 @@ function CanvasFrame<N extends Node>({
         <Button size="icon" variant="outline" className={controlClass} aria-label="Reset view" onClick={resetView}>
           <RotateCcw className="h-3.5 w-3.5" aria-hidden />
         </Button>
+        {overview && (
+          <Button
+            size="icon"
+            variant={mapShown ? "secondary" : "outline"}
+            className={mapShown ? "h-7 w-7" : controlClass}
+            aria-label="Overview map"
+            aria-pressed={mapShown}
+            title={mapShown ? "Hide the overview map" : "Show the overview map"}
+            onClick={() => setMapShown((shown) => !shown)}
+          >
+            <MapIcon className="h-3.5 w-3.5" aria-hidden />
+          </Button>
+        )}
         <Button
           size="icon"
           variant={locked ? "outline" : "secondary"}

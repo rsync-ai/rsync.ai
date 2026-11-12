@@ -306,7 +306,6 @@ class CapabilitiesResponse(BaseResponse):
     terminology: Dict[str, str] = {}
     operations: List[Dict[str, Any]] = []
     features: Optional[Dict[str, Any]] = None
-    optimization_category: Optional[str] = None
     performance_target_ms: Optional[int] = None
 
 

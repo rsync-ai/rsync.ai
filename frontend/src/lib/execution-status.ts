@@ -8,6 +8,10 @@
 // error_message ("silent_drop_detected: products: read=5 landed=0").
 // `normalizeExecutionStatus` re-derives the original status so the UI
 // shows the right badge.
+//
+// A run status that Runs and Home also show takes its word from
+// ACTIVITY_STATUS_LABELS, so one run never reads "Success" here and
+// "Succeeded" there.
 
 import type { LucideIcon } from "lucide-react"
 import {
@@ -18,6 +22,8 @@ import {
   Loader2,
   XCircle,
 } from "lucide-react"
+import { ACTIVITY_STATUS_LABELS } from "@/lib/api/activity"
+import type { PillTone } from "@/components/kit/StatusPill"
 
 export type ExecutionStatus =
   | "pending"
@@ -58,7 +64,7 @@ export const executionStatusConfig: Record<ExecutionStatus, ExecutionStatusConfi
     animate: false,
   },
   running: {
-    label: "Running",
+    label: ACTIVITY_STATUS_LABELS.running,
     icon: Loader2,
     variant: "info",
     color: "text-blue-600 dark:text-blue-400",
@@ -66,7 +72,7 @@ export const executionStatusConfig: Record<ExecutionStatus, ExecutionStatusConfi
     animate: true,
   },
   success: {
-    label: "Success",
+    label: ACTIVITY_STATUS_LABELS.succeeded,
     icon: CheckCircle2,
     variant: "success",
     color: "text-emerald-600 dark:text-emerald-400",
@@ -74,7 +80,7 @@ export const executionStatusConfig: Record<ExecutionStatus, ExecutionStatusConfi
     animate: false,
   },
   failed: {
-    label: "Failed",
+    label: ACTIVITY_STATUS_LABELS.failed,
     icon: XCircle,
     variant: "destructive",
     color: "text-red-600 dark:text-red-400",
@@ -106,7 +112,7 @@ export const executionStatusConfig: Record<ExecutionStatus, ExecutionStatusConfi
     animate: false,
   },
   waiting_for_user: {
-    label: "Awaiting User",
+    label: ACTIVITY_STATUS_LABELS.waiting,
     icon: AlertTriangle,
     variant: "warning",
     color: "text-amber-700 dark:text-amber-400",
@@ -114,13 +120,26 @@ export const executionStatusConfig: Record<ExecutionStatus, ExecutionStatusConfi
     animate: false,
   },
   cancelled: {
-    label: "Cancelled",
+    label: ACTIVITY_STATUS_LABELS.cancelled,
     icon: Ban,
     variant: "secondary",
     color: "text-zinc-500 dark:text-zinc-400",
     bg: "bg-zinc-100 dark:bg-zinc-800",
     animate: false,
   },
+}
+
+/** The kit's StatusPill tone for each status, so a run reads the same colour here as on Runs and Home. */
+export const EXECUTION_STATUS_TONES: Record<ExecutionStatus, PillTone> = {
+  pending: "skip",
+  running: "run",
+  success: "ok",
+  failed: "fail",
+  cancelled: "cancel",
+  silent_drop_detected: "err",
+  silent_partial_drop_detected: "err",
+  waiting_for_credential_reauth: "wait",
+  waiting_for_user: "wait",
 }
 
 export function normalizeExecutionStatus(

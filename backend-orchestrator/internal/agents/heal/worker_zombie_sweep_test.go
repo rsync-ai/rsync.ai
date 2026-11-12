@@ -159,8 +159,8 @@ func TestSweepZombiesQuery_HITLGuardIsAgeBounded(t *testing.T) {
 }
 
 // TestSweepZombies_ScansRowColumnsInOrder is the plumbing check: the query returns one row per
-// swept execution (id, pipeline_id) plus the two repair counts, and those four columns must land
-// in the four destinations the caller uses. A transposition of the first two would attribute the
+// swept execution (id, pipeline_id) plus the two repair counts and the notify flag, and those five
+// columns must land in the five destinations the caller uses. A transposition of the first two would attribute the
 // reap to the wrong pipeline on the timeline; of the last two, misreport how many pipelines were
 // closed.
 //
@@ -176,8 +176,8 @@ func TestSweepZombies_ScansRowColumnsInOrder(t *testing.T) {
 
 	mock.ExpectQuery("WITH swept AS").
 		WithArgs(ZombieTimeout.String(), AbandonedParkTimeout.String()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "reconciled", "pipelines_closed"}).
-			AddRow("exec-7", "pipe-7", 2, 3))
+		WillReturnRows(zombieSweepRows().
+			AddRow("exec-7", "pipe-7", 2, 3, false))
 	mock.ExpectExec(`INSERT INTO pipeline_run_events`).
 		WithArgs("pipe-7", "exec-7", sqlmock.AnyArg(), "healer_zombie_swept", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))

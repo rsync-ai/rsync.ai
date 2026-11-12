@@ -16,6 +16,9 @@ func TestExplorerFindStatus(t *testing.T) {
 		"filter_too_deep":      http.StatusBadRequest,
 		"invalid_cursor":       http.StatusBadRequest,
 		"invalid_skip":         http.StatusBadRequest,
+		"invalid_pipeline":     http.StatusBadRequest,
+		"invalid_target":       http.StatusBadRequest,
+		"target_exists":        http.StatusConflict,
 		"":                     http.StatusBadRequest,
 	}
 	for code, want := range cases {

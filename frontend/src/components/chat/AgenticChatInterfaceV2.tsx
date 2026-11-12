@@ -1,27 +1,25 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
-import { PanelRightOpen, PanelRightClose } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { cn } from "@/lib/utils"
 
 import { AgenticPipelineHome } from "@/components/chat/AgenticPipelineHome"
 import {
   PipelineAccordionView,
   type PipelineState as AuthoritativePipelineState,
 } from "@/components/chat/PipelineAccordionView"
-import { PipelineMonitoringPanel } from "@/components/pipeline/PipelineMonitoringPanel"
 import { PipelineConnectionSelector } from "@/components/pipeline/PipelineConnectionSelector"
 import { PipelineTableSelector } from "@/components/pipeline/PipelineTableSelector"
 import { SuggestionsReviewDialog } from "@/components/chat/SuggestionsReviewDialog"
-import { ChatRightPanel } from "@/components/chat/ChatRightPanel"
 import { ActivePipelinesList } from "@/components/chat/ActivePipelinesList"
 import { ChatMessageItem, type ChatMessage } from "@/components/chat/ChatMessageItem"
-import { ChatInputBar } from "@/components/chat/ChatInputBar"
+import { ChatInputBar, replySuggestion } from "@/components/chat/ChatInputBar"
 import { useActivePipelines } from "@/lib/hooks/useActivePipelines"
 import { useChatPersistence } from "@/lib/hooks/useChatPersistence"
 import { useHITLState } from "@/lib/hooks/useHITLState"
@@ -40,10 +38,6 @@ import { useOptimisticAction, usePipelineState } from "@/lib/pipeline/usePipelin
 import { isSlotFillingState, nextActiveIntent, shouldStartFreshThread } from "@/lib/chat/thread-intent"
 import { notifyPipelinesChanged } from "@/lib/plan/plan-events"
 
-// Re-export so consumers can import the type from this file.
-export type { ChatMessage as Message }
-
-// Concrete alias used throughout this file.
 type Message = ChatMessage
 
 function msgId(prefix: string) {
@@ -53,6 +47,9 @@ function msgId(prefix: string) {
 function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
 }
+
+// How long one read of a pipeline's /state may take before it counts as failed.
+const STATE_READ_TIMEOUT_MS = 15_000
 
 // stopPipeline asks the gateway to stop the pipeline. It resolves when the
 // pipeline is stopped, including when it already was (another tab, the pipeline
@@ -89,11 +86,13 @@ export function AgenticChatInterfaceV2() {
 
   const { state: pipelineState, dispatch, resolveHITL, resetPipeline } = usePipelineState()
   const optimisticAction = useOptimisticAction(dispatch)
-  const { pipelines: activePipelines, addPipeline, updatePipeline, removePipeline, clearCompleted } =
-    useActivePipelines()
+  const { pipelines: activePipelines, addPipeline, updatePipeline, clearCompleted } = useActivePipelines()
 
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
+  const chatInputRef = useRef<HTMLInputElement>(null)
+  // The empty chat's first example, grounded in the user's connections.
+  const [homeSuggestion, setHomeSuggestion] = useState<string | undefined>(undefined)
   const [isSendingMessage, setIsSendingMessage] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollAreaRootRef = useRef<React.ComponentRef<typeof ScrollArea>>(null)
@@ -128,10 +127,6 @@ export function AgenticChatInterfaceV2() {
     activeIntentRef.current = activeIntent
   }, [chatSlot, activeIntent])
 
-  // Right panel (DAG/Status/Timeline)
-  const [rightPanelOpen, setRightPanelOpen] = useState(false)
-  const [activeTab, setActiveTab] = useState<"pipeline" | "monitoring">("pipeline")
-
   // Resuming indicator shown after HITL resolution (Temporal processing lag)
   const [resumingFromHITL, setResumingFromHITL] = useState(false)
   const resumingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -143,6 +138,11 @@ export function AgenticChatInterfaceV2() {
   }, [])
 
   const pipelineId = pipelineState.metadata.pipelineId ?? undefined
+  const showHome = !pipelineId && messages.length === 0 && !activeIntent && !isSendingMessage
+  const chatSuggestion = useMemo(
+    () => replySuggestion(messages) ?? (showHome ? homeSuggestion : undefined),
+    [messages, showHome, homeSuggestion]
+  )
   const isPipelineDone =
     pipelineState.executionState === "completed" ||
     pipelineState.executionState === "failed" ||
@@ -167,7 +167,6 @@ export function AgenticChatInterfaceV2() {
     suggestedTables,
     tableSourceType,
     setTableSourceType,
-    tableHitlNodeId,
     setTableHitlNodeId,
     tableDiscoveryStatus,
     tableSourceDatabase,
@@ -233,10 +232,22 @@ export function AgenticChatInterfaceV2() {
   useEffect(() => {
     if (typeof window === "undefined") return
     try {
-      const { messages: persisted, activeIntent: persistedIntent } = loadPersistedUiState()
-      if (persisted.length === 0 && !persistedIntent) return
+      const {
+        messages: persisted,
+        activeIntent: persistedIntent,
+        pipelineId: persistedPipelineId,
+      } = loadPersistedUiState()
+      if (persisted.length === 0 && !persistedIntent && !persistedPipelineId) return
       setMessages((prev) => (prev.length > 0 ? prev : persisted))
       if (persistedIntent) setActiveIntent((prev) => (prev ? prev : persistedIntent))
+      // The pipeline this chat started. Its run id is not saved: the state poll
+      // reads it on its first read and corrects it.
+      if (persistedPipelineId) {
+        dispatch({
+          type: "PIPELINE_STARTED",
+          payload: { pipelineId: persistedPipelineId, executionId: persistedPipelineId, timestamp: Date.now() },
+        })
+      }
     } catch {
       // ignore
     }
@@ -276,10 +287,10 @@ export function AgenticChatInterfaceV2() {
     scrollToBottom("smooth")
   }, [messages, pipelineId, authoritativePipelineState?.status, authoritativePipelineState?.current_stage, scrollToBottom])
 
-  // ── Persist state whenever messages / intent change ───────────────────────
+  // ── Persist state whenever messages / intent / pipeline change ────────────
   useEffect(() => {
-    persistUiState({ messages, activeIntent })
-  }, [activeIntent, messages, persistUiState])
+    persistUiState({ messages, activeIntent, pipelineId })
+  }, [activeIntent, messages, persistUiState, pipelineId])
 
   // ── addMessage ────────────────────────────────────────────────────────────
   const addMessage = useCallback(
@@ -323,7 +334,6 @@ export function AgenticChatInterfaceV2() {
     setInput("")
     setActiveIntent("")
     setAuthoritativePipelineState(null)
-    setRightPanelOpen(false)
     setChatSlot(null)
     clearPersistedState()
   }, [resetPipeline, resetHITL, clearPersistedState])
@@ -376,11 +386,18 @@ export function AgenticChatInterfaceV2() {
     // The last status read. A run that has ended is read every 30 s rather than
     // every 2 s: only a new run moves it on, and that is still picked up.
     let lastStatus = ""
+    // Ends a read still in flight when the poll stops.
+    const stop = new AbortController()
 
     const poll = async () => {
       try {
+        // The loop waits for each read before it schedules the next, so a read
+        // that never answered stopped the poll for good, and the panel sat on
+        // "Loading pipeline status…". A read that times out counts as a failed one.
         const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
           cache: "no-store",
+          timeoutMs: STATE_READ_TIMEOUT_MS,
+          signal: stop.signal,
         })
         // A failed poll used to `return` in silence. This view is driven
         // entirely by this poll, so the last state received simply stayed on
@@ -498,6 +515,7 @@ export function AgenticChatInterfaceV2() {
     void loop()
     return () => {
       cancelled = true
+      stop.abort()
       clearTimeout(timer)
       document.removeEventListener("visibilitychange", onVisibility)
     }
@@ -529,6 +547,7 @@ export function AgenticChatInterfaceV2() {
     try {
       const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
         cache: "no-store",
+        timeoutMs: STATE_READ_TIMEOUT_MS,
       })
       if (!res.ok) return
       const raw: unknown = await res.json()
@@ -870,7 +889,6 @@ export function AgenticChatInterfaceV2() {
             // with the user's selection intact if the resume fails.
             onClose={handleSkipSuggestions}
             pipelineId={pipelineId}
-            executionId={pipelineState.metadata.executionId || undefined}
             sourceConnectionId={sourceConnectionIdForSuggestions}
             selectedTables={selectedTablesForSuggestions}
             onApplyContinue={handleApplySuggestions}
@@ -883,10 +901,19 @@ export function AgenticChatInterfaceV2() {
           />
         )}
 
-        <ScrollArea ref={scrollAreaRootRef} className="flex-1 p-4">
-          {!pipelineId && messages.length === 0 && !activeIntent && !isSendingMessage ? (
+        {/* A size container on the home screen only, so the home can centre itself in it (100cqh). */}
+        <ScrollArea ref={scrollAreaRootRef} className={cn("flex-1 p-4", showHome && "[container-type:size]")}>
+          {showHome ? (
             <div>
-              <AgenticPipelineHome onSubmit={(p) => void runPrompt(p)} onRunPipeline={() => {}} />
+              <AgenticPipelineHome
+                onSubmit={(p) => void runPrompt(p)}
+                onPrefill={(text) => {
+                  setInput(text)
+                  chatInputRef.current?.focus()
+                }}
+                onCustom={() => chatInputRef.current?.focus()}
+                onSuggestion={setHomeSuggestion}
+              />
             </div>
           ) : (
             <div className="space-y-4">
@@ -927,70 +954,43 @@ export function AgenticChatInterfaceV2() {
                       pipelines={activePipelines}
                       currentPipelineId={pipelineId}
                       onSelect={(id) => router.push(`/pipelines/${id}?from=chat`)}
-                      onRemove={removePipeline}
                       onClearCompleted={clearCompleted}
                     />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setRightPanelOpen(!rightPanelOpen)}
-                      className="gap-1"
-                    >
-                      {rightPanelOpen ? (
-                        <>
-                          <PanelRightClose className="h-4 w-4" />
-                          <span className="hidden sm:inline">Hide Panel</span>
-                        </>
-                      ) : (
-                        <>
-                          <PanelRightOpen className="h-4 w-4" />
-                          <span className="hidden sm:inline">Show DAG</span>
-                        </>
-                      )}
-                    </Button>
-                    <Button variant="outline" size="sm" onClick={startNew}>
-                      Start new
-                    </Button>
+                    {/* The pipeline's own page has its DAG, data flow and runs; the
+                        chat shows only setting it up. Once the run ends the input
+                        bar offers both buttons. */}
+                    {!isPipelineDone && (
+                      <>
+                        <Button asChild variant="outline" size="sm">
+                          <Link href={`/pipelines/${pipelineId}?from=chat`}>Open pipeline →</Link>
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={startNew}>
+                          Start new
+                        </Button>
+                      </>
+                    )}
                   </div>
 
-                  <Tabs
-                    value={activeTab}
-                    onValueChange={(v) => setActiveTab(v as "pipeline" | "monitoring")}
-                    className="w-full"
-                  >
-                    <TabsList>
-                      <TabsTrigger value="pipeline">Pipeline</TabsTrigger>
-                      <TabsTrigger value="monitoring">Monitoring</TabsTrigger>
-                    </TabsList>
-
-                    <TabsContent value="pipeline" className="space-y-4">
-                      <FeedOutageNotice health={feedHealth} />
-                      {authoritativePipelineState ? (
-                        <PipelineAccordionView
-                          key={`${authoritativePipelineState.pipeline_id}:${authoritativePipelineState.execution_id || ""}:${authoritativePipelineState.status}:${authoritativePipelineState.current_stage || ""}`}
-                          state={authoritativePipelineState}
-                          userIntent={activeIntent || "Start a pipeline"}
-                          onRefresh={handleRefreshPipelineState}
-                          onCancel={handleCancelPipeline}
-                          onSelectTables={(details) => handleOpenTableModal(details)}
-                          onConfigureConnections={() => handleOpenConnectionModal()}
-                          onGenerateConnectors={(details) => void handleConnectorGeneration(details)}
-                          onViewMonitoring={() => setActiveTab("monitoring")}
-                          resumingFromHITL={resumingFromHITL}
-                        />
-                      ) : (
-                        <Card className="p-5">
-                          <div className="text-sm text-zinc-600 dark:text-zinc-400">
-                            Loading pipeline status…
-                          </div>
-                        </Card>
-                      )}
-                    </TabsContent>
-
-                    <TabsContent value="monitoring" className="space-y-4">
-                      <PipelineMonitoringPanel pipelineId={pipelineId} />
-                    </TabsContent>
-                  </Tabs>
+                  <FeedOutageNotice health={feedHealth} />
+                  {authoritativePipelineState ? (
+                    <PipelineAccordionView
+                      key={`${authoritativePipelineState.pipeline_id}:${authoritativePipelineState.execution_id || ""}:${authoritativePipelineState.status}:${authoritativePipelineState.current_stage || ""}`}
+                      state={authoritativePipelineState}
+                      userIntent={activeIntent || "Start a pipeline"}
+                      onRefresh={handleRefreshPipelineState}
+                      onCancel={handleCancelPipeline}
+                      onSelectTables={(details) => handleOpenTableModal(details)}
+                      onConfigureConnections={() => handleOpenConnectionModal()}
+                      onGenerateConnectors={(details) => void handleConnectorGeneration(details)}
+                      resumingFromHITL={resumingFromHITL}
+                    />
+                  ) : (
+                    <Card className="p-5">
+                      <div className="text-sm text-zinc-600 dark:text-zinc-400">
+                        Loading pipeline status…
+                      </div>
+                    </Card>
+                  )}
                 </div>
               )}
             </div>
@@ -1040,29 +1040,21 @@ export function AgenticChatInterfaceV2() {
           <ChatInputBar
             input={input}
             onInputChange={setInput}
-            onSubmit={handleSubmit}
             isSendingMessage={isSendingMessage}
             pipelineId={pipelineId}
             isPipelineDone={isPipelineDone}
             executionFailed={pipelineState.executionState === "failed"}
             onStartNew={startNew}
-            onViewPipeline={() => router.push(`/pipelines/${pipelineId}`)}
+            onViewPipeline={() => router.push(`/pipelines/${pipelineId}?from=chat`)}
             onRetry={() => {
               startNew()
               setTimeout(() => setInput(activeIntent), 50)
             }}
+            suggestion={chatSuggestion}
+            inputRef={chatInputRef}
           />
         </form>
       </div>
-
-      {/* Right Panel — DAG/Status/Timeline */}
-      {pipelineId && (
-        <ChatRightPanel
-          pipelineId={pipelineId}
-          isOpen={rightPanelOpen}
-          onClose={() => setRightPanelOpen(false)}
-        />
-      )}
     </div>
   )
 }

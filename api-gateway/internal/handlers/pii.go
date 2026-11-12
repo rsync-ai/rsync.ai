@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/transforms"
@@ -1022,8 +1023,10 @@ func (h *PIIHandler) DecideApproval(c *gin.Context) {
 		return
 	}
 
-	// Get user ID from context
-	userID, _ := c.Get("user_id")
+	userID, ok := resolveUserID(c)
+	if !ok {
+		return
+	}
 	conditionsJSON, err := json.Marshal(req.Conditions)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid conditions payload"})
@@ -1031,12 +1034,34 @@ func (h *PIIHandler) DecideApproval(c *gin.Context) {
 	}
 	now := time.Now()
 
+	// KI-PII-APPROVAL-SELF-APPROVE: an approval the requester can grant themselves
+	// is not an approval. Another member of the workspace must decide. Scoped by
+	// workspace, so another workspace's approval reads as not found.
+	var requestedBy string
+	if err := h.db.QueryRow(
+		`SELECT requested_by::text FROM pii_approval_requests WHERE id = $1 AND workspace_id = $2`,
+		approvalID, wsID,
+	).Scan(&requestedBy); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Approval request not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update approval"})
+		return
+	}
+	if requestedBy == userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You requested this approval, so someone else in the workspace must decide it"})
+		return
+	}
+
 	// Scope by workspace: a decision on an approval in another workspace touches
-	// zero rows → 404 below (never reveals the approval exists).
+	// zero rows → 404 below (never reveals the approval exists). The requester
+	// check is repeated in the write, so the rule holds even if the row changed
+	// between the read and here.
 	query := `
 		UPDATE pii_approval_requests
 		SET status = $1, decided_by = $2, decided_at = $3, conditions = $4
-		WHERE id = $5 AND workspace_id = $6
+		WHERE id = $5 AND workspace_id = $6 AND requested_by <> $2
 	`
 
 	result, err := h.db.Exec(query, req.Decision, userID, now, conditionsJSON, approvalID, wsID)

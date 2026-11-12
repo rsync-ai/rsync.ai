@@ -30,6 +30,9 @@
  * through `.slice(0, 50)` and then appended "..." unconditionally, so
  * `{"column":"password"}` — 21 characters — rendered as truncated when nothing
  * had been cut. The element already carries `truncate`; CSS does that job.
+ *
+ * The cards now live in the transform editor of a pipeline's Transforms tab
+ * (the Builder page was removed), so this file renders that editor.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -37,17 +40,12 @@ import type { Mock } from "vitest"
 import { render, screen, waitFor } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
-import TransformsPage from "@/app/(dashboard)/transforms/page"
+import { TransformPlanEditor } from "@/components/transforms/TransformPlanEditor"
 import { authFetch } from "@/lib/api/auth-fetch"
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn(), message: vi.fn() },
-}))
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn(), refresh: vi.fn(), replace: vi.fn() }),
-  usePathname: () => "/transforms",
-  useSearchParams: () => new URLSearchParams(),
 }))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
@@ -92,15 +90,14 @@ const PRODUCER_RULES = [
 
 beforeEach(() => {
   mockFetch.mockReset()
-  // The page reads the id off window.location itself, not through useSearchParams.
-  window.history.replaceState({}, "", `/transforms?pipeline=${PIPELINE}`)
   mockFetch.mockImplementation(async (url: string) => {
     if (url.includes("/transforms/pipeline/"))
       return res(200, { pipeline_id: PIPELINE, producer_transforms: PRODUCER_RULES, consumer_transforms: [] })
-    if (url.includes("/pipelines")) return res(200, { pipelines: [{ id: PIPELINE, name: "cdc-dedup-skip-proof pg-to-mongo" }] })
     return res(200, {})
   })
 })
+
+const Editor = () => <TransformPlanEditor pipelineId={PIPELINE} onClose={() => {}} />
 
 async function cards() {
   const rows = await screen.findAllByTestId("transform-card-row")
@@ -112,7 +109,7 @@ async function cards() {
 
 describe("a transform card's controls stay inside the card", () => {
   it("lets the title block shrink, so a long operation name cannot shove the controls out", async () => {
-    render(<TransformsPage />)
+    render(<Editor />)
     for (const row of await cards()) {
       const title = row.querySelector('[data-testid="transform-card-title"]')!
       const classes = Array.from(title.classList)
@@ -131,7 +128,7 @@ describe("a transform card's controls stay inside the card", () => {
   })
 
   it("never lets the control cluster be the thing that gives way", async () => {
-    render(<TransformsPage />)
+    render(<Editor />)
     for (const row of await cards()) {
       const controls = row.querySelector('[data-testid="transform-card-controls"]')!
       expect({ controls: controls.className, fixed: Array.from(controls.classList).includes("shrink-0") }).toEqual({
@@ -150,7 +147,7 @@ describe("a transform card's controls stay inside the card", () => {
   })
 
   it("truncates the operation name rather than the card", async () => {
-    render(<TransformsPage />)
+    render(<Editor />)
     for (const row of await cards()) {
       const title = row.querySelector('[data-testid="transform-card-title"]')!
       const truncating = Array.from(title.querySelectorAll("span")).some((s) =>
@@ -168,7 +165,7 @@ describe("a transform card's controls stay inside the card", () => {
   // this row that truncates, so it cannot be relied on to say which rule the
   // buttons belong to.
   it("gives every control an accessible name that says which rule it acts on", async () => {
-    render(<TransformsPage />)
+    render(<Editor />)
     const announced = new Set<string>()
     for (const row of await cards()) {
       const controls = row.querySelector('[data-testid="transform-card-controls"]')!
@@ -212,7 +209,7 @@ describe("a transform card's controls stay inside the card", () => {
     // carries the "No engine can run this" badge.
     PRODUCER_RULES[1].transform_config = { ...original, operation: "sql" }
     try {
-      render(<TransformsPage />)
+      render(<Editor />)
       const rows = await cards()
       for (const row of rows) {
         const nameLine = row.querySelector('[data-testid="transform-card-name"]')!
@@ -224,7 +221,7 @@ describe("a transform card's controls stay inside the card", () => {
         expect(nameLine.children.length).toBe(2)
         const badges = row.querySelector('[data-testid="transform-card-badges"]')!
         expect(Array.from(badges.classList)).toContain("flex-wrap")
-        expect(badges.textContent).toMatch(/producer/)
+        expect(badges.textContent).toMatch(/Batch only/)
       }
       // The card that most needs identifying: the destructive badge is on the
       // badge line, not beside the name.
@@ -238,7 +235,7 @@ describe("a transform card's controls stay inside the card", () => {
   })
 
   it("does not claim a short config was truncated", async () => {
-    render(<TransformsPage />)
+    render(<Editor />)
     await cards()
     // `{"column":"password"}` is 21 characters, well under the old 50-char
     // slice, so the trailing "..." the old code appended was a lie about the

@@ -114,3 +114,95 @@ func TestEvaluateAssessmentGate(t *testing.T) {
 		t.Errorf("error finding with Blocking=false = %v, want blocked", got)
 	}
 }
+
+// TestSinkSupportsAutoCreate_APIDestinationsAreNotBlocked — the same false
+// SINK_NO_DDL blocker, for a REST/GraphQL API destination (P5, live: a re-run
+// of a Sample Data → ClickUp pipeline was refused before it started, "cannot
+// auto-create … tables. Create them manually first"). An API has resources, not
+// tables: there is nothing the user can go and pre-create, so the stop cannot be
+// cleared. Whether the named resource takes writes is checked when the sink
+// starts (executor destResourceNotWritable), against what the connector says
+// it can write.
+//
+// stripe and shopify-admin-graphql are shipped API destinations that declare
+// supports_ddl=false and auto_create_destination_tables=false, as every
+// generated REST connector does; the temp connector is that generated shape.
+func TestSinkSupportsAutoCreate_APIDestinationsAreNotBlocked(t *testing.T) {
+	root := t.TempDir()
+	writeConnector := func(id, category string) {
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(filepath.Join(dir, "versions", "v1.0.0"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		latest := `{"current_version": "v1.0.0", "all_versions": ["v1.0.0"]}`
+		meta := `{"id": "` + id + `", "connector_type": "` + id + `", "category": "` + category + `",
+		  "supports_ddl": false, "auto_create_destination_tables": false,
+		  "capabilities": {"supports_destination": true, "supports_ddl": false, "auto_create_destination_tables": false}}`
+		if err := os.WriteFile(filepath.Join(dir, "latest.json"), []byte(latest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "versions", "v1.0.0", "metadata.json"), []byte(meta), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConnector("t-api-dest", "api_saas")
+	// Control: the same flags on a database. A database without DDL has tables
+	// the user must create, so it stays blocked — the rule is the category, not
+	// "any connector with metadata".
+	writeConnector("t-db-no-ddl", "relational_db")
+	for _, real := range []string{"stripe", "shopify-admin-graphql"} {
+		src := filepath.Join("..", "..", "..", "shared", "mcp-connectors", "public", real)
+		if _, err := os.Stat(src); err != nil {
+			t.Skipf("connector tree not present at %s: %v", src, err)
+		}
+		copyConnectorMetadata(t, src, filepath.Join(root, real))
+	}
+	t.Setenv("MCP_PUBLIC_CONNECTORS_PATH", root)
+
+	for _, tc := range []struct {
+		connector string
+		want      bool
+	}{
+		{"t-api-dest", true},
+		{"stripe", true},
+		{"shopify-admin-graphql", true},
+		{"t-db-no-ddl", false},
+		{"definitely-not-a-connector", false},
+	} {
+		if got := sinkSupportsAutoCreate(tc.connector); got != tc.want {
+			t.Errorf("sinkSupportsAutoCreate(%q) = %v, want %v", tc.connector, got, tc.want)
+		}
+	}
+	// The other side: an API destination must not start claiming DDL, or the
+	// sink (probeDDLSupport: supports_ddl && auto_create) would send it CREATE TABLE.
+	for _, ct := range []string{"t-api-dest", "stripe", "shopify-admin-graphql"} {
+		if connectorSupportsDDL(ct) {
+			t.Errorf("connectorSupportsDDL(%q) = true, want false", ct)
+		}
+	}
+}
+
+// copyConnectorMetadata copies a connector's latest.json and the metadata.json of
+// its current version — the files the connector index reads — so a test root can
+// hold real connectors beside made-up ones (WalkDir does not follow symlinks).
+func copyConnectorMetadata(t *testing.T, src, dst string) {
+	t.Helper()
+	latest, err := os.ReadFile(filepath.Join(src, "latest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ver := readCurrentVersionFromLatestJSON(src)
+	meta, err := os.ReadFile(filepath.Join(src, "versions", ver, "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dst, "versions", ver), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "latest.json"), latest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "versions", ver, "metadata.json"), meta, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

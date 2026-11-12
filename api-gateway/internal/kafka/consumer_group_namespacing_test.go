@@ -307,6 +307,7 @@ type groupIDSite struct {
 // its own ReaderConfig is scanned like any other.
 func collectGroupIDSites(files map[string]*ast.File, ctxs map[string]fileCtx, fset *token.FileSet) []groupIDSite {
 	var sites []groupIDSite
+	seams := saramaConstructorSeams(files)
 
 	for rel, f := range files {
 		// Scoped per top-level declaration rather than by walking the whole
@@ -317,7 +318,7 @@ func collectGroupIDSites(files map[string]*ast.File, ctxs map[string]fileCtx, fs
 			if fd, ok := decl.(*ast.FuncDecl); ok {
 				fn = fd
 			}
-			sites = append(sites, sitesInNode(decl, rel, ctxs[rel], fn, fset)...)
+			sites = append(sites, sitesInNode(decl, rel, ctxs[rel], fn, fset, seams[filepath.Dir(rel)])...)
 		}
 	}
 
@@ -330,8 +331,47 @@ func collectGroupIDSites(files map[string]*ast.File, ctxs map[string]fileCtx, fs
 	return sites
 }
 
-// sitesInNode finds the group-id expressions inside one declaration.
-func sitesInNode(root ast.Node, rel string, ctx fileCtx, fn *ast.FuncDecl, fset *token.FileSet) []groupIDSite {
+// saramaConstructorSeams finds the package-level vars bound to a sarama
+// constructor, `var newNotifierConsumerGroup = sarama.NewConsumerGroup`, keyed
+// by package directory, then var name, to the constructor's name.
+//
+// A test swaps such a var to play a broker that is still starting. A call
+// through it is the constructor's call all the same: without this, adding the
+// seam hid the notifier's and the domain event manager's group ids from the
+// scan.
+func saramaConstructorSeams(files map[string]*ast.File) map[string]map[string]string {
+	seams := map[string]map[string]string{}
+	for rel, f := range files {
+		for _, decl := range f.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs := spec.(*ast.ValueSpec)
+				for i, v := range vs.Values {
+					sel, ok := v.(*ast.SelectorExpr)
+					if !ok || i >= len(vs.Names) {
+						continue
+					}
+					if sel.Sel.Name != "NewConsumerGroup" && sel.Sel.Name != "NewConsumerGroupFromClient" {
+						continue
+					}
+					dir := filepath.Dir(rel)
+					if seams[dir] == nil {
+						seams[dir] = map[string]string{}
+					}
+					seams[dir][vs.Names[i].Name] = sel.Sel.Name
+				}
+			}
+		}
+	}
+	return seams
+}
+
+// sitesInNode finds the group-id expressions inside one declaration. seams are
+// this package's vars bound to a sarama constructor (saramaConstructorSeams).
+func sitesInNode(root ast.Node, rel string, ctx fileCtx, fn *ast.FuncDecl, fset *token.FileSet, seams map[string]string) []groupIDSite {
 	var sites []groupIDSite
 	ast.Inspect(root, func(node ast.Node) bool {
 		switch n := node.(type) {
@@ -363,7 +403,11 @@ func sitesInNode(root ast.Node, rel string, ctx fileCtx, fn *ast.FuncDecl, fset 
 				})
 			}
 		case *ast.CallExpr:
-			switch calleeName(n) {
+			callee := calleeName(n)
+			if id, ok := n.Fun.(*ast.Ident); ok && seams[id.Name] != "" {
+				callee = seams[id.Name]
+			}
+			switch callee {
 			case "NewConsumerGroup":
 				// sarama.NewConsumerGroup(brokers, groupID, config)
 				if len(n.Args) >= 2 {
@@ -669,5 +713,49 @@ func TestEmptyPrefixLeavesEveryAPIGatewayGroupIDUntouched(t *testing.T) {
 			t.Errorf("with the prefix disabled, group %q became %q; a deployment taking this code would "+
 				"lose its committed offsets", logical, got)
 		}
+	}
+}
+
+// A test seam must not hide a site. A package-level var bound to
+// sarama.NewConsumerGroup is that constructor: its group id is checked like a
+// direct call's, bare or qualified.
+func TestScannerSeesThroughATestSeam(t *testing.T) {
+	fset := token.NewFileSet()
+	const src = `package p
+
+import (
+	"github.com/rsync-ai/shared/kafkaclient"
+	"github.com/IBM/sarama"
+)
+
+var newGroup = sarama.NewConsumerGroup
+
+func stranded() {
+	_, _ = newGroup(brokers, "api-gateway-notifier", nil)
+}
+
+func qualifiedInAClosure() {
+	group := kafkaclient.Group("api-gateway-domain-events")
+	go consume(func() (sarama.ConsumerGroup, error) { return newGroup(brokers, group, nil) })
+}
+`
+	f, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing the fixture: %v", err)
+	}
+	files := map[string]*ast.File{"fixture.go": f}
+	ctxs := buildFileCtxs(files, "example.test")
+	derivers := deriverFuncs(files, ctxs)
+	sites := collectGroupIDSites(files, ctxs, fset)
+
+	if len(sites) != 2 {
+		t.Fatalf("found %d sites through the seam, want 2: a call through a var bound to "+
+			"sarama.NewConsumerGroup is not being scanned", len(sites))
+	}
+	if isQualifiedGroupID(sites[0], derivers) {
+		t.Error("accepted the bare literal passed through the seam")
+	}
+	if !isQualifiedGroupID(sites[1], derivers) {
+		t.Error("rejected a qualified local used inside a closure: the dial closure in a consumer's starter would fail the scan")
 	}
 }

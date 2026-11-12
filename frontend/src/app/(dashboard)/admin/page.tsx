@@ -6,8 +6,8 @@ import { AdminNav } from "@/components/admin/AdminNav"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { adminRead, type AdminReadFailure } from "@/lib/api/admin"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 
 type OverviewResponse = {
   counts: {
@@ -31,61 +31,23 @@ type OverviewResponse = {
 export default function AdminOverviewPage() {
   const [data, setData] = useState<OverviewResponse | null>(null)
   const [loading, setLoading] = useState(true)
-  const [status, setStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
 
   async function load() {
     setLoading(true)
-    setError(null)
-    setStatus(null)
-    setRetryAfter(null)
-
-    const res = await authFetch("/api/v1/admin/overview", { method: "GET" }).catch(() => null)
-    if (!res) {
-      setError("Network error")
-      setLoading(false)
-      return
-    }
-
-    if (res.status === 401) {
-      window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`
-      return
-    }
-
-    if (res.status === 403) {
-      setStatus(403)
-      setLoading(false)
-      return
-    }
-
-    if (res.status === 429) {
-      setStatus(429)
-      const ra = parseInt(res.headers.get("Retry-After") || "", 10)
-      setRetryAfter(Number.isFinite(ra) ? ra : null)
-      setLoading(false)
-      return
-    }
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "")
-      setError(txt || `HTTP ${res.status}`)
-      setLoading(false)
-      return
-    }
-
-    const json = (await res.json().catch(() => null)) as OverviewResponse | null
-    setData(json)
+    setFailure(null)
+    const r = await adminRead<OverviewResponse>("/api/v1/admin/overview")
+    if (r.ok) setData(r.data)
+    else setFailure(r)
     setLoading(false)
   }
 
   useEffect(() => {
     load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Operator-wide overview (beta)" />
       <AdminNav />
 
@@ -99,25 +61,13 @@ export default function AdminOverviewPage() {
 
       {loading ? (
         <LoadingState />
-      ) : status === 403 ? (
-        <AccessDeniedState />
-      ) : status === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
-      ) : error ? (
-        <Card className="border border-red-200 bg-red-50 p-4 dark:border-red-900/40 dark:bg-red-950/20">
-          <div className="font-semibold text-red-800 dark:text-red-200">Failed to load</div>
-          <div className="mt-1 text-sm text-red-700 dark:text-red-300">{error}</div>
-          <div className="mt-3">
-            <Button variant="outline" onClick={load}>
-              Retry
-            </Button>
-          </div>
-        </Card>
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : !data ? (
         <LoadingState label="No data" />
       ) : (
         <div className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-4">
+          <div className="grid gap-4 @xl:grid-cols-4">
             <Card className="p-4">
               <div className="text-sm text-zinc-500 dark:text-zinc-400">Users</div>
               <div className="text-2xl font-semibold">{data.counts.users}</div>

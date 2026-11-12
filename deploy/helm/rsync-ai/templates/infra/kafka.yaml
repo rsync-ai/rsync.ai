@@ -154,6 +154,14 @@ spec:
             */}}
             - name: KAFKA_MESSAGE_MAX_BYTES
               value: {{ .Values.kafka.maxMessageBytes | int64 | quote }}
+            {{/*
+              No broker auto-creation, as in docker-compose.yml (which carries the
+              full note). Every topic the platform uses has an explicit creator; with
+              auto-creation on, a missing one is invisible until a customer cluster
+              that has it off runs a pipeline that moves zero rows.
+            */}}
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
           ports:
             - name: kafka
               containerPort: 9092

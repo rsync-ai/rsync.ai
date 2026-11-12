@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"strings"
 
+	"api-gateway/internal/config"
 	"api-gateway/internal/db"
 	"api-gateway/internal/security"
+	"api-gateway/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -78,6 +80,7 @@ func WorkspaceContextMiddleware() gin.HandlerFunc {
 			case err == nil:
 				c.Set(ctxWorkspaceID, requested)
 				c.Set(ctxWorkspaceRole, string(role))
+				c.Request = c.Request.WithContext(withLLMWorkspace(c.Request.Context(), requested))
 				c.Next()
 				return
 			case err == sql.ErrNoRows:
@@ -102,6 +105,23 @@ func WorkspaceContextMiddleware() gin.HandlerFunc {
 		case err == nil:
 			c.Set(ctxWorkspaceID, wsID)
 			c.Set(ctxWorkspaceRole, string(role))
+			c.Request = c.Request.WithContext(withLLMWorkspace(c.Request.Context(), wsID))
+		case err == sql.ErrNoRows && config.SingleWorkspace():
+			// Single-workspace sign-ups get no personal workspace: default to
+			// the install workspace, else the oldest other membership.
+			wsID, role, err := installWorkspaceMembership(database, userID)
+			switch {
+			case err == nil:
+				c.Set(ctxWorkspaceID, wsID)
+				c.Set(ctxWorkspaceRole, string(role))
+				c.Request = c.Request.WithContext(withLLMWorkspace(c.Request.Context(), wsID))
+			case err == sql.ErrNoRows:
+				// A member of nothing: unset, as below.
+			default:
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+				c.Abort()
+				return
+			}
 		case err == sql.ErrNoRows:
 			// No personal workspace (should not happen post-069). Leave the
 			// context unset; resource/role gates fail closed downstream.
@@ -156,6 +176,22 @@ func personalWorkspace(database *sql.DB, userID string) (string, security.Worksp
 	return wsID, security.WorkspaceRole(role), err
 }
 
+// installWorkspaceMembership is the default workspace of a caller with no
+// personal workspace in single-workspace mode: their install-workspace
+// membership, else their oldest one (an upgraded install can hold others).
+func installWorkspaceMembership(database *sql.DB, userID string) (string, security.WorkspaceRole, error) {
+	var wsID, role string
+	err := database.QueryRow(`
+		SELECT wm.workspace_id, wm.role
+		FROM workspace_members wm
+		LEFT JOIN instance_settings s ON s.key = $2 AND s.value = wm.workspace_id::text
+		WHERE wm.user_id = $1
+		ORDER BY (s.key IS NOT NULL) DESC, wm.created_at ASC
+		LIMIT 1
+	`, userID, installWorkspaceSetting).Scan(&wsID, &role)
+	return wsID, security.WorkspaceRole(role), err
+}
+
 // activeWorkspaceID returns the workspace pinned by the middleware, or "" when
 // none is active. Non-writing: callers that surface their own error shape (e.g.
 // the chat path, which returns an error tuple rather than an HTTP body) use this
@@ -186,9 +222,48 @@ func requireWorkspaceRole(c *gin.Context, min security.WorkspaceRole) (security.
 	return role, true
 }
 
+// restActor is the REST caller as services.Authorize sees it.
+func restActor(c *gin.Context, userID, workspaceID string) services.Actor {
+	return services.Actor{
+		UserID:      userID,
+		WorkspaceID: workspaceID,
+		Role:        security.WorkspaceRole(c.GetString(ctxWorkspaceRole)),
+		Channel:     services.ChannelREST,
+	}
+}
+
+// chatActor is the chat caller as services.Authorize sees it: the same user,
+// workspace and role the middleware pinned for REST, marked as chat.
+func chatActor(c *gin.Context) services.Actor {
+	return services.Actor{
+		UserID:      c.GetString("user_id"),
+		WorkspaceID: activeWorkspaceID(c),
+		Role:        security.WorkspaceRole(c.GetString(ctxWorkspaceRole)),
+		Channel:     services.ChannelChat,
+	}
+}
+
+// refusal is a user-facing refusal that still satisfies errors.Is(err,
+// services.ErrForbidden), so callers and tests can tell it from a failure.
+type refusal struct {
+	msg string
+	err error
+}
+
+func (r refusal) Error() string { return r.msg }
+func (r refusal) Unwrap() error { return r.err }
+
+// chatRefusal turns a services.Authorize refusal into the sentence the chat shows.
+func chatRefusal(err error, what string) error {
+	return refusal{
+		msg: fmt.Sprintf("your role in this workspace can't %s. Ask a workspace admin to give you the member role.", what),
+		err: err,
+	}
+}
+
 // WorkspaceGeneratorMiddleware gates connector-generation routes on workspace
-// role >= admin (owner or admin). It replaces the global-role PowerUserOrAdmin
-// gate on these routes.
+// role >= admin (owner or admin). It replaced the old global-role power_user
+// gate on these routes (since deleted).
 //
 // Why the axis changed: connector generation is a TENANT capability — every
 // self-serve signup owns their personal workspace — not a platform-staff one.

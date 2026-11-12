@@ -76,10 +76,6 @@ class TableSchema(BaseModel):
         """Get all temporal columns in the table."""
         return [c for c in self.columns if c.is_temporal()]
 
-    def get_numeric_columns(self) -> list[ColumnSchema]:
-        """Get all numeric columns in the table."""
-        return [c for c in self.columns if c.is_numeric()]
-
     @property
     def column_names(self) -> list[str]:
         """Get all column names."""
@@ -127,28 +123,6 @@ class TypedSchema(BaseModel):
         """Check if a table has a column with the given name."""
         table = self.get_table(table_name)
         return table is not None and table.has_column(column_name)
-
-    def get_join_candidates(self, from_table: str, to_table: str) -> list[ForeignKey]:
-        """Get all possible join paths between two tables."""
-        from_lower = from_table.lower()
-        to_lower = to_table.lower()
-        candidates = []
-        for fk in self.foreign_keys:
-            if (fk.from_table.lower() == from_lower and fk.to_table.lower() == to_lower) or \
-               (fk.from_table.lower() == to_lower and fk.to_table.lower() == from_lower):
-                candidates.append(fk)
-        return sorted(candidates, key=lambda fk: -fk.confidence)
-
-    def get_related_tables(self, table_name: str) -> list[str]:
-        """Get all tables that have a relationship with the given table."""
-        name_lower = table_name.lower()
-        related = set()
-        for fk in self.foreign_keys:
-            if fk.from_table.lower() == name_lower:
-                related.add(fk.to_table)
-            elif fk.to_table.lower() == name_lower:
-                related.add(fk.from_table)
-        return list(related)
 
     @property
     def table_names(self) -> list[str]:

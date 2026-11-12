@@ -208,10 +208,6 @@ class DeployerClient:
             "GET", "/v1/status", params={"name": name}, timeout=self._rpc_timeout,
         )
 
-    def healthz(self) -> Dict[str, Any]:
-        """GET /healthz — daemon reachability (no auth required, but harmless)."""
-        return self._request("GET", "/healthz", timeout=self._rpc_timeout)
-
     # ------------------------------------------------------------------ #
     # transport
     # ------------------------------------------------------------------ #
@@ -265,13 +261,25 @@ class DeployerClient:
 
     @staticmethod
     def _error_detail(resp: httpx.Response) -> str:
-        """Best-effort extraction of a human-readable error detail from a response."""
+        """Best-effort extraction of a human-readable error detail from a response.
+
+        A failed build's detail is "<builder> failed: <last 1500 chars of output>",
+        and the cause is at the END of that output, so a long detail keeps its head
+        and its tail. Keeping only the first 300 characters left the build's opening
+        steps and dropped the error.
+        """
         try:
             body = resp.json()
         except ValueError:
-            return (resp.text or "")[:300]
+            return _head_and_tail((resp.text or ""))
         if isinstance(body, dict):
             for key in ("detail", "error", "message"):
                 if body.get(key):
-                    return str(body[key])[:300]
-        return str(body)[:300]
+                    return _head_and_tail(str(body[key]))
+        return _head_and_tail(str(body))
+
+
+def _head_and_tail(text: str, head: int = 200, tail: int = 1500) -> str:
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]} … {text[-tail:]}"

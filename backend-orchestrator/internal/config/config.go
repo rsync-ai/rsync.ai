@@ -212,7 +212,7 @@ func StartupSettingProblems(getenv func(string) string) []string {
 			"pipeline re-runs started by the self-healer, OAuth token refresh, pipeline namespace "+
 			"locking (runs go ahead unlocked) and connector deploys in production will not work, "+
 			"and when ENVIRONMENT is production other services' internal calls into the "+
-			"orchestrator (such as the dashboard's pipeline statistics) are refused too. Generate "+
+			"orchestrator are refused too. Generate "+
 			"one (for example openssl rand -hex 32) and give the same value to api-gateway, "+
 			"orchestrator, temporal-adapter and frontend.")
 	}

@@ -1,0 +1,66 @@
+# Go functions no main package can reach, kept on purpose. Read by
+# scripts/check-deadcode.sh, which fails on any unreachable function not listed
+# here AND on any line here whose function is no longer unreachable.
+#
+# One "<import path> <function>" per line; a method is "Type.Method". Full-line
+# comments and blank lines are ignored. Every group says why it is kept and
+# what would retire it -- a line without a reason is a deletion nobody made.
+
+# The object-storage key layout contract (L6), layout.go's header: "pure key
+# builders, not yet called by any writer or reader". v1 ports what the sink
+# worker writes today, v2 is the agreed next layout (not live-verified), and
+# shared/object_layout_golden.json pins both from Go, the worker and Python.
+# Retired when a writer adopts the layout, or by the decision to drop v2.
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1BatchManifestKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1BatchPartKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1BatchSuccessKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1CDCObjectKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1CDCPipelineRootPrefix
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV1TablePrefix
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV2CDCKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV2ManifestKey
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV2SidecarTablePrefix
+github.com/rsync-ai/backend-orchestrator/internal/storage LayoutV2SuccessKey
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1BatchPath
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1CDCPipelineSegment
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1FileExt
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1FirstStr
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1Prefix
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1Sanitize
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1Slugify
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV1TablePrefix
+github.com/rsync-ai/backend-orchestrator/internal/storage layoutV2SidecarKey
+
+# The agent gateway's tool reference renderer. docs_test.go regenerates
+# docs/api/agent-gateway.md with it and fails when the committed page differs,
+# so the page cannot drift from the tool table. Generator code, test-driven by
+# design; a main package never needs it.
+api-gateway/internal/agentgw RenderDocs
+api-gateway/internal/agentgw argNotes
+api-gateway/internal/agentgw argRow
+api-gateway/internal/agentgw argType
+api-gateway/internal/agentgw cell
+api-gateway/internal/agentgw codeList
+api-gateway/internal/agentgw needs
+
+# Error methods on refusal types every function returns as the typed pointer
+# (`*chartRefusal`, never `error`), so nothing calls the method. Kept so a type
+# named like an error still is one; retired by renaming the type.
+api-gateway/internal/handlers chartRefusal.Error
+api-gateway/internal/handlers silverRefusal.Error
+api-gateway/internal/validators DocumentFindError.Error
+
+# Kept deliberately (INVENTORY.md, "Scrub round-trip guard"): tells a caller
+# about to EXECUTE a model's reply that the reply echoes a redaction marker.
+# Its last caller, the healer's model-suggested DDL, went on 2026-09-28.
+github.com/rsync-ai/backend-orchestrator/pkg/llmscrub ContainsRedaction
+
+# The Go reference of the namespace filter, run by filter_test.go against
+# shared/mcp-connectors/public/namespace_filter_vectors.json -- the vectors the
+# Python twin also reads. Retired with the vectors.
+github.com/rsync-ai/backend-orchestrator/pkg/namespacefilter Filter.Apply
+
+# The tenant-scoped replacement for fetching a connection's decrypted config,
+# parked until the adapter carries the caller's tenant (BACKLOG.md,
+# "TenantScope-TemporalAdapter"). Retired when that lands.
+github.com/rsync-ai/backend-temporal-adapter/internal/workflows fetchDecryptedConnectionConfigForUser

@@ -1,7 +1,9 @@
 package email
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -249,5 +251,57 @@ func TestConfigStatus_CallsOutTheLeftInPlaceholder(t *testing.T) {
 	got := (&Client{apiKey: "re_xxxxxxxxxxxx", fromAddr: "noreply@example.com"}).ConfigStatus()
 	if !strings.Contains(got, "placeholder") {
 		t.Fatalf("ConfigStatus() = %q, want it to say the key is still the placeholder", got)
+	}
+}
+
+// A workflow's chart rides in the email as an inline attachment: Resend takes
+// the bytes as base64 and shows the file where the HTML says cid:<content_id>.
+// A send without files carries no attachments key at all.
+func TestSendWithAttachments_SendsInlineImages(t *testing.T) {
+	var bodies [][]byte
+	c := &Client{
+		apiKey:   "re_test_key",
+		fromAddr: "noreply@rsync.ai",
+		httpClient: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, b)
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"id":"email_1"}`)),
+				Header: make(http.Header)}, nil
+		})},
+	}
+	png := []byte("\x89PNG\r\n\x1a\nchart")
+	err := c.SendWithAttachments(context.Background(), "owner@example.com", "Orders",
+		`<img src="cid:chart-1">`, []Attachment{{Filename: "orders.png", Content: png, ContentType: "image/png",
+			ContentID: "chart-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Send(context.Background(), "owner@example.com", "Orders", "<p>no chart</p>"); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("%d requests", len(bodies))
+	}
+	var got struct {
+		HTML        string           `json:"html"`
+		Attachments []map[string]any `json:"attachments"`
+	}
+	if err := json.Unmarshal(bodies[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attachments) != 1 {
+		t.Fatalf("attachments = %v", got.Attachments)
+	}
+	a := got.Attachments[0]
+	if a["filename"] != "orders.png" || a["content_type"] != "image/png" || a["content_id"] != "chart-1" {
+		t.Fatalf("attachment = %v", a)
+	}
+	var back []byte
+	raw, _ := json.Marshal(a["content"])
+	if err := json.Unmarshal(raw, &back); err != nil || !bytes.Equal(back, png) {
+		t.Fatalf("content %v is not the PNG in base64 (%v)", a["content"], err)
+	}
+	if bytes.Contains(bodies[1], []byte(`"attachments"`)) {
+		t.Fatalf("a send without files names attachments: %s", bodies[1])
 	}
 }

@@ -12,7 +12,6 @@ export function GlobalConnectorModal() {
       onClose={modal.closeModal}
       connectorType={modal.connectorType || ""}
       direction={modal.direction || "source"}
-      pipelineId={modal.pipelineId || undefined}
       onSave={(connectionId, config) => {
         modal.onSaveCallback?.(connectionId, config)
         modal.closeModal()

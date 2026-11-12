@@ -11,6 +11,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
+	"github.com/rsync-ai/backend-orchestrator/internal/runcancel"
 	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 )
 
@@ -35,6 +36,13 @@ import (
 // Kafka is lost — the next run's start_sink for the same pipeline-scoped group
 // resumes from that offset.
 //
+// The executor run in flight is cancelled first (runcancel), before the sink:
+// the Temporal cancel does not reach it, and left alone it kept exporting the
+// source and its healer re-ran the whole export
+// (KI-STOP-DOES-NOT-REACH-RUNNING-TRANSFER). Only runs in this process are
+// reached; the orchestrator runs as a single replica by design (helm
+// values.yaml orchestrator.replicaCount).
+//
 // Best effort, always 200: the gateway has already cancelled the run and flipped
 // the row, and a worker that could not be stopped is reported as a warning.
 func StopBatchSinkWorkers(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.TopologyManager) gin.HandlerFunc {
@@ -52,9 +60,11 @@ func stopBatchSinkWorkers(db *sql.DB, sinks sinkStopExecutor, tm *kafka.Topology
 			return
 		}
 
+		executorRuns := runcancel.Cancel(pipelineID)
+
 		var groups, warnings []string
 		if sinks != nil {
-			ctx, cancel := context.WithTimeout(c.Request.Context(), cdcStopSinkBudget)
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcStopSinkBudget)
 			names := pipelineKafkaNames{id8: utils.SafeID8(pipelineID), uuid: pipelineID}
 			if id8IsUnique(ctx, db, pipelineID, names.id8) {
 				groups = batchSinkGroups(discoverSinkGroups(ctx, tm, names))
@@ -66,10 +76,12 @@ func stopBatchSinkWorkers(db *sql.DB, sinks sinkStopExecutor, tm *kafka.Topology
 		}
 
 		log.WithFields(log.Fields{
-			"pipeline_id": pipelineID, "groups": groups, "warnings": len(warnings),
-		}).Info("batch stop: sink workers stopped; consumer-group offsets kept")
+			"pipeline_id": pipelineID, "executor_runs_cancelled": executorRuns,
+			"groups": groups, "warnings": len(warnings),
+		}).Info("batch stop: executor runs cancelled, sink workers stopped; consumer-group offsets kept")
 		c.JSON(http.StatusOK, gin.H{
-			"success": true, "pipeline_id": pipelineID, "consumer_groups": groups, "warnings": warnings,
+			"success": true, "pipeline_id": pipelineID, "executor_runs_cancelled": executorRuns,
+			"consumer_groups": groups, "warnings": warnings,
 		})
 	}
 }

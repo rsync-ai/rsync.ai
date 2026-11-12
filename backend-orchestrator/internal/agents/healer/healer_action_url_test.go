@@ -52,7 +52,7 @@ func TestActionURLForError(t *testing.T) {
 }
 
 // TestSchemaDriftNotificationDeepLinks proves the end-to-end wiring the fix
-// depends on: the drift notify at processAnalysis builds its StructuredError
+// depends on: notifyDrift builds its StructuredError
 // via diagnose.FromDiagnosis(CategorySchemaDrift), which stamps the schema_drift
 // category + the SCHEMA_DRIFT_DETECTED remediation envelope. That category is
 // exactly what routes the deep-link — so a drift alert now lands on the schema

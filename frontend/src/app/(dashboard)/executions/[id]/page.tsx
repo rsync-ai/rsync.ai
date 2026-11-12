@@ -1,29 +1,21 @@
 import { notFound, unstable_rethrow } from "next/navigation"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { 
-  ArrowLeft,
-  Clock,
-  CheckCircle2,
-  XCircle,
-  Loader2,
-  Ban,
-  Timer,
-  GitBranch,
-  AlertTriangle,
-  Calendar,
-  Play,
-  Layers,
-} from "lucide-react"
-import { cn, formatElapsed } from "@/lib/utils"
+import { ArrowLeft, Clock, Timer, AlertTriangle, Calendar, Play, Layers, Rows3 } from "lucide-react"
+import { cn, formatAgeMs } from "@/lib/utils"
+import { formatDurationBetween } from "@/lib/duration"
 import { LocalDateTime } from "@/components/ui/local-date-time"
 import { ExecutionDetailClient } from "@/components/executions/ExecutionDetailClient"
 import { TransformExecutionLogsPanel, type TransformExecutionLog } from "@/components/transforms/TransformExecutionLogsPanel"
-import { ExecutionComparison } from "@/components/executions/ExecutionComparison"
+import { RecentRunsCard } from "@/components/executions/RecentRunsCard"
+import { durationChange } from "@/components/executions/run-history"
+import type { ChartRun } from "@/components/runs/run-chart-specs"
 import { RunLogPanel } from "@/components/executions/RunLogPanel"
 import { DiagnosisCard, type DiagnosisData } from "@/components/chat/DiagnosisCard"
+import { CopyId } from "@/components/kit/CopyId"
+import { StatCard } from "@/components/kit/StatCard"
+import { StatusPill } from "@/components/kit/StatusPill"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import {
   pickExecutionFreshness,
@@ -33,8 +25,10 @@ import {
 import { cookies } from "next/headers"
 import { activeWorkspaceCookieHeader } from "@/lib/workspace/server-workspace"
 import {
+  EXECUTION_STATUS_TONES,
   executionStatusConfig as statusConfig,
   normalizeExecutionStatus,
+  type ExecutionStatus,
   type ExecutionStatusConfig,
 } from "@/lib/execution-status"
 
@@ -42,20 +36,6 @@ export const dynamic = "force-dynamic"
 
 interface Props {
   params: Promise<{ id: string }>
-}
-
-// formatAge renders a coarse "how long ago" label for the freshness KPI. Computed
-// at render (the page is force-dynamic), so it reflects staleness at page load.
-// Floored like every other age in the app: rounding made 15h40m read "16h ago"
-// here while the pipeline page said "15h ago" for the same moment.
-function formatAge(ms: number): string {
-  if (ms < 45_000) return "just now"
-  const mins = Math.floor(ms / 60_000)
-  if (mins < 60) return `${Math.max(1, mins)}m ago`
-  const hrs = Math.floor(ms / 3_600_000)
-  if (hrs < 24) return `${hrs}h ago`
-  const days = Math.floor(ms / 86_400_000)
-  return `${days}d ago`
 }
 
 export default async function ExecutionDetailPage({ params }: Props) {
@@ -81,6 +61,10 @@ export default async function ExecutionDetailPage({ params }: Props) {
   // ISO string, rendered by <LocalDateTime> so it shows in the viewer's zone.
   let freshnessAbs: string | null = null
   let freshnessLabel: FreshnessLabel = "Last activity"
+  // The pipeline's last 10 runs, newest first, for the chart and the Duration
+  // card's change. Null when they could not be read: the page then shows neither.
+  let recentRuns: ChartRun[] | null = null
+  let rowsWritten: number | undefined
 
   try {
     const res = await fetch(API_ENDPOINTS.EXECUTIONS.GET_INTERNAL(id), {
@@ -105,6 +89,8 @@ export default async function ExecutionDetailPage({ params }: Props) {
       startedAt: rawExecution.start_time ? new Date(rawExecution.start_time) : new Date(),
       finishedAt: rawExecution.end_time ? new Date(rawExecution.end_time) : null,
       liveStream: rawExecution.live_stream === true,
+      // The gateway sends a count only when it is above zero (GetExecution).
+      recordsProcessed: typeof rawExecution.metrics?.records_processed === "number" ? rawExecution.metrics.records_processed : undefined,
       error: rawExecution.error_message || null,
       nodeResults: Array.isArray(rawExecution.node_results) ? rawExecution.node_results : [],
       pipeline: rawExecution.pipeline || { 
@@ -118,23 +104,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
 
     config = statusConfig[execution.status as keyof typeof statusConfig] || statusConfig.pending
 
-    const calculateDuration = (startedAt: Date, finishedAt: Date | null) => {
-      try {
-        const start = new Date(startedAt)
-        const end = finishedAt ? new Date(finishedAt) : new Date()
-        
-        if (isNaN(start.getTime()) || (finishedAt && isNaN(end.getTime()))) return "-"
-
-        const diffMs = end.getTime() - start.getTime()
-        
-        if (diffMs < 0) return "0s"
-        return formatElapsed(diffMs)
-      } catch (e) {
-        return "-"
-      }
-    }
-
-    duration = calculateDuration(execution.startedAt, execution.finishedAt)
+    duration = formatDurationBetween(execution.startedAt, execution.finishedAt)
     nodeResults = execution.nodeResults
 
     try {
@@ -182,14 +152,31 @@ export default async function ExecutionDetailPage({ params }: Props) {
     freshnessLabel = freshness.label
     if (freshness.at !== null) {
       freshnessAbs = new Date(freshness.at).toISOString()
-      freshnessAge = formatAge(Math.max(0, now - freshness.at))
+      freshnessAge = formatAgeMs(now - freshness.at)
     }
+
+    // The pipeline's recent runs (the same trends call its Overview makes).
+    // Best-effort: without them the page has no chart and no change, nothing else.
+    if (execution.pipelineId) {
+      try {
+        const trRes = await fetch(API_ENDPOINTS.PIPELINES.TRENDS_INTERNAL(execution.pipelineId, 10), {
+          cache: "no-store",
+          headers: { ...authHeaders },
+        })
+        if (trRes.ok) {
+          const tr = (await trRes.json()) as { recent_executions?: unknown } | null
+          recentRuns = Array.isArray(tr?.recent_executions) ? (tr.recent_executions as ChartRun[]) : null
+        }
+      } catch {
+        recentRuns = null
+      }
+    }
+    rowsWritten = execution.recordsProcessed
 
     // Fetch the Phase 3 diagnosis for failed/silent-drop executions. Best-effort:
     // a missing endpoint or empty response leaves the section hidden rather than
     // breaking the page.
-    const failureStatuses = new Set(["failed", "silent_drop_detected", "silent_partial_drop_detected", "waiting_for_credential_reauth", "waiting_for_user"])
-    if (failureStatuses.has(execution.status)) {
+    if (FAILURE_STATUSES.has(execution.status)) {
       try {
         const diagRes = await fetch(API_ENDPOINTS.EXECUTIONS.DIAGNOSE_INTERNAL(id), {
           cache: "no-store",
@@ -236,171 +223,134 @@ export default async function ExecutionDetailPage({ params }: Props) {
         <AlertTriangle className="h-10 w-10 text-red-500" />
         <h2 className="text-xl font-semibold">Failed to load execution details</h2>
         <p className="text-zinc-500 dark:text-zinc-400">{String(error)}</p>
-        <Link href="/executions">
-          <Button variant="outline">Back to Executions</Button>
+        <Link href="/runs">
+          <Button variant="outline">Back to Runs</Button>
         </Link>
       </div>
     )
   }
 
-  const StatusIcon = config.icon
+  const status = execution.status as ExecutionStatus
+  const failed = FAILURE_STATUSES.has(status)
+  const running = status === "running" || status === "pending"
+  const change = recentRuns ? durationChange(recentRuns, execution.id, execution.pipelineId) : undefined
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center gap-4">
-        <Button asChild variant="ghost" size="icon">
-          <Link href="/executions" aria-label="Back to executions">
-            <ArrowLeft className="h-5 w-5" />
-          </Link>
-        </Button>
-        <div className="flex-1">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold text-zinc-900 dark:text-white">
-              Execution Details
-            </h1>
-            <Badge variant={config.variant} className="text-sm">
-              <StatusIcon className={cn("h-3.5 w-3.5 mr-1", config.animate && "animate-spin")} />
-              {config.label}
-            </Badge>
+    <div className="space-y-5">
+      {/* Header: the pipeline this run belongs to, its status, and what can be done. */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2">
+          <Button asChild variant="ghost" size="icon" className="-ml-2 shrink-0">
+            <Link href="/runs" aria-label="Back to runs">
+              <ArrowLeft className="h-5 w-5" />
+            </Link>
+          </Button>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="truncate text-xl font-semibold text-zinc-900 dark:text-white">
+                {execution.pipeline.name}
+              </h1>
+              <StatusPill tone={EXECUTION_STATUS_TONES[status] ?? "skip"}>{config.label}</StatusPill>
+            </div>
+            <p className="mt-1 flex items-center gap-1.5 text-sm text-zinc-500 dark:text-zinc-400">
+              Run <CopyId value={execution.id} label="run ID" />
+            </p>
           </div>
-          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1 font-mono">
-            {execution.id}
-          </p>
         </div>
+        <ExecutionDetailClient
+          execution={{
+            id: execution.id,
+            status: execution.status,
+            pipelineId: execution.pipelineId || "",
+            liveStream: execution.liveStream === true,
+          }}
+        />
       </div>
 
-      {/* Overview Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-violet-100 dark:bg-violet-900/30">
-                <GitBranch className="h-5 w-5 text-violet-600 dark:text-violet-400" />
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">Pipeline</p>
-                <Link 
-                  href={`/pipelines/${execution.pipeline.id}`}
-                  className="text-sm font-semibold text-zinc-900 dark:text-white hover:text-violet-600 dark:hover:text-violet-400"
-                >
-                  {execution.pipeline.name}
-                </Link>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-blue-100 dark:bg-blue-900/30">
-                <Calendar className="h-5 w-5 text-blue-600 dark:text-blue-400" />
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">Started At</p>
-                <p className="text-sm font-semibold text-zinc-900 dark:text-white">
-                  <LocalDateTime value={execution.startedAt} />
-                </p>
-                {execution.finishedAt && (
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                    Ended <LocalDateTime value={execution.finishedAt} />
-                  </p>
-                )}
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-emerald-100 dark:bg-emerald-900/30">
-                <Timer className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">Duration</p>
-                <p className="text-sm font-semibold text-zinc-900 dark:text-white">
-                  {duration}
-                </p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Batch runs report no per-node results (node_results is empty), so a
-            "0 nodes" tile after an 8-transform run reads as a failure. Only show
-            this stat when there are actually node results (agentic/DAG runs). */}
-        {nodeResults.length > 0 && (
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                  <Layers className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400">Nodes Executed</p>
-                  <p className="text-sm font-semibold text-zinc-900 dark:text-white">
-                    {nodeResults.length} nodes
-                  </p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-teal-100 dark:bg-teal-900/30">
-                <Clock className="h-5 w-5 text-teal-600 dark:text-teal-400" />
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">Data Freshness</p>
-                <p className="text-sm font-semibold text-zinc-900 dark:text-white">
-                  {freshnessAge}
-                </p>
-                {freshnessAbs && (
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                    {freshnessLabel} <LocalDateTime value={freshnessAbs} />
-                  </p>
-                )}
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Always four cards: a node-count card used to make a fifth, but batch and
+          CDC runs record no node results, so most runs drew four cards in a
+          five-column row. The count now reads in the timeline's header. */}
+      <div className="grid grid-cols-1 gap-4 @xl:grid-cols-2 @3xl:grid-cols-4">
+        <StatCard
+          title="Started"
+          icon={Calendar}
+          value={formatAgeMs(Date.now() - execution.startedAt.getTime())}
+          hint={<LocalDateTime value={execution.startedAt} />}
+        />
+        <StatCard
+          title="Duration"
+          icon={Timer}
+          value={duration}
+          hint={
+            running ? (
+              "So far"
+            ) : execution.finishedAt ? (
+              <>
+                {change && <span className="block">{change}</span>}
+                Ended <LocalDateTime value={execution.finishedAt} />
+              </>
+            ) : (
+              change
+            )
+          }
+        />
+        <StatCard
+          title="Rows written"
+          icon={Rows3}
+          href={execution.pipelineId ? `/pipelines/${execution.pipelineId}?tab=table-stats` : undefined}
+          value={rowsWritten ?? "—"}
+          hint={
+            rowsWritten !== undefined
+              ? "Per table on the pipeline's Table statistics"
+              : running
+                ? "Counted as each table lands"
+                : "No rows recorded for this run"
+          }
+        />
+        <StatCard
+          title="Data freshness"
+          icon={Clock}
+          value={freshnessAge}
+          hint={
+            freshnessAbs ? (
+              <>
+                {freshnessLabel} <LocalDateTime value={freshnessAbs} />
+              </>
+            ) : undefined
+          }
+        />
       </div>
 
-      {/* Error Message */}
-      {execution.error && (
-        <Card className="border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20">
-          <CardContent className="p-4">
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="h-5 w-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-red-700 dark:text-red-300">
-                  {config.label === "Silent Drop" || config.label === "Partial Silent Drop"
-                    ? `Execution: ${config.label}`
-                    : "Execution Failed"}
-                </p>
-                <p className="text-sm text-red-600 dark:text-red-400 mt-1">
-                  {execution.error}
-                </p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Only for a run that did not succeed: a succeeded run can keep the error
+          message of an attempt it recovered from. */}
+      {failed && execution.error && (
+        <div
+          role="alert"
+          className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 dark:border-red-900/60 dark:bg-red-950/30"
+        >
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" aria-hidden />
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-red-700 dark:text-red-300">
+              {status === "failed" ? "This run failed" : config.label}
+            </p>
+            <p className="mt-1 break-words text-sm text-red-700 dark:text-red-300">{execution.error}</p>
+          </div>
+        </div>
       )}
 
       {/* Phase 3/4 Healer Diagnosis — auto-renders for failure statuses */}
       {diagnosis && (
         <div>
-          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-2 flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 text-amber-500" />
-            Healer Diagnosis
+          <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+            <AlertTriangle className="h-4 w-4 text-amber-500" aria-hidden />
+            Healer diagnosis
           </h2>
           <DiagnosisCard data={diagnosis} />
         </div>
+      )}
+
+      {recentRuns && execution.pipelineId && (
+        <RecentRunsCard runs={recentRuns} executionId={execution.id} pipelineId={execution.pipelineId} />
       )}
 
       {/* The run's own log — where "View Logs" in a pipeline's ⋯ menu lands (#logs). */}
@@ -408,101 +358,72 @@ export default async function ExecutionDetailPage({ params }: Props) {
         <RunLogPanel pipelineId={execution.pipelineId} executionId={execution.id} />
       )}
 
-      {/* Node Results */}
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle className="text-lg flex items-center gap-2">
-            <Layers className="h-5 w-5" />
-            Transform execution logs
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <TransformExecutionLogsPanel logs={transformLogs} emptyLabel="No transform execution logs for this execution." />
-        </CardContent>
-      </Card>
-
-      {/* Row counts per table live on the pipeline's Table statistics tab; this
-          page used to repeat them where a run's log belongs. */}
-      {execution.pipelineId && (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">
-          Row counts per table are on the pipeline&apos;s{" "}
-          <Link
-            href={`/pipelines/${execution.pipelineId}?tab=table-stats`}
-            className="font-medium text-blue-700 underline-offset-2 hover:underline dark:text-blue-300"
-          >
-            Table statistics tab
-          </Link>
-          .
-        </p>
-      )}
-
-      {/* Comparison with previous run — uses /api/v1/pipelines/:id/compare
-          (previously unused). Component renders nothing when no prior run
-          exists, so this slot is invisible on the first execution. */}
-      {execution.pipelineId && (
-        <ExecutionComparison pipelineId={execution.pipelineId} executionId={execution.id} />
+      {/* Most runs run no transforms; an always-empty card read as missing data. */}
+      {transformLogs.length > 0 && (
+        <Card>
+          <CardHeader className="pb-4">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Layers className="h-4 w-4" aria-hidden />
+              Transform execution logs
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <TransformExecutionLogsPanel logs={transformLogs} emptyLabel="No transform execution logs for this execution." />
+          </CardContent>
+        </Card>
       )}
 
       {/* Only batch runs record per-node results. A CDC run never has any, and an
           empty "No node results available" card read as missing data. */}
       {nodeResults.length > 0 && (
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle className="text-lg flex items-center gap-2">
-            <Play className="h-5 w-5" />
-            Execution Timeline
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
+        <Card>
+          <CardHeader className="pb-4">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Play className="h-4 w-4" aria-hidden />
+              Execution timeline
+              <span className="text-sm font-normal text-zinc-500 dark:text-zinc-400">
+                {nodeResults.length} {nodeResults.length === 1 ? "node" : "nodes"}
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
             <div className="space-y-4">
               {nodeResults.map((node: any, index: number) => {
-                const nodeConfig = statusConfig[node?.status as keyof typeof statusConfig] || statusConfig.pending
+                const nodeStatus = normalizeExecutionStatus(node?.status)
+                const nodeConfig = statusConfig[nodeStatus]
                 const NodeIcon = nodeConfig.icon
-                
+
                 return (
                   <div key={node?.node_id || index} className="relative">
                     {index < nodeResults.length - 1 && (
-                      <div className="absolute left-[21px] top-12 bottom-0 w-0.5 bg-zinc-200 dark:bg-zinc-700" />
+                      <div className="absolute bottom-0 left-[21px] top-12 w-0.5 bg-zinc-200 dark:bg-zinc-700" />
                     )}
-                    
+
                     <div className="flex items-start gap-4">
-                      <div className={cn(
-                        "flex h-11 w-11 shrink-0 items-center justify-center rounded-full",
-                        nodeConfig.bg
-                      )}>
-                        <NodeIcon className={cn(
-                          "h-5 w-5",
-                          nodeConfig.color,
-                          nodeConfig.animate && "animate-spin"
-                        )} />
+                      <div className={cn("flex h-11 w-11 shrink-0 items-center justify-center rounded-full", nodeConfig.bg)}>
+                        <NodeIcon className={cn("h-5 w-5", nodeConfig.color, nodeConfig.animate && "animate-spin")} />
                       </div>
-                      
-                      <div className="flex-1 min-w-0 pb-6">
-                        <div className="flex items-center justify-between">
-                          <div>
+
+                      <div className="min-w-0 flex-1 pb-6">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
                             <p className="font-semibold text-zinc-900 dark:text-white">
                               {node?.node_name || `Node ${index + 1}`}
                             </p>
-                            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                              {node?.node_id}
-                            </p>
+                            <p className="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-400">{node?.node_id}</p>
                           </div>
-                          <Badge variant={nodeConfig.variant}>
-                            {nodeConfig.label}
-                          </Badge>
+                          <StatusPill tone={EXECUTION_STATUS_TONES[nodeStatus]}>{nodeConfig.label}</StatusPill>
                         </div>
-                        
+
                         {node?.duration_ms !== undefined && (
-                          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-2">
+                          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
                             Duration: {node.duration_ms}ms
                             {node.row_count !== undefined && ` • ${node.row_count} rows processed`}
                           </p>
                         )}
-                        
+
                         {node?.error && (
-                          <p className="text-sm text-red-600 dark:text-red-400 mt-2">
-                            Error: {node.error}
-                          </p>
+                          <p className="mt-2 text-sm text-red-600 dark:text-red-400">Error: {node.error}</p>
                         )}
                       </div>
                     </div>
@@ -510,19 +431,18 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 )
               })}
             </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
       )}
-
-      {/* Actions */}
-      <ExecutionDetailClient 
-        execution={{
-          id: execution.id,
-          status: execution.status,
-          pipelineId: execution.pipelineId || "",
-          liveStream: execution.liveStream === true,
-        }} 
-      />
     </div>
   )
 }
+
+/** Statuses that are not a success: the error card and the diagnosis show for these. */
+const FAILURE_STATUSES = new Set<ExecutionStatus>([
+  "failed",
+  "silent_drop_detected",
+  "silent_partial_drop_detected",
+  "waiting_for_credential_reauth",
+  "waiting_for_user",
+])

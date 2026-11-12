@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest"
 import {
   splitSqlStatements,
   resolveRunTarget,
-  spliceRunTarget,
 } from "../sqlStatements"
 import {
   classifyExplorerStatement,
@@ -248,42 +247,5 @@ describe("gate/execute alignment (resolveRunTarget × classifyExplorerStatement)
     // The server rejects stacked statements by design; the UI must not send this.
     const t = resolveRunTarget(doc, 0, doc.length)
     expect(t.multi).toBe(true)
-  })
-})
-
-describe("spliceRunTarget", () => {
-  it("replaces only the target statement, leaving the rest of the buffer intact", () => {
-    const doc = "SELECT 1;\nSELECT * FROM orders;\nSELECT 3;"
-    const caret = at(doc, "SELECT * FROM orders")
-    const t = resolveRunTarget(doc, caret, caret)
-    const out = spliceRunTarget(doc, t, "SELECT * FROM public.orders LIMIT 100")
-    expect(out).toBe("SELECT 1;\nSELECT * FROM public.orders LIMIT 100;\nSELECT 3;")
-  })
-
-  it("round-trips when the replacement is unchanged", () => {
-    const doc = "SELECT 1;\nSELECT 2;"
-    const t = resolveRunTarget(doc, at(doc, "SELECT 2"), at(doc, "SELECT 2"))
-    expect(spliceRunTarget(doc, t, t.sql)).toBe(doc)
-  })
-
-  it("rewrites a single-statement buffer in place", () => {
-    const doc = "SELECT * FROM orders"
-    const t = resolveRunTarget(doc)
-    expect(spliceRunTarget(doc, t, "SELECT * FROM public.orders")).toBe("SELECT * FROM public.orders")
-  })
-
-  it("no-ops when the buffer changed under a stale target", () => {
-    // The destructive-confirm dialog can hold a target across an edit. Splicing by raw
-    // offsets would then rewrite whatever now occupies that range.
-    const doc = "SELECT 1;\nDROP TABLE users;"
-    const t = resolveRunTarget(doc, at(doc, "DROP"), at(doc, "DROP"))
-    const edited = "SELECT 1;\nSELECT 2;\nDROP TABLE users;"
-    expect(spliceRunTarget(edited, t, "DROP TABLE public.users")).toBe(edited)
-  })
-
-  it("returns the document unchanged for an out-of-range target", () => {
-    const doc = "SELECT 1"
-    expect(spliceRunTarget(doc, { ...resolveRunTarget(doc), from: 0, to: 999 }, "X")).toBe(doc)
-    expect(spliceRunTarget(doc, { ...resolveRunTarget(doc), from: 5, to: 2 }, "X")).toBe(doc)
   })
 })

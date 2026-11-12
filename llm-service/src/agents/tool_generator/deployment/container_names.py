@@ -16,7 +16,7 @@ candidate list that does not read STACK_PREFIX (scripts/mcp_generate_compose.py)
 
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 DEFAULT_STACK_PREFIX = "rsync-ai"
 
@@ -38,14 +38,31 @@ def teardown_name_patterns(*connector_ids: str) -> Tuple[List[str], List[str]]:
     underscore variant). Scoped to STACK_PREFIX so a teardown on one stack never
     matches another stack's containers on the same Docker host."""
     prefix = stack_prefix()
+    ids = _id_variants(*connector_ids)
+    versioned = [f"{prefix}-{cid}-v" for cid in ids]
+    legacy = [f"{prefix}-{cid}-mcp" for cid in ids]
+    return versioned, legacy
+
+
+def teardown_names_for_versions(versions: Iterable[str], *connector_ids: str) -> List[str]:
+    """The concrete names ``teardown_name_patterns`` matches, for the given versions:
+    every versioned name, then the legacy stable names. For a caller that cannot list
+    containers (connector-deployer mode has no Docker socket and no list call), so it
+    removes names one by one instead of matching prefixes."""
+    ids = _id_variants(*connector_ids)
+    names = [versioned_container_name(cid, v) for cid in ids for v in versions]
+    names += [f"{stack_prefix()}-{cid}-mcp" for cid in ids]
+    return list(dict.fromkeys(names))
+
+
+def _id_variants(*connector_ids: str) -> List[str]:
+    """Each id as given and with ``-`` → ``_``, deduplicated, order kept."""
     ids: List[str] = []
     for cid in connector_ids:
         for variant in (cid, cid.replace("-", "_")):
             if variant and variant not in ids:
                 ids.append(variant)
-    versioned = [f"{prefix}-{cid}-v" for cid in ids]
-    legacy = [f"{prefix}-{cid}-mcp" for cid in ids]
-    return versioned, legacy
+    return ids
 
 
 def strip_stack_affixes(container_name: str) -> Optional[str]:

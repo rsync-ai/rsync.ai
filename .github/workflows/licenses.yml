@@ -23,6 +23,7 @@ on:
       - 'THIRD_PARTY_NOTICES.md'
       - 'scripts/gen-third-party-notices.sh'
       - 'scripts/check-third-party-notices.sh'
+      - 'scripts/check-third-party-notices-frontend.py'
       - '.github/workflows/licenses.yml'
   push:
     branches: [main]
@@ -74,7 +75,7 @@ jobs:
           echo "✓ No new strong-copyleft dependencies in manifests."
 
   notices:
-    name: THIRD_PARTY_NOTICES lists what ships (Go)
+    name: THIRD_PARTY_NOTICES lists what ships (Go, frontend)
     # Same fork guard as `denylist`. Both jobs are GitHub-hosted since the
     # fork-safety split, so the guard is now defence-in-depth rather than the
     # control -- keep it: it is what stops a fork PR spending this repo's
@@ -121,3 +122,9 @@ jobs:
           GOOS: darwin
           GOARCH: arm64
         run: ./scripts/check-third-party-notices.sh
+
+      # The frontend table drifted with nothing to catch it: it listed `next` 16.2.10
+      # against a shipped 16.3.8 and seven packages package.json had dropped. Stdlib
+      # Python against the manifest -- no npm install, any runner.
+      - name: Frontend table matches frontend/package.json
+        run: python3 scripts/check-third-party-notices-frontend.py

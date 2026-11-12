@@ -15,8 +15,10 @@ import (
 // llm-service via the check_and_charge_user() Postgres function on every
 // completion.
 //
-// Cost values are stored as integer USD cents on users.cost_quota_usd_cents
-// and users.monthly_cost_usd_cents (see migration 057_llm_usage_quotas.sql).
+// The quota, users.cost_quota_usd_cents, is whole USD cents (migration 057);
+// users.monthly_cost_usd_cents is the month's exact spend, to a millionth of a
+// cent (migration 149). It is read here rounded down to a whole cent: against a
+// whole-cent quota, FLOOR(spent) >= quota exactly when spent >= quota.
 func checkUserCostQuotaOK(parent context.Context, database *sql.DB, userID string) bool {
 	if database == nil || userID == "" {
 		return true
@@ -29,7 +31,7 @@ func checkUserCostQuotaOK(parent context.Context, database *sql.DB, userID strin
 	err := database.QueryRowContext(ctx,
 		`SELECT cost_quota_usd_cents,
 		        CASE WHEN monthly_cost_period = to_char(now(),'YYYY-MM')
-		             THEN monthly_cost_usd_cents
+		             THEN FLOOR(monthly_cost_usd_cents)::int
 		             ELSE 0
 		        END AS current_cents,
 		        monthly_cost_period

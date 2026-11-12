@@ -1,0 +1,64 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M29.1 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.1 218.5L560 218.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.1 171.5L560 171.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.1 123.5L560 123.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.1 75.5L560 75.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.1 28.5L560 28.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="-3.0250000000000004" transform="translate(29.15 13)" fill="#a1a1aa">Low · High</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(294.575 288.95)" fill="#a1a1aa">day</text>
+<path d="M29.1 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#3f3f46" stroke-linecap="round" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 265.95)" fill="#a1a1aa">30</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 218.36)" fill="#a1a1aa">60</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 170.77)" fill="#a1a1aa">90</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 123.18)" fill="#a1a1aa">120</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 75.59)" fill="#a1a1aa">150</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 28)" fill="#a1a1aa">180</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(95.5063 273.95)" fill="#a1a1aa">2026-10-01</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(228.2188 273.95)" fill="#a1a1aa">2026-10-02</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(360.9313 273.95)" fill="#a1a1aa">2026-10-03</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(493.6438 273.95)" fill="#a1a1aa">2026-10-04</text>
+<g clip-path="url(#zr-c-0)">
+<path d="M95.5 123.2L228.2 59.7L228.2 226.3L95.5 250.1ZM493.6 170.8L493.6 266Z" fill="#5071de" fill-opacity="0.25" class="zr-cls-1"></path>
+</g>
+<g clip-path="url(#zr-c-1)">
+<path d="M95.5 250.1L228.2 226.3M493.6 266" fill="none" pointer-events="visible" stroke="#5071de" stroke-width="1.5" stroke-linejoin="bevel" class="zr-cls-2"></path>
+</g>
+<g clip-path="url(#zr-c-0)">
+<path d="M95.5 123.2L228.2 59.7M493.6 170.8" fill="none" pointer-events="visible" stroke="#5071de" stroke-width="1.5" stroke-linejoin="bevel" class="zr-cls-2"></path>
+</g>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,95.5062,250.0867)" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,228.2188,226.2917)" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,493.6437,265.95)" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="3" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,95.5062,123.18)" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,228.2188,59.7267)" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(2.5,0,0,2.5,493.6437,170.77)" fill="#5071de" ecmeta_series_index="1" ecmeta_data_index="3" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<defs >
+<clipPath id="zr-c-0">
+<path d="M28 27.3l534 0l0 239.5l-534 0Z" fill="#000" class="zr-cls-3"></path>
+</clipPath>
+<clipPath id="zr-c-1">
+<path d="M28 27.3l534 0l0 239.5l-534 0Z" fill="#000" class="zr-cls-3"></path>
+</clipPath>
+</defs>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-3:hover {
+cursor:pointer;
+fill:rgba(0,0,0,1);
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+.zr-cls-2:hover {
+cursor:pointer;
+}
+
+]]>
+
+</style>
+</svg>

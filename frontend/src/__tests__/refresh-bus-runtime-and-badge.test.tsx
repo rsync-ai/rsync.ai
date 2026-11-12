@@ -1,12 +1,12 @@
 /**
  * #13: Pause / Resume / Edit tables / Re-snapshot announce themselves on the
- * pipeline refresh bus (`emitPipelineRefresh`). The status pill and the
- * runtime hook must re-read on it, or a paused pipeline keeps reading
+ * pipeline refresh bus (`emitPipelineRefresh`). The status pill (the health
+ * header's, the page's only one) and the runtime hook must re-read on it, or a paused pipeline keeps reading
  * "Running" / "Streaming" until the next poll — or forever, once a terminal
  * phase has stopped the runtime poll.
  *
  * Pinned here:
- *  - the badge re-reads /state (and the hook /runtime) on THIS pipeline's
+ *  - the pill re-reads /state and /runtime on THIS pipeline's
  *    refresh, without waiting for a poll; another pipeline's refresh is ignored;
  *  - a refresh re-arms a runtime poll that a terminal phase stopped;
  *  - but not one a 404 stopped (the endpoint does not exist on that backend).
@@ -20,8 +20,9 @@ const authFetch = vi.fn()
 vi.mock("@/lib/api/auth-fetch", () => ({
   authFetch: (...a: unknown[]) => authFetch(...a),
 }))
+vi.mock("@/components/pipeline/DiagnosePanel", () => ({ DiagnosePanel: () => null }))
 
-import { PipelineExecutionStatusBadge } from "@/components/pipeline/PipelineExecutionStatusBadge"
+import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 
@@ -67,12 +68,13 @@ describe("status badge on the refresh bus", () => {
   it("flips to Paused on this pipeline's refresh, before any poll, and re-reads /runtime too", async () => {
     let state = "running"
     authFetch.mockImplementation(async (url: string) => {
-      if (url.endsWith("/runtime")) return res(200, runtime("streaming"))
+      // /runtime's phase follows pipelines.status, as computeRuntimePhase does.
+      if (url.endsWith("/runtime")) return res(200, runtime(state === "paused" ? "paused" : "streaming"))
       if (url.endsWith("/state")) return res(200, { status: state })
       return res(404, {})
     })
-    render(<PipelineExecutionStatusBadge pipelineId="p1" />)
-    await waitFor(() => expect(screen.getByText("Running")).toBeInTheDocument())
+    render(<PipelineHealthHeader pipelineId="p1" />)
+    await waitFor(() => expect(screen.getByText("Streaming")).toBeInTheDocument())
     await waitFor(() => expect(gets("/runtime")).toBe(1))
     const stateBefore = gets("/state")
     const runtimeBefore = gets("/runtime")
@@ -83,10 +85,10 @@ describe("status badge on the refresh bus", () => {
     act(() => emitPipelineRefresh("p2"))
     expect(gets("/state")).toBe(stateBefore)
     expect(gets("/runtime")).toBe(runtimeBefore)
-    expect(screen.getByText("Running")).toBeInTheDocument()
+    expect(screen.getByText("Streaming")).toBeInTheDocument()
 
     act(() => emitPipelineRefresh("p1"))
-    // Well inside the 4 s badge poll and the 5 s runtime poll: only the
+    // Well inside the 4 s /state poll and the 5 s runtime poll: only the
     // refresh can have caused these reads.
     await waitFor(() => expect(screen.getByText("Paused")).toBeInTheDocument(), { timeout: 1000 })
     expect(gets("/state")).toBe(stateBefore + 1)

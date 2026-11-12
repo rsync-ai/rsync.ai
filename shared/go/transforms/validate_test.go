@@ -1,6 +1,9 @@
 package transforms
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestNormalizeAndValidate_SortsAndFiltersByTable(t *testing.T) {
 	raw := []map[string]any{
@@ -147,5 +150,56 @@ func TestNormalizeAndValidate_RejectsBadNewTypeConfig(t *testing.T) {
 		if err == nil {
 			t.Fatalf("case %d: expected validation error, got nil", i)
 		}
+	}
+}
+
+// NormalizeAndValidate must leave its input as it found it. It used to rewrite the
+// caller's config map in place — deleting `operation`, `table` and
+// `requires_full_dataset`, renaming aliases — so the same chain validated twice
+// failed the second time with "missing transform type". The CDC sink validates
+// its cached chain once per message, so every message after the first discarded
+// the cache and re-read transform_definitions from the control-plane database.
+// Each config shape and each kind of rewrite is covered: a deleted key, a moved
+// key (table into scope) and a renamed alias.
+func TestNormalizeAndValidate_LeavesItsInputUnchanged(t *testing.T) {
+	cases := map[string]func() []map[string]any{
+		"transform_config, operation deleted": func() []map[string]any {
+			return []map[string]any{{"transform_order": 1, "enabled": true, "transform_config": map[string]any{
+				"operation": "mask", "column": "email", "mask_type": "hash", "hash_function": "sha256",
+			}}}
+		},
+		"transform_config, table moved and alias renamed": func() []map[string]any {
+			return []map[string]any{{"transform_order": 1, "enabled": true, "transform_config": map[string]any{
+				"operation": "type_convert", "column": "qty", "to_type": "integer", "table": "orders",
+				"requires_full_dataset": false,
+			}}}
+		},
+		"config": func() []map[string]any {
+			return []map[string]any{{"order": 1, "enabled": true, "type": "type_convert", "config": map[string]any{
+				"column": "qty", "to_type": "integer", "table": "orders",
+			}}}
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw, pristine := build(), build()
+			first, _, err := NormalizeAndValidate(raw, "orders", NormalizeModeCDC)
+			if err != nil {
+				t.Fatalf("first validation: %v", err)
+			}
+			if len(first) != 1 {
+				t.Fatalf("first validation kept %d rules, want 1 — the case proves nothing", len(first))
+			}
+			if !reflect.DeepEqual(raw, pristine) {
+				t.Errorf("validation rewrote its input:\n got %v\nwant %v", raw, pristine)
+			}
+			second, _, err := NormalizeAndValidate(raw, "orders", NormalizeModeCDC)
+			if err != nil {
+				t.Fatalf("the same chain validated a second time: %v", err)
+			}
+			if !reflect.DeepEqual(first, second) {
+				t.Errorf("a second validation gave a different chain:\n got %+v\nwant %+v", second, first)
+			}
+		})
 	}
 }

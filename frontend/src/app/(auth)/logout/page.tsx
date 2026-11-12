@@ -2,8 +2,8 @@
 
 import { Suspense, useEffect } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
+import { clearSignedInState } from "@/lib/auth/signed-in-state"
 import { API_GATEWAY_URL } from "@/lib/config/api"
-import { clearAllWorkspaceScopes } from "@/lib/workspace/scoped-storage"
 
 // Self-correcting base URL (see @/lib/config/api): a mis-baked localhost value
 // is ignored in favor of the current origin on a real deployment.
@@ -26,20 +26,8 @@ function LogoutContent() {
       } catch {
         // Ignore network failures; still clear client state and proceed.
       } finally {
-        if (typeof window !== "undefined") {
-          try {
-            localStorage.removeItem("user_id")
-            localStorage.removeItem("user_email")
-            localStorage.removeItem("user_role")
-            // Workspace-scoped keys: clear every workspace's slot, not just the
-            // one that happened to be active (mirrors lib/auth.ts logout()).
-            clearAllWorkspaceScopes("rsync_chat_session_id")
-            clearAllWorkspaceScopes("rsync_chat_ui_v2_state")
-            clearAllWorkspaceScopes("rsync_active_pipelines")
-          } catch {
-            // ignore
-          }
-        }
+        // The same list lib/auth.ts logout() clears, in every workspace.
+        clearSignedInState()
         if (!cancelled) {
           const next = searchParams.get("next")
           router.replace(next ? `/login?next=${encodeURIComponent(next)}` : "/login")

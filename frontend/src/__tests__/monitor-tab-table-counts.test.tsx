@@ -126,12 +126,12 @@ describe("Monitor tab — table counts reconcile with the total", () => {
     expect(total).toBe(5)
     expect(rows.map((r) => r.label)).toEqual([
       "Replicating",
-      "Tables degraded",
+      "Tables with rows not written",
       "Tables with no data yet",
     ]) // zero rows (failed) stay hidden
     expect(valueOf(rows, "Replicating")).toBe(2) // completed + running
     expect(valueOf(rows, "Tables with no data yet")).toBe(2)
-    expect(valueOf(rows, "Tables degraded")).toBe(1)
+    expect(valueOf(rows, "Tables with rows not written")).toBe(1)
     expectReconciles(rows, total)
   })
 

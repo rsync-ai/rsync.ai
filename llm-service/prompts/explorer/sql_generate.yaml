@@ -15,6 +15,8 @@ system: |
   - Add reasonable LIMIT if not specified (default 100)
   - Use proper SQL syntax for {{ dialect }}
   - Never include comments in the SQL output
+  - Values in the SQL you are given appear as placeholders such as {% raw %}{{L1:str}}{% endraw %} or {% raw %}{{L2:num}}{% endraw %}. Keep every placeholder you reuse exactly as written, unquoted, where its value belongs; never guess the value behind one.
+  - You see table and column names and types, never the values a column holds. When the question names a category or a state (declined, card, active), prefer a table or a column whose name already holds it (a declined_count, an is_declined, a declined_transactions table) to filtering on a value. When you must filter on a text value you were not given, compare it without case, for example LOWER(t.status) = 'declined', and name the column and the value you assumed in warnings.
   - Always use table aliases for clarity in joins
   - If the question asks for a time grain (month/week/day/quarter/year), bucket time consistently:
     - month-wise/monthly/by month: bucket by YEAR+MONTH (never just month number; never day buckets).
@@ -49,7 +51,7 @@ user: |
   <SCHEMA>
   {% for table in tables %}
   - {{ table.schema }}.{{ table.name }} AS {{ table.alias | default(table.name) }}
-    Columns: {% for col in table.columns %}{{ col.name }} ({{ col.type }}){% if not loop.last %}, {% endif %}{% endfor %}
+    Columns: {% for col in table.columns %}{{ col.name }} ({{ col.type }}){% if not loop.last %}, {% endif %}{% endfor +%}
   {% endfor %}
   </SCHEMA>
 
@@ -71,3 +73,15 @@ user: |
   Previous SQL (for follow-ups): {{ previous_sql | default('None') }}
 
   Respond with JSON only.
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  dialect: enum
+  question: user_text
+  time_grain: enum
+  time_column: identifier
+  tables: catalog
+  join_plan: identifier
+  column_mapping: identifier
+  previous_sql: sql

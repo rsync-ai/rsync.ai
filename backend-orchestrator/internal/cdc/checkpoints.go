@@ -77,58 +77,6 @@ func SaveCheckpoint(ctx context.Context, db *sql.DB, checkpoint Checkpoint) erro
 	return nil
 }
 
-// GetCheckpoints retrieves all checkpoints for a pipeline
-func GetCheckpoints(ctx context.Context, db *sql.DB, pipelineID string) ([]Checkpoint, error) {
-	query := `
-		SELECT id, pipeline_id, connection_id, source_table, cdc_resource_id, position, created_at, updated_at
-		FROM pipeline_checkpoints
-		WHERE pipeline_id = $1
-		ORDER BY source_table
-	`
-
-	rows, err := db.QueryContext(ctx, query, pipelineID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query checkpoints: %w", err)
-	}
-	defer rows.Close()
-
-	var checkpoints []Checkpoint
-	for rows.Next() {
-		var cp Checkpoint
-		var positionJSON []byte
-		var cdcResourceID sql.NullString
-
-		err := rows.Scan(
-			&cp.ID,
-			&cp.PipelineID,
-			&cp.ConnectionID,
-			&cp.SourceTable,
-			&cdcResourceID,
-			&positionJSON,
-			&cp.CreatedAt,
-			&cp.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan checkpoint: %w", err)
-		}
-
-		if cdcResourceID.Valid {
-			cp.CDCResourceID = &cdcResourceID.String
-		}
-
-		if len(positionJSON) > 0 {
-			if err := json.Unmarshal(positionJSON, &cp.Position); err != nil {
-				return nil, fmt.Errorf("%w: pipeline %s table %s: %v",
-					ErrCheckpointPositionUnreadable, pipelineID, cp.SourceTable, err)
-			}
-		}
-
-		checkpoints = append(checkpoints, cp)
-	}
-
-	return checkpoints, nil
-}
-
 // GetCheckpointForTable retrieves the checkpoint for a specific table
 func GetCheckpointForTable(ctx context.Context, db *sql.DB, pipelineID, table string) (*Checkpoint, error) {
 	query := `
@@ -265,6 +213,7 @@ func RewindCheckpointsOfExecution(ctx context.Context, db *sql.DB, pipelineID, e
 		return 0, fmt.Errorf("failed to begin checkpoint rewind: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	recordRewoundTables(ctx, tx, pipelineID, executionID)
 	restored, err := tx.ExecContext(ctx, `
 		UPDATE pipeline_checkpoints SET position = position->'run_start', updated_at = NOW()
 		WHERE pipeline_id = $1 AND position->>'execution_id' = $2
@@ -292,4 +241,35 @@ func RewindCheckpointsOfExecution(ctx context.Context, db *sql.DB, pipelineID, e
 		"deleted":      d,
 	}).Info("Rewound checkpoints of a run that lost batches")
 	return r + d, nil
+}
+
+// recordRewoundTables notes, in the rewind's transaction, each table whose
+// checkpoint is about to be rewound — the same rows the UPDATE and DELETE in
+// RewindCheckpointsOfExecution touch, read before they lose the execution id. The
+// table stats called every table short of rows "degraded"; this record is what lets
+// them say "Rewound" only for a run that was (migration 141).
+//
+// Under a savepoint: a record that fails (a gateway that has not applied migration
+// 141 yet) costs the label, never the rewind.
+func recordRewoundTables(ctx context.Context, tx *sql.Tx, pipelineID, executionID string) {
+	logger := log.WithFields(log.Fields{"pipeline_id": pipelineID, "execution_id": executionID})
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT record_rewound_tables`); err != nil {
+		logger.WithError(err).Warn("could not record the tables this rewind touches; the table stats will not say they were rewound")
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pipeline_run_rewinds (pipeline_id, execution_id, source_table)
+		SELECT pipeline_id, $2, source_table FROM pipeline_checkpoints
+		WHERE pipeline_id = $1 AND position->>'execution_id' = $2 AND jsonb_typeof(position->'run_start') = 'object'
+		ON CONFLICT (pipeline_id, execution_id, source_table) DO UPDATE SET rewound_at = NOW()`,
+		pipelineID, executionID); err != nil {
+		logger.WithError(err).Warn("could not record the tables this rewind touches; the table stats will not say they were rewound")
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT record_rewound_tables`); err != nil {
+			logger.WithError(err).Warn("could not roll back the rewind record")
+		}
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT record_rewound_tables`); err != nil {
+		logger.WithError(err).Warn("could not release the rewind record's savepoint")
+	}
 }

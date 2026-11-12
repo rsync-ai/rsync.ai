@@ -21,6 +21,7 @@
   "supports_ddl": false,
   "auto_create_destination_tables": false,
   "spec_version": "1.1",
+  "source": "generated",
   "generated_at": "2026-06-19T14:11:28.695382",
   "status": "active",
   "quality_tier": "silver",
@@ -41,7 +42,10 @@
   "required_config": [
     "access_token"
   ],
-  "optional_config": [],
+  "optional_config": [
+    "owner",
+    "repo"
+  ],
   "configuration_schema": {
     "type": "object",
     "properties": {
@@ -49,6 +53,16 @@
         "type": "string",
         "description": "GitHub personal access token, sent as a Bearer token in the Authorization header.",
         "secret": true
+      },
+      "owner": {
+        "type": "string",
+        "description": "Repository owner (user or organization) for the issues, pulls and commits resources.",
+        "ui_tier": "basic"
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name for the issues, pulls and commits resources.",
+        "ui_tier": "basic"
       }
     },
     "required": [
@@ -62,6 +76,16 @@
         "type": "string",
         "description": "GitHub personal access token, sent as a Bearer token in the Authorization header.",
         "secret": true
+      },
+      "owner": {
+        "type": "string",
+        "description": "Repository owner (user or organization) for the issues, pulls and commits resources.",
+        "ui_tier": "basic"
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name for the issues, pulls and commits resources.",
+        "ui_tier": "basic"
       }
     },
     "required": [
@@ -147,6 +171,30 @@
       "type": "source",
       "description": "Export records from licenses (/licenses)",
       "method": "github-rest_licenses"
+    },
+    {
+      "name": "repos",
+      "type": "source",
+      "description": "Export records from repos (/user/repos)",
+      "method": "github-rest_repos"
+    },
+    {
+      "name": "issues",
+      "type": "source",
+      "description": "Export records from issues (/repos/{owner}/{repo}/issues)",
+      "method": "github-rest_issues"
+    },
+    {
+      "name": "pulls",
+      "type": "source",
+      "description": "Export records from pulls (/repos/{owner}/{repo}/pulls)",
+      "method": "github-rest_pulls"
+    },
+    {
+      "name": "commits",
+      "type": "source",
+      "description": "Export records from commits (/repos/{owner}/{repo}/commits)",
+      "method": "github-rest_commits"
     }
   ],
   "resources": [
@@ -165,6 +213,79 @@
       "supports": [
         "list",
         "get"
+      ]
+    },
+    {
+      "name": "repos",
+      "endpoint": "/user/repos",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "link",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "per_page",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    },
+    {
+      "name": "issues",
+      "endpoint": "/repos/{owner}/{repo}/issues",
+      "path_params": [
+        "owner",
+        "repo"
+      ],
+      "id_field": "id",
+      "pagination_type": "link",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "per_page",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    },
+    {
+      "name": "pulls",
+      "endpoint": "/repos/{owner}/{repo}/pulls",
+      "path_params": [
+        "owner",
+        "repo"
+      ],
+      "id_field": "id",
+      "pagination_type": "link",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "per_page",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    },
+    {
+      "name": "commits",
+      "endpoint": "/repos/{owner}/{repo}/commits",
+      "path_params": [
+        "owner",
+        "repo"
+      ],
+      "id_field": "sha",
+      "pagination_type": "link",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "per_page",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list"
       ]
     }
   ],

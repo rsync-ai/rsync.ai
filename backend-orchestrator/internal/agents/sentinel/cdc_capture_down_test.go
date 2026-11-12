@@ -34,7 +34,7 @@ func captureRows() *sqlmock.Rows {
 }
 
 func expectCaptureIssueInsert(mock sqlmock.Sqlmock, pid string) {
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
 		WithArgs(
 			captureStoppedIssueID(pid),
 			string(IssueTypeCaptureStopped),
@@ -44,7 +44,7 @@ func expectCaptureIssueInsert(mock sqlmock.Sqlmock, pid string) {
 			sqlmock.AnyArg(),
 			sqlmock.AnyArg(),
 		).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(detectedAtRow())
 }
 
 // TestDeadCaptureIsSurfacedEvenWhenConnectIsUnreachable drives the real tick,
@@ -116,9 +116,9 @@ func TestCaptureDownVerdict(t *testing.T) {
 			if tc.raise {
 				expectCaptureIssueInsert(mock, captureTestPID)
 			} else {
-				mock.ExpectExec(regexp.QuoteMeta("DELETE FROM sentinel_active_issues WHERE id = $1")).
+				mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM sentinel_active_issues WHERE id = $1 RETURNING severity, detected_at")).
 					WithArgs(captureStoppedIssueID(captureTestPID)).
-					WillReturnResult(sqlmock.NewResult(0, 0))
+					WillReturnRows(sqlmock.NewRows([]string{"severity", "detected_at"})) // nothing was open
 			}
 
 			s.surfaceCaptureDown(context.Background())
@@ -156,10 +156,10 @@ func TestCaptureStoppedDescriptionFollowsTheHealerRule(t *testing.T) {
 		var desc string
 		mock.ExpectQuery(regexp.QuoteMeta("FROM pipeline_dependencies d")).
 			WillReturnRows(captureRows().AddRow(captureTestPID, "cdc-11111111", "unhealthy", lastError, CaptureDownFloor))
-		mock.ExpectExec(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
 			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 				descCapture{&desc}, sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
+			WillReturnRows(detectedAtRow())
 		s.surfaceCaptureDown(context.Background())
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("no issue raised: %v", err)

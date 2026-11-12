@@ -13,7 +13,7 @@
 #                               bump, not a piecemeal Dependabot PR.
 version: 2
 updates:
-  # ---- Go modules: 3 services + 4 shared libs + kafka-mcp-sink worker ----
+  # ---- Go modules: 3 services + 6 shared libs + kafka-mcp-sink worker ----
   - package-ecosystem: "gomod"
     directories:
       - "/api-gateway"
@@ -23,6 +23,8 @@ updates:
       - "/shared/go/crypto"
       - "/shared/go/naming"
       - "/shared/go/transforms"
+      - "/shared/go/workflowdef"
+      - "/shared/go/sqlexec"
       - "/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
     schedule:
       interval: "monthly"
@@ -164,7 +166,7 @@ updates:
   #
   # This list was the five service directories only, which left the base image of
   # SEVEN published images unwatched -- every one of them built by
-  # docker-publish.yml: connector-deployer (moby/buildkit + golang:1.25), the
+  # docker-publish.yml: connector-deployer (moby/buildkit + golang:1.26), the
   # Kafka Connect image (maven/eclipse-temurin), the connector seed (busybox),
   # and the context7, kafka-mcp-sink, debezium and minio internal connectors.
   # Nothing proposed a bump for those, so a base-image CVE there had no fix PR at

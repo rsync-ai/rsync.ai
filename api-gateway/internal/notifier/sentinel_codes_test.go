@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"testing"
 )
 
@@ -56,4 +57,69 @@ func TestEverySentinelCodeHasCopy(t *testing.T) {
 		}
 	}
 	t.Logf("checked %d sentinel codes against the catalog", len(codes))
+}
+
+// The same drift can hit the other direction: a resolved notice a producer sends that
+// resolvedPairs does not know is delivered as a plain info notice with no dedup
+// pairing or "was the alert pushed" gate, and one in resolvedPairs that no producer
+// sends is dead policy. So the set of resolved codes the two producers write must
+// equal the set the gateway pairs, and each must have copy and a category.
+func TestEveryResolvedCodeAProducerSendsIsPairedHere(t *testing.T) {
+	root := filepath.Join("..", "..", "..")
+	producers := []struct {
+		path string
+		re   *regexp.Regexp
+	}{
+		// The sentinel names its resolved codes in a field called resolvedCode, so
+		// TestEverySentinelCodeHasCopy's `code:` scan, which requires critical, skips them.
+		{filepath.Join(root, "backend-orchestrator", "internal", "agents", "sentinel", "resolved_notice.go"),
+			regexp.MustCompile(`(?m)^\s*resolvedCode:\s*"([A-Z0-9_]+)"`)},
+		{filepath.Join(root, "api-gateway", "internal", "handlers", "core_service_watch.go"),
+			regexp.MustCompile(`"([A-Z0-9_]+_RESOLVED)"`)},
+	}
+
+	sent := map[string]bool{}
+	for _, p := range producers {
+		src, err := os.ReadFile(p.path)
+		if err != nil {
+			t.Fatalf("cannot read the resolved-notice producer at %s: %v\n"+
+				"If it moved, update this path — do not delete the check.", p.path, err)
+		}
+		matches := p.re.FindAllStringSubmatch(string(src), -1)
+		if len(matches) == 0 {
+			t.Fatalf("parsed 0 resolved codes out of %s — the producer's shape changed and "+
+				"this check silently stopped checking anything", p.path)
+		}
+		for _, m := range matches {
+			sent[m[1]] = true
+		}
+	}
+
+	for code := range sent {
+		if _, ok := resolvedPairs[code]; !ok {
+			t.Errorf("a producer sends %s but resolvedPairs does not pair it with an alert, "+
+				"so the gateway would deliver it ungated", code)
+		}
+		entry, ok := catalog[code]
+		switch {
+		case !ok:
+			t.Errorf("a producer sends %s but no catalog entry renders it", code)
+		case entry.Severity != severityInfo:
+			t.Errorf("%s severity = %q, want %q", code, entry.Severity, severityInfo)
+		}
+		if _, ok := codeCategory[code]; !ok {
+			t.Errorf("%s has no category, so its alert's mutes would not silence it", code)
+		}
+	}
+	var unsent []string
+	for code := range resolvedPairs {
+		if !sent[code] {
+			unsent = append(unsent, code)
+		}
+	}
+	sort.Strings(unsent)
+	if len(unsent) > 0 {
+		t.Errorf("resolvedPairs has codes no producer sends: %v", unsent)
+	}
+	t.Logf("checked %d resolved codes against the producers", len(sent))
 }

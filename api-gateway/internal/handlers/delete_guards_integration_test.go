@@ -635,6 +635,8 @@ func TestDGDeleteConnection_ForceDeletesAndSaysWhatToDrop(t *testing.T) {
 	dgCDC(t, conn, c, "publication", pub, "failed", "postgresql")
 	dgCDC(t, conn, c, "replication_slot", "rsync_slot_old", "deleted", "postgresql")
 
+	// A stand-in orchestrator that drops nothing: what is recorded stays undropped.
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	w := dgServe(dgRouter(f.user, f.ws), "/api/v1/connections/"+c+"?force=true")
 
 	if w.Code != http.StatusOK {
@@ -669,6 +671,8 @@ func TestDGDeleteConnection_ForceStillRefusesForPipelines(t *testing.T) {
 	dgCDC(t, conn, c, "replication_slot", "rsync_slot_inuse", "active", "postgresql")
 	dgPipeline(t, conn, f.ws, f.user, c, "running")
 
+	// A stand-in orchestrator that drops nothing: what is recorded stays undropped.
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	w := dgServe(dgRouter(f.user, f.ws), "/api/v1/connections/"+c+"?force=true")
 
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"pipeline_count":1`) {
@@ -776,6 +780,8 @@ func TestDGDeleteConnection_ForceWarnsAboutASlotRecordBeingWritten(t *testing.T)
 		t.Fatalf("insert cdc_resources: %v", err)
 	}
 
+	// A stand-in orchestrator that drops nothing: what is recorded stays undropped.
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	done := dgServeAsync(dgRouter(f.user, f.ws), "/api/v1/connections/"+c+"?force=true")
 	if w, blocked := dgWaitBlockedOrDone(t, conn, done); !blocked {
 		t.Fatalf("force delete answered %d before the slot record committed; it must wait for it: %s", w.Code, w.Body.String())

@@ -57,7 +57,7 @@ import {
   usePipelineStatePoll,
 } from "@/lib/hooks/usePipelineStatePoll"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
-import { PipelineExecutionStatusBadge } from "@/components/pipeline/PipelineExecutionStatusBadge"
+import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 import { PipelineActions } from "@/components/pipeline/PipelineActions"
 import { CDCPipelineActions } from "@/components/pipeline/CDCPipelineActions"
 import { PipelineHeaderOverflowMenu } from "@/components/pipeline/PipelineHeaderOverflowMenu"
@@ -126,7 +126,7 @@ describe("the pipeline page header", () => {
     vi.useFakeTimers()
     render(
       <>
-        <PipelineExecutionStatusBadge pipelineId="p1" />
+        <PipelineHealthHeader pipelineId="p1" />
         <PipelineActions pipelineId="p1" status="running" />
         <CDCPipelineActions pipelineId="p1" pipelineName="P1" status="running" />
         <PipelineHeaderOverflowMenu pipelineId="p1" pipelineName="P1" pipelineType="cdc" status="running" />

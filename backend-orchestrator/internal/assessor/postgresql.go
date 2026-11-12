@@ -398,7 +398,8 @@ func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcD
 	if !tableExists {
 		// The CDC_ prefix is historical — see the identical note in
 		// assessor/mysql.go oneMySQLTablePKCheck. A plain BATCH pipeline into a
-		// relational destination raises this too, and SeverityError BLOCKS the run.
+		// relational destination raises this too, and SeverityError BLOCKS the run
+		// (the same batch drift exception applies).
 		return Check{
 			Code: "CDC_TABLE_NOT_FOUND_IN_SOURCE", Severity: SeverityError, Passed: false,
 			Message: fmt.Sprintf("Table %s.%s does not exist in source", schema, table),
@@ -414,12 +415,17 @@ func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcD
 		}
 	}
 
+	// pg_catalog, not information_schema.table_constraints: that view hides
+	// every table the user neither owns nor holds a non-SELECT privilege on,
+	// so a read-only source user's keyed table was reported keyless.
 	var hasPK bool
 	err = db.QueryRowContext(ctx, `
 		SELECT EXISTS (
 			SELECT 1
-			FROM information_schema.table_constraints
-			WHERE table_schema = $1 AND table_name = $2 AND constraint_type = 'PRIMARY KEY'
+			FROM pg_catalog.pg_constraint con
+			JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'p'
 		)`,
 		schema, table,
 	).Scan(&hasPK)

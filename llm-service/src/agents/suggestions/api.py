@@ -159,8 +159,11 @@ async def generate_data_suggestions(request: SuggestionsRequest):
                 )
             else:
                 error_code = "internal_error"
+                # err_str can quote a provider reply or a database error; the
+                # log above keeps it, the response does not.
+                logger.warning("suggestion workflow error: %s", err_str)
                 error_msg = (
-                    f"Partial failure during suggestion generation: {err_str}. "
+                    "Partial failure during suggestion generation. "
                     "You can apply the suggestions shown or continue without."
                 )
 
@@ -190,7 +193,7 @@ async def generate_data_suggestions(request: SuggestionsRequest):
             total_suggestions=0,
             error_code="internal_error",
             error=(
-                f"Suggestion service hit an unexpected error: {type(e).__name__}: {e}. "
+                f"Suggestion service hit an unexpected error ({type(e).__name__}). "
                 "You can continue without transforms — the pipeline will sync "
                 "the raw schema as-is."
             ),

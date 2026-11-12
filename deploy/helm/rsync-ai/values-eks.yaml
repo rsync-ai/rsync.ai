@@ -114,7 +114,7 @@ redis:
 # What is missing is the other two thirds of the platform:
 #   * llm-service lists AWS_MSK_IAM as unimplemented — the token would have to
 #     be a SigV4 signature and that module does not sign one
-#     (src/utils/kafka_security.py:123).
+#     (src/utils/kafka_security.py:121).
 #   * the Kafka Connect image ships no aws-msk-iam-auth jar, so there is no JAAS
 #     login module for the CDC plane to name.
 #   * this chart has no kafka.external.awsRegion knob, so even the Go half would

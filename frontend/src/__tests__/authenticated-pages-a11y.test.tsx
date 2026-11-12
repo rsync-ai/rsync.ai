@@ -1,41 +1,51 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
-import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, render, screen, waitFor, within } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import axe from "axe-core"
 
 import SettingsPage from "@/app/(dashboard)/settings/page"
 import ConnectionsPage from "@/app/(dashboard)/connections/page"
+import { PipelinesPageClient } from "@/app/(dashboard)/pipelines/PipelinesPageClient"
+import HomePage from "@/app/(dashboard)/page"
 import { Sidebar } from "@/components/layout/Sidebar"
 import { AgenticPipelineHome } from "@/components/chat/AgenticPipelineHome"
+import { ChatInputBar } from "@/components/chat/ChatInputBar"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { featureFlagsManager } from "@/config/features"
 
-// KI-AXE-VIOLATIONS-ON-AUTHENTICATED-PAGES (was KI-2). The Playwright a11y suite (`npm run test:a11y`) is the only thing that can
-// measure these routes end to end, and it CANNOT run them in CI: the frontend-a11y
-// job starts no api-gateway, so `e2e/fixtures/auth.setup.ts` skips on its :5001
-// health probe and all four authenticated specs in `e2e/a11y/authenticated_pages.spec.ts`
-// self-skip — a skip that reads as a pass in the report.
+// KI-AXE-VIOLATIONS-ON-AUTHENTICATED-PAGES (was KI-2). The Playwright a11y suite
+// (`npm run test:a11y`) measures these routes end to end in Chromium, signed in to a
+// stub api-gateway (e2e/fixtures/a11y-api-stub.mjs) — but only nightly and on manual
+// dispatch, not on PRs, and only on an empty workspace.
 //
-// This file is the guard that actually runs on every PR: `src/__tests__/**` is in the
+// This file is the guard that runs on every PR: `src/__tests__/**` is in the
 // vitest `include` list, and ci.yml runs `npm test` in the `frontend` job. It renders
 // the same components under jsdom and applies the SAME blocking bar as the Playwright
-// spec (`e2e/a11y/authenticated_pages.spec.ts:33` — zero serious/critical violations
+// spec (`e2e/a11y/authenticated_pages.spec.ts:17` — zero serious/critical violations
 // under wcag2a/wcag2aa/wcag21a/wcag21aa), so the two gates agree on what "blocking" means.
 //
 // SCOPE — this is a name/role/label gate, NOT a contrast gate. `color-contrast` is
 // explicitly disabled because jsdom has no layout and no paint: the rule needs real
 // computed colours (and `HTMLCanvasElement.getContext`, which jsdom does not implement),
-// so it can only ever return `incomplete`, never `violations`. Contrast on these routes
-// stays unmeasured until `npm run test:a11y` runs against a live stack.
+// so it can only ever return `incomplete`, never `violations`. Contrast is the
+// Playwright suite's job. What jsdom CAN see is the class behind the contrast failures
+// that suite reported on /pipelines and the old /dashboard (now Home): see
+// faintLightModeText below.
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn(), replace: vi.fn() }),
   usePathname: () => "/settings",
+  useSearchParams: () => new URLSearchParams(),
 }))
+// Home (/) is an async server component: it forwards the request cookies and
+// fetches the gateway itself for the first-run checklist, so both are stubbed.
+vi.mock("next/headers", () => ({ cookies: async () => ({ getAll: () => [] }) }))
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ resolvedTheme: "light", setTheme: vi.fn() }),
+  useTheme: () => ({ theme: "light", resolvedTheme: "light", setTheme: vi.fn() }),
 }))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
@@ -88,6 +98,17 @@ async function blockingViolations(container: HTMLElement): Promise<string[]> {
     .map((v) => `${v.id} (${v.impact}) x${v.nodes.length}`)
 }
 
+/**
+ * Text drawn in light-mode `text-zinc-400` (#a1a1aa): 2.6:1 on white, under both the
+ * 4.5:1 AA bar and the 3:1 large-text one. `[class~=…]` matches the bare token only,
+ * so `dark:text-zinc-400` (on a dark background) passes. Icons are not text.
+ */
+function faintLightModeText(container: HTMLElement): string[] {
+  return Array.from(container.querySelectorAll<HTMLElement>("[class~='text-zinc-400']"))
+    .filter((el) => !(el instanceof SVGElement) && el.textContent?.trim())
+    .map((el) => el.textContent!.trim().slice(0, 40))
+}
+
 beforeAll(() => {
   // Radix (Switch, DropdownMenu, AlertDialog, ScrollArea) observes element size.
   window.ResizeObserver ||= class {
@@ -102,7 +123,7 @@ beforeEach(() => {
 })
 
 describe("authenticated pages — no serious/critical axe violations", () => {
-  it("/settings", async () => {
+  it("/settings, every tab", async () => {
     mockFetch.mockImplementation((url: string) => {
       if (url === API_ENDPOINTS.NOTIFICATIONS.PREFERENCES) {
         return Promise.resolve(
@@ -117,16 +138,35 @@ describe("authenticated pages — no serious/critical axe violations", () => {
           }),
         )
       }
+      if (url === API_ENDPOINTS.AGENT_TOKENS.LIST) return Promise.resolve(res({ tokens: [] }))
       return Promise.resolve(res({ name: "Ada Lovelace", email: "ada@example.com" }))
     })
+    act(() => featureFlagsManager.updateFlags({ agentGateway: true }))
 
-    const { container } = render(<SettingsPage />)
-    // Wait for the profile GET and the preferences GET to land, so the real
-    // (non-empty) form and the real notification switches are measured.
-    await waitFor(() => expect(screen.getByDisplayValue("ada@example.com")).toBeInTheDocument())
-    await waitFor(() => expect(screen.getByRole("switch", { name: "Email: Run failed or stopped" })).toBeInTheDocument())
+    try {
+      const { container } = render(<SettingsPage />)
+      // An inactive tab is not in the DOM, so each tab is opened and measured in
+      // turn, once its data has landed (the real form, switches and token list).
+      const measured: Record<string, string[]> = {}
+      await waitFor(() => expect(screen.getByLabelText("Email")).toHaveValue("ada@example.com"))
+      measured.Account = await blockingViolations(container)
 
-    expect(await blockingViolations(container)).toEqual([])
+      await userEvent.click(screen.getByRole("tab", { name: "Email alerts" }))
+      await screen.findByRole("switch", { name: "Email: Run failed or stopped" })
+      measured["Email alerts"] = await blockingViolations(container)
+
+      await userEvent.click(screen.getByRole("tab", { name: "AI apps" }))
+      await screen.findByText(/no agent tokens/i)
+      measured["AI apps"] = await blockingViolations(container)
+
+      await userEvent.click(screen.getByRole("tab", { name: "Appearance" }))
+      await screen.findByRole("button", { name: "System" })
+      measured.Appearance = await blockingViolations(container)
+
+      expect(measured).toEqual({ Account: [], "Email alerts": [], "AI apps": [], Appearance: [] })
+    } finally {
+      act(() => featureFlagsManager.resetFlags())
+    }
   })
 
   it("/connections", async () => {
@@ -162,14 +202,146 @@ describe("authenticated pages — no serious/critical axe violations", () => {
     expect(await blockingViolations(container)).toEqual([])
   })
 
-  it("/chat landing (AgenticPipelineHome)", async () => {
-    mockFetch.mockImplementation(() => Promise.resolve(res({ connections: [], pipelines: [], total: 0 })))
+  it("/pipelines", async () => {
+    // As for /connections: the row's actions only exist once a pipeline is listed.
+    mockFetch.mockImplementation((url: string) => {
+      if (url.startsWith(`${API_ENDPOINTS.PIPELINES.LIST}?`)) {
+        return Promise.resolve(
+          res({
+            pipelines: [
+              {
+                id: "pipe-1",
+                name: "Orders to warehouse",
+                pipeline_status: "active",
+                derived_status: "completed",
+                sync_mode: "batch",
+                created_at: "2026-01-02T03:04:05Z",
+                updated_at: "2026-01-02T03:04:05Z",
+                source_connection: { id: "c1", name: "Orders PG", connector_type: "postgresql" },
+                destination_connection: { id: "c2", name: "Lake", connector_type: "gcs" },
+                last_execution: { id: "e1", status: "completed" },
+              },
+            ],
+            pagination: { page: 1, per_page: 25, total: 1, total_pages: 1, has_next: false, has_prev: false },
+          }),
+        )
+      }
+      return Promise.resolve(res({}))
+    })
 
-    const { container } = render(<AgenticPipelineHome onSubmit={() => {}} />)
-    // Type an intent so the icon-only submit arrow is enabled — the state a user
-    // actually reaches it in (#47 prod retest: it had no accessible name).
-    fireEvent.change(screen.getByPlaceholderText(/sync mysql to s3/), { target: { value: "sync pg to gcs" } })
-    expect(screen.getByRole("button", { name: "Start pipeline chat" })).toBeEnabled()
+    const { container } = render(<PipelinesPageClient />)
+    await waitFor(() => expect(screen.getByText("Orders to warehouse")).toBeInTheDocument())
+
+    expect(await blockingViolations(container)).toEqual([])
+    expect(faintLightModeText(container)).toEqual([])
+  })
+
+  it("/ (Home), with and without a model", async () => {
+    // A workspace with something in every card and one run of each outcome, so
+    // the attention list, the status badges, the run links and the run charts are
+    // all measured: an empty Home would pass vacuously. The SSR checklist read sees no
+    // connections, so the first-run checklist renders too.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ total: 0, pipelines: [], connections: [] }) })),
+    )
+    const now = new Date().toISOString()
+    mockFetch.mockImplementation((url: string) => {
+      const path = url.replace(/^https?:\/\/[^/]+/, "")
+      if (path.startsWith("/api/v1/pipelines?status=failed")) {
+        return Promise.resolve(res({ total: 1, pipelines: [{ id: "p1", name: "Orders to warehouse" }] }))
+      }
+      if (path.startsWith("/api/v1/pipelines?status=")) return Promise.resolve(res({ total: 0, pipelines: [] }))
+      if (path.startsWith("/api/v1/pipelines")) return Promise.resolve(res({ total: 3, pipelines: [] }))
+      if (path.startsWith("/api/v1/explorer/schedules")) {
+        return Promise.resolve(res({ schedules: [{ schedule_id: "s1", saved_query_id: "q1", name: "Daily revenue", status: "active" }] }))
+      }
+      if (path.startsWith("/api/v1/explorer/freshness")) return Promise.resolve(res({ breaches: [] }))
+      if (path.startsWith("/api/v1/workflows")) {
+        return Promise.resolve(res({ workflows: [{ id: "w1", name: "Weekly report", status: "active" }] }))
+      }
+      if (path.startsWith("/api/v1/activity/metrics")) {
+        const day = now.slice(0, 10)
+        return Promise.resolve(
+          res({
+            days: [day],
+            time_zone: "UTC",
+            pipeline_runs: [{ day, status: "failed", count: 1 }],
+            rows_written: [{ day, rows: 10 }],
+          }),
+        )
+      }
+      if (path.startsWith("/api/v1/activity")) {
+        const run = (id: string, kind: string, name: string, status: string) => ({
+          kind, id, subject_id: `${id}-subject`, subject_name: name, status,
+          source_status: status, trigger: "schedule", started_at: now,
+        })
+        return Promise.resolve(
+          res({
+            runs: [
+              run("e1", "pipeline", "Orders to warehouse", "failed"),
+              run("e2", "scheduled_query", "Daily revenue", "succeeded"),
+              run("e3", "workflow", "Weekly report", "running"),
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(res({}))
+    })
+
+    try {
+      // No model: the box is the pipeline builder, with the Tab hint and the note.
+      act(() => {
+        featureFlagsManager.updateFlags({ assistant: true, llmConfigured: false })
+        featureFlagsManager.markResolved()
+      })
+      const { container } = render(await HomePage())
+      // Both landed: the failed pipeline is in the attention list AND the runs.
+      await waitFor(() => expect(screen.getAllByRole("link", { name: /Orders to warehouse/ }).length).toBe(2))
+      // And the Activity card drew its six run charts.
+      await waitFor(() => expect(within(screen.getByRole("region", { name: "Activity" })).getAllByRole("figure")).toHaveLength(6))
+      expect(screen.getByRole("heading", { name: "Create a pipeline" })).toBeInTheDocument()
+      expect(screen.getByText("to use the suggestion")).toBeInTheDocument()
+      const measured: Record<string, string[]> = {}
+      measured.builder = [...(await blockingViolations(container)), ...faintLightModeText(container)]
+
+      // With a model: the box is Ask rsync.ai.
+      act(() => featureFlagsManager.updateFlags({ llmConfigured: true }))
+      await screen.findByRole("heading", { name: "Ask rsync.ai" })
+      measured.assistant = [...(await blockingViolations(container)), ...faintLightModeText(container)]
+
+      expect(measured).toEqual({ builder: [], assistant: [] })
+    } finally {
+      act(() => featureFlagsManager.resetFlags())
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("/chat landing (AgenticPipelineHome)", async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(res({ connections: [] })))
+
+    // The landing over the chat's box, the page's only box, with an intent typed so
+    // its icon-only send button is enabled: the state a user reaches it in (#47
+    // prod retest: the landing's own box, since removed, had a send arrow with no
+    // accessible name).
+    const { container } = render(
+      <>
+        <AgenticPipelineHome onSubmit={() => {}} onPrefill={() => {}} onCustom={() => {}} />
+        <ChatInputBar
+          input="sync pg to gcs"
+          onInputChange={() => {}}
+          isSendingMessage={false}
+          pipelineId={undefined}
+          isPipelineDone={false}
+          executionFailed={false}
+          onStartNew={() => {}}
+          onViewPipeline={() => {}}
+          onRetry={() => {}}
+        />
+      </>,
+    )
+    await screen.findByText("Example pipelines")
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled()
 
     expect(await blockingViolations(container)).toEqual([])
   })

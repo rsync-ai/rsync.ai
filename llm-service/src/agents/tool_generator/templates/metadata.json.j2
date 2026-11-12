@@ -19,8 +19,15 @@
   "destination_modes": {{ (spec.destination_modes or []) | tojson }},
   "supports_cdc": {{ spec.supports_cdc | tojson }},
   "supports_ddl": {{ spec.supports_ddl | tojson }},
-  "auto_create_destination_tables": {{ spec.auto_create_destination_tables | tojson }},
+  "auto_create_destination_tables": {{ spec.auto_create_destination_tables | tojson }},{#
+  record_ids: this destination addresses each record by the id its API assigned,
+  which only the batch lane's key map knows, so the gateway refuses a CDC pipeline
+  into it (api-gateway preflight_pipeline.go). Same condition as the
+  get_capabilities entry in connector.py.j2; test_metadata_declares_record_ids.py
+  holds the two equal. #}{% if connector_template == 'connector.py.j2' and spec.supports_destination and spec.category.value == 'api_saas' %}
+  "record_ids": true,{% endif %}
   "spec_version": "{{ spec.spec_version }}",
+  "source": {{ (spec.source or 'generated') | tojson }},
   "generated_at": "{{ generation_timestamp }}",
   "status": "{{ spec.status or 'active' if (spec.quality_tier and spec.quality_tier != 'draft') else (spec.status or 'draft') }}",{% if spec.quality_tier %}
   "quality_tier": "{{ spec.quality_tier }}",{% endif %}{% if spec.quality_score is not none %}
@@ -84,7 +91,8 @@
         "ui_widget": {{ field.ui_widget | tojson }}{% endif %}{% if field.ui_order is not none %},
         "ui_order": {{ field.ui_order }}{% endif %}{% if field.ui_placeholder %},
         "ui_placeholder": {{ field.ui_placeholder | tojson }}{% endif %}{% if field.ui_help_text %},
-        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.pattern %},
+        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.ui_tier %},
+        "ui_tier": {{ field.ui_tier | tojson }}{% endif %}{% if field.pattern %},
         "pattern": {{ field.pattern | tojson }}{% endif %}{% if field.min_length is not none %},
         "minLength": {{ field.min_length }}{% endif %}{% if field.max_length is not none %},
         "maxLength": {{ field.max_length }}{% endif %}{% if field.minimum is not none %},
@@ -115,7 +123,8 @@
         "ui_widget": {{ field.ui_widget | tojson }}{% endif %}{% if field.ui_order is not none %},
         "ui_order": {{ field.ui_order }}{% endif %}{% if field.ui_placeholder %},
         "ui_placeholder": {{ field.ui_placeholder | tojson }}{% endif %}{% if field.ui_help_text %},
-        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.pattern %},
+        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.ui_tier %},
+        "ui_tier": {{ field.ui_tier | tojson }}{% endif %}{% if field.pattern %},
         "pattern": {{ field.pattern | tojson }}{% endif %}{% if field.min_length is not none %},
         "minLength": {{ field.min_length }}{% endif %}{% if field.max_length is not none %},
         "maxLength": {{ field.max_length }}{% endif %}{% if field.minimum is not none %},

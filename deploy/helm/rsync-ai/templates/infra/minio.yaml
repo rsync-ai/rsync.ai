@@ -69,6 +69,17 @@ spec:
                 secretKeyRef:
                   name: {{ include "rsync-ai.secretName" . }}
                   key: MINIO_SECRET_KEY
+            # SSE-S3 for the claim-check objects minio-mcp writes encrypted.
+            # Optional: an existingSecret made before this key existed has no such
+            # entry, and a required ref would hold the pod in
+            # CreateContainerConfigError. Absent, MinIO refuses SSE and objects are
+            # stored unencrypted (minio-mcp logs "MinIO SSE (AES256) rejected").
+            - name: MINIO_KMS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: MINIO_KMS_SECRET_KEY
+                  optional: true
           ports:
             - name: api
               containerPort: 9000

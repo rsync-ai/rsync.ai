@@ -399,6 +399,63 @@ type setModelFreshnessRequest struct {
 	DeadlineSeconds *int `json:"deadline_seconds"`
 }
 
+// GetSavedQueryFreshness answers the model page's freshness row: the deadline, and the
+// longest the model's schedule can leave between two rebuilds (modelRebuildInterval),
+// so the page can say when the deadline is shorter than that and the model will show
+// Overdue between builds by design.
+// GET /api/v1/explorer/saved/:id/freshness
+//
+// rebuild_interval_seconds is null when the interval cannot be known — a CDC pipeline in
+// the chain, nothing scheduled — and when working it out failed: the interval only
+// decides whether a warning shows, so a failure costs the warning, not the deadline.
+func GetSavedQueryFreshness(c *gin.Context) {
+	database := db.GetDB()
+	if database == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
+		return
+	}
+	if !requireVisibleSavedQuery(c, id, security.WSViewer) {
+		return
+	}
+	workspaceID, ok := resolveActiveWorkspace(c)
+	if !ok {
+		return
+	}
+
+	var deadline sql.NullInt64
+	err := database.QueryRowContext(c.Request.Context(), `
+		SELECT freshness_deadline_seconds FROM saved_queries WHERE id = $1 AND workspace_id = $2
+	`, id, workspaceID).Scan(&deadline)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "saved query not found"})
+		return
+	}
+	if err != nil {
+		log.WithError(err).WithField("model_id", id).Error("failed to read freshness deadline")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read freshness deadline"})
+		return
+	}
+
+	out := gin.H{"saved_query_id": id, "deadline_seconds": nil, "rebuild_interval_seconds": nil}
+	if deadline.Valid {
+		out["deadline_seconds"] = deadline.Int64
+	}
+	interval, err := modelRebuildInterval(c.Request.Context(), database, workspaceID, id, time.Now())
+	switch {
+	case err != nil:
+		log.WithError(err).WithField("model_id", id).Warn("rebuild interval unavailable")
+	case interval.Known:
+		out["rebuild_interval_seconds"] = interval.Seconds
+	}
+	c.JSON(http.StatusOK, out)
+}
+
 // SetSavedQueryFreshness declares — or withdraws — a freshness promise about a model's
 // target table.
 // PUT /api/v1/explorer/saved/:id/freshness

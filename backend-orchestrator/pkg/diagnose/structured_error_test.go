@@ -198,6 +198,19 @@ func TestRefinement_MongoDBResumeTokenInvalid(t *testing.T) {
 	if se.Remediation == nil || len(se.Remediation.CommandsToRun) == 0 {
 		t.Fatal("expected CommandsToRun (oplog sizing) for resume-token invalidation")
 	}
+	// The healer never re-snapshots on its own (ReSnapshotExecutor is not
+	// HITL-safe and the rule sits below the auto band), and Resume or Reload keep
+	// the lost position. The copy once promised an automatic re-snapshot and told
+	// the user to resume — a fix that fails the same way.
+	text := strings.ToLower(se.UserMessage + " " + strings.Join(se.Remediation.Steps, " "))
+	for _, promise := range []string{"rsync.ai re-snapshots", "no manual", "resume this pipeline"} {
+		if strings.Contains(text, promise) {
+			t.Errorf("remediation says %q, which nothing does: %q", promise, text)
+		}
+	}
+	if !strings.Contains(text, "reset_offsets") {
+		t.Errorf("remediation does not name the step that clears the lost position (reset_offsets): %q", text)
+	}
 }
 
 func TestRefinement_MissingPKGivesActionableSteps(t *testing.T) {
@@ -260,24 +273,3 @@ func TestUnknownCategoryRoutesToDeveloper(t *testing.T) {
 		t.Errorf("unknown should route to developer, got %s", se.Audience)
 	}
 }
-
-func TestFromError_PreservesRawError(t *testing.T) {
-	se := FromError(
-		errString("connection refused"),
-		"NETWORK_TRANSIENT_FAILURE",
-		FailureTypeTransientError,
-		AudienceUser,
-		"Network blip; retrying",
-	)
-	if se.InternalMessage != "connection refused" {
-		t.Errorf("expected internal_message preserved, got %q", se.InternalMessage)
-	}
-	if se.Code != "NETWORK_TRANSIENT_FAILURE" {
-		t.Errorf("code not set correctly")
-	}
-}
-
-// tiny inline error helper so we don't pull in another package
-type errString string
-
-func (e errString) Error() string { return string(e) }

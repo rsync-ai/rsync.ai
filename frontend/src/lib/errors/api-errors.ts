@@ -2,6 +2,7 @@
  * API Error handling utilities
  * Provides user-friendly error messages for all API errors
  */
+import { isNetworkFailure } from "@/lib/errors/network"
 import { parseApiError as parseApiErrorGeneric } from "@/lib/utils/error-handling"
 
 // Error codes returned by backend
@@ -77,13 +78,11 @@ export function parseAPIError(error: unknown): APIError {
   }
 
   // Network errors
-  if (error instanceof TypeError) {
-    if (error.message.includes("Failed to fetch") || error.message.includes("NetworkError")) {
-      return {
-        code: ErrorCodes.NETWORK_ERROR,
-        message: "Unable to connect to the server",
-        suggestion: "Please check your internet connection and try again.",
-      }
+  if (isNetworkFailure(error)) {
+    return {
+      code: ErrorCodes.NETWORK_ERROR,
+      message: "Unable to connect to the server",
+      suggestion: "Please check your internet connection and try again.",
     }
   }
 

@@ -15,7 +15,7 @@ reader will otherwise assume one of them still holds.
   so Postgres arriving late does not heal it.
 
   *Mock data.* The emitter gates on `db.GetDB() == nil`
-  (api-gateway/internal/handlers/connections.go:504), and `db.Init` assigns `DB` from
+  (api-gateway/internal/handlers/connections.go:507), and `db.Init` assigns `DB` from
   `sql.Open` BEFORE it pings, so a ping failure leaves `DB` non-nil and the branch
   unreachable.
 

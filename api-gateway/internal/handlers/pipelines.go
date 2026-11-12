@@ -742,6 +742,10 @@ type Pipeline struct {
 	Dataset *string `json:"dataset,omitempty"`
 	// Default run mode: "resume" (continue from checkpoints) or "reload" (rebuild from scratch)
 	DefaultRunMode *string `json:"default_run_mode,omitempty"`
+	// ReloadSupported is false when the destination is an app's API: a run there
+	// updates the records it wrote and the Run endpoint refuses a Reload
+	// (apiDestinationReloadRefusal). Set by GetPipeline; the UI hides Reload on false.
+	ReloadSupported *bool `json:"reload_supported,omitempty"`
 	// Destination namespace (schema/database) used when writing to the destination.
 	// Resolved at create time (user override or auto-picked + collision-suffixed)
 	// and persisted into pipelines.config.destination_namespace.
@@ -1722,6 +1726,10 @@ func GetPipeline(c *gin.Context) {
 			p.Destination = v
 		}
 	}
+	if p.DestinationConnection != nil {
+		reload := destinationHasReload(p.DestinationConnection.ConnectorType)
+		p.ReloadSupported = &reload
+	}
 
 	// Best-effort: extract selected tables from pipelines.config.selected_tables (if present).
 	// We return them as a top-level field so the UI can preselect tables in "Edit tables".
@@ -1928,10 +1936,11 @@ func CreatePipeline(c *gin.Context) {
 		return
 	}
 
-	// RBAC: creating a pipeline is a MUTATION; viewers are read-only. Require at
-	// least `member` in the active workspace (mirrors UpdatePipeline / RunPipeline
-	// and the roles.ts capability matrix).
-	if _, ok := requireWorkspaceRole(c, security.WSMember); !ok {
+	// RBAC: creating a pipeline is a MUTATION; viewers are read-only. The minimum
+	// role lives in services.Authorize, the one table chat asks too (mirrors
+	// UpdatePipeline / RunPipeline and the roles.ts capability matrix).
+	if err := services.Authorize(restActor(c, userID, workspaceID), services.ActionPipelineCreate); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient workspace role"})
 		return
 	}
 
@@ -2277,6 +2286,10 @@ func inferScheduleFromNaturalLanguage(req string) (scheduleType string, spec Sch
 // createPipelineScheduleBestEffort inserts a schedule row and creates the Temporal schedule.
 // This intentionally does not fail the caller if Temporal operations fail.
 func createPipelineScheduleBestEffort(ctx context.Context, database *sql.DB, userID, pipelineID, scheduleType string, spec ScheduleSpec) (string, error) {
+	// The row, the Temporal schedule and the row's clean-up must not stop between
+	// steps when the caller hangs up (CreatePipelineSchedule says why).
+	ctx = context.WithoutCancel(ctx)
+
 	// Validate + normalize (reuse schedule validator)
 	if err := validateScheduleSpec(scheduleType, spec); err != nil {
 		return "", err
@@ -2487,6 +2500,11 @@ func DeletePipeline(c *gin.Context) {
 		return
 	}
 	database := db.GetDB()
+	// The delete runs on a context the caller's hang-up cannot cancel: with the tab
+	// closed during the source cleanup, every later step failed on the cancelled
+	// context, so the slot and connector were gone while the row, its schedules and
+	// its topics stayed. Each step is still bounded by its own timeout.
+	ctx := context.WithoutCancel(c.Request.Context())
 
 	// Drop CDC replication slots / publications / connector on the SOURCE DB
 	// BEFORE deleting the pipeline row. Ordering is critical: cdc_resources.
@@ -2499,7 +2517,7 @@ func DeletePipeline(c *gin.Context) {
 	// block the delete because the CDC reconciler reaps any orphaned slot as a
 	// safety net (065/reconciler sweep).
 	var teardownWarnings []string
-	if w := runCDCCleanupSync(c.Request.Context(), id); w != "" {
+	if w := runCDCCleanupSync(ctx, id); w != "" {
 		teardownWarnings = append(teardownWarnings, w)
 	}
 
@@ -2512,7 +2530,7 @@ func DeletePipeline(c *gin.Context) {
 	// existence guard, but still burns worker slots and pollutes usage meters).
 	// We delete them from Temporal only AFTER the pipeline delete commits (below),
 	// so a 404 or a rolled-back delete never tears down a live pipeline's schedule.
-	temporalScheduleIDs := listTemporalScheduleIDs(c.Request.Context(), database, id)
+	temporalScheduleIDs := listTemporalScheduleIDs(ctx, database, id)
 
 	// Terminate any workflow still executing for this pipeline, BEFORE the
 	// executions rows are deleted (they are what names the workflows: WorkflowID
@@ -2520,10 +2538,10 @@ func DeletePipeline(c *gin.Context) {
 	// workflow running against a pipeline that no longer exists — it keeps
 	// occupying a worker slot and keeps writing progress rows for a dead parent
 	// until it times out on its own, hours later.
-	cancelRunningWorkflowsBestEffort(c.Request.Context(), database, id)
+	cancelRunningWorkflowsBestEffort(ctx, database, id)
 
 	// Start a transaction to ensure both deletes succeed or both fail
-	tx, err := database.BeginTx(c.Request.Context(), &sql.TxOptions{})
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		log.Printf("Failed to begin transaction: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete pipeline"})
@@ -2553,7 +2571,7 @@ func DeletePipeline(c *gin.Context) {
 	// not match and we'll 404 below.
 	// Models that rebuilt only after this pipeline would otherwise stay active with no
 	// upstream at all. In this transaction so a delete that rolls back pauses nothing.
-	if _, err := pauseTriggersOrphanedBy(c.Request.Context(), tx, upstreamKindPipeline, id); err != nil {
+	if _, err := pauseTriggersOrphanedBy(ctx, tx, upstreamKindPipeline, id); err != nil {
 		log.Printf("Failed to pause model schedules orphaned by pipeline delete: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete pipeline"})
 		return
@@ -2568,7 +2586,7 @@ func DeletePipeline(c *gin.Context) {
 	// Same transaction as the delete, so the pipeline and its tombstone can never
 	// disagree. Best-effort: a gateway running ahead of migration 110 has no such
 	// table, and failing the delete over it would be worse than the leak.
-	writeDestinationNamespaceTombstone(c.Request.Context(), tx, id, wsID)
+	writeDestinationNamespaceTombstone(ctx, tx, id, wsID)
 
 	result, err := tx.Exec("DELETE FROM pipelines WHERE id=$1 AND workspace_id=$2", id, wsID)
 	if err != nil {
@@ -2591,8 +2609,8 @@ func DeletePipeline(c *gin.Context) {
 		var remaining int
 		if verr := database.QueryRow(`SELECT COUNT(*) FROM pipelines WHERE id = $1`, id).Scan(&remaining); verr == nil && remaining == 0 {
 			committed = true
-			deleteTemporalSchedulesBestEffort(c.Request.Context(), temporalScheduleIDs)
-			if w := runKafkaTeardownSync(c.Request.Context(), id); w != "" {
+			deleteTemporalSchedulesBestEffort(ctx, temporalScheduleIDs)
+			if w := runKafkaTeardownSync(ctx, id); w != "" {
 				teardownWarnings = append(teardownWarnings, w)
 			}
 			logAudit(c, "delete_pipeline", "pipeline", id, map[string]interface{}{"commit_error": err.Error()})
@@ -2606,12 +2624,12 @@ func DeletePipeline(c *gin.Context) {
 	committed = true
 
 	// Pipeline is gone: tear down its orphaned Temporal schedules (best-effort).
-	deleteTemporalSchedulesBestEffort(c.Request.Context(), temporalScheduleIDs)
+	deleteTemporalSchedulesBestEffort(ctx, temporalScheduleIDs)
 
 	// …and its Kafka topics and consumer groups. This one runs AFTER the delete
 	// on purpose: while the pipelines row exists, the CDC table-stats agent and
 	// the sink workers recreate any consumer group we remove.
-	if w := runKafkaTeardownSync(c.Request.Context(), id); w != "" {
+	if w := runKafkaTeardownSync(ctx, id); w != "" {
 		teardownWarnings = append(teardownWarnings, w)
 	}
 
@@ -2713,30 +2731,37 @@ func runKafkaTeardownSync(parent context.Context, pipelineID string) string {
 // for the delete response. Full detail goes to the log only: the orchestrator's
 // error strings come from source-database drivers and are not for the API body.
 func postOrchestratorTeardown(parent context.Context, path, pipelineID string, timeout time.Duration, label, fallback string) string {
+	return postOrchestratorStep(parent, path, map[string]string{"pipeline_id": pipelineID},
+		"pipeline "+pipelineID, timeout, label, fallback)
+}
+
+// postOrchestratorStep is postOrchestratorTeardown for any internal endpoint and
+// payload; subject names what the step is for in the log ("pipeline <id>").
+func postOrchestratorStep(parent context.Context, path string, payload map[string]string, subject string, timeout time.Duration, label, fallback string) string {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]string{"pipeline_id": pipelineID})
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		orchestratorBaseURL()+path, strings.NewReader(string(body)))
 	if err != nil {
-		log.Warnf("%s: failed to build request for pipeline %s: %v", label, pipelineID, err)
+		log.Warnf("%s: failed to build request for %s: %v", label, subject, err)
 		return fmt.Sprintf("%s did not run: %s", label, fallback)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	setInternalServiceSecret(req)
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
-		log.Warnf("%s: request failed for pipeline %s: %v (%s)", label, pipelineID, err, fallback)
+		log.Warnf("%s: request failed for %s: %v (%s)", label, subject, err, fallback)
 		return fmt.Sprintf("%s did not run (orchestrator unreachable): %s", label, fallback)
 	}
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
 	summary, detail := teardownOutcome(resp.StatusCode, respBody)
 	if summary != "" {
-		log.Warnf("%s: FAILED for pipeline %s: %s (%s)", label, pipelineID, detail, fallback)
+		log.Warnf("%s: FAILED for %s: %s (%s)", label, subject, detail, fallback)
 		return fmt.Sprintf("%s did not finish (%s): %s", label, summary, fallback)
 	}
-	log.Printf("%s: completed for pipeline %s (HTTP %d)", label, pipelineID, resp.StatusCode)
+	log.Printf("%s: completed for %s (HTTP %d)", label, subject, resp.StatusCode)
 	return ""
 }
 
@@ -3021,35 +3046,11 @@ func RunPipeline(c *gin.Context) {
 	}
 	database := db.GetDB()
 
-	// Per-user monthly cost quota gate. Refuse new runs when the user is
-	// already over their LLM-spend cap so a single buggy pipeline can't
-	// drain cloud credits. The actual charge happens in llm-service per
-	// completion via check_and_charge_user(); this is just a soft pre-check.
-	if !checkUserCostQuotaOK(c.Request.Context(), database, userID) {
-		c.JSON(http.StatusPaymentRequired, gin.H{
-			"error":   "quota_exceeded",
-			"message": "Monthly LLM spend quota exceeded. Contact admin to raise cost_quota_usd_cents.",
-		})
-		return
-	}
-
-	// Plan run gate. A workspace whose trial/free window has fully expired (or
-	// whose plan is marked can_run=false) may not start new runs. Scoped to the
-	// active workspace (the billable tenant), not the caller. See plan_quota.go.
-	if q := resolvePlanQuota(c.Request.Context(), database, wsID); !q.canRun {
-		c.JSON(http.StatusPaymentRequired, gin.H{
-			"error":   "trial_expired",
-			"message": "Your free trial has ended. Upgrade to Pro to run pipelines.",
-			"plan":    q.plan,
-		})
-		return
-	}
-
-	// Plan GB run gate (Ship 2 Phase 2). Refuse a new run when the workspace is
-	// already over its monthly data-transfer allowance. Per-WORKSPACE; a soft
-	// pre-check like the cost gate above (bytes accrue post-run). Fail-open inside.
-	if allowed, errBody := checkWorkspaceGBOK(c.Request.Context(), database, wsID); !allowed {
-		c.JSON(http.StatusPaymentRequired, errBody)
+	// Billing gates (pipeline_run_gates.go), the same for every run path: the
+	// caller's monthly LLM spend (a soft pre-check; llm-service charges per
+	// completion), then the workspace's plan and monthly GB. 402 on a refusal.
+	if ref := runQuotaRefusal(c.Request.Context(), database, wsID, userID); ref != nil {
+		c.JSON(ref.status, ref.body)
 		return
 	}
 
@@ -3066,6 +3067,13 @@ func RunPipeline(c *gin.Context) {
 			"error":   "pipeline_cooldown",
 			"message": "Another run for this pipeline started in the last " + strconv.Itoa(cooldown) + " seconds. Wait before retrying.",
 		})
+		return
+	}
+
+	// Refuse before the body's overrides are saved or the assessment runs, so a
+	// Run clicked while one is copying changes nothing. enqueuePipelineRun asks
+	// again, since the assessment can take a while.
+	if _, ok := refuseOverlappingRun(c, database, id); !ok {
 		return
 	}
 
@@ -3209,6 +3217,83 @@ func resolveRunMode(queryOverride, bodyRunMode string, defaultRunMode *string) s
 }
 
 func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID string, runReq RunPipelineRequest) {
+	execID, refusal := startPipelineRun(telemetry.GetOTelContext(c), database, id, wsID, userID, runReq, pipelineRunOpts{
+		RunModeQuery: c.Query("run_mode"),
+		DraftGate:    c.Query("allow_draft") != "true",
+		// The pipeline's workspace: the healer's internal route has no active one.
+		DraftWorkspaceID: wsID,
+	})
+	if refusal != nil {
+		c.JSON(refusal.status, refusal.body)
+		return
+	}
+	logAudit(c, "run_pipeline", "pipeline", id, map[string]interface{}{"execution_id": execID})
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Pipeline execution started",
+		"pipeline_id":  id,
+		"execution_id": execID,
+		"status":       "running",
+	})
+}
+
+// pipelineRunOpts are what a caller of startPipelineRun decides: the Run
+// endpoints read them off the request (enqueuePipelineRun), a workflow's
+// run_pipeline step sets them itself (workflow_graph_runs.go).
+type pipelineRunOpts struct {
+	// ExecID is the run's execution id, which is also its Temporal workflow
+	// id. Empty draws a new one.
+	ExecID string
+	// WorkflowRunID is the workflow run whose run_pipeline step starts this
+	// run (executions.workflow_run_id, migration 140). Empty otherwise.
+	WorkflowRunID string
+	// RunModeQuery is a ?run_mode= override, ahead of the body's
+	// (resolveRunMode).
+	RunModeQuery string
+	// DraftGate refuses a run whose source or destination connector is a
+	// draft, looking its connections up in DraftWorkspaceID.
+	DraftGate        bool
+	DraftWorkspaceID string
+}
+
+// pipelineRunRefusal is why startPipelineRun started no run: the status and
+// body the Run endpoints answer with.
+type pipelineRunRefusal struct {
+	status int
+	body   gin.H
+}
+
+// destinationHasReload reports whether a run into this destination can be a Reload:
+// every destination but an app's API (metadata.json "category": "api_saas").
+func destinationHasReload(destType string) bool {
+	return connectorMetadataString(destType, "category") != "api_saas"
+}
+
+// apiDestinationReloadRefusal refuses a Reload into a REST/GraphQL API destination
+// (metadata.json "category": "api_saas"). Writing to an app is reverse ETL: a run
+// updates the records it wrote before and deletes nothing, so there is no table to
+// rebuild and no Reload (BACKLOG "Reverse ETL into an API destination"). runMode is
+// resolveRunMode's answer; fromDefault says it came from the pipeline's default.
+func apiDestinationReloadRefusal(runMode, destType string, fromDefault bool) *pipelineRunRefusal {
+	if runMode != "reload" || destinationHasReload(destType) {
+		return nil
+	}
+	msg := "Reload is not available when the destination is an app's API (" + destType + "). " +
+		"A run updates the records it wrote before and deletes nothing in the app. Run it without Reload."
+	if fromDefault {
+		msg += " This pipeline's default run mode is Reload: set default_run_mode to resume."
+	}
+	return &pipelineRunRefusal{http.StatusUnprocessableEntity, gin.H{
+		"error":   "reload_not_supported",
+		"message": msg,
+	}}
+}
+
+// startPipelineRun is enqueuePipelineRun without the request: it starts one
+// run of pipeline id in wsID as userID and returns its execution id, or the
+// refusal the Run endpoint answers with. ctx carries the trace context the
+// pipeline workflow is started with.
+func startPipelineRun(ctx context.Context, database *sql.DB, id, wsID, userID string, runReq RunPipelineRequest,
+	opts pipelineRunOpts) (string, *pipelineRunRefusal) {
 	// Get full pipeline details including connections
 	var name, status string
 	var sourceConnID, destConnID, nlRequest, createdBy, dataset, defaultRunMode *string // All nullable fields as pointers
@@ -3218,8 +3303,14 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		FROM pipelines WHERE id = $1 AND workspace_id = $2
 	`, id, wsID).Scan(&name, &status, &sourceConnID, &destConnID, &nlRequest, &createdBy, &configJSON, &dataset, &defaultRunMode)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Pipeline not found"})
-		return
+		return "", &pipelineRunRefusal{http.StatusNotFound, gin.H{"error": "Pipeline not found"}}
+	}
+
+	// One run at a time: 409 while another is copying; a parked or dead one is
+	// replaced once this run's workflow has started (pipeline_run_overlap.go).
+	overlap, refusal := overlapRefusal(ctx, database, id)
+	if refusal != nil {
+		return "", refusal
 	}
 
 	// Get connection details (connector types)
@@ -3229,6 +3320,33 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 	}
 	if destConnID != nil && *destConnID != "" {
 		database.QueryRow("SELECT connector_type FROM connections WHERE id = $1", *destConnID).Scan(&destType)
+	}
+
+	// An API destination has no Reload: refuse one before anything is written.
+	runMode := resolveRunMode(opts.RunModeQuery, runReq.RunMode, defaultRunMode)
+	fromDefault := resolveRunMode(opts.RunModeQuery, runReq.RunMode, nil) != runMode
+	if refusal := apiDestinationReloadRefusal(runMode, destType, fromDefault); refusal != nil {
+		return "", refusal
+	}
+
+	// Propagate connection IDs to downstream (also used for fast rerun detection).
+	sourceConnIDVal := ""
+	if sourceConnID != nil {
+		sourceConnIDVal = strings.TrimSpace(*sourceConnID)
+	}
+	destConnIDVal := ""
+	if destConnID != nil {
+		destConnIDVal = strings.TrimSpace(*destConnID)
+	}
+
+	// Lifecycle=draft gate (mirrors CreatePipeline): refuse a run whose source
+	// or destination connector is a draft (never run or tested). Escape via
+	// `?allow_draft=true`. Before anything is written, so a refused run leaves
+	// the pipeline and its runs as they were.
+	if opts.DraftGate {
+		if refusal := runDraftRefusal(database, opts.DraftWorkspaceID, sourceConnIDVal, destConnIDVal); refusal != nil {
+			return "", refusal
+		}
 	}
 
 	// NEW: Resolve and snapshot connector versions if connections are known
@@ -3283,19 +3401,28 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 	}
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline status"})
-		return
+		return "", &pipelineRunRefusal{http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline status"}}
 	}
 
 	// Create execution record
-	execID := uuid.New().String()
-	if _, err := database.Exec(`
+	execID := opts.ExecID
+	if execID == "" {
+		execID = uuid.New().String()
+	}
+	if opts.WorkflowRunID == "" {
+		_, err = database.Exec(`
 		INSERT INTO executions (id, pipeline_id, status, start_time)
 		VALUES ($1, $2, 'running', NOW())
-	`, execID, id); err != nil {
+	`, execID, id)
+	} else {
+		_, err = database.Exec(`
+		INSERT INTO executions (id, pipeline_id, status, start_time, workflow_run_id)
+		VALUES ($1, $2, 'running', NOW(), $3)
+	`, execID, id, opts.WorkflowRunID)
+	}
+	if err != nil {
 		log.Printf("❌ Failed to create execution record (pipeline_id=%s execution_id=%s pipeline_name=%s): %v", id, execID, name, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create execution record"})
-		return
+		return "", &pipelineRunRefusal{http.StatusInternalServerError, gin.H{"error": "Failed to create execution record"}}
 	}
 
 	// Sticky table selection: use persisted selection when available, otherwise infer from last run table-stats.
@@ -3306,30 +3433,9 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		selectedTables = inferSelectedTablesFromLastRun(database, id)
 	}
 
-	// Propagate connection IDs to downstream (also used for fast rerun detection).
-	sourceConnIDVal := ""
-	if sourceConnID != nil {
-		sourceConnIDVal = strings.TrimSpace(*sourceConnID)
-	}
-	destConnIDVal := ""
-	if destConnID != nil {
-		destConnIDVal = strings.TrimSpace(*destConnID)
-	}
-
 	fastRerun := sourceConnIDVal != "" && sourceConnIDVal != "auto" &&
 		destConnIDVal != "" && destConnIDVal != "auto" &&
 		len(selectedTables) > 0
-
-	// Lifecycle=draft gate (mirrors CreatePipeline). Refuse to re-run
-	// a pipeline whose source or destination connector has slipped
-	// back into "draft" (e.g. all recent runs failed). Escape via
-	// `?allow_draft=true`. ARCH-1 audit flagged that this gate
-	// previously fired only on CreatePipeline.
-	if sourceConnIDVal != "auto" && destConnIDVal != "auto" {
-		if blocked := checkConnectionLifecycleDraft(c, database, sourceConnIDVal, destConnIDVal); blocked {
-			return
-		}
-	}
 
 	// Best-effort: mark pipeline_progress as started (authoritative updates come from Temporal adapter).
 	initialStage := "intent"
@@ -3362,6 +3468,10 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		    progress_current_step = EXCLUDED.progress_current_step,
 		    progress_total_steps = EXCLUDED.progress_total_steps,
 		    message = EXCLUDED.message,
+		    -- A replaced run's question must not stay on screen over this run.
+		    blocking_reason_type = NULL,
+		    blocking_reason_description = NULL,
+		    blocking_reason_estimated_seconds = NULL,
 		    updated_at = NOW()
 	`, id, execID, initialStage, initialTotalSteps, initialMessage); err != nil {
 		log.Printf("⚠️ [RunPipeline] failed to upsert pipeline_progress (ignored): %v", err)
@@ -3420,8 +3530,8 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		// every "Reload" click through as a `resume`. We now read the
 		// already-decoded `runReq` from the gate instead of re-parsing
 		// the body.
-		// Query > body > pipeline default > "resume". See resolveRunMode.
-		runModeVal := resolveRunMode(c.Query("run_mode"), runReq.RunMode, defaultRunMode)
+		// Query > body > pipeline default > "resume", resolved above. See resolveRunMode.
+		runModeVal := runMode
 
 		workflowInput := map[string]interface{}{
 			"pipeline_id":  id,
@@ -3465,8 +3575,7 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 
 		// Propagate distributed trace context into Temporal workflow input so Temporal adapter
 		// can attach trace headers to Kafka commands/events.
-		otelCtx := telemetry.GetOTelContext(c)
-		reqCtx := context.WithoutCancel(otelCtx)
+		reqCtx := context.WithoutCancel(ctx)
 		traceHeaders := telemetry.InjectTraceToHeaders(reqCtx)
 		if v := traceHeaders["trace_id"]; v != "" {
 			workflowInput["trace_id"] = v
@@ -3503,15 +3612,16 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 			`, err.Error(), id); uerr != nil {
 				log.Printf("⚠️ [RunPipeline] failed to mark pipeline_progress failed (ignored): %v", uerr)
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{
+			return "", &pipelineRunRefusal{http.StatusInternalServerError, gin.H{
 				"error":   "Failed to start workflow",
 				"message": err.Error(),
-			})
-			return
+			}}
 		}
 
 		log.Printf("✅ Started Temporal workflow: %s (run: %s)", workflowOptions.ID, workflowRun.GetRunID())
 		log.Printf("   Pattern: Temporal → Kafka → Agents")
+
+		applyRunOverlap(reqCtx, database, id, execID, overlap)
 
 	} else {
 		// Temporal is the ONLY supported orchestration path. An old fallback here
@@ -3541,19 +3651,12 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		`, errMsg, id); uerr != nil {
 			log.Printf("⚠️ [RunPipeline] failed to mark pipeline_progress failed (ignored): %v", uerr)
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{
+		return "", &pipelineRunRefusal{http.StatusServiceUnavailable, gin.H{
 			"error":   "orchestration_unavailable",
 			"message": errMsg,
-		})
-		return
+		}}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":      "Pipeline execution started",
-		"pipeline_id":  id,
-		"execution_id": execID,
-		"status":       "running",
-	})
+	return execID, nil
 }
 
 // RunPipelineInternal is the service-to-service (self-healer) re-run entry point,
@@ -3597,20 +3700,10 @@ func RunPipelineInternal(c *gin.Context) {
 		return
 	}
 
-	// Per-WORKSPACE plan run gate (trial expired / can_run=false) — identical to
-	// RunPipeline, keyed by the pipeline's workspace.
-	if q := resolvePlanQuota(c.Request.Context(), database, wsID); !q.canRun {
-		c.JSON(http.StatusPaymentRequired, gin.H{
-			"error":   "trial_expired",
-			"message": "Your free trial has ended. Upgrade to Pro to run pipelines.",
-			"plan":    q.plan,
-		})
-		return
-	}
-
-	// Per-WORKSPACE monthly GB gate — identical to RunPipeline.
-	if allowed, errBody := checkWorkspaceGBOK(c.Request.Context(), database, wsID); !allowed {
-		c.JSON(http.StatusPaymentRequired, errBody)
+	// Per-WORKSPACE plan + monthly GB gates — identical to RunPipeline, keyed by
+	// the pipeline's workspace. No actor: the per-user spend check is skipped.
+	if ref := runQuotaRefusal(c.Request.Context(), database, wsID, ""); ref != nil {
+		c.JSON(ref.status, ref.body)
 		return
 	}
 
@@ -3696,6 +3789,9 @@ func StopPipeline(c *gin.Context) {
 	// Send cancel signal to Temporal workflow (best-effort).
 	// We try execution_id first, then legacy chat-v2 workflow ID pattern.
 	execID := ""
+	// workflowSignalled: a live workflow took the cancel, and its terminal defer
+	// tells the owner (PIPELINE_RUN_STOPPED). Otherwise the notice below does.
+	workflowSignalled := false
 	if temporalClient != nil {
 		var resolveErr error
 		execID, resolveErr = resolveExecutionIDForPipeline(database, id)
@@ -3706,9 +3802,11 @@ func StopPipeline(c *gin.Context) {
 				"timestamp":    time.Now().UTC().Format(time.RFC3339),
 				"action":       "stop",
 			}
-			signalErr := signalPipelineWorkflowWithFallback(c.Request.Context(), id, execID, "cancel", payload)
+			signalErr := signalPipelineWorkflowWithFallback(context.WithoutCancel(c.Request.Context()), id, execID, "cancel", payload)
 			if signalErr != nil {
 				log.Printf("⚠️  Failed to signal cancel for pipeline %s (exec %s): %v", id, execID, signalErr)
+			} else {
+				workflowSignalled = true
 			}
 		}
 	}
@@ -3773,6 +3871,10 @@ func StopPipeline(c *gin.Context) {
 	}
 
 	log.Printf("✓ Pipeline %s stopped", id)
+	logAudit(c, "stop_pipeline", "pipeline", id, nil)
+	if !workflowSignalled {
+		publishUserStopNotice(id, execID, isCDC, stopNoticeMessage)
+	}
 
 	resp := gin.H{
 		"message":     "Pipeline stopped",
@@ -3797,11 +3899,17 @@ func stopAllowedFrom(status string, isCDC bool) bool {
 	return false
 }
 
+// cdcStopProxyTimeout is how long the gateway waits for a CDC Stop: past the
+// orchestrator's 25s cdcStopBudget (connector stop, sink stop, status write), so the
+// pipeline row is written from the orchestrator's answer and not from a timeout, and
+// short of Cloudflare's 100s cut.
+const cdcStopProxyTimeout = 30 * time.Second
+
 // stopCDCStreaming asks the orchestrator to stop the pipeline's connector and sink.
 // On failure it has already answered the request and returns false.
 func stopCDCStreaming(c *gin.Context, pipelineID string) ([]string, bool) {
 	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/stop", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	req, err := http.NewRequestWithContext(context.WithoutCancel(c.Request.Context()), http.MethodPut, url, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
 		return nil, false
@@ -3810,7 +3918,7 @@ func stopCDCStreaming(c *gin.Context, pipelineID string) ([]string, bool) {
 		req.Header.Set("X-Trace-ID", traceID)
 	}
 	setInternalServiceSecret(req)
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: cdcStopProxyTimeout}).Do(req)
 	if err != nil {
 		respondError(c, http.StatusBadGateway, "orchestrator_unreachable", "Orchestrator is unreachable", err)
 		return nil, false
@@ -3831,13 +3939,19 @@ func stopCDCStreaming(c *gin.Context, pipelineID string) ([]string, bool) {
 // worker (PUT /api/v1/pipelines/:id/sink/stop). Best effort: the pipeline is
 // already stopped, so a failure becomes a warning, never an error response.
 func stopBatchSinkWorkers(c *gin.Context, pipelineID string) []string {
+	return stopBatchSinkWorkersCtx(context.WithoutCancel(c.Request.Context()), pipelineID, c.GetHeader("X-Trace-ID"))
+}
+
+// stopBatchSinkWorkersCtx is stopBatchSinkWorkers without the request, for a stop a
+// workflow step makes (workflow_graph_runs.go).
+func stopBatchSinkWorkersCtx(ctx context.Context, pipelineID, traceID string) []string {
 	const unstopped = "the sink worker for this batch run may still be writing already-produced rows to the destination: "
 	url := fmt.Sprintf("%s/api/v1/pipelines/%s/sink/stop", orchestratorBaseURL(), pipelineID)
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, nil)
 	if err != nil {
 		return []string{unstopped + err.Error()}
 	}
-	if traceID := c.GetHeader("X-Trace-ID"); traceID != "" {
+	if traceID != "" {
 		req.Header.Set("X-Trace-ID", traceID)
 	}
 	setInternalServiceSecret(req)
@@ -3915,7 +4029,7 @@ func PausePipeline(c *gin.Context) {
 		"timestamp":    time.Now().UTC().Format(time.RFC3339),
 		"action":       "pause",
 	}
-	if err := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "pause", payload); err != nil {
+	if err := signalPipelineWorkflowWithFallback(context.WithoutCancel(c.Request.Context()), pipelineID, execID, "pause", payload); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed_to_pause", "Failed to pause pipeline", err)
 		return
 	}
@@ -3924,6 +4038,7 @@ func PausePipeline(c *gin.Context) {
 		log.Printf("⚠️ [PausePipeline] failed to update pipeline status (ignored): %v", err)
 	}
 
+	logAudit(c, "pause_pipeline", "pipeline", pipelineID, map[string]interface{}{"execution_id": execID})
 	c.JSON(http.StatusOK, gin.H{"success": true, "pipeline_id": pipelineID, "execution_id": execID, "status": "paused"})
 }
 
@@ -3979,7 +4094,7 @@ func ResumePipeline(c *gin.Context) {
 		"timestamp":    time.Now().UTC().Format(time.RFC3339),
 		"action":       "resume",
 	}
-	if err := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "resume", payload); err != nil {
+	if err := signalPipelineWorkflowWithFallback(context.WithoutCancel(c.Request.Context()), pipelineID, execID, "resume", payload); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed_to_resume", "Failed to resume pipeline", err)
 		return
 	}
@@ -3988,6 +4103,7 @@ func ResumePipeline(c *gin.Context) {
 		log.Printf("⚠️ [ResumePipeline] failed to update pipeline status (ignored): %v", err)
 	}
 
+	logAudit(c, "resume_pipeline", "pipeline", pipelineID, map[string]interface{}{"execution_id": execID})
 	c.JSON(http.StatusOK, gin.H{"success": true, "pipeline_id": pipelineID, "execution_id": execID, "status": "running"})
 }
 
@@ -3995,26 +4111,30 @@ func signalPipelineWorkflowWithFallback(reqCtx context.Context, pipelineID strin
 	ctx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
 	defer cancel()
 
-	candidates := []string{}
-	if execID != "" {
-		candidates = append(candidates, execID)
-	}
+	legacyID := ""
 	if pipelineID != "" {
-		candidates = append(candidates, fmt.Sprintf("pipeline-workflow-%s", pipelineID))
+		legacyID = fmt.Sprintf("pipeline-workflow-%s", pipelineID)
+	}
+	if execID == "" {
+		if legacyID == "" {
+			return errors.New("no workflow to signal: neither an execution id nor a pipeline id")
+		}
+		return temporalClient.SignalWorkflow(ctx, legacyID, "", signal, payload)
 	}
 
-	var lastErr error
-	for _, wfID := range candidates {
-		if wfID == "" {
-			continue
-		}
-		err := temporalClient.SignalWorkflow(ctx, wfID, "", signal, payload)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
+	err := temporalClient.SignalWorkflow(ctx, execID, "", signal, payload)
+	// The legacy workflow id is tried only when the run's own workflow never
+	// existed. "Already completed" is also a NotFound, and it is the answer: it
+	// used to be overwritten by the legacy id's "not found", and a completed run
+	// was then written down as failed (pipeline a3b07ece). It also must not hand
+	// a finished run's answer to some other workflow that happens to be open.
+	if err == nil || legacyID == "" || !isWorkflowNotFoundError(err) || isWorkflowAlreadyCompletedError(err) {
+		return err
 	}
-	return lastErr
+	if legacyErr := temporalClient.SignalWorkflow(ctx, legacyID, "", signal, payload); legacyErr == nil {
+		return nil
+	}
+	return err
 }
 
 // Execution represents a pipeline execution
@@ -4046,6 +4166,40 @@ type Execution struct {
 // ExecutionMetrics holds derived per-run counters surfaced to the UI.
 type ExecutionMetrics struct {
 	RecordsProcessed int64 `json:"records_processed"`
+}
+
+// repairStaleWorkspaceExecutions runs the stale-run repair across the active
+// workspace's pipelines so the run lists (GET /executions, GET /activity) and the
+// "Running" stat card don't show ghost runs forever (ISSUE-005 / ISSUE-019).
+// pipeline_progress has one row per pipeline (pipeline_id PRIMARY KEY), so each pp
+// row is correlated to the execution's own pipeline_id. Same stale-detection
+// condition as ListExecutions' per-pipeline branch: only flip 'running' rows whose
+// pipeline_progress is terminal AND that are NOT the execution pp currently points
+// at. Bounded to runs started over a few minutes ago so a just-launched run is
+// never cancelled before its pp row is seeded, and scoped to the workspace
+// (p.workspace_id = $1) so the write matches the tenancy of the lists. Best effort:
+// a failure is logged and the list is served as it stands.
+func repairStaleWorkspaceExecutions(database *sql.DB, workspaceID string) {
+	if _, err := database.Exec(`
+		UPDATE executions e
+		SET status = 'cancelled',
+		    end_time = COALESCE(e.end_time, NOW()),
+		    error_message = COALESCE(e.error_message, 'Cancelled (stale run)')
+		FROM pipeline_progress pp
+		WHERE pp.pipeline_id = e.pipeline_id
+		  AND e.status = 'running'
+		  AND e.id <> e.pipeline_id
+		  AND e.start_time < NOW() - INTERVAL '5 minutes'
+		  AND pp.status IN ('completed','failed','cancelled')
+		  AND pp.execution_id IS NOT NULL
+		  AND e.id <> pp.execution_id
+		  AND EXISTS (
+		      SELECT 1 FROM pipelines p
+		      WHERE p.id = e.pipeline_id AND p.workspace_id = $1
+		  )
+	`, workspaceID); err != nil {
+		log.Printf("⚠️ [executions] workspace stale execution repair failed (ignored): %v", err)
+	}
 }
 
 // ListExecutions returns all executions
@@ -4178,36 +4332,8 @@ func ListExecutions(c *gin.Context) {
 		args = append(args, pipelineID)
 		argIdx++
 	} else {
-		// Global view (GET /executions, no pipeline filter): run the same stale-run
-		// repair across the active workspace's pipelines so the Executions list and the "Running"
-		// stat card don't show ghost runs forever (ISSUE-005 / ISSUE-019). pipeline_progress
-		// has one row per pipeline (pipeline_id PRIMARY KEY), so we correlate each
-		// pp row to the execution's own pipeline_id. Same stale-detection condition as
-		// the per-pipeline branch: only flip 'running' rows whose pipeline_progress is
-		// terminal AND that are NOT the execution pp currently points at. Bounded to
-		// runs started over a few minutes ago so we never cancel a just-launched run
-		// before its pp row is seeded, and scoped to the active workspace
-		// (p.workspace_id = $1) so the write matches the tenancy of the SELECT below.
-		if _, err := database.Exec(`
-			UPDATE executions e
-			SET status = 'cancelled',
-			    end_time = COALESCE(e.end_time, NOW()),
-			    error_message = COALESCE(e.error_message, 'Cancelled (stale run)')
-			FROM pipeline_progress pp
-			WHERE pp.pipeline_id = e.pipeline_id
-			  AND e.status = 'running'
-			  AND e.id <> e.pipeline_id
-			  AND e.start_time < NOW() - INTERVAL '5 minutes'
-			  AND pp.status IN ('completed','failed','cancelled')
-			  AND pp.execution_id IS NOT NULL
-			  AND e.id <> pp.execution_id
-			  AND EXISTS (
-			      SELECT 1 FROM pipelines p
-			      WHERE p.id = e.pipeline_id AND p.workspace_id = $1
-			  )
-		`, scopeWS); err != nil {
-			log.Printf("⚠️ [ListExecutions] global stale execution repair failed (ignored): %v", err)
-		}
+		// Global view (GET /executions, no pipeline filter).
+		repairStaleWorkspaceExecutions(database, scopeWS)
 	}
 
 	// COUNT query — same WHERE conditions, no LIMIT, so total reflects reality even when
@@ -4365,9 +4491,15 @@ func GetExecution(c *gin.Context) {
 		&recordsProcessed,
 	)
 
-	if err != nil {
-		log.Printf("[GetExecution] Query error: %v", err)
+	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Execution not found"})
+		return
+	}
+	if err != nil {
+		// A failed read is not a missing run: a 404 here tells the run page,
+		// and the agent gateway's tools, that the run does not exist.
+		log.Printf("[GetExecution] Query error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read the execution"})
 		return
 	}
 
@@ -4564,10 +4696,28 @@ func CancelExecution(c *gin.Context) {
 		return
 	}
 
+	// Cancel marks the pipeline stopped, so it stops what Stop stops
+	// (StopPipeline): a CDC pipeline's connector and sink first — if the
+	// orchestrator cannot, nothing changes here — and a batch run's sink worker.
+	var isCDC bool
+	if err := database.QueryRow(`SELECT `+pipelineRowIsCDCSQL+` FROM pipelines p WHERE p.id = $1 AND p.workspace_id = $2`,
+		pipelineID, scopeWS).Scan(&isCDC); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to cancel execution"})
+		return
+	}
+	var stopWarnings []string
+	if isCDC {
+		var stopped bool
+		stopWarnings, stopped = stopCDCStreaming(c, pipelineID)
+		if !stopped {
+			return
+		}
+	}
+
 	// Cancel Temporal workflow (best-effort). WorkflowID == execution ID in this system.
 	temporalCancelled := false
 	if temporalClient != nil {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
 		defer cancel()
 		if err := temporalClient.CancelWorkflow(ctx, id, ""); err != nil {
 			log.Printf("[CancelExecution] Temporal cancel failed for %s: %v", id, err)
@@ -4593,16 +4743,40 @@ func CancelExecution(c *gin.Context) {
 	}
 
 	// Update pipeline status to 'stopped' (best-effort)
-	if _, err := database.Exec("UPDATE pipelines SET status = 'stopped', updated_at = NOW() WHERE id = $1", pipelineID); err != nil {
+	if _, err := database.Exec("UPDATE pipelines SET status = 'stopped', updated_at = NOW() WHERE id = $1 AND workspace_id = $2", pipelineID, scopeWS); err != nil {
 		log.Printf("⚠️ [CancelExecution] failed to mark pipeline stopped (ignored): %v", err)
 	}
 
-	log.Printf("✓ Execution %s cancelled (pipeline %s stopped)", id, pipelineID)
+	if isCDC {
+		// The stream row the sink keeps open (id = pipeline id) is over too.
+		if _, err := database.Exec(`
+			UPDATE executions
+			SET status = 'cancelled',
+			    end_time = NOW(),
+			    error_message = COALESCE(error_message, 'Cancelled by user')
+			WHERE pipeline_id = $1 AND status IN ('running','pending')
+		`, pipelineID); err != nil {
+			log.Printf("⚠️ [CancelExecution] failed to close CDC executions (ignored): %v", err)
+		}
+	} else {
+		stopWarnings = stopBatchSinkWorkers(c, pipelineID)
+	}
 
-	c.JSON(http.StatusOK, gin.H{
+	log.Printf("✓ Execution %s cancelled (pipeline %s stopped)", id, pipelineID)
+	logAudit(c, "cancel_execution", "execution", id, gin.H{"pipeline_id": pipelineID})
+	// Always: CancelWorkflow is not the cancel signal the workflow handles, so
+	// nothing else is sure to say it. A batch notice is keyed by this run, so a
+	// PIPELINE_RUN_STOPPED from the run's own workflow lands on the same key.
+	publishUserStopNotice(pipelineID, id, isCDC, cancelNoticeMessage)
+
+	resp := gin.H{
 		"message":            "Execution cancelled",
 		"execution_id":       id,
 		"status":             "cancelled",
 		"temporal_cancelled": temporalCancelled,
-	})
+	}
+	if len(stopWarnings) > 0 {
+		resp["warnings"] = stopWarnings
+	}
+	c.JSON(http.StatusOK, resp)
 }

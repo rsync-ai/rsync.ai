@@ -27,7 +27,6 @@ interface ActivePipelinesListProps {
   pipelines: ActivePipeline[]
   currentPipelineId?: string
   onSelect: (pipelineId: string) => void
-  onRemove: (pipelineId: string) => void
   onClearCompleted: () => void
 }
 
@@ -35,7 +34,6 @@ export function ActivePipelinesList({
   pipelines,
   currentPipelineId,
   onSelect,
-  onRemove,
   onClearCompleted,
 }: ActivePipelinesListProps) {
   const router = useRouter()
@@ -70,7 +68,7 @@ export function ActivePipelinesList({
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Layers className="h-4 w-4" />
-          <span className="hidden sm:inline">Pipelines</span>
+          <span className="hidden @md:inline">Pipelines</span>
           {activePipelines.length > 0 && (
             <Badge variant="secondary" className="h-5 px-1.5 text-xs">
               {activePipelines.length}

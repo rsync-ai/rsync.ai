@@ -648,13 +648,6 @@ func min(a, b int) int {
 	return b
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // SinkBootstrapServers is the bootstrap string handed to the kafka-mcp-sink
 // connector over MCP when a sink is started or restarted.
 //

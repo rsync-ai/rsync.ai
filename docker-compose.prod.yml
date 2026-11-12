@@ -394,8 +394,9 @@ services:
       # Autonomous CDC sink self-heal (Bug B, #678): default OFF; arm by setting
       # CDC_SINK_AUTORESTART_ENABLED=true in prod .env (op-safety gate, not edition gate).
       - CDC_SINK_AUTORESTART_ENABLED=${CDC_SINK_AUTORESTART_ENABLED:-false}
-      # Orphan sink-worker reaper: off | dry_run | enforce; default OFF (op-safety gate).
-      - SINK_WORKER_REAPER_MODE=${SINK_WORKER_REAPER_MODE:-off}
+      # Sink-worker reaper: enforce (default) | dry_run | off. Stops the workers of deleted
+      # or stopped pipelines and of finished batch runs; re-cleans a deleted pipeline's topics.
+      - SINK_WORKER_REAPER_MODE=${SINK_WORKER_REAPER_MODE:-enforce}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - TOOLS_DIR=/app/shared/mcp-connectors
       - TOOL_GENERATOR_URL=http://tool-generator:5010
@@ -542,6 +543,12 @@ services:
       - FEATURE_MONITORING_OVERVIEW=true
       - FEATURE_MONITORING_INFRA=true
       - FEATURE_MONITORING_TRACES=true
+      # AI agent access: the MCP server at /api/agent/v1/mcp and the agent token
+      # routes. On unless .env.prod sets it false; a rollout flag, not an edition gate.
+      - RSYNC_AGENT_GATEWAY_ENABLED=${RSYNC_AGENT_GATEWAY_ENABLED:-true}
+      # The "Ask rsync.ai" panel and its admin model keys. On unless .env.prod sets it
+      # false; a rollout flag, not an edition gate.
+      - RSYNC_ASSISTANT_ENABLED=${RSYNC_ASSISTANT_ENABLED:-true}
       - TOOLS_PATH=/app/shared/mcp-connectors
       # Used by admin invitation creation to generate signup URLs.
       - FRONTEND_URL=${FRONTEND_URL:-https://${DOMAIN}}
@@ -589,6 +596,12 @@ services:
       - PORT=5000
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # The assistant's Gemini entry, and each entry's model. A key an admin sets in
+      # Admin -> Settings -> AI models wins over these.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ASSISTANT_CLAUDE_MODEL=${ASSISTANT_CLAUDE_MODEL:-}
+      - ASSISTANT_OPENAI_MODEL=${ASSISTANT_OPENAI_MODEL:-}
+      - ASSISTANT_GEMINI_MODEL=${ASSISTANT_GEMINI_MODEL:-}
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
@@ -623,6 +636,11 @@ services:
       - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      # gcp-metadata: the bearer token for a googleapis.com OPENAI_BASE_URL (Vertex AI)
+      # comes from the VM's service account, no key (docs/deployment/self-hosting.md).
+      - OPENAI_API_KEY_SOURCE=${OPENAI_API_KEY_SOURCE:-}
+      # Empty = the code's default headroom for a thinking model's reasoning.
+      - LLM_REASONING_TOKEN_HEADROOM=${LLM_REASONING_TOKEN_HEADROOM:-}
       - EXPLORER_OFFLINE_ONLY=${EXPLORER_OFFLINE_ONLY:-false}
       # env_file is !override [] above, so Explorer overrides need explicit
       # passthrough. All soft-default empty: unset ⇒ the code's own defaults
@@ -835,6 +853,15 @@ services:
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
       - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2025-01-01-preview}
       - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
+      # The rest of what the llm-service block passes, for the same reason: an
+      # OpenAI-compatible endpoint such as Vertex AI (base URL, gcp-metadata token)
+      # and its model. Empty LLM_MODEL keeps the agents' own default (agents/base.py).
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - OPENAI_API_KEY_SOURCE=${OPENAI_API_KEY_SOURCE:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - LLM_REASONING_TOKEN_HEADROOM=${LLM_REASONING_TOKEN_HEADROOM:-}
       # Logo.dev token for the connector logo downloader. env_file:!override []
       # drops ./llm-service/.env, so it must be passed through explicitly here.
       - LOGO_DEV_TOKEN=${LOGO_DEV_TOKEN:-}
@@ -894,9 +921,6 @@ services:
         # runtime environment variables have no effect on them.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://${DOMAIN}}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://${DOMAIN}/ws}
-        NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL: ${NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL:-https://${DOMAIN}/orchestrator}
-        NEXT_PUBLIC_WS_ORCHESTRATOR_URL: ${NEXT_PUBLIC_WS_ORCHESTRATOR_URL:-wss://${DOMAIN}/ws/orchestrator}
-        NEXT_PUBLIC_LLM_SERVICE_URL: ${NEXT_PUBLIC_LLM_SERVICE_URL:-https://${DOMAIN}/llm}
         NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: "true"
         NEXT_PUBLIC_FEATURE_MONITORING_INFRA: "true"
         NEXT_PUBLIC_FEATURE_MONITORING_TRACES: "true"
@@ -904,9 +928,8 @@ services:
         NEXT_PUBLIC_OTEL_SERVICE_NAME: "frontend"
     environment:
       - API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
-      - ORCHESTRATOR_INTERNAL_URL=http://orchestrator:8080
-      # Server-only (NOT NEXT_PUBLIC): lets the RSC dashboard authenticate its
-      # server-side call to the orchestrator's now-gated CDC endpoints.
+      # Server-only (NOT NEXT_PUBLIC): api-gateway sends it when it asks this server to
+      # draw a workflow's chart PNG or dashboard PDF.
       - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
       # Frontend appends /api/v1/... to NEXT_PUBLIC_API_URL, so this must be the origin (no /api).
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-https://${DOMAIN}}
@@ -959,6 +982,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY_ID:?MINIO_ACCESS_KEY_ID must be set in prod .env (refusing the minioadmin default)}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_ACCESS_KEY:?MINIO_SECRET_ACCESS_KEY must be set in prod .env (refusing the minioadmin default)}
+      # The base file's dev key is public, so prod refuses it the same way. Set it
+      # once, before first start, and never change it (see the base file).
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY:?MINIO_KMS_SECRET_KEY must be set in prod .env (the prefix rsync-ai-kms and a colon, then openssl rand -base64 32; set once, never change it)}
     deploy:
       resources:
         limits:
@@ -1000,7 +1026,7 @@ services:
   # drains the Kafka topic, and 0 rows reach the destination while the pipeline
   # still reports "completed".
   #
-  # docker-compose.staging.yml:300 already carries this override with a
+  # docker-compose.staging.yml:297 already carries this override with a
   # hardcoded `require`. Repeating it here with ${DB_SSLMODE:-require} keeps the
   # single knob working in both directions instead of pinning TLS on.
   kafka-mcp-sink-mcp:

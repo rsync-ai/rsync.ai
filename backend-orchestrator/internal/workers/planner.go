@@ -21,6 +21,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/telemetry"
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/correlation"
 )
 
@@ -220,6 +221,44 @@ func forwardErrorContext(dst, taskContext map[string]interface{}) {
 	}
 }
 
+// forwardConnectorTypes tells the planner service which engine is the source and
+// which the destination. A V2 task holds them only in the capability resolver's
+// output ("connectors"), and the service's own lookup of the connection ids needs a
+// gateway session it does not hold, so without this the heuristic planner guessed
+// the roles: prod a6ca2103 (PostgreSQL -> MongoDB CDC) planned MongoDB's Debezium class.
+func forwardConnectorTypes(dst, taskContext map[string]interface{}) {
+	if taskContext == nil {
+		return
+	}
+	resolved := map[string]interface{}{}
+	if connectors, ok := taskContext["connectors"].(map[string]interface{}); ok {
+		if rc, ok := connectors["resolved_connectors"].(map[string]interface{}); ok {
+			resolved = rc
+		}
+	}
+	for _, side := range []string{"source", "destination"} {
+		for _, v := range []interface{}{taskContext[side+"_type"], taskContext[side+"_connector"], resolved[side]} {
+			if t := connectorTypeOf(v); t != "" {
+				dst[side+"_type"] = t
+				break
+			}
+		}
+	}
+}
+
+func connectorTypeOf(v interface{}) string {
+	if m, ok := v.(map[string]interface{}); ok {
+		if t := getStringFromMap(m, "connector_type"); t != "" {
+			return t
+		}
+		return getStringFromMap(m, "type")
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
 // generatePlan calls the Python planner service to generate an execution plan
 func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecision *ModeDecision) (map[string]interface{}, error) {
 	ctx, span := w.tracer.Start(ctx, "planner.llm_call",
@@ -307,6 +346,7 @@ func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecisio
 	// planner service so it can produce a corrected plan instead of regenerating the failing
 	// one. Absent on the normal first planning pass, so the existing path is unchanged.
 	forwardErrorContext(plannerContext, task.Context)
+	forwardConnectorTypes(plannerContext, task.Context)
 
 	// Add mode decision if available
 	if modeDecision != nil {
@@ -347,6 +387,7 @@ func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecisio
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	stampPlanWorkspace(req, taskWorkspaceID(ctx, w.db, task))
 	for k, v := range telemetry.InjectTraceToHeaders(ctx) {
 		req.Header.Set(k, v)
 	}
@@ -362,8 +403,11 @@ func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecisio
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Same as the intent worker: the body can quote the request or the
+		// provider's error, and this error becomes the step's failure message.
 		body, _ := io.ReadAll(resp.Body)
-		err := fmt.Errorf("planner returned status %d: %s", resp.StatusCode, string(body))
+		log.WithField("trace_id", task.TraceID).Warnf("Planner Worker: /plan returned %d: %s", resp.StatusCode, llmscrub.ScrubMax(string(body), 500))
+		err := fmt.Errorf("planner returned status %d", resp.StatusCode)
 		span.RecordError(err)
 		return nil, err
 	}

@@ -342,6 +342,8 @@ INSERT INTO e2e_db.{table} VALUES (1, 'ok');
         cfg = {
             "connector.class": "io.debezium.connector.mysql.MySqlConnector",
             "tasks.max": "1",
+            "topic.creation.default.replication.factor": "-1",
+            "topic.creation.default.partitions": "-1",
             "topic.prefix": connector,
             "database.hostname": MYSQL_CONTAINER,
             "database.port": "3306",

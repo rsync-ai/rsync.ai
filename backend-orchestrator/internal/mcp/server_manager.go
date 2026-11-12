@@ -597,13 +597,16 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 	//   - CDC pipelines (RequireHTTP=true): no stdio fallback, so we must wait for the container.
 	//   - Fresh installs: connector images exist but containers were never started.
 	// Max wait is gated by config.DeployWaitTimeout (default 60s). Batch callers that don't
-	// need HTTP transport will reach the stdio fallback below if the container never appears.
+	// need HTTP transport will reach the stdio fallback below if the container never appears,
+	// provided the connector's dependencies install locally.
 	deployed, building, deployErr := sm.tryDeployConnectorContainer(config.Name, config.Version)
-	if deployErr != nil && (config.RequireHTTP || config.NoStdioWhileDeploying) {
+	if deployErr != nil && (config.RequireHTTP || config.NoStdioWhileDeploying || IsConnectorBuildFailedMessage(deployErr.Error())) {
 		// tool-generator said the deploy failed, so no container is coming: waiting out
 		// DeployWaitTimeout would only delay the error, and the guards below would replace
 		// the reason with "no container is reachable" or "still being set up". Callers
-		// that can use stdio fall through to it, as they do when no deploy was possible.
+		// that can use stdio fall through to it, as they do when no deploy was possible —
+		// unless the connector's image failed to build: its dependencies do not install,
+		// and stdio would run it without them on the orchestrator's interpreter.
 		return finish(nil, fmt.Errorf("connector %s@%s could not be deployed: %w", config.Name, config.Version, deployErr))
 	}
 	if deployed {
@@ -631,7 +634,17 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 		deadline := time.Now().Add(waitTimeout)
 		const pollInterval = 3 * time.Second
 		attempt := 0
+		lastAsked := time.Now()
 		for time.Now().Before(deadline) {
+			if building && time.Since(lastAsked) >= deployRecheckInterval {
+				// The build runs on tool-generator; ask how it went. A failed build ends
+				// the wait with its cause, for every caller (see the deployErr guard above).
+				_, building, deployErr = sm.tryDeployConnectorContainer(config.Name, config.Version)
+				lastAsked = time.Now()
+				if deployErr != nil && IsConnectorBuildFailedMessage(deployErr.Error()) {
+					return finish(nil, fmt.Errorf("connector %s@%s could not be deployed: %w", config.Name, config.Version, deployErr))
+				}
+			}
 			for _, candidate := range connectorNameCandidates(config.Name) {
 				for _, containerName := range containerNameCandidates(candidate, config.Version) {
 					if dockerServer := sm.checkDockerContainer(containerName, strings.ToLower(config.Name)); dockerServer != nil {
@@ -650,6 +663,9 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 				break
 			}
 			sleep := pollInterval
+			if building && deployRecheckInterval < sleep {
+				sleep = deployRecheckInterval
+			}
 			if remaining < sleep {
 				sleep = remaining
 			}
@@ -696,6 +712,22 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 	plan, err := sm.prepareRuntime(connectorPath, config.Name)
 	if err != nil {
 		return finish(nil, fmt.Errorf("failed to prepare runtime: %w", err))
+	}
+
+	// A deploy is underway but the connector's dependencies did not install here, so
+	// the stdio run would be on an interpreter without its imports and could only answer
+	// "No module named 'X'". That holds for every caller, not only the ones that opted
+	// in above: return the retryable "still being set up" error instead. Stdio is kept
+	// when the dependencies installed, and when no deploy was possible (deployed=false),
+	// where stdio is the supported transport and a failed install is reported on the run.
+	if deployed && plan.depsErr != nil {
+		log.Warnf("⏳ Connector %s@%s is still deploying and its dependencies did not install locally (%v) — returning a retryable result instead of the stdio fallback",
+			config.Name, config.Version, plan.depsErr)
+		return finish(nil, &ConnectorDeployingError{
+			Connector:   config.Name,
+			Version:     config.Version,
+			DisplayName: sm.ConnectorDisplayName(config.Name, config.Version),
+		})
 	}
 
 	// Prepare command
@@ -911,6 +943,12 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 // deployCallTimeout bounds the tool-generator /v1/deploy request. A var so tests can
 // shorten it.
 var deployCallTimeout = 15 * time.Second
+
+// deployRecheckInterval is how often StartServer asks tool-generator again about a
+// build it reported as running, so a build that fails ends the wait with its cause
+// instead of a poll that runs out. tool-generator joins the running build rather than
+// starting another. A var so tests can shorten it.
+var deployRecheckInterval = 15 * time.Second
 
 // cachedHTTPVerifyInterval is how long StartServer trusts a cached HTTP server's last
 // good /health answer. Every tool call passes through StartServer, so asking on each

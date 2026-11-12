@@ -51,6 +51,31 @@ func IsConnectorDeployingMessage(msg string) bool {
 	return strings.Contains(msg, ConnectorDeployingMarker)
 }
 
+// ConnectorBuildFailedMarker starts tool-generator's answer for a connector image that
+// failed to build (deployment/routes.py BUILD_FAILED_PREFIX), which carries the end of
+// the build log. A build failure is not a wait: the same files fail the same way, so
+// it is shown with its cause and never as "still being set up". Keep it in lockstep
+// with api-gateway handlers.connectorBuildFailedMarker and the frontend's
+// CONNECTOR_BUILD_FAILED_MARKER (src/lib/errors/connector-deploying.ts).
+const ConnectorBuildFailedMarker = "connector image failed to build"
+
+// IsConnectorBuildFailedMessage reports whether a flattened error string carries a
+// failed image build.
+func IsConnectorBuildFailedMessage(msg string) bool {
+	return strings.Contains(msg, ConnectorBuildFailedMarker)
+}
+
+// connectorBuildFailedMessage is the user-facing text for a failed build: the
+// connector's name, then tool-generator's answer from the marker on, without the
+// "Connection test failed: Failed to start server: … could not be deployed:" chain.
+func connectorBuildFailedMessage(displayName, errMsg string) string {
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		displayName = "This"
+	}
+	return fmt.Sprintf("The %s %s", displayName, errMsg[strings.Index(errMsg, ConnectorBuildFailedMarker):])
+}
+
 // missingModuleRe matches a Python import failure for a third-party dependency:
 // "No module named 'pymongo'" / "ModuleNotFoundError: No module named pymongo.errors".
 var missingModuleRe = regexp.MustCompile(`(?i)(ModuleNotFoundError|No module named\s)`)
@@ -66,8 +91,13 @@ func IsMissingModuleError(msg string) bool {
 // the request reached a stdio fallback whose interpreter lacks the connector's
 // dependencies ("No module named 'X'"). A connector running in its own image always
 // has its dependencies, so an import error on a test is never the user's to fix.
+// A failed image build is checked first: its build log can name a missing module,
+// and it is the one failure here that waiting does not fix.
 // Returns (mapped, true) when mapped; (errMsg, false) otherwise.
 func FriendlyTestConnectionError(displayName, errMsg string) (string, bool) {
+	if IsConnectorBuildFailedMessage(errMsg) {
+		return connectorBuildFailedMessage(displayName, errMsg), true
+	}
 	if IsConnectorDeployingMessage(errMsg) || IsMissingModuleError(errMsg) {
 		return ConnectorDeployingMessage(displayName), true
 	}

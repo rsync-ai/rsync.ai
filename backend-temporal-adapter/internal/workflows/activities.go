@@ -180,18 +180,38 @@ func stateUpdateActivity(ctx context.Context, update StateUpdateInput) error {
 		return nil
 	}
 
+	// pipeline_progress is one row per pipeline; once a newer run has replaced
+	// this one, the row is the newer run's (run_superseded.go).
+	if runSuperseded(ctx, db, update.ExecutionID) {
+		log.WithFields(log.Fields{"pipeline_id": update.PipelineID, "execution_id": update.ExecutionID, "status": update.Status}).
+			Info("StateUpdateActivity: a newer run owns the pipeline; skipping this run's state write")
+		return nil
+	}
+
 	// Retry loop for optimistic locking
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Read current version
+		// Read current version, and the progress an update with no plan keeps.
 		var currentVersion int
+		var storedExec sql.NullString
+		var storedPercent, storedStep, storedTotal sql.NullInt64
 		err := db.QueryRowContext(ctx, `
-			SELECT COALESCE(version, 1) FROM pipeline_progress WHERE pipeline_id = $1
-		`, update.PipelineID).Scan(&currentVersion)
+			SELECT COALESCE(version, 1), execution_id::text,
+			       progress_percent, progress_current_step, progress_total_steps
+			FROM pipeline_progress WHERE pipeline_id = $1
+		`, update.PipelineID).Scan(&currentVersion, &storedExec, &storedPercent, &storedStep, &storedTotal)
 
 		newVersion := 1
+		stored := storedProgress{}
 		if err == nil {
 			newVersion = currentVersion + 1
+			stored = storedProgress{
+				executionID: storedExec.String,
+				percent:     int(storedPercent.Int64),
+				step:        int(storedStep.Int64),
+				total:       int(storedTotal.Int64),
+				ok:          storedTotal.Valid && storedTotal.Int64 > 0,
+			}
 		} else if err != sql.ErrNoRows {
 			// DB is unhealthy or schema mismatch; treat as non-fatal.
 			log.WithError(err).Warn("⚠️  StateUpdateActivity: Failed to read current version, skipping")
@@ -207,11 +227,7 @@ func stateUpdateActivity(ctx context.Context, update StateUpdateInput) error {
 		}
 
 		// Derive progress from execution_plan when present (drives fully dynamic UI).
-		progressPercent, progressStep, progressTotal := deriveProgressFromExecutionPlan(update.Metadata)
-		if progressTotal == 0 {
-			progressTotal = 7
-		}
-		progressPercent, progressStep = normalizeTerminalProgress(update.Status, progressPercent, progressStep, progressTotal)
+		progressPercent, progressStep, progressTotal := progressForUpdate(update.Status, update.Metadata, update.ExecutionID, stored)
 
 		// Persist blocking_reason_* columns for wait states so /api/v1/pipelines/:id/state
 		// can return a consistent, query-friendly blocking_reason (in addition to metadata JSON).

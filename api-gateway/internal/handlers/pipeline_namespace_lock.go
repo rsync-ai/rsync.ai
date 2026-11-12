@@ -157,7 +157,10 @@ func LockPipelineNamespaceInternal(c *gin.Context) {
 		return
 	}
 
-	res, err := lockNamespaceForRun(c.Request.Context(), database, id, req.SelectedTables, req.DestinationTables)
+	// Not on the request's context: the executor's hang-up failed the collision probe,
+	// and the chosen namespace was then locked for good, unverified. The probe is
+	// bounded at 8 s a candidate, well inside the executor's 45 s wait.
+	res, err := lockNamespaceForRun(context.WithoutCancel(c.Request.Context()), database, id, req.SelectedTables, req.DestinationTables)
 	if err != nil {
 		if err == errNamespaceLockNoTables {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "no_tables", "message": "selected_tables must be non-empty"})

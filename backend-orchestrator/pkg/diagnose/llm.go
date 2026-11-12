@@ -15,9 +15,13 @@
 //   - any transport/decode/validation error falls back to the rules
 //     result; the healer path never fails because the LLM did.
 //
-// Privacy: signal.ErrorMessage passes llmscrub.ScrubMax before it enters
-// the prompt. Everything else in the prompt is metadata (connector
-// types, stage, row counts) — never row values, credentials, or PII.
+// Privacy: the prompt text is llm-service's, not this file's. The diagnoser
+// POSTs a registered prompt name (prompts/diagnose/healer_classify.yaml) and
+// its variables to llm-service's /v1/completion, whose egress guard renders
+// the prompt field by field — Go never reaches a model provider directly.
+// signal.ErrorMessage passes llmscrub.ScrubMax before it is sent; every other
+// variable is metadata (connector types, stage, and whether rows were read and
+// written) — never a row count, row values, credentials, or PII.
 package diagnose
 
 import (
@@ -25,7 +29,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -38,7 +41,9 @@ import (
 
 const (
 	defaultLLMServiceURL = "http://llm-service:5000"
-	llmRequestTimeout    = 15 * time.Second
+	// The registered prompt llm-service renders for this diagnoser.
+	llmDiagnosePromptName = "diagnose/healer_classify"
+	llmRequestTimeout     = 15 * time.Second
 	// Max runes of scrubbed error text included in the prompt.
 	llmErrorMessageCap = 1500
 	// Cap the LLM's confidence just below the auto-execute band so an LLM
@@ -76,12 +81,12 @@ var (
 	diagnoserModeLogOnce sync.Once
 )
 
-// LLMDiagnoser classifies a Signal by calling the llm-service
-// OpenAI-compatible chat endpoint. It satisfies Diagnoser, but callers
-// should normally use it via ChainDiagnoser so the rules run first.
+// LLMDiagnoser classifies a Signal through llm-service's POST /v1/completion.
+// llm-service picks the model (LLM_MODEL, else the prompt's default). It
+// satisfies Diagnoser, but callers should normally use it via ChainDiagnoser
+// so the rules run first.
 type LLMDiagnoser struct {
 	BaseURL    string
-	Model      string
 	HTTPClient *http.Client
 }
 
@@ -104,16 +109,8 @@ func NewLLMDiagnoserFromEnv() *LLMDiagnoser {
 	if baseURL == "" {
 		baseURL = defaultLLMServiceURL
 	}
-	model := os.Getenv("RSYNC_LLM_DIAGNOSER_MODEL")
-	if model == "" {
-		model = os.Getenv("LLM_MODEL")
-	}
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
 	return &LLMDiagnoser{
 		BaseURL:    baseURL,
-		Model:      model,
 		HTTPClient: &http.Client{Timeout: llmRequestTimeout},
 	}
 }
@@ -146,29 +143,16 @@ func (d *LLMDiagnoser) diagnoseLLM(signal Signal) (Diagnosis, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), llmRequestTimeout)
 	defer cancel()
 
-	messages := []map[string]string{
-		{
-			"role":    "system",
-			"content": llmDiagnoseSystemPrompt(),
-		},
-		{
-			"role":    "user",
-			"content": buildLLMDiagnosePrompt(signal),
-		},
-	}
 	reqBody, err := json.Marshal(map[string]interface{}{
-		"model":       d.Model,
-		"messages":    messages,
-		"temperature": 0.1,
-		"response_format": map[string]string{
-			"type": "json_object",
-		},
+		"prompt_name": llmDiagnosePromptName,
+		"variables":   llmDiagnoseVariables(signal),
+		"pipeline_id": signal.PipelineID,
 	})
 	if err != nil {
 		return Diagnosis{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", d.BaseURL+"/v1/chat/completions", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", d.BaseURL+"/v1/completion", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return Diagnosis{}, err
 	}
@@ -185,27 +169,24 @@ func (d *LLMDiagnoser) diagnoseLLM(signal Signal) (Diagnosis, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return Diagnosis{}, fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
+		// The status only: the body is not read, because an error answer can
+		// quote the request and this error is logged.
+		return Diagnosis{}, fmt.Errorf("llm-service returned status %d", resp.StatusCode)
 	}
 
-	// OpenAI-compatible envelope: { "choices": [ { "message": { "content": "..." } } ] }
+	// llm-service's /v1/completion answer: { "content": "...", "model": "...", ... }
 	var llmResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return Diagnosis{}, fmt.Errorf("failed to decode LLM response: %w", err)
+		return Diagnosis{}, fmt.Errorf("failed to decode llm-service response: %w", err)
 	}
-	if len(llmResp.Choices) == 0 {
-		return Diagnosis{}, fmt.Errorf("invalid LLM response: no choices")
+	if llmResp.Content == "" {
+		return Diagnosis{}, fmt.Errorf("invalid llm-service response: no content")
 	}
 
 	var parsed llmDiagnosisResponse
-	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResp.Choices[0].Message.Content)), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResp.Content)), &parsed); err != nil {
 		return Diagnosis{}, fmt.Errorf("failed to parse LLM diagnosis: %w", err)
 	}
 
@@ -239,49 +220,36 @@ func (d *LLMDiagnoser) diagnoseLLM(signal Signal) (Diagnosis, error) {
 	}, nil
 }
 
-func llmDiagnoseSystemPrompt() string {
-	return `You are a data-pipeline reliability engineer. Classify a pipeline execution failure into exactly one category and recommend exactly one recovery action, in strict JSON.
-
-Valid categories: auth_expired, auth_scope, rate_limit, schema_drift, network, connector_bug, dest_capacity, user_config, unknown.
-Valid actions: regenerate_connector, refresh_auth, backoff_retry, request_user_config, escalate_to_human, no_op.
-
-Respond with a JSON object: {"category": "...", "action": "...", "confidence": 0.0-1.0, "rationale": "one line"}.
-Confidence is your certainty the category is correct. When uncertain, use category "unknown" with action "escalate_to_human" and low confidence.`
-}
-
-// buildLLMDiagnosePrompt renders the user message. The error message is
-// scrubbed + truncated (privacy contract: schema metadata and user text
-// only — never row values, credentials, or PII); everything else here
-// is metadata.
-func buildLLMDiagnosePrompt(signal Signal) string {
-	return fmt.Sprintf(`Classify this pipeline execution failure.
-
-- Stage: %s
-- Executor status: %s
-- Source connector type: %s
-- Destination connector type: %s
-- Source row count: %d
-- Rows written to destination: %d
-- Tables that read rows but landed none: %d of %d tables reporting
-- Error message (sensitive values redacted):
-%s`,
+// llmDiagnoseVariables builds the variables of prompts/diagnose/healer_classify.yaml,
+// whose llm_fields tag each one for llm-service's egress guard. The error
+// message is scrubbed + truncated here as well as there (privacy contract:
+// schema metadata and user text only — never row values, credentials, or
+// PII); everything else is metadata.
+func llmDiagnoseVariables(signal Signal) map[string]string {
+	return map[string]string{
 		// Closed-set metadata today ("executor"/"sentinel", an execution
 		// status, connector type names), so Scrub is a no-op on every real
 		// value. Applied anyway so the metadata-only privacy claim holds by
 		// construction rather than depending on every future caller keeping
 		// these fields closed-set.
-		llmscrub.Scrub(signal.Stage),
-		llmscrub.Scrub(signal.ExecutorStatus),
-		llmscrub.Scrub(signal.SourceType),
-		llmscrub.Scrub(signal.DestinationType),
-		signal.SourceRowCount,
-		signal.WrittenRows,
-		// Counts only — no table names. The prompt stays metadata-only per the
-		// LLM data-privacy rule; a count cannot carry a row value or a PII column.
-		signal.TablesWithNoLandedRows,
-		signal.TablesObserved,
-		llmscrub.ScrubMax(signal.ErrorMessage, llmErrorMessageCap),
-	)
+		"stage":            llmscrub.Scrub(signal.Stage),
+		"executor_status":  llmscrub.Scrub(signal.ExecutorStatus),
+		"source_type":      llmscrub.Scrub(signal.SourceType),
+		"destination_type": llmscrub.Scrub(signal.DestinationType),
+		// Yes or no, never the count: a row count describes the customer's
+		// data. No table names either.
+		"source_rows_read":   yesNo(signal.SourceRowCount > 0),
+		"rows_written":       yesNo(signal.WrittenRows > 0),
+		"tables_landed_none": yesNo(signal.TablesWithNoLandedRows > 0),
+		"error_message":      llmscrub.ScrubMax(signal.ErrorMessage, llmErrorMessageCap),
+	}
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 // ChainDiagnoser — rules first, LLM only for what the rules can't name.

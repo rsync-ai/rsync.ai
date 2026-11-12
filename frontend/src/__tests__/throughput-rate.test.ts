@@ -144,6 +144,33 @@ describe("nextRateWindow / movedSinceOpen", () => {
   })
 })
 
+// The card's sparkline: the rate after each reading since the page opened.
+describe("nextRateWindow trend", () => {
+  const t0 = 1_700_000_000_000
+
+  it("adds a point per reading once there is a rate, and none before", () => {
+    let w = EMPTY_RATE_WINDOW
+    for (let i = 0; i <= 3; i++) w = nextRateWindow(w, 1000 + i * 100, t0 + i * 5000)
+    // Readings at 0 s and 5 s are too close to divide; 10 s and 15 s each add a point.
+    expect(w.trend).toEqual([1200, 1200])
+  })
+
+  it("keeps the newest 120 points: ten minutes at one read every 5 s", () => {
+    let w = EMPTY_RATE_WINDOW
+    for (let i = 0; i <= 200; i++) w = nextRateWindow(w, i * 10, t0 + i * 5000)
+    expect(w.trend).toHaveLength(120)
+  })
+
+  it("forgets the trend when the counter stops being measured; a reset adds no point", () => {
+    let w = EMPTY_RATE_WINDOW
+    for (let i = 0; i <= 3; i++) w = nextRateWindow(w, 1000 + i * 100, t0 + i * 5000)
+    w = nextRateWindow(w, 5, t0 + 20_000)
+    expect(w.trend).toEqual([1200, 1200])
+    w = nextRateWindow(w, undefined, t0 + 25_000)
+    expect(w.trend).toEqual([])
+  })
+})
+
 describe("sinceOpenLine", () => {
   it("waits for a whole minute on both sides, so it never reads '(0 min)'", () => {
     expect(sinceOpenLine(["captured", "written"], [{ delta: 5, spanMs: 59_000 }, { delta: 5, spanMs: 120_000 }])).toBeNull()

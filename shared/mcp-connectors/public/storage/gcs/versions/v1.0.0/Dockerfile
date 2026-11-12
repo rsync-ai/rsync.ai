@@ -32,9 +32,6 @@ COPY --from=shared rsync_protocol /app/rsync_protocol
 RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \
     rm -f /app/base_connector.py; \
-    fi && \
-    if [ -d /app/oauth ]; then \
-      mkdir -p /app/shared/mcp-connectors/oauth && cp -r /app/oauth/* /app/shared/mcp-connectors/oauth/; \
     fi
 
 ENV PYTHONPATH="/app/shared/mcp-connectors:/app:${PYTHONPATH}"

@@ -32,7 +32,7 @@ import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
 export default function GenerateConnectorPage() {
   return (
     <Suspense fallback={
-      <div className="flex items-center justify-center min-h-screen">
+      <div className="flex items-center justify-center py-24">
         <Loader2 className="h-8 w-8 animate-spin text-violet-500" />
       </div>
     }>
@@ -56,7 +56,7 @@ function GeneratePageContent() {
   }, [])
   const specMode = discovery === "unavailable"
   return (
-    <div className="container mx-auto px-6 py-8 max-w-6xl">
+    <div className="mx-auto max-w-6xl">
       {/* Hero */}
       <div className="relative overflow-hidden rounded-2xl border border-violet-200/70 dark:border-violet-900/40 bg-gradient-to-br from-violet-50 via-indigo-50 to-white dark:from-violet-950/40 dark:via-indigo-950/30 dark:to-zinc-950 p-6 mb-6">
         <div className="absolute -top-10 -right-10 h-40 w-40 rounded-full bg-violet-200/40 blur-3xl pointer-events-none" />

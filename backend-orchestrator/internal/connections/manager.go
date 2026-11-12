@@ -13,6 +13,7 @@ import (
 
 	"github.com/rsync-ai/shared/crypto"
 	"github.com/rsync-ai/backend-orchestrator/internal/oauth"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 )
 
 // Connection represents a connection entity
@@ -33,6 +34,10 @@ type Manager struct {
 	db            *sql.DB
 	tokenManager  *oauth.TokenManager
 	refreshClient *oauth.RefreshClient
+	// latest, when set, pins a connection whose connector_version is still
+	// "latest" on its first read (see version_pin.go). Only the executor's
+	// manager sets it: it is the one that hydrates a run.
+	latest LatestResolver
 }
 
 // NewManager creates a new connection manager
@@ -57,6 +62,13 @@ func NewManager(db *sql.DB) *Manager {
 		tokenManager:  tokenManager,
 		refreshClient: refreshClient,
 	}
+}
+
+// PinVersionsWith makes every read through this manager pin a connection
+// still at "latest" to the version r resolves it to. Pass a non-nil r.
+func (m *Manager) PinVersionsWith(r LatestResolver) *Manager {
+	m.latest = r
+	return m
 }
 
 // GetRefreshClient returns the OAuth refresh client (for executor)
@@ -148,7 +160,7 @@ func (m *Manager) getInternal(ctx context.Context, userID, connectionID string) 
 
 	config := make(map[string]string)
 	for k, v := range rawConfig {
-		config[k] = fmt.Sprintf("%v", v)
+		config[k] = utils.ConfigString(v)
 	}
 
 	// Hydrate OAuth token if present (stored inside encrypted config)
@@ -197,8 +209,11 @@ func (m *Manager) getInternal(ctx context.Context, userID, connectionID string) 
 	config["type"] = strings.ToLower(connectorType)           // legacy key used by some agents
 	config["connector_type"] = strings.ToLower(connectorType) // explicit
 	config["connection_type"] = strings.ToLower(connType)     // source|destination
+	if m.latest != nil && IsFloatingVersion(connectorVersion) {
+		connectorVersion = ResolvePinned(ctx, m.db, m.latest, connectionID, strings.ToLower(connectorType), connectorVersion)
+	}
 	if strings.TrimSpace(connectorVersion) != "" {
-		config["connector_version"] = strings.TrimSpace(connectorVersion) // "latest" or "vX.Y.Z"
+		config["connector_version"] = strings.TrimSpace(connectorVersion) // "vX.Y.Z", or "latest" when unpinned
 	}
 
 	// #region agent log
@@ -259,7 +274,7 @@ func (m *Manager) GetByName(ctx context.Context, name string) (map[string]string
 
 	config := make(map[string]string)
 	for k, v := range rawConfig {
-		config[k] = fmt.Sprintf("%v", v)
+		config[k] = utils.ConfigString(v)
 	}
 
 	// Include connection metadata for downstream agents (executor direct transfer, etc.)
@@ -342,7 +357,7 @@ func (m *Manager) List(ctx context.Context, connectorType string) ([]Connection,
 
 		config := make(map[string]string)
 		for k, v := range rawConfig {
-			config[k] = fmt.Sprintf("%v", v)
+			config[k] = utils.ConfigString(v)
 		}
 
 		conn.Config = config

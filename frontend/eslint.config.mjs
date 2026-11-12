@@ -33,6 +33,15 @@ const eslintConfig = defineConfig([
       "react-hooks/preserve-manual-memoization": "warn",
     },
   },
+  // An error, not a warning: an unused import, variable or prop is dead code, and
+  // at "warn" 36 of them had piled up unseen. The file-level half of the same
+  // guard is scripts/check-deadcode-ts.mjs (knip). ignoreRestSiblings keeps the
+  // `const { x: _omit, ...rest } = obj` idiom for dropping a key.
+  {
+    rules: {
+      "@typescript-eslint/no-unused-vars": ["error", { ignoreRestSiblings: true }],
+    },
+  },
 ]);
 
 export default eslintConfig;

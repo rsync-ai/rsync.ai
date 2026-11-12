@@ -1,0 +1,75 @@
+# settings: {"version":2,"type":"scatter","roles":{"x":[{"column":"amount"}],"y":[{"column":"quantity"}]}}
+
+-- postgres
+SELECT src."amount" AS "amount", src."quantity" AS "quantity", COUNT(*) AS "rsync_rows"
+FROM "gold"."orders" src
+WHERE src."amount" IS NOT NULL AND src."quantity" IS NOT NULL AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY src."amount", src."quantity"
+ORDER BY COUNT(*) DESC, src."amount" ASC, src."quantity" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, COUNT(*) AS `rsync_rows`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`amount`, src.`quantity`
+ORDER BY COUNT(*) DESC, src.`amount` ASC, src.`quantity` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) src.[amount] AS [amount], src.[quantity] AS [quantity], COUNT_BIG(*) AS [rsync_rows]
+FROM [gold].[orders] src
+WHERE src.[amount] IS NOT NULL AND src.[quantity] IS NOT NULL AND src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY src.[amount], src.[quantity]
+ORDER BY COUNT_BIG(*) DESC, src.[amount] ASC, src.[quantity] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, COUNT(*) AS `rsync_rows`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL
+GROUP BY src.`amount`, src.`quantity`
+ORDER BY COUNT(*) DESC, src.`amount` ASC, src.`quantity` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT src."AMOUNT" AS "AMOUNT", src."QUANTITY" AS "QUANTITY", COUNT(*) AS "RSYNC_ROWS"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL AND src."QUANTITY" IS NOT NULL
+GROUP BY src."AMOUNT", src."QUANTITY"
+ORDER BY COUNT(*) DESC, src."AMOUNT" ASC, src."QUANTITY" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, COUNT(*) AS `rsync_rows`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY src.`amount`, src.`quantity`
+ORDER BY COUNT(*) DESC, src.`amount` ASC, src.`quantity` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, COUNT(*) AS `rsync_rows`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL
+GROUP BY src.`amount`, src.`quantity`
+ORDER BY COUNT(*) DESC, src.`amount` ASC, src.`quantity` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT src."AMOUNT" AS "AMOUNT", src."QUANTITY" AS "QUANTITY", COUNT(*) AS "RSYNC_ROWS"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL AND src."QUANTITY" IS NOT NULL
+GROUP BY src."AMOUNT", src."QUANTITY"
+ORDER BY COUNT(*) DESC, src."AMOUNT" ASC, src."QUANTITY" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

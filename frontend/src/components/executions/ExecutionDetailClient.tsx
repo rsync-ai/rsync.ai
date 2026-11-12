@@ -3,14 +3,7 @@
 import { useState } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
-import { 
-  StopCircle, 
-  RotateCcw, 
-  Play, 
-  ArrowLeft,
-  Loader2
-} from "lucide-react"
+import { StopCircle, RotateCcw, GitBranch, Loader2 } from "lucide-react"
 import { cancelExecution } from "@/lib/api/executions"
 import {
   AssessmentRequiredError,
@@ -18,8 +11,10 @@ import {
   type AssessmentReport,
 } from "@/lib/api/pipelines"
 import { PreMigrationAssessmentModal } from "@/components/pipeline/PreMigrationAssessmentModal"
+import { usePipelineReloadSupported } from "@/lib/hooks/usePipelineReloadSupported"
 import Link from "next/link"
 import { toast } from "sonner"
+import { classifyError } from "@/lib/utils/error-handling"
 
 interface Props {
   execution: {
@@ -38,6 +33,8 @@ export function ExecutionDetailClient({ execution }: Props) {
   const [isCancelling, setIsCancelling] = useState(false)
   const [isRerunning, setIsRerunning] = useState(false)
   const [rerunMode, setRerunMode] = useState<"resume" | "reload" | null>(null)
+  // No Re-run (Reload) when the destination is an app's API (reverse ETL).
+  const reloadSupported = usePipelineReloadSupported(execution.pipelineId || undefined)
 
   // Pre-migration assessment modal state. The re-run hits the same 422
   // assessment gate as PipelineActions; without this it silently fails.
@@ -94,7 +91,11 @@ export function ExecutionDetailClient({ execution }: Props) {
         setPendingRunMode(mode)
         return { awaitingAck: true }
       }
+      // A refused re-run (another run is already in progress, a plan limit) used
+      // to reach only the console: the button stopped spinning and nothing said why.
       console.error("Failed to re-run pipeline:", error)
+      const e = classifyError(error, "pipeline.run")
+      toast.error(e.title, { description: e.hint ?? e.message })
       return { awaitingAck: false }
     } finally {
       // If navigation happens, this component will unmount; this is still safe.
@@ -107,79 +108,59 @@ export function ExecutionDetailClient({ execution }: Props) {
   const isRunning = !liveStream && (execution.status === "running" || execution.status === "pending")
   const isComplete = !liveStream && (execution.status === "success" || execution.status === "failed" || execution.status === "cancelled")
 
+  // The run's actions, in the page header: the pipeline, then what can be done to
+  // this run. They used to sit in a card at the bottom with a second Back button.
   return (
     <>
-    <Card>
-      <CardContent className="p-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Link href="/executions">
-              <Button variant="outline">
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                Back to Executions
-              </Button>
-            </Link>
-          </div>
-          
-          <div className="flex items-center gap-2">
-            {liveStream && (
-              <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                Streaming changes. Stop or pause the stream from the pipeline page.
-              </p>
-            )}
+    <div className="flex flex-wrap items-center gap-2">
+      {liveStream && (
+        <p className="text-sm text-zinc-600 dark:text-zinc-300">
+          Streaming changes. Stop or pause the stream from the pipeline page.
+        </p>
+      )}
 
-            {isRunning && (
-              <Button
-                variant="destructive"
-                onClick={handleCancel}
-                disabled={isCancelling}
-              >
-                {isCancelling ? (
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                ) : (
-                  <StopCircle className="h-4 w-4 mr-2" />
-                )}
-                {isCancelling ? "Cancelling..." : "Cancel Execution"}
-              </Button>
-            )}
-            
-            {isComplete && (
-              <div className="flex items-center gap-2">
-                <Button
-                  onClick={() => handleRerun("resume")}
-                  disabled={isRerunning}
-                  className="bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700"
-                >
-                  {isRerunning && rerunMode === "resume" ? (
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : (
-                    <RotateCcw className="h-4 w-4 mr-2" />
-                  )}
-                  {isRerunning && rerunMode === "resume" ? "Starting..." : "Re-run (Resume)"}
-                </Button>
-                <Button variant="outline" onClick={() => handleRerun("reload")} disabled={isRerunning}>
-                  {isRerunning && rerunMode === "reload" ? (
-                    <>
-                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Reloading...
-                    </>
-                  ) : (
-                    "Re-run (Reload)"
-                  )}
-                </Button>
-              </div>
-            )}
-            
-            <Link href={`/pipelines/${execution.pipelineId}`}>
-              <Button variant="outline">
-                <Play className="h-4 w-4 mr-2" />
-                View Pipeline
-              </Button>
-            </Link>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
+      <Button asChild variant="outline" size="sm">
+        <Link href={`/pipelines/${execution.pipelineId}`}>
+          <GitBranch className="h-4 w-4 mr-2" />
+          View pipeline
+        </Link>
+      </Button>
+
+      {isRunning && (
+        <Button variant="destructive" size="sm" onClick={handleCancel} disabled={isCancelling}>
+          {isCancelling ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <StopCircle className="h-4 w-4 mr-2" />
+          )}
+          {isCancelling ? "Cancelling..." : "Cancel run"}
+        </Button>
+      )}
+
+      {isComplete && reloadSupported && (
+        <Button variant="outline" size="sm" onClick={() => handleRerun("reload")} disabled={isRerunning}>
+          {isRerunning && rerunMode === "reload" ? (
+            <>
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              Reloading...
+            </>
+          ) : (
+            "Re-run (Reload)"
+          )}
+        </Button>
+      )}
+
+      {isComplete && (
+        <Button size="sm" onClick={() => handleRerun("resume")} disabled={isRerunning}>
+          {isRerunning && rerunMode === "resume" ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <RotateCcw className="h-4 w-4 mr-2" />
+          )}
+          {isRerunning && rerunMode === "resume" ? "Starting..." : "Re-run (Resume)"}
+        </Button>
+      )}
+    </div>
 
     <PreMigrationAssessmentModal
       open={!!assessmentReport}

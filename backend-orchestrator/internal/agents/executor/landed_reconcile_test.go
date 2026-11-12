@@ -169,3 +169,29 @@ func TestClassifyLandedReconcile(t *testing.T) {
 		})
 	}
 }
+
+// A total loss the sink explained is a refusal, not a silent drop: the run said
+// "destination silently dropped all rows … ; sink error: dest error: HTTP 400"
+// (P5 live, 2026-10-06), which reads as if nobody knew why. The status stays
+// silent_drop_detected — routing keys on it — only the words change.
+func TestAllLostReason_SaysRefusedWhenTheSinkSaidWhy(t *testing.T) {
+	d := classifyLandedReconcile(10, 0, 10, 1, 1, 0, 1, "dest error: 10 of 10 rows refused: HTTP 400", "e1")
+	if d.Status != "silent_drop_detected" || !d.AckEvidencedDrop {
+		t.Fatalf("status/verdict changed: %+v", d)
+	}
+	if !strings.HasPrefix(d.Reason, "destination refused all rows: dispatched 10") ||
+		!strings.Contains(d.Reason, "; sink error: dest error: 10 of 10 rows refused") {
+		t.Fatalf("Reason = %q", d.Reason)
+	}
+	// The control: with no sink error the loss IS silent, and says so.
+	if d := classifyLandedReconcile(10, 0, 10, 1, 1, 0, 1, "", "e1"); !strings.HasPrefix(d.Reason, "destination silently dropped all rows") {
+		t.Fatalf("Reason with no sink error = %q", d.Reason)
+	}
+	// The blob lane builds its reason from the same helper.
+	if r := allLostReason("blobs", 4, 2, "e2", "gcs: 403"); !strings.HasPrefix(r, "destination refused all blobs: dispatched 4") {
+		t.Fatalf("blob reason = %q", r)
+	}
+	if r := allLostReason("blobs", 4, 2, "e2", " "); !strings.HasPrefix(r, "destination silently dropped all blobs") {
+		t.Fatalf("blob reason with a blank sink error = %q", r)
+	}
+}

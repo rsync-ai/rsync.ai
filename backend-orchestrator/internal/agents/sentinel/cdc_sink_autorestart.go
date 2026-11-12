@@ -198,3 +198,45 @@ func (s *CDCSentinel) maybeAutoRestartSink(ctx context.Context, pipelineID, pipe
 			})
 	}
 }
+
+// resolveSinkWedgedSQL closes the wedged escalation once the sink has applied a change for
+// this pipeline after the alert was last raised. last_applied_ts is the sink's own apply time
+// (loadSinkAppliedProgress says why it, not the source side's last_event_ts, is the proof).
+const resolveSinkWedgedSQL = `
+	DELETE FROM sentinel_active_issues si
+	WHERE si.id = $1
+	  AND EXISTS (
+		SELECT 1 FROM pipeline_run_table_stats t
+		WHERE t.pipeline_id = $2
+		  AND t.mode = 'cdc'
+		  AND t.last_applied_ts > si.last_occurrence
+	  )`
+
+// resolveSinkWedged closes the cdc-sink-wedged- escalation once the sink is delivering again,
+// whoever fixed it. Before this nothing closed it: the row stayed open until the pipeline was
+// deleted. It runs whether or not the auto-restart rung is armed, so switching the flag off
+// after an escalation does not strand the row.
+//
+// Closing it re-arms the escalation and keeps the restart count: a second wedge inside the
+// same window escalates again at once, instead of staying silent (escalated was still set)
+// or buying itself a fresh set of restarts. Silent, like the other resolvers outside the D2
+// allowlist (resolved_notice.go).
+func (s *CDCSentinel) resolveSinkWedged(ctx context.Context, pipelineID string) {
+	if s.db == nil {
+		return
+	}
+	res, err := s.db.ExecContext(ctx, resolveSinkWedgedSQL, sinkWedgedEscalationIssueID(pipelineID), pipelineID)
+	if err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Debug("🛡️ sink wedged: could not clear the escalation")
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return
+	}
+	s.mu.Lock()
+	if st := s.sinkRestartState[pipelineID]; st != nil {
+		st.escalated = false
+	}
+	s.mu.Unlock()
+	log.WithField("pipeline_id", pipelineID).Info("🛡️ CDC sink applied changes after the wedged escalation — closed it")
+}

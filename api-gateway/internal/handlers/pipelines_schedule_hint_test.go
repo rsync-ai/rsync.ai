@@ -5,7 +5,7 @@ import "testing"
 // The pipelines list gives each row ONE line under the status badge. Two things
 // compete for it: the schedule hint ("cron: 0 9 * * 1") and the last run's real
 // error message. The frontend renders the hint whenever it is present and only
-// falls back to the error when it is absent (PipelinesTable.tsx:297-315).
+// falls back to the error when it is absent (PipelinesTable.tsx:300-318).
 //
 // So an unconditional hint silently hid the failure reason of every scheduled
 // pipeline behind its own cron string — a pipeline that died with "zombie:

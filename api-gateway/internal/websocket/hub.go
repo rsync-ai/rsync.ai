@@ -205,18 +205,6 @@ func (h *Hub) PipelineOwner(ctx context.Context, pipelineID string) (string, boo
 	return ownerID, true
 }
 
-// cachePipelineOwner is a test seam: it lets unit tests prime the owner cache
-// without standing up a database. Production code resolves owners via
-// PipelineOwner (which falls back to Postgres).
-func (h *Hub) cachePipelineOwner(pipelineID, userID string) {
-	if pipelineID == "" || userID == "" {
-		return
-	}
-	h.ownerMu.Lock()
-	h.pipelineOwners[pipelineID] = userID
-	h.ownerMu.Unlock()
-}
-
 // sendScopedToPipeline marshals + delivers a payload that must only be visible
 // to the owner of pipelineID. If the owner cannot be resolved we fail closed.
 func (h *Hub) sendScopedToPipeline(pipelineID string, payload []byte, traceID string) {

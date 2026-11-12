@@ -2,14 +2,16 @@
 
 /**
  * SchemaDriftPolicyCard — "which source schema changes should this pipeline
- * stop and ask me about?"
+ * handle and list for me?"
  *
  * Reads and writes pipelines.config.schema_drift_policy through
  * GET/PUT /pipelines/:id/schema-drift-policy (api-gateway schema_evolution.go).
  * The orchestrator's batch detector applies it (schema_drift.go
  * filterChangesByPolicy): the switch turns detection off for this pipeline, the
- * two boxes drop additions or drops from what is filed for review, and a type
- * change is always filed, because it can silently break writes.
+ * two boxes leave additions or dropped columns out of what is filed, and a type
+ * change is always filed, because it can silently break writes. A dropped table
+ * is always filed too: it is the one change that waits for a decision, and runs
+ * skip the table until someone makes it.
  *
  * Every toggle saves at once, optimistically, and rolls back with a toast if the
  * save fails. Saves are serialized (controls lock while one is in flight) so two
@@ -107,7 +109,8 @@ export function SchemaDriftPolicyCard({ pipelineId, isCDC }: { pipelineId: strin
               </span>
             </CardTitle>
             <p className="mt-1 text-xs text-muted-foreground">
-              Choose which changes to a source table&apos;s columns are listed below for review.
+              Choose which source schema changes rsync.ai handles and lists below. A dropped source table always
+              waits for your decision.
             </p>
           </div>
           <Switch
@@ -133,7 +136,7 @@ export function SchemaDriftPolicyCard({ pipelineId, isCDC }: { pipelineId: strin
 
         <fieldset disabled={optionsLocked} className={cn("space-y-2", !policy.enabled && "opacity-60")}>
           <legend className="mb-1 text-xs font-medium text-muted-foreground">
-            {policy.enabled ? "Ask me about" : "Off for this pipeline: no changes are checked."}
+            {policy.enabled ? "Handle and list" : "Off for this pipeline: no changes are checked."}
           </legend>
           <PolicyOption
             id={`drift-add-${pipelineId}`}
@@ -144,7 +147,7 @@ export function SchemaDriftPolicyCard({ pipelineId, isCDC }: { pipelineId: strin
           />
           <PolicyOption
             id={`drift-drop-${pipelineId}`}
-            label="Dropped tables and columns"
+            label="Dropped columns"
             checked={policy.notify_on_drop}
             disabled={optionsLocked}
             onChange={(v) => void save({ ...policy, notify_on_drop: v })}
@@ -157,6 +160,14 @@ export function SchemaDriftPolicyCard({ pipelineId, isCDC }: { pipelineId: strin
               always reported, since a type change can break writes to the destination
             </span>
           </div>
+          <div className="flex items-center gap-2 text-sm" data-testid="drift-drop-table-row">
+            <Checkbox checked disabled aria-label="Dropped tables (always wait for your decision)" />
+            <span>Dropped tables</span>
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Lock className="h-3 w-3" />
+              always wait for your decision; runs skip the table until then
+            </span>
+          </div>
         </fieldset>
 
         {isCDC && (
@@ -164,7 +175,8 @@ export function SchemaDriftPolicyCard({ pipelineId, isCDC }: { pipelineId: strin
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>
               For a CDC pipeline these settings apply only to a batch initial load. While it streams, new columns
-              are added to the destination automatically and dropped tables or columns are always reported.
+              are added to the destination automatically and a dropped column is kept and reported. A dropped table
+              waits for your decision when the source reports it (MySQL, MariaDB, SQL Server, Oracle and Db2).
             </span>
           </p>
         )}

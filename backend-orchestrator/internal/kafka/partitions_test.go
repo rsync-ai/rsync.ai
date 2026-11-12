@@ -123,15 +123,15 @@ func TestTheDefaultThreeBrokerShape(t *testing.T) {
 
 // ok=false is the whole safety margin: the fallback for an unknown cluster is RF=1,
 // and on a managed broker whose default min.insync.replicas is 2 an RF=1 topic is
-// permanently unwritable. A caller that cannot see the cluster must leave topic
-// creation exactly as it was rather than publish a confident wrong number.
+// permanently unwritable. A caller that cannot see the cluster must not start
+// creating topics rather than publish a confident wrong number.
 func TestCDCTopicShapeForClusterRefusesToGuess(t *testing.T) {
 	for name, m := range map[string]*Manager{
 		"never connected":      {},
 		"connected, no client": {connected: true},
 	} {
 		if shape, ok := m.CDCTopicShapeForCluster(); ok {
-			t.Errorf("%s → ok=true with %+v, want ok=false so the caller leaves creation alone", name, shape)
+			t.Errorf("%s → ok=true with %+v, want ok=false so the caller refuses", name, shape)
 		}
 	}
 }

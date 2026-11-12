@@ -48,10 +48,24 @@ type coreServiceCheck struct {
 	probe   func() serviceHealth
 
 	failures int
+	// downSince is when the current run of failed checks began; the resolved notice
+	// sends it as opened_at.
+	downSince time.Time
 	// alerted is set once this outage has been delivered, so one outage is one alert.
-	// It clears when the service answers again.
+	// It clears once the "responding again" notice has been delivered too.
 	alerted bool
 }
+
+// dataPathImpact is what the Kafka outage alert says stops, and what does not. It used to
+// end "nothing will resume on its own once it is back", which was false: a streaming
+// pipeline continues from its last position and a schedule runs at its next time.
+//
+// The sentinel's outage alert says the same thing in the same words
+// (backend-orchestrator/internal/agents/sentinel/notify.go dataPathImpact). The two are in
+// different modules, so neither can import the other: change both or neither.
+const dataPathImpact = "Pipelines cannot move data while it is down. Once it is back, streaming pipelines " +
+	"continue from where they left off and schedules run at their next time, but a run that failed, " +
+	"a pipeline that was stopped, or a scheduled time that passed during the outage may need you to start it again."
 
 func defaultCoreServiceChecks() []*coreServiceCheck {
 	return []*coreServiceCheck{
@@ -72,7 +86,7 @@ func defaultCoreServiceChecks() []*coreServiceCheck {
 		{
 			subject: "infrastructure:kafka",
 			name:    "Kafka",
-			impact:  "Pipelines cannot move data while it is down, and nothing will resume on its own once it is back.",
+			impact:  dataPathImpact,
 			probe:   checkKafka,
 		},
 	}
@@ -111,15 +125,28 @@ func StartCoreServiceWatch(ctx context.Context, p assessmentPublisher) {
 func (c *coreServiceCheck) observe(ctx context.Context, p assessmentPublisher) {
 	h := c.probe()
 	if h.Status == "up" {
+		c.failures = 0
 		if c.alerted {
 			log.WithField("service", c.name).Info("core service watch: responding again")
+			// Tell the admins the outage they were paged for is over. A notice that
+			// cannot be delivered leaves the outage marked as alerted, so the next
+			// tick sends it again; the notifier drops one that is not wanted
+			// (api-gateway notifier/resolved.go), so sending is always safe.
+			pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := p.Publish(pctx, coreServiceResolvedPayload(c)); err != nil {
+				log.WithError(err).WithField("service", c.name).Warn("core service watch: could not deliver the recovery notice")
+				return
+			}
 		}
-		c.failures = 0
 		c.alerted = false
 		return
 	}
 
 	c.failures++
+	if c.failures == 1 {
+		c.downSince = time.Now()
+	}
 	if c.failures < coreServiceWatchThreshold || c.alerted {
 		return
 	}
@@ -163,5 +190,34 @@ func coreServiceDownPayload(c *coreServiceCheck) []byte {
 			"dedup_subject": c.subject,
 		},
 	})
+	return raw
+}
+
+// coreServiceResolvedPayload is the "responding again" notice for the alert above: the
+// same instance scope, action_url and dedup subject, so the notifier pairs it with that
+// service's INFRASTRUCTURE_DOWN and with no other, and opened_at so it counts how long the
+// outage lasted (sentinel/resolved_notice.go publishInstanceResolved sends the same shape).
+func coreServiceResolvedPayload(c *coreServiceCheck) []byte {
+	message := "The " + c.name + " service is responding again."
+	body := map[string]interface{}{
+		"type":        "alert_resolved",
+		"pipeline_id": "instance",
+		"message":     message,
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+		"action_url":  "/admin/health",
+		"severity":    "info",
+		"error": map[string]interface{}{
+			"failure_type":  "transient_error",
+			"code":          "INFRASTRUCTURE_DOWN_RESOLVED",
+			"severity":      "info",
+			"audience":      "user",
+			"user_message":  message,
+			"dedup_subject": c.subject,
+		},
+	}
+	if !c.downSince.IsZero() {
+		body["opened_at"] = c.downSince.UTC().Format(time.RFC3339)
+	}
+	raw, _ := json.Marshal(body)
 	return raw
 }

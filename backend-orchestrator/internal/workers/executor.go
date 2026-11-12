@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	appmetrics "github.com/rsync-ai/backend-orchestrator/internal/metrics"
+	"github.com/rsync-ai/backend-orchestrator/internal/runcancel"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 	"github.com/rsync-ai/shared/correlation"
 )
 
@@ -37,6 +40,9 @@ type ExecutorWorker struct {
 	correlationClient *correlation.Client
 	workerID          string
 	healerAgent       *healer.Agent // PHASE 3: Healer integration
+
+	// runTaskFn replaces executorAgent.ExecuteTask in tests; nil in production.
+	runTaskFn func(context.Context, executor.ExecutorTask) executor.ExecutorResponse
 }
 
 // NewExecutorWorkerWithAgent lets the caller pass an existing executor.Agent
@@ -498,6 +504,16 @@ func (w *ExecutorWorker) Execute(ctx context.Context, task Task) TaskResult {
 				Stage:       "executor",
 			},
 		})
+	} else if result.Status == "cancelled" {
+		// The user stopped the run (executeWithHealer reports "cancelled" for
+		// nothing else). The Stop has already written the progress row as
+		// cancelled; a STAGE_FAILED here overwrote it with "Data transfer
+		// failed: task cancelled: context canceled".
+		log.WithFields(log.Fields{
+			"task_id":     task.TaskID,
+			"pipeline_id": task.PipelineID,
+		}).Info("🛑 Executor Worker: run stopped by the user")
+		stopHeartbeat()
 	} else {
 		log.WithFields(log.Fields{
 			"task_id": task.TaskID,
@@ -507,12 +523,15 @@ func (w *ExecutorWorker) Execute(ctx context.Context, task Task) TaskResult {
 		// Stop heartbeats immediately on failure to avoid late STAGE_PROGRESS overwriting newer stages.
 		stopHeartbeat()
 
-		// Emit STAGE_FAILED event
+		// Emit STAGE_FAILED event. Status is the PIPELINE status, and a failed
+		// task is not yet a failed run: the workflow may park it in the
+		// connection-fix wait, replan, or retry, and writes "failed" itself
+		// when it gives up. The stage still reads failed (stateForEventType).
 		w.progressEmitter.EmitProgress(ctx, ProgressEvent{
 			EventType:   "STAGE_FAILED",
 			PipelineID:  task.PipelineID,
 			ExecutionID: getExecutionID(task),
-			Status:      "failed",
+			Status:      "processing",
 			Message:     fmt.Sprintf("Data transfer failed: %s", result.Error),
 			Progress: ProgressInfo{
 				Percent:     80,
@@ -756,7 +775,42 @@ func tableSelectionWaitingDetails(result map[string]interface{}, payload map[str
 	if destConnID != "" {
 		details["destination_connection_id"] = destConnID
 	}
+	// The one-time transform-step pause for tables named in chat
+	// (transforms_review_gate.go): the chat skips the picker and opens the
+	// transform step with these tables. Written on every wait, like
+	// source_database: the gateway merges details into the stored metadata, so a
+	// "review only" flag from that pause would otherwise survive into a later
+	// table-selection wait and skip its picker.
+	details["review_transforms_only"] = false
+	details["preselected_tables"] = []string{}
+	if review, _ := result["review_transforms_only"].(bool); review {
+		if pre := stringsFromResult(result["preselected_tables"]); len(pre) > 0 {
+			details["review_transforms_only"] = true
+			details["preselected_tables"] = pre
+		}
+	}
 	return details
+}
+
+// stringsFromResult reads a table list that is a []string in-process and a
+// []interface{} after a JSON round trip; blanks are dropped.
+func stringsFromResult(v interface{}) []string {
+	var out []string
+	switch tv := v.(type) {
+	case []string:
+		for _, s := range tv {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+	case []interface{}:
+		for _, it := range tv {
+			if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	}
+	return out
 }
 
 // intFromResult reads a count that is an int in-process and a float64 after a
@@ -776,7 +830,7 @@ func intFromResult(v interface{}) int {
 func convertToStringMap(m map[string]interface{}) map[string]string {
 	result := make(map[string]string)
 	for k, v := range m {
-		result[k] = fmt.Sprintf("%v", v)
+		result[k] = utils.ConfigString(v)
 	}
 	return result
 }
@@ -880,6 +934,102 @@ func isNonFailureStatus(status string) bool {
 	return ok
 }
 
+// runTask runs one attempt of the task.
+func (w *ExecutorWorker) runTask(ctx context.Context, task executor.ExecutorTask) executor.ExecutorResponse {
+	if w.runTaskFn != nil {
+		return w.runTaskFn(ctx, task)
+	}
+	return w.executorAgent.ExecuteTask(ctx, task)
+}
+
+// newExecutorRunContext is the context one executor run executes under: its
+// time limit, and a cancel the Stop handler reaches through runcancel while the
+// run is in flight. done releases both; call it when the run returns.
+func newExecutorRunContext(parent context.Context, pipelineID string, timeout time.Duration) (context.Context, func()) {
+	timed, cancelTimeout := context.WithTimeout(parent, timeout)
+	ctx, cancel := context.WithCancelCause(timed)
+	unregister := func() {}
+	if pipelineID != "" && pipelineID != "<nil>" {
+		unregister = runcancel.Register(pipelineID, func() { cancel(runcancel.ErrStopped) })
+	}
+	return ctx, func() {
+		unregister()
+		cancel(nil)
+		cancelTimeout()
+	}
+}
+
+// stoppedByUser reports whether a Stop cancelled this run's context.
+func stoppedByUser(ctx context.Context) bool {
+	return ctx.Err() != nil && errors.Is(context.Cause(ctx), runcancel.ErrStopped)
+}
+
+// settleRunStatus makes "cancelled" mean exactly one thing — the user stopped
+// the run — whatever the executor made of its context ending:
+//   - a Stop cancelled the context: the run is "cancelled", even when the
+//     executor reported the interrupted read or write as a failure;
+//   - the context ended for another reason (its time limit, the worker
+//     shutting down): the executor's "cancelled" is a failure, not a stop.
+func settleRunStatus(ctx context.Context, response executor.ExecutorResponse) executor.ExecutorResponse {
+	switch {
+	case stoppedByUser(ctx):
+		return stoppedResponse(response)
+	case response.Status == "cancelled" && ctx.Err() != nil:
+		response.Status = "failed"
+		if response.Error == "" {
+			response.Error = fmt.Sprintf("the run ended before it finished: %v", context.Cause(ctx))
+		}
+	}
+	return response
+}
+
+func stoppedResponse(response executor.ExecutorResponse) executor.ExecutorResponse {
+	response.Status = "cancelled"
+	response.Error = "stopped by user"
+	return response
+}
+
+// executionCancelled reports whether the run's execution row says a Stop
+// ended it. Best effort: an unreachable DB, a missing row or a non-UUID id
+// reads as "not stopped", so a flaky DB cannot switch healing off.
+func (w *ExecutorWorker) executionCancelled(ctx context.Context, execTask executor.ExecutorTask) bool {
+	if w.db == nil {
+		return false
+	}
+	executionID, _ := execTask.Payload["execution_id"].(string)
+	if _, err := uuid.Parse(executionID); err != nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	var cancelled bool
+	if err := w.db.QueryRowContext(probeCtx,
+		`SELECT EXISTS (SELECT 1 FROM executions WHERE id = $1 AND status = 'cancelled')`,
+		executionID).Scan(&cancelled); err != nil {
+		log.WithError(err).WithField("execution_id", executionID).
+			Warn("healer: could not read whether the run was stopped; treating it as not stopped")
+		return false
+	}
+	return cancelled
+}
+
+// reRunAllowed decides, just before a re-run, whether the run is still live.
+// A run the user stopped is never exported again (KI-STOP-DOES-NOT-REACH-
+// RUNNING-TRANSFER: the healer re-ran a stopped transfer and double-wrote the
+// destination). A run whose own context ended is over too: re-running it hands
+// the executor a dead context, which answers "cancelled" at once.
+func (w *ExecutorWorker) reRunAllowed(ctx context.Context, execTask executor.ExecutorTask, response executor.ExecutorResponse) (executor.ExecutorResponse, bool) {
+	if stoppedByUser(ctx) || w.executionCancelled(ctx, execTask) {
+		log.WithField("task_id", execTask.TaskID).Info("🛑 Healer: the run was stopped; not re-running it")
+		return stoppedResponse(response), false
+	}
+	if ctx.Err() != nil {
+		log.WithField("task_id", execTask.TaskID).Warn("Healer: the run's context has ended; not re-running it")
+		return settleRunStatus(ctx, response), false
+	}
+	return response, true
+}
+
 // PHASE 3: executeWithHealer wraps execution with healer recovery logic
 func (w *ExecutorWorker) executeWithHealer(
 	ctx context.Context,
@@ -887,7 +1037,7 @@ func (w *ExecutorWorker) executeWithHealer(
 	attemptCount int,
 ) executor.ExecutorResponse {
 	// Execute the task
-	response := w.executorAgent.ExecuteTask(ctx, execTask)
+	response := settleRunStatus(ctx, w.runTask(ctx, execTask))
 
 	// Return immediately for any status that is not a failure — see
 	// isNonFailureStatus for the list and why each one is on it.
@@ -905,10 +1055,13 @@ func (w *ExecutorWorker) executeWithHealer(
 	// Create error context for healer
 	errorContext := map[string]interface{}{
 		"error_message": response.Error,
-		"task_id":       execTask.TaskID,
-		"pipeline_id":   execTask.PipelineID,
-		"attempt_count": attemptCount,
-		"task_payload":  execTask.Payload,
+		// The executor's own verdict. A silent-drop status is decisive even when
+		// the message is empty or reworded.
+		"executor_status": response.Status,
+		"task_id":         execTask.TaskID,
+		"pipeline_id":     execTask.PipelineID,
+		"attempt_count":   attemptCount,
+		"task_payload":    execTask.Payload,
 	}
 
 	// Ask healer for recovery action (using its error analysis)
@@ -924,10 +1077,13 @@ func (w *ExecutorWorker) executeWithHealer(
 	case "retry_smaller_batch":
 		// Reduce batch size and retry
 		if batchSize, ok := execTask.Params["batch_size"].(int); ok && batchSize > 100 {
+			if stopped, ok := w.reRunAllowed(ctx, execTask, response); !ok {
+				return stopped
+			}
 			newBatchSize := batchSize / 2
 			log.WithField("new_batch_size", newBatchSize).Info("🔄 Retrying with smaller batch")
 			execTask.Params["batch_size"] = newBatchSize
-			return w.executorAgent.ExecuteTask(ctx, execTask)
+			return settleRunStatus(ctx, w.runTask(ctx, execTask))
 		}
 
 	case "skip_and_continue":
@@ -936,13 +1092,20 @@ func (w *ExecutorWorker) executeWithHealer(
 		response.Status = "partial_success"
 		return response
 
-	case "retry_with_backoff":
-		// Simple backoff retry
+	case "retry_with_backoff", "retry_after_rate_limit":
+		// Backoff retry; a rate limit waits out its window (healerBackoff).
 		if attemptCount < 3 {
-			backoffDuration := time.Duration(attemptCount*2) * time.Second
+			backoffDuration := healerBackoff(recoveryAction, attemptCount)
 			log.WithField("backoff_seconds", backoffDuration.Seconds()).Info("⏰ Backing off before retry")
-			time.Sleep(backoffDuration)
-			return w.executorAgent.ExecuteTask(ctx, execTask)
+			// A Stop during the wait ends it rather than sleeping through it.
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoffDuration):
+			}
+			if stopped, ok := w.reRunAllowed(ctx, execTask, response); !ok {
+				return stopped
+			}
+			return settleRunStatus(ctx, w.runTask(ctx, execTask))
 		}
 
 	case "fail":
@@ -953,6 +1116,74 @@ func (w *ExecutorWorker) executeWithHealer(
 	return response
 }
 
+// rateLimitBackoffFloor is the shortest wait before re-running a rate-limited
+// run. A var so a test can shorten it.
+var rateLimitBackoffFloor = 60 * time.Second
+
+// healerBackoff is how long executeWithHealer waits before re-running. A rate
+// limit waits at least a minute: attemptCount*2 is zero on the first attempt,
+// which re-ran straight into the same limit window.
+func healerBackoff(action string, attemptCount int) time.Duration {
+	d := time.Duration(attemptCount*2) * time.Second
+	if action == "retry_after_rate_limit" && d < rateLimitBackoffFloor {
+		d = rateLimitBackoffFloor
+	}
+	return d
+}
+
+// destinationFullMarkers: the destination has no room left.
+var destinationFullMarkers = []string{
+	"over your space quota", // MongoDB Atlas free tier
+	"no space left",
+	"disk full",
+	"storage full",
+}
+
+// rateLimitMarkers: an explicit rate limit. A status code counts only with
+// "status"/"http"/"error" before it, so a row count of 1429 is not one.
+var rateLimitMarkers = []string{
+	"status 429", "http 429", "error 429",
+	"too many requests",
+	"rate limit", "rate-limit", "ratelimit",
+}
+
+// missingConfigMarkers: a required setting is missing or invalid. Kept in
+// step with pkg/diagnose's user-config rule.
+var missingConfigMarkers = []string{
+	"missing required",
+	"required field",
+	"invalid configuration",
+	"config validation failed",
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// silentDropStatuses are the executor's own findings that rows did not land.
+var silentDropStatuses = map[string]struct{}{
+	"silent_drop_detected":         {},
+	"silent_partial_drop_detected": {},
+}
+
+// silentDropReasons are the reasons the executor gives with those statuses
+// (agents/executor/silent_drop_check.go, blob_lane.go), for a caller that
+// passes only the message.
+var silentDropReasons = []string{
+	"destination write unconfirmed",
+	"destination silently dropped",
+	"destination refused all",
+	"connector returned 0 rows but source",
+	"no data reached the destination lane",
+	"silent_drop_detected",
+	"silent_partial_drop_detected",
+}
+
 // suggestRecoveryAction analyzes error and suggests recovery
 func (w *ExecutorWorker) suggestRecoveryAction(
 	ctx context.Context,
@@ -960,6 +1191,72 @@ func (w *ExecutorWorker) suggestRecoveryAction(
 ) string {
 	errorMsg := fmt.Sprintf("%v", errorContext["error_message"])
 	errorLower := strings.ToLower(errorMsg)
+
+	// A silent-drop verdict first, ahead of the transient-network rule: its
+	// message quotes the sink's error, which may well say "timeout". Retrying
+	// re-exports the whole transfer into a destination that may already hold
+	// the rows. The asynchronous healer does not retry one either
+	// (pkg/diagnose/diagnose.go:168 → regenerate-connector or escalate).
+	// KI-DESTINATION-WRITE-UNCONFIRMED-RETRIED.
+	status, _ := errorContext["executor_status"].(string)
+	_, silentDrop := silentDropStatuses[status]
+	for _, reason := range silentDropReasons {
+		if silentDrop {
+			break
+		}
+		silentDrop = strings.Contains(errorLower, reason)
+	}
+	if silentDrop {
+		errorContext["reasoning"] = "Silent drop — rows did not land, and a re-run may duplicate the ones that did (non-retryable; needs a human)"
+		log.Warnf("⚠️  Non-retryable silent drop: %s", errorMsg)
+		return "fail"
+	}
+
+	// Deterministic shapes the default below used to retry as a blip
+	// (generator-trust phase 2). Ahead of the transient rule: each can quote a
+	// timeout or a connection error from deeper down.
+	//
+	// Destination out of space. The free Atlas cluster says "you are over your
+	// space quota". Ahead of the rate-limit rule because a storage message can
+	// also say "quota".
+	if containsAny(errorLower, destinationFullMarkers) {
+		errorContext["reasoning"] = "Destination is out of space (non-retryable; free space or raise the destination's quota)"
+		log.Warnf("⚠️  Non-retryable destination capacity error: %s", errorMsg)
+		return "fail"
+	}
+	// Rate limit: the same request is refused until the window passes, so wait
+	// it out (healerBackoff) instead of re-running at once.
+	if containsAny(errorLower, rateLimitMarkers) {
+		errorContext["reasoning"] = "Rate limited — waiting out the limit window before re-running"
+		return "retry_after_rate_limit"
+	}
+	// A bare "quota exceeded" without a 429 is a storage or plan quota.
+	// Uncertain, so not retried: an unneeded stop is recoverable, a retry loop
+	// is not (CLAUDE.md healer rule).
+	if strings.Contains(errorLower, "quota exceeded") {
+		errorContext["reasoning"] = "Destination quota exceeded (non-retryable; raise the quota or free space)"
+		log.Warnf("⚠️  Non-retryable quota error: %s", errorMsg)
+		return "fail"
+	}
+	// A setting the run needs is missing or invalid, e.g. a blank list ID in a
+	// generated connector: "Missing required path parameter '…' for endpoint
+	// '…'". A retry re-sends the same blank setting. Same phrases as
+	// pkg/diagnose's user-config rule (→ ActionRequestUserConfig); the run's
+	// wait step asks the user for the setting by name.
+	if containsAny(errorLower, missingConfigMarkers) {
+		errorContext["reasoning"] = "A required connection setting is missing or invalid (non-retryable; set it on the connection, then resume)"
+		log.Warnf("⚠️  Non-retryable missing setting: %s", errorMsg)
+		return "fail"
+	}
+
+	// A run aimed at a destination resource that takes no writes
+	// (agents/executor/dest_writable_check.go): the same target refuses on every
+	// attempt. Same phrases as pkg/diagnose's user-config rule.
+	if strings.Contains(errorLower, "is not writable") || strings.Contains(errorLower, "are not writable") {
+		errorContext["reasoning"] = "The destination resource the run writes is not writable (non-retryable; name one the destination can write, then re-run)"
+		log.Warnf("⚠️  Non-retryable destination target: %s", errorMsg)
+		return "fail"
+	}
 
 	// Rule-based recovery suggestions
 	if strings.Contains(errorLower, "timeout") ||

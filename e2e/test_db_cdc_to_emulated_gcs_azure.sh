@@ -255,7 +255,7 @@ run_provider() {  # $1=gcs|azure
   local payload
   payload="$(cat <<JSON
 {"name":"${conn}","config":{
-  "connector.class":"io.debezium.connector.mysql.MySqlConnector","tasks.max":"1",
+  "connector.class":"io.debezium.connector.mysql.MySqlConnector","tasks.max":"1","topic.creation.default.replication.factor":"-1","topic.creation.default.partitions":"-1",
   "database.hostname":"mysql-e2e","database.port":"3306","database.user":"root","database.password":"${MYSQL_ROOT_PW}",
   "database.server.id":"${sid}","topic.prefix":"${conn}","database.include.list":"${db}","table.include.list":"${db}.${tbl}",
   "snapshot.mode":"never","include.schema.changes":"false","database.allowPublicKeyRetrieval":"true","database.ssl.mode":"disabled",

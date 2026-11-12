@@ -6,12 +6,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Button } from "@/components/ui/button"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Label } from "@/components/ui/label"
-import { Loader2, Database, ArrowDown, Plus, Check, AlertCircle } from "lucide-react"
+import { Loader2, Database, ArrowDown, Plus, Check, AlertCircle, ExternalLink } from "lucide-react"
 
 import { cn, formatDate } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { resumePipelineConnections } from "@/lib/api/pipelines"
+import { isStaleHITLAnswer, resumePipelineConnections } from "@/lib/api/pipelines"
+import { notifyStaleHITLAnswer } from "@/lib/pipeline/staleHitlAnswer"
+import { connectionEditHref, type ConnectionRequirements } from "@/lib/pipeline/connectionRequirements"
 import { extractErrorMessage } from "@/lib/utils/error-handling"
 import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
 
@@ -32,16 +34,11 @@ interface PipelineConnectionSelectorProps {
   onSuccess?: () => void
   pipelineId: string
   executionId?: string
-  requirements: {
-    source: { connector_type: string }
-    destination: { connector_type: string }
-    // Which directions still need a user-selected connection. The backend lists
-    // ONLY unresolved directions; a direction it already resolved + auto-assigned
-    // is intentionally absent. When omitted (or empty), both are treated as
-    // required (backward compatible). Used to avoid rendering a bogus picker
-    // (e.g. "Source: Unknown") for an already-wired side.
-    missing?: ("source" | "destination")[]
-  }
+  // `missing` lists the directions still needing a user-selected connection
+  // (absent/empty → both), so an already-wired side gets no bogus "Source:
+  // Unknown" picker. `fixes` (a run that stopped on a missing setting) switches
+  // the dialog to "edit that connection, then resume on the same IDs".
+  requirements: ConnectionRequirements
   // Optional UX helpers (additive; backend may omit)
   userRequest?: string
   suggestions?: Array<{
@@ -217,6 +214,16 @@ export function PipelineConnectionSelector({
   const sourceSatisfied = !sourceRequired || !!selectedSourceId
   const destSatisfied = !destRequired || !!selectedDestId
 
+  // A run that stopped on a missing setting already has its connections: name
+  // the setting, link to that connection's edit form, and resume on the same
+  // IDs — no picker.
+  const fixes = requirements.fixes ?? []
+  const fixMode = fixes.length > 0
+  const fixSourceId =
+    requirements.sourceConnectionId || fixes.find((f) => f.direction === "source")?.connectionId || ""
+  const fixDestId =
+    requirements.destinationConnectionId || fixes.find((f) => f.direction === "destination")?.connectionId || ""
+
   const sourceCandidates = useMemo(() => connectorCandidates(effectiveSourceType), [effectiveSourceType])
   const destCandidates = useMemo(() => connectorCandidates(effectiveDestType), [effectiveDestType])
 
@@ -225,8 +232,8 @@ export function PipelineConnectionSelector({
   const requirementsKey = useMemo(() => {
     return `${normalizeConnectorType(requirements?.source?.connector_type)}|${normalizeConnectorType(
       requirements?.destination?.connector_type
-    )}`
-  }, [requirements?.source?.connector_type, requirements?.destination?.connector_type])
+    )}|${fixMode ? "fix" : "pick"}`
+  }, [requirements?.source?.connector_type, requirements?.destination?.connector_type, fixMode])
 
   // Telemetry for suggestion usage (sent as optional metadata to backend)
   const [suggestionUsed, setSuggestionUsed] = useState(false)
@@ -247,7 +254,12 @@ export function PipelineConnectionSelector({
       setOverrideSourceType("")
       setOverrideDestType("")
       setSuggestionUsed(false)
-      fetchAllConnections()
+      if (fixMode) {
+        setError(null)
+        setLoading(false)
+      } else {
+        fetchAllConnections()
+      }
     } else {
       // If modal is closed while a submit is in-flight, abort it and reset UI.
       submitAbortRef.current?.abort()
@@ -260,7 +272,7 @@ export function PipelineConnectionSelector({
   // A switch invalidates every connection currently listed. Clear the selection
   // too: the ids belong to the workspace we just left.
   useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen || fixMode) return
     return onActiveWorkspaceChange(() => {
       setSourceConnections([])
       setDestConnections([])
@@ -268,7 +280,7 @@ export function PipelineConnectionSelector({
       setSelectedDestId("")
       fetchAllConnections()
     })
-  }, [isOpen])
+  }, [isOpen, fixMode])
 
   async function fetchAllConnections() {
     // The modal can stay open across a workspace switch (same tab or another
@@ -414,6 +426,13 @@ export function PipelineConnectionSelector({
       return
     }
 
+    // Send only the direction(s) the user actually picked. The backend resume
+    // handler ignores empty/omitted ids (omitempty), so an already-resolved
+    // direction keeps its existing assignment instead of being wiped.
+    await submitConnections(selectedSourceId, selectedDestId)
+  }
+
+  async function submitConnections(sourceId: string, destId: string) {
     if (submitting) return
     setSubmitting(true)
     setError(null)
@@ -430,11 +449,8 @@ export function PipelineConnectionSelector({
         pipelineId,
         {
         execution_id: executionId,
-        // Send only the direction(s) the user actually picked. The backend resume
-        // handler ignores empty/omitted ids (omitempty), so an already-resolved
-        // direction keeps its existing assignment instead of being wiped.
-        source_connection_id: selectedSourceId || undefined,
-        destination_connection_id: selectedDestId || undefined,
+        source_connection_id: sourceId || undefined,
+        destination_connection_id: destId || undefined,
         // Optional analytics payload; backend will ignore if unsupported.
         metadata: {
           intent_method: suggestions.length > 0 ? "hitl" : "deterministic",
@@ -452,6 +468,13 @@ export function PipelineConnectionSelector({
       onSuccess?.()
       onClose()
     } catch (err) {
+      if (isStaleHITLAnswer(err)) {
+        // This dialog outlived its step (answered in another tab, or the run
+        // ended): close it and say so — a retry here cannot succeed.
+        notifyStaleHITLAnswer(err)
+        onClose()
+        return
+      }
       console.error("Failed to configure connections:", err)
       if (controller.signal.aborted) {
         setError("Cancelled. If this keeps happening, try again or refresh the page.")
@@ -560,6 +583,7 @@ export function PipelineConnectionSelector({
   }
 
   const canConfirm = sourceSatisfied && destSatisfied && !loading && !submitting
+  const canResumeFix = fixMode && !!(fixSourceId || fixDestId) && !submitting
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => (!open ? onClose() : null)}>
@@ -571,7 +595,43 @@ export function PipelineConnectionSelector({
           </DialogTitle>
         </DialogHeader>
 
-        {loading ? (
+        {fixMode ? (
+          <div className="space-y-4 py-4">
+            {fixes.map((fix) => (
+              <div
+                key={`${fix.direction}-${fix.connectionId}`}
+                className="p-3 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20"
+              >
+                <p className="text-sm text-amber-900 dark:text-amber-200">
+                  The {fix.direction} connection
+                  {fix.connectorType ? ` (${formatConnectorName(fix.connectorType)})` : ""} is missing{" "}
+                  {fix.missingFields.length === 1 ? "a setting" : "settings"}:{" "}
+                  {fix.missingFields.map((field, i) => (
+                    <span key={field}>
+                      {i > 0 ? ", " : ""}
+                      <code className="font-mono text-xs px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40">{field}</code>
+                    </span>
+                  ))}
+                </p>
+                <Button asChild variant="outline" size="sm" className="mt-2">
+                  <a href={connectionEditHref(fix)} target="_blank" rel="noopener noreferrer">
+                    Edit connection
+                    <ExternalLink className="h-3.5 w-3.5 ml-1" />
+                  </a>
+                </Button>
+              </div>
+            ))}
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Fill it in on the connection and save, then resume the run here.
+            </p>
+            {error && (
+              <div className="flex items-center gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300">
+                <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                {error}
+              </div>
+            )}
+          </div>
+        ) : loading ? (
           <div className="space-y-6 py-4">
             <div>
               <h3 className="font-semibold text-gray-900 dark:text-gray-100 mb-3">Source</h3>
@@ -735,6 +795,22 @@ export function PipelineConnectionSelector({
           <Button variant="outline" onClick={handleCancel}>
             Cancel
           </Button>
+          {fixMode ? (
+            <Button
+              onClick={() => submitConnections(fixSourceId, fixDestId)}
+              disabled={!canResumeFix}
+              className="bg-violet-600 hover:bg-violet-700 dark:bg-violet-600 dark:hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {submitting ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Resuming...
+                </>
+              ) : (
+                "Resume run"
+              )}
+            </Button>
+          ) : (
           <Button onClick={handleConfirm} disabled={!canConfirm} className="bg-violet-600 hover:bg-violet-700 dark:bg-violet-600 dark:hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed">
             {submitting ? (
               <>
@@ -748,6 +824,7 @@ export function PipelineConnectionSelector({
               </>
             )}
           </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

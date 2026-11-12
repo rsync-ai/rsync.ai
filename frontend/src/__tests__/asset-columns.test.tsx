@@ -93,11 +93,46 @@ describe("ColumnsPanel", () => {
     expect(screen.getByText("No column matches.")).toBeInTheDocument()
   })
 
+  it("makes each name a button that chooses the column, given a way to choose one", async () => {
+    const onPick = vi.fn()
+    const { rerender } = render(
+      <ColumnsPanel
+        node={ORDERS}
+        tables={ready([{ name: "orders", schema: "public", columns }])}
+        onRetry={() => {}}
+        onPickColumn={onPick}
+        isChosen={(c) => c === "id"}
+        isOnPath={(c) => c === "field_01"}
+      />,
+    )
+    const button = (name: string) => screen.getByRole("button", { name })
+    expect(button("id")).toHaveAttribute("aria-pressed", "true")
+    expect(button("id")).toHaveAttribute("title", "Stop tracing id")
+    expect(button("field_01")).toHaveAttribute("aria-pressed", "false")
+    expect(button("field_01")).toHaveClass("bg-violet-50")
+    expect(button("field_02")).toHaveAttribute("title", "Trace where field_02 comes from and what reads it")
+    await userEvent.click(button("field_02"))
+    expect(onPick).toHaveBeenCalledWith("field_02")
+
+    // Without one, the names are text.
+    rerender(<ColumnsPanel node={ORDERS} tables={ready([{ name: "orders", schema: "public", columns }])} onRetry={() => {}} />)
+    expect(screen.queryByRole("button", { name: "id" })).toBeNull()
+    expect(screen.getByText("id")).toBeInTheDocument()
+  })
+
   it("keeps its controls out of the tab order inside a canvas card", () => {
     panel(ready([{ name: "orders", schema: "public", columns }]), ORDERS, true)
     expect(screen.getByRole("searchbox")).toHaveAttribute("tabindex", "-1")
     expect(screen.getByRole("searchbox")).toHaveClass("nodrag", "nopan")
     for (const name of ["Previous", "Next"]) expect(screen.getByRole("button", { name })).toHaveAttribute("tabindex", "-1")
+  })
+
+  it("keeps a column it lets you choose out of the tab order inside a canvas card", () => {
+    render(
+      <ColumnsPanel node={ORDERS} tables={ready([{ name: "orders", schema: "public", columns }])} onRetry={() => {}} inCanvas onPickColumn={() => {}} />,
+    )
+    expect(screen.getByRole("button", { name: "id" })).toHaveAttribute("tabindex", "-1")
+    expect(screen.getByRole("button", { name: "id" })).toHaveClass("nodrag", "nopan")
   })
 })
 

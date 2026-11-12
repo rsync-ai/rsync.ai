@@ -33,9 +33,6 @@ RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \
     # Ensure runtime imports always resolve to the shared base_connector, not a per-connector copy. \
     rm -f /app/base_connector.py; \
-    fi && \
-    if [ -d /app/oauth ]; then \
-      mkdir -p /app/shared/mcp-connectors/oauth && cp -r /app/oauth/* /app/shared/mcp-connectors/oauth/; \
     fi
 
 # Add shared connectors to Python path

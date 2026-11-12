@@ -15,6 +15,7 @@ package heal
 
 import (
 	"context"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -114,5 +115,46 @@ func TestReapQueryKeepsItsTwoStructuralGuards(t *testing.T) {
 	// 3. Never DELETE. The row is the record that the alarm fired.
 	if strings.Contains(strings.ToUpper(q), "DELETE") {
 		t.Fatal("the reaper DELETEs; it must set resolved_at so the audit trail survives")
+	}
+}
+
+// TestReapQuerySparesWALAlarmsTheWatchdogStillWatches — a WAL alarm is keyed by slot
+// and carries its pipeline's id, and the slot can outlive the pipeline (ON DELETE SET
+// NULL; a failed drop leaves it 'failed'). The watchdog never reopens a row it finds
+// resolved, so the reaper must leave alone every row whose slot the watchdog still
+// lists — the same status list, or the two drift apart and one status reopens the
+// hole. Read from source because heal cannot import sentinel (sentinel imports heal).
+// The behaviour itself is proven in issue_reaper_pg_test.go; this pins it in CI.
+func TestReapQuerySparesWALAlarmsTheWatchdogStillWatches(t *testing.T) {
+	q := reapOrphanedIssuesQuery
+	for _, frag := range []string{
+		"c.id = 'cdc-wal-' || cr.resource_name",
+		"cr.resource_type = 'replication_slot'",
+		"cr.database_type = 'postgresql'",
+	} {
+		if !strings.Contains(q, frag) {
+			t.Fatalf("the reaper no longer exempts WAL alarms of watched slots (missing %q): a pipeline "+
+				"delete would hide the alarm of a slot that is still pinning WAL", frag)
+		}
+	}
+
+	src, err := os.ReadFile("../sentinel/cdc_wal_watchdog.go")
+	if err != nil {
+		t.Fatalf("read the WAL watchdog: %v", err)
+	}
+	statusList := regexp.MustCompile(`cr\.status IN \(([^)]*)\)`)
+	watched := statusList.FindAllStringSubmatch(string(src), -1)
+	if len(watched) != 1 {
+		t.Fatalf("found %d `cr.status IN (...)` lists in cdc_wal_watchdog.go, want the one in "+
+			"checkWALRetention's slot listing", len(watched))
+	}
+	exempt := statusList.FindStringSubmatch(q)
+	if exempt == nil {
+		t.Fatal("the reaper's WAL exemption has no status list")
+	}
+	if exempt[1] != watched[0][1] {
+		t.Errorf("the reaper exempts slots in (%s) but the watchdog watches (%s): a status in one "+
+			"and not the other either hides a live alarm or leaves a dead one open forever",
+			exempt[1], watched[0][1])
 	}
 }

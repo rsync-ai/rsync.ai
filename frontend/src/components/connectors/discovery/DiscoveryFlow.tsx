@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useId, useState, type ReactNode } from "react"
 import { useSearchParams } from "next/navigation"
 import { AlertTriangle, Loader2, Play, RefreshCw, Sparkles } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -20,6 +20,7 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS, API_GATEWAY_URL } from "@/lib/config/api"
 import { VendorPicker } from "./VendorPicker"
 import { ContractPreviewCard } from "./ContractPreviewCard"
+import { PinnedConnectionsPrompt } from "./PinnedConnectionsPrompt"
 
 interface Props {
   onGenerate?: (contract: GenerationContract) => void | Promise<void>
@@ -58,7 +59,10 @@ export function DiscoveryFlow({ onGenerate }: Props) {
 
   // Phase 13c — advanced options ported from the classic form
   const [showAdvanced, setShowAdvanced] = useState(false)
+  // Generate again for a name that already exists: a new version by default,
+  // or (overwrite) the current version rewritten in place.
   const [forceRegenerate, setForceRegenerate] = useState(false)
+  const [overwrite, setOverwrite] = useState(false)
   // P0 — collapse the spec-first inputs (OpenAPI / GraphQL / curl) for custom
   // APIs so a non-technical user sees only name + docs URL + type on first
   // paint. Separate from showAdvanced (Phase-2 force-regenerate) so the two
@@ -213,6 +217,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
       const result = await generateFromSession(connectorName || contract.api_name, contract.session_id, {
         description: description.trim() || `${connectorName || contract.api_name} connector`,
         forceRegenerate,
+        overwrite: forceRegenerate && overwrite,
         apiCategoryHint: categoryDetect?.category_hint,
       })
       setGenerationResult(result)
@@ -224,13 +229,13 @@ export function DiscoveryFlow({ onGenerate }: Props) {
       await onGenerate?.(contract)
     } catch (e) {
       const err = e as { status?: number; message?: string }
-      // The api-gateway restricts generation to power_user/admin. The generate
-      // page gates base users out before they reach here, but surface a clear
-      // message if a 403 still slips through (e.g. a mid-session tier change)
-      // instead of an opaque "Generation failed".
-      if (err?.status === 403) {
+      // A 403 is not always about access: the gateway also refuses to
+      // regenerate a built-in connector (isProtectedCoreConnector), and says
+      // so. Show its sentence; only the workspace role gate's own 403
+      // (requireWorkspaceRole: "insufficient workspace role") is an access problem.
+      if (err?.status === 403 && (!err.message || err.message === "insufficient workspace role")) {
         setError(
-          "Connector generation requires power user or admin access. Contact an admin to upgrade your account.",
+          "Connector generation needs a workspace owner or admin. Ask one of them to generate it, or to make you an admin.",
         )
       } else {
         setError(err?.message || "Generation failed")
@@ -238,7 +243,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
     } finally {
       setGenerating(false)
     }
-  }, [contract, onGenerate, description, forceRegenerate, connectorName])
+  }, [contract, onGenerate, description, forceRegenerate, overwrite, connectorName])
 
   // Auto-derive connector slug from api_name + variant unless user edited it.
   // Full slugify (not just whitespace→hyphen) so a natural-cased or punctuated
@@ -267,10 +272,11 @@ export function DiscoveryFlow({ onGenerate }: Props) {
 
   // When discovery has produced a contract (regardless of can_generate),
   // check whether a connector with that slug already exists. Auto-enables
-  // force-regenerate so the user can overwrite.
+  // force-regenerate so the user can generate it again (a new version unless
+  // they choose to overwrite).
   //
   // NOTE: the backend sets contract.can_generate=false when the connector
-  // already exists (service.py:857). Gating this effect on can_generate
+  // already exists (service.py:986). Gating this effect on can_generate
   // would skip the existence check in exactly the case we need to surface
   // the Force-regenerate checkbox — the user would see the "already exists"
   // warning text but no UI to act on it.
@@ -291,6 +297,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
         if (!cancelled) {
           setConnectorExists(false)
           setForceRegenerate(false)
+          setOverwrite(false)
         }
       })
     return () => { cancelled = true }
@@ -400,7 +407,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
   )
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-6 items-start">
+    <div className="grid grid-cols-1 @3xl:grid-cols-[minmax(0,1fr)_360px] gap-6 items-start">
       <div className="space-y-4 min-w-0">
       {!contract ? (
         // ── Phase 1: Inputs ────────────────────────────────────────────
@@ -455,24 +462,21 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                   {nameCheck.warning && (
                     <div className="mt-1">{nameCheck.warning}</div>
                   )}
-                  {/* Force-regenerate toggle — Phase 1 placement.
+                  {/* Generate-again choice — Phase 1 placement.
                       When backend reports the connector already exists, the user
-                      needs to opt in to overwrite before Discover will unblock.
-                      Without this checkbox in Phase 1 the warning text was just a
-                      dead-end. */}
+                      needs to opt in to generating it again before Discover will
+                      unblock. Without this checkbox in Phase 1 the warning text
+                      was just a dead-end. */}
                   {nameCheck.alreadyExists && (
-                    <label className="mt-2 flex items-center gap-2 cursor-pointer">
-                      <input
-                        data-testid="force-regenerate-toggle"
-                        type="checkbox"
-                        checked={forceRegenerate}
-                        onChange={(e) => setForceRegenerate(e.target.checked)}
-                        className="h-3.5 w-3.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                    <div className="mt-2">
+                      <RegenerateChoice
+                        regenerate={forceRegenerate}
+                        onRegenerateChange={setForceRegenerate}
+                        overwrite={overwrite}
+                        onOverwriteChange={setOverwrite}
+                        label={<><strong>Generate again</strong> — this name already has a connector.</>}
                       />
-                      <span>
-                        <strong>Force regenerate</strong> — overwrite the existing connector.
-                      </span>
-                    </label>
+                    </div>
                   )}
                   {nameCheck.similar && nameCheck.similar.length > 0 && (
                     <div className="mt-1">
@@ -711,7 +715,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                 nameCheck?.valid === false ||
                 // Backend says can_generate=false. The most common cause is
                 // "connector already exists" — in that case we let the user
-                // proceed iff they've ticked Force regenerate. Any other
+                // proceed iff they've ticked Generate again. Any other
                 // canGenerate=false reason still blocks.
                 (nameCheck?.canGenerate === false && !(nameCheck?.alreadyExists && forceRegenerate))
               }
@@ -754,18 +758,15 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                 <div className="text-xs font-medium text-amber-900 dark:text-amber-200">
                   A connector named <code className="font-mono">{connectorName}</code> already exists.
                 </div>
-                <label className="flex items-center gap-2 text-xs text-amber-800 dark:text-amber-300 cursor-pointer">
-                  <input
-                    data-testid="force-regenerate-toggle"
-                    type="checkbox"
-                    checked={forceRegenerate}
-                    onChange={(e) => setForceRegenerate(e.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                <div className="text-xs text-amber-800 dark:text-amber-300">
+                  <RegenerateChoice
+                    regenerate={forceRegenerate}
+                    onRegenerateChange={setForceRegenerate}
+                    overwrite={overwrite}
+                    onOverwriteChange={setOverwrite}
+                    label={<strong>Generate again</strong>}
                   />
-                  <span>
-                    <strong>Force regenerate</strong> — overwrite the existing connector.
-                  </span>
-                </label>
+                </div>
               </div>
             </div>
           )}
@@ -781,19 +782,20 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                 Advanced options
               </summary>
               <div className="px-3 pb-3 pt-1">
-                <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300 cursor-pointer">
-                  <input
-                    data-testid="force-regenerate-toggle"
-                    type="checkbox"
-                    checked={forceRegenerate}
-                    onChange={(e) => setForceRegenerate(e.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-zinc-300 text-violet-600 focus:ring-violet-500"
+                <div className="text-xs text-zinc-700 dark:text-zinc-300">
+                  <RegenerateChoice
+                    regenerate={forceRegenerate}
+                    onRegenerateChange={setForceRegenerate}
+                    overwrite={overwrite}
+                    onOverwriteChange={setOverwrite}
+                    label={
+                      <>
+                        <strong>Generate again</strong> if a connector with this name exists.
+                        Use this after fixing a vendor entry or upgrading a stale connector.
+                      </>
+                    }
                   />
-                  <span>
-                    <strong>Force regenerate</strong> — overwrite the connector if it already exists.
-                    Use this after fixing a vendor entry or upgrading a stale connector.
-                  </span>
-                </label>
+                </div>
               </div>
             </details>
           )}
@@ -852,7 +854,7 @@ function ResultPanel({
 }) {
   return (
     <aside
-      className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm lg:sticky lg:top-6"
+      className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm @3xl:sticky @3xl:top-20"
       data-testid="generation-panel"
     >
       <div className="px-5 pt-5 pb-3 border-b border-zinc-100 dark:border-zinc-800">
@@ -885,6 +887,13 @@ function ResultPanel({
                 {result.protocol ? (
                   <>protocol: <strong>{result.protocol}</strong><br /></>
                 ) : null}
+                {result.version ? (
+                  <span data-testid="generation-version">
+                    version: <strong>{result.version}</strong>
+                    {result.overwritten ? " (overwritten in place)" : ""}
+                    <br />
+                  </span>
+                ) : null}
                 {result.operation_count != null ? (
                   <>operations: <strong>{result.operation_count}</strong><br /></>
                 ) : null}
@@ -896,6 +905,21 @@ function ResultPanel({
                 ) : null}
               </div>
             </div>
+            {result.restart_error && (
+              <div
+                data-testid="generation-restart-error"
+                className="rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-3 text-[11px] text-amber-900 dark:text-amber-200"
+              >
+                {result.restart_error}
+              </div>
+            )}
+            {result.version && result.connector_name && result.pinned_connections && (
+              <PinnedConnectionsPrompt
+                connectorName={result.connector_name}
+                version={result.version}
+                pinned={result.pinned_connections}
+              />
+            )}
             <Button
               size="sm"
               className="w-full bg-gradient-to-r from-violet-600 to-indigo-600 text-white"
@@ -941,6 +965,73 @@ function ResultPanel({
         )}
       </div>
     </aside>
+  )
+}
+
+/**
+ * Generate again for a name that already has a connector. A new version is the
+ * default: connections set to a version keep it until they are moved. Overwrite
+ * rewrites the current version in place, so every connection on it gets the new
+ * code; the gateway refuses it while a run uses that version.
+ */
+function RegenerateChoice({
+  regenerate,
+  onRegenerateChange,
+  overwrite,
+  onOverwriteChange,
+  label,
+}: {
+  regenerate: boolean
+  onRegenerateChange: (v: boolean) => void
+  overwrite: boolean
+  onOverwriteChange: (v: boolean) => void
+  label: ReactNode
+}) {
+  const group = useId()
+  return (
+    <div className="space-y-1.5">
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          data-testid="force-regenerate-toggle"
+          type="checkbox"
+          checked={regenerate}
+          onChange={(e) => onRegenerateChange(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-zinc-300 text-violet-600 focus:ring-violet-500"
+        />
+        <span>{label}</span>
+      </label>
+      {regenerate && (
+        <div role="radiogroup" aria-label="How to save it" className="pl-5 space-y-1">
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              data-testid="regenerate-new-version"
+              type="radio"
+              name={group}
+              checked={!overwrite}
+              onChange={() => onOverwriteChange(false)}
+              className="mt-0.5 h-3.5 w-3.5"
+            />
+            <span>
+              <strong>Save as a new version</strong> — connections set to a version keep it until you move them.
+            </span>
+          </label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              data-testid="regenerate-overwrite"
+              type="radio"
+              name={group}
+              checked={overwrite}
+              onChange={() => onOverwriteChange(true)}
+              className="mt-0.5 h-3.5 w-3.5"
+            />
+            <span>
+              <strong>Overwrite the current version</strong> — every connection on it gets the new code and
+              its container restarts. Refused while a run uses it.
+            </span>
+          </label>
+        </div>
+      )}
+    </div>
   )
 }
 

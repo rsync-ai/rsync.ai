@@ -29,9 +29,9 @@ Frontend (Next.js)
 │   ├── Execution Timeline
 │   └── Chat Interface
 ├── Hooks
-│   ├── useWebSocket
-│   ├── usePipeline
-│   └── useExplorer
+│   ├── useWebSocket (contexts/WebSocketContext.tsx)
+│   ├── useSuggestionTab (hooks/)
+│   └── feature hooks beside their components (e.g. chat/home/useHomeData.ts)
 └── Services
     ├── API Client
     └── WebSocket Manager
@@ -68,13 +68,14 @@ The UI shows:
 - **Connection Testing**: Real-time connectivity check
 - **OAuth Flows**: GitHub, Google, Salesforce, HubSpot, Slack
 
-### 4. Data Explorer (NL2SQL)
+### 4. Data Explorer (SQL)
 
-- **Natural Language Input**: Ask questions in English
-- **Table Resolution**: AI identifies relevant tables
-- **Column Mapping**: Smart column selection
-- **Query Execution**: Run and view results
-- **Export**: CSV, Metabase integration
+- **SQL Editor**: Schema-aware autocomplete
+- **Query Tabs**: Up to 10, kept in the browser
+- **Schema Browser**: Tables and columns of the chosen connection
+- **Query Execution**: Run and cancel, view results
+- **Export**: CSV / TSV / JSON, Slack share
+- **From Ask rsync.ai**: SQL drafted by `generate_sql` opens in a new tab with Open in Explorer
 
 ### 5. Real-Time Updates
 
@@ -94,21 +95,30 @@ The UI shows:
 
 | Route | Description |
 |-------|-------------|
-| `/` | Dashboard with pipeline overview |
+| `/` | Home: an ask box (Ask rsync.ai when an LLM is set up, otherwise the pipeline chat), counts for pipelines, scheduled models and workflows with what needs attention, and the latest runs. `/dashboard` redirects here |
 | `/pipelines` | Pipeline list and management |
 | `/pipelines/[id]` | Pipeline detail view |
 | `/pipelines/create` | Pipeline creation wizard |
 | `/connections` | Connection management |
-| `/connectors` | Connector catalog (17 pre-built + generated) |
+| `/connectors` | Connector catalog (20 pre-built + generated) |
 | `/connectors/generate` | AI connector generation |
-| `/explorer` | Data exploration with NL2SQL |
+| `/explorer` | Explorer (under Analyze): SQL in up to 10 browser-kept query tabs, schema browser, Saved and History; SQL drafted by Ask rsync.ai opens here |
+| `/charts` | Charts: make and save a chart on a model or saved query |
+| `/dashboards` | Dashboards: saved charts and text on a grid, up to 4 filters |
+| `/dashboard-proposals/[id]` | A dashboard Ask rsync.ai drafted, saved by a person |
+| `/pipeline-plans/[id]` | A pipeline plan proposed by Ask rsync.ai or an agent, created by the person |
 | `/cdc/new` | Legacy — redirects to `/chat` (CDC and batch pipelines are both created there) |
-| `/chat` | Direct agent conversation |
+| `/chat` | Pipeline chat: builds a pipeline from a description. Reached from Pipelines' Create New and Home's box without an LLM; no sidebar row of its own |
 | `/admin` | System administration |
 | `/pii` | PII scanning tool |
-| `/transforms` | Data transformation rules |
+| `/transforms` | Redirect only: to a pipeline's Transforms tab, or to `/pipelines` |
 | `/settings` | User preferences |
-| `/executions` | Execution history |
+| `/usage` | Usage: this workspace's consumption against its plan limits |
+| `/workspace/settings`, `/workspace/members` | Workspace settings and members |
+| `/models` | Models — every model, scheduled or Manual (`/explorer/schedules` redirects here) |
+| `/workflows` | Workflows: reports and data alerts drafted in Ask rsync.ai |
+| `/runs` | Runs: every pipeline, scheduled-query and workflow run, newest first, filtered by kind and status |
+| `/executions` | Redirects to `/runs?kind=pipeline`; one pipeline run is still `/executions/[id]` |
 
 ---
 

@@ -191,6 +191,8 @@ def main():
     cfg = {
         "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
         "tasks.max": "1",
+        "topic.creation.default.replication.factor": "-1",
+        "topic.creation.default.partitions": "-1",
         "topic.prefix": connector,
         "mongodb.connection.string": MONGO_CONN_STR,
         "database.include.list": "e2e_db",

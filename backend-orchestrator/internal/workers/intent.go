@@ -22,6 +22,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/telemetry"
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/correlation"
 )
 
@@ -48,6 +49,7 @@ type IntentWorker struct {
 	progressEmitter   *ProgressEmitter
 	correlationClient *correlation.Client
 	workerID          string
+	db                *sql.DB // the pipeline row names the workspace a /plan call is for
 }
 
 // NewIntentWorker creates a new intent worker
@@ -77,6 +79,7 @@ func NewIntentWorker(kafkaManager *kafka.Manager, db *sql.DB) *IntentWorker {
 	w := &IntentWorker{
 		kafkaManager:      kafkaManager,
 		llmServiceURL:     llmServiceURL,
+		db:                db,
 		progressEmitter:   NewProgressEmitter(kafkaManager, db),
 		correlationClient: correlationClient,
 		workerID:          fmt.Sprintf("intent-worker-%s", uuid.New().String()[:8]),
@@ -159,7 +162,7 @@ func (w *IntentWorker) Execute(ctx context.Context, task Task) TaskResult {
 	}
 
 	// Call LLM to parse intent (AUTONOMOUS DECISION)
-	intent, err := w.parseIntent(ctx, userRequest, task.TraceID)
+	intent, err := w.parseIntent(ctx, userRequest, task.TraceID, taskWorkspaceID(ctx, w.db, task))
 	if err != nil {
 		// Stop heartbeats immediately on failure to avoid late STAGE_PROGRESS overwriting newer stages.
 		stopHeartbeat()
@@ -167,12 +170,13 @@ func (w *IntentWorker) Execute(ctx context.Context, task Task) TaskResult {
 		span.SetStatus(codes.Error, err.Error())
 		log.WithError(err).Error("❌ Intent Worker: Failed to parse intent")
 
-		// Emit STAGE_FAILED event
+		// Emit STAGE_FAILED event. Status is the PIPELINE status; the workflow
+		// writes "failed" when it ends the run (see executor.go's STAGE_FAILED).
 		w.progressEmitter.EmitProgress(ctx, ProgressEvent{
 			EventType:   "STAGE_FAILED",
 			PipelineID:  task.PipelineID,
 			ExecutionID: getExecutionID(task),
-			Status:      "failed",
+			Status:      "processing",
 			Message:     fmt.Sprintf("Failed to understand request: %v", err),
 			Progress: ProgressInfo{
 				Percent:     10,
@@ -259,7 +263,7 @@ func (w *IntentWorker) Execute(ctx context.Context, task Task) TaskResult {
 
 // parseIntent calls the LLM service to parse natural language
 // This is where the AUTONOMOUS DECISION happens
-func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, traceID string) (map[string]interface{}, error) {
+func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, traceID string, workspaceID string) (map[string]interface{}, error) {
 	ctx, span := w.tracer.Start(ctx, "intent.llm_call",
 		trace.WithAttributes(
 			attribute.String("trace_id", traceID),
@@ -312,6 +316,7 @@ func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, trac
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	stampPlanWorkspace(req, workspaceID)
 	for k, v := range telemetry.InjectTraceToHeaders(ctx) {
 		req.Header.Set(k, v)
 	}
@@ -327,8 +332,12 @@ func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, trac
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// The body can quote the request or the provider's error, and this
+		// error becomes the STAGE_FAILED message the UI shows: log the body
+		// scrubbed, return the status only.
 		body, _ := io.ReadAll(resp.Body)
-		err := fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
+		log.WithField("trace_id", traceID).Warnf("Intent Worker: /plan returned %d: %s", resp.StatusCode, llmscrub.ScrubMax(string(body), 500))
+		err := fmt.Errorf("LLM returned status %d", resp.StatusCode)
 		span.RecordError(err)
 		return nil, err
 	}

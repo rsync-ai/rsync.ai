@@ -10,6 +10,7 @@ import {
   overdueSeconds,
   parseOpenBreaches,
   parseRunningModels,
+  waitsForAll,
   type Fetched,
   type ModelFreshnessBreach,
   type ModelRefreshState,
@@ -116,9 +117,16 @@ describe("liveCellFor", () => {
     expect((uncapped as { reason: string }).reason).not.toMatch(/first/)
   })
 
+  it("does not say an upstream rebuilds it when the server gave no reason", () => {
+    // The fallback cannot know the model's upstream policy, so it must be true for both.
+    const cell = liveCellFor("after_upstream", SQ, ok([work({ state: "idle", message: "" })]))
+    expect(cell).toMatchObject({ kind: "idle" })
+    expect((cell as { reason: string }).reason).not.toMatch(/an upstream/)
+  })
+
   it("reads idle only when the server said idle", () => {
-    const cell = liveCellFor("after_upstream", SQ, ok([work({ state: "idle", message: "no refresh loop has run for this model" })]))
-    expect(cell).toEqual({ kind: "idle", reason: "no refresh loop has run for this model" })
+    const cell = liveCellFor("after_upstream", SQ, ok([work({ state: "idle", message: "not rebuilding now; it rebuilds when an upstream finishes" })]))
+    expect(cell).toEqual({ kind: "idle", reason: "not rebuilding now; it rebuilds when an upstream finishes" })
   })
 
   it("splits a running loop by phase", () => {
@@ -138,9 +146,9 @@ describe("liveCellFor", () => {
     const noDetail = liveCellFor(
       "after_upstream",
       SQ,
-      ok([work({ state: "running", detail_available: false, message: "the refresh loop answered with no state" })]),
+      ok([work({ state: "running", detail_available: false, message: "it answered without saying what it is doing" })]),
     )
-    expect(noDetail).toEqual({ kind: "running_no_detail", reason: "the refresh loop answered with no state" })
+    expect(noDetail).toEqual({ kind: "running_no_detail", reason: "it answered without saying what it is doing" })
 
     // detail_available true but no body is still no detail.
     expect(liveCellFor("after_upstream", SQ, ok([work({ state: "running", detail_available: true })])).kind).toBe(
@@ -165,11 +173,11 @@ describe("liveCellFor", () => {
     // The server's message is a bare query error; the reason says what was being asked.
     expect(liveCellFor("after_upstream", SQ, ok([work({ state: "unreachable", message: "deadline exceeded" })]))).toEqual({
       kind: "unreachable",
-      reason: "The refresh loop could not be asked what it is doing (deadline exceeded).",
+      reason: "The server could not ask it what it is doing (deadline exceeded).",
     })
     expect(liveCellFor("after_upstream", SQ, ok([work({ state: "unreachable" })]))).toEqual({
       kind: "unreachable",
-      reason: "The refresh loop could not be asked what it is doing.",
+      reason: "The server could not ask it what it is doing.",
     })
     expect(liveCellFor("after_upstream", SQ, ok([work({ state: "unknown" })])).kind).toBe("unknown")
   })
@@ -255,13 +263,74 @@ describe("formatSpan", () => {
 
 describe("describeFreshnessCause", () => {
   it("names every cause the classifier produces, and does not blank an unfamiliar one", () => {
-    expect(describeFreshnessCause("overdue")).toMatch(/active but has not rebuilt/)
+    expect(describeFreshnessCause("overdue")).toBe("its schedule is on, but no scheduled rebuild has succeeded in time")
     expect(describeFreshnessCause("no_schedule")).toMatch(/nothing is scheduled/)
     expect(describeFreshnessCause("schedule_paused")).toBe("its schedule is paused")
     expect(describeFreshnessCause("schedule_auto_paused")).toMatch(/paused automatically/)
     expect(describeFreshnessCause("no_upstreams")).toMatch(/none are set/)
     expect(describeFreshnessCause("cosmic_rays")).toMatch(/cosmic_rays/)
     expect(describeFreshnessCause("")).toMatch(/no cause/)
+  })
+
+  // classifyFreshnessCause says "overdue" for an after-upstream model too, which has no
+  // clock: blaming "its schedule" sent people to a schedule that was fine, when the fix is
+  // whichever upstream stopped finishing.
+  it("names the upstreams an overdue after-upstream model waits on", () => {
+    const up = (name?: string) => ({ kind: "pipeline", id: `id-${name}`, name })
+    const one = describeFreshnessCause("overdue", { scheduleType: "after_upstream", upstreams: [up("Loans")] })
+    expect(one).toBe("it rebuilds when Loans finishes, and no rebuild has succeeded in time: check when Loans last ran")
+    expect(one).not.toMatch(/schedule/)
+    expect(
+      describeFreshnessCause("overdue", { scheduleType: "after_upstream", upstreams: [up("Loans"), up("Cards"), up("Fraud")] }),
+    ).toBe("it rebuilds when Loans, Cards or Fraud finishes, and no rebuild has succeeded in time: check when they last ran")
+    expect(
+      describeFreshnessCause("overdue", {
+        scheduleType: "after_upstream",
+        upstreams: [up("A"), up("B"), up("C"), up(undefined)],
+      }),
+    ).toMatch(/^it rebuilds when A, B or 2 more finishes/)
+    expect(describeFreshnessCause("overdue", { scheduleType: "after_upstream" })).toBe(
+      "it rebuilds when one of its upstreams finishes, and no rebuild has succeeded in time",
+    )
+    expect(describeFreshnessCause("overdue", { scheduleType: "cron" })).toMatch(/^its schedule is on/)
+  })
+
+  // Bug class: wording that names one upstream ("A or B finishes") for a model on policy
+  // "all", which rebuilds only once every upstream has run. Seen live on a fan-in whose
+  // Trigger read "After all of A, B run" while its Overdue line said "A or B finishes".
+  it("says a model that waits for all its upstreams needs every one of them", () => {
+    const up = (name?: string) => ({ kind: "model", id: `id-${name}`, name })
+    const all = (upstreams?: ReturnType<typeof up>[]) =>
+      describeFreshnessCause("overdue", { scheduleType: "after_upstream", upstreamPolicy: "all", upstreams })
+    expect(all([up("Loan payments"), up("Loans")])).toBe(
+      "it rebuilds once Loan payments and Loans have both run, and no rebuild has succeeded in time: check when they last ran",
+    )
+    expect(all([up("Loans"), up("Cards"), up("Fraud")])).toBe(
+      "it rebuilds once Loans, Cards and Fraud have all run, and no rebuild has succeeded in time: check when they last ran",
+    )
+    expect(all([up("A"), up("B"), up("C"), up(undefined)])).toMatch(/^it rebuilds once A, B and 2 more have all run/)
+    expect(all()).toBe("it rebuilds once all its upstreams have run, and no rebuild has succeeded in time")
+    for (const text of [all([up("A"), up("B")]), all([up("A"), up("B"), up("C")]), all()]) {
+      expect(text).not.toMatch(/\bor\b|one of|an upstream/)
+    }
+    // With one upstream the policy changes nothing, as describeUpstreamNextRun has it.
+    expect(all([up("Loans")])).toBe(
+      "it rebuilds when Loans finishes, and no rebuild has succeeded in time: check when Loans last ran",
+    )
+  })
+})
+
+describe("waitsForAll", () => {
+  const two = [
+    { kind: "model", id: "a" },
+    { kind: "model", id: "b" },
+  ]
+  it("is a fan-in on all with more than one upstream, and nothing else", () => {
+    expect(waitsForAll("all", two)).toBe(true)
+    expect(waitsForAll("all", two.slice(0, 1))).toBe(false)
+    expect(waitsForAll("all", undefined)).toBe(false)
+    expect(waitsForAll("any", two)).toBe(false)
+    expect(waitsForAll(undefined, two)).toBe(false)
   })
 })
 

@@ -291,7 +291,7 @@ var scheduledSummaryColumns = []string{
 	"created_by", "created_at", "updated_at",
 	"paused_at", "paused_reason",
 	"auto_paused_at", "auto_paused_reason",
-	"upstream_policy",
+	"upstream_policy", "layer",
 }
 
 // The list is where a fan-in's cadence is read ("After all of orders, customers run"),
@@ -313,7 +313,7 @@ func TestListSavedQuerySchedules_CarriesTheUpstreamPolicy(t *testing.T) {
 			wsScopeUser, time.Now(), time.Now(),
 			nil, "",
 			nil, "",
-			policy}
+			policy, ""}
 	}
 	mock.ExpectQuery(`FROM saved_query_schedules s[\s\S]+WHERE sq\.workspace_id = \$1`).
 		WithArgs(wsScopeWS, wsScopeUser).
@@ -366,7 +366,7 @@ func TestListSavedQuerySchedules_ReportsMaterializationSupportFromTheConnector(t
 						wsScopeUser, time.Now(), time.Now(),
 						nil, "",
 						nil, "",
-						upstreamPolicyAny))
+						upstreamPolicyAny, ""))
 			// Since migration 100 the upstreams are a second workspace-scoped query rather
 			// than a join, so the list handler is two round trips and this expectation is
 			// what fails if someone folds them back into one.
@@ -900,12 +900,24 @@ func TestPerIDModelEndpoints_AnotherMembersPrivateModelIsNotFound(t *testing.T) 
 		{"retarget the materialization", http.MethodPut, "/explorer/saved/:id/materialization", "/materialization",
 			SetSavedQueryMaterialization, map[string]any{"materialization": "table", "target_table": "attacker.pwned"}},
 		{"run it by hand", http.MethodPost, "/explorer/saved/:id/run", "/run", RunSavedQueryModel, nil},
+		{"start a background run", http.MethodPost, "/explorer/saved/:id/run-async", "/run-async", StartSavedQueryModelRun, nil},
 		// Lives in saved_query_freshness.go, and is the reason this table is a table:
 		// it shipped with the same role-only gate months after the ones above, because
 		// nothing made the omission visible. Widening a deadline silences the breach
 		// alert on a model the caller cannot even read.
 		{"widen the freshness deadline", http.MethodPut, "/explorer/saved/:id/freshness", "/freshness",
 			SetSavedQueryFreshness, map[string]any{"deadline_seconds": 31536000}},
+		// Reads the deadline and walks the pipelines and workflows above the model.
+		{"read the freshness deadline", http.MethodGet, "/explorer/saved/:id/freshness", "/freshness",
+			GetSavedQueryFreshness, nil},
+		// saved_query_checks_api.go. Test now runs a model's checks against its live
+		// table, so it reads the model's data; the two reads name its check queries.
+		{"read the checks", http.MethodGet, "/explorer/saved/:id/checks", "/checks", ListModelChecks, nil},
+		{"read one run's check results", http.MethodGet, "/explorer/saved/:id/runs/:runId/checks",
+			"/runs/" + checkAPIRunID + "/checks", ListModelRunChecks, nil},
+		{"run the checks now", http.MethodPost, "/explorer/saved/:id/checks/test", "/checks/test", TestModelChecks, nil},
+		// plan_model_checks reads the model's target and its check names.
+		{"plan checks", http.MethodPost, "/explorer/saved/:id/checks/plan", "/checks/plan", PlanModelChecks, nil},
 	}
 
 	for _, tc := range cases {

@@ -1,0 +1,120 @@
+{
+  "kind": "echart",
+  "settings": {
+    "description": "Highest amount by day and region",
+    "x": {
+      "field": "x",
+      "label": "day",
+      "categories": [
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-04"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "decimal",
+      "title": "Highest amount"
+    },
+    "series": {
+      "field": "s",
+      "values": [
+        {
+          "key": "s0",
+          "label": "APAC",
+          "color": "series-1"
+        },
+        {
+          "key": "s1",
+          "label": "EU",
+          "color": "series-2"
+        },
+        {
+          "key": "s2",
+          "label": "US",
+          "color": "series-3"
+        }
+      ]
+    },
+    "type": "area",
+    "stacked": false
+  },
+  "rows": [
+    {
+      "x": "2026-10-01",
+      "s": "s1",
+      "v": 500
+    },
+    {
+      "x": "2026-10-01",
+      "s": "s2",
+      "v": 590
+    },
+    {
+      "x": "2026-10-01",
+      "s": "s0",
+      "v": 680
+    },
+    {
+      "x": "2026-10-02",
+      "s": "s1",
+      "v": 460
+    },
+    {
+      "x": "2026-10-02",
+      "s": "s2",
+      "v": 550
+    },
+    {
+      "x": "2026-10-02",
+      "s": "s0",
+      "v": 640
+    },
+    {
+      "x": "2026-10-03",
+      "s": "s1",
+      "v": 420
+    },
+    {
+      "x": "2026-10-03",
+      "s": "s2",
+      "v": 510
+    },
+    {
+      "x": "2026-10-03",
+      "s": "s0",
+      "v": 600
+    },
+    {
+      "x": "2026-10-04",
+      "s": "s1",
+      "v": 380
+    },
+    {
+      "x": "2026-10-04",
+      "s": "s2",
+      "v": 470
+    },
+    {
+      "x": "2026-10-04",
+      "s": "s0",
+      "v": 560
+    }
+  ],
+  "series": [
+    {
+      "value": "APAC",
+      "color": "series-1"
+    },
+    {
+      "value": "EU",
+      "color": "series-2"
+    },
+    {
+      "value": "US",
+      "color": "series-3"
+    }
+  ],
+  "notes": []
+}

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
@@ -128,6 +129,46 @@ func dgExpectForceDeleteUpToTheDelete(mock sqlmock.Sqlmock, rows *sqlmock.Rows) 
 	mock.ExpectExec(`DELETE FROM connections\s+WHERE id = \$1 AND workspace_id = \$2`).
 		WithArgs(wsScopeConnection, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// dgReleasedNothing is the orchestrator's answer when it had nothing to drop.
+const dgReleasedNothing = `{"success":true,"dropped":0}`
+
+// dgRelease records the release calls a stand-in orchestrator received.
+type dgRelease struct {
+	mu                   sync.Mutex
+	calls                int
+	method, path, secret string
+}
+
+func (r *dgRelease) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// dgStubOrchestratorRelease points the gateway at a stand-in orchestrator that answers
+// the forced delete's release call with status and body. during, when set, runs inside
+// the call, so a test can see what the handler had done by then.
+func dgStubOrchestratorRelease(t *testing.T, status int, body string, during func()) *dgRelease {
+	t.Helper()
+	rel := &dgRelease{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rel.mu.Lock()
+		rel.calls++
+		rel.method, rel.path, rel.secret = r.Method, r.URL.Path, r.Header.Get("X-Internal-Secret")
+		rel.mu.Unlock()
+		if during != nil {
+			during()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ORCHESTRATOR_URL", srv.URL)
+	t.Setenv("INTERNAL_SERVICE_SECRET", "dg-internal-secret")
+	return rel
 }
 
 func TestDeleteConnectionCDCGuard_RefusesWhileSlotOrPublicationUndropped(t *testing.T) {
@@ -260,6 +301,7 @@ func TestDeleteConnectionCDCGuard_ForceDeletesAndSaysWhatToDrop(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT 1 FROM connections WHERE id = \$1 AND workspace_id = \$2`).
 		WithArgs(wsScopeConnection, wsScopeWS).
@@ -306,11 +348,108 @@ func TestDeleteConnectionCDCGuard_ForceDeletesAndSaysWhatToDrop(t *testing.T) {
 	}
 }
 
+// Force first has the orchestrator drop what deleted pipelines left on the source,
+// before the delete transaction starts: the delete cascades away the cdc_resources rows
+// and the credentials a drop needs, so afterwards nobody but the user can drop them.
+// The list read inside the transaction is then what is left, so a release that dropped
+// everything leaves nothing to warn about.
+//
+// Bug class: a destructive delete that erases the only record of what it tracks before
+// trying to release it. Before this, force went straight to the delete and every slot
+// and publication stayed on the source for the user to drop by hand.
+func TestDeleteConnectionCDCGuard_ForceReleasesOnTheSourceBeforeDeleting(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+	dgExpectGateAndNoPipelines(mock)
+	var unmetAtRelease error
+	rel := dgStubOrchestratorRelease(t, http.StatusOK, `{"success":true,"dropped":2}`, func() {
+		unmetAtRelease = mock.ExpectationsWereMet()
+	})
+	dgExpectForceDeleteUpToTheDelete(mock, sqlmock.NewRows([]string{"resource_type", "resource_name", "status"}))
+	mock.ExpectCommit()
+	mock.ExpectExec(`INSERT INTO audit_logs`).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := dgServeConnectionDelete("?force=true")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	if rel.count() != 1 || rel.method != http.MethodPost ||
+		rel.path != "/api/v1/cdc/connections/"+wsScopeConnection+"/release" {
+		t.Fatalf("orchestrator release calls = %d (%s %s), want 1 POST to this connection's release",
+			rel.count(), rel.method, rel.path)
+	}
+	if rel.secret != "dg-internal-secret" {
+		t.Errorf("release call carried X-Internal-Secret %q, want the service secret", rel.secret)
+	}
+	// While the orchestrator dropped, the delete transaction had not started.
+	if unmetAtRelease == nil || !strings.Contains(unmetAtRelease.Error(), "Begin") {
+		t.Fatalf("first unmet db expectation during the release: %v; want the transaction's Begin", unmetAtRelease)
+	}
+	if b := dgDecode(t, w); len(b.Warnings) != 0 || len(b.Undropped) != 0 {
+		t.Fatalf("warnings %q, undropped %+v; want none once the release dropped them", b.Warnings, b.Undropped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// A release that does not run or does not finish never blocks the forced delete: it
+// deletes anyway and names what is left on the source and how to drop it, as before.
+func TestDeleteConnectionCDCGuard_ForceDeletesWhenTheReleaseFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stub func(t *testing.T) *dgRelease
+	}{
+		{"orchestrator answers 500", func(t *testing.T) *dgRelease {
+			return dgStubOrchestratorRelease(t, http.StatusInternalServerError, `{"error":"boom"}`, nil)
+		}},
+		{"release reports a failure", func(t *testing.T) *dgRelease {
+			return dgStubOrchestratorRelease(t, http.StatusOK, `{"success":false,"dropped":0,"errors":["cdc_resources unreadable"]}`, nil)
+		}},
+		{"orchestrator unreachable", func(t *testing.T) *dgRelease {
+			srv := httptest.NewServer(http.NotFoundHandler())
+			srv.Close()
+			t.Setenv("ORCHESTRATOR_URL", srv.URL)
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, cleanup := wsScopeMockDB(t)
+			defer cleanup()
+			dgExpectGateAndNoPipelines(mock)
+			rel := tc.stub(t)
+			dgExpectForceDeleteUpToTheDelete(mock, dgUndroppedRows())
+			mock.ExpectCommit()
+			mock.ExpectExec(`INSERT INTO audit_logs`).
+				WithArgs(wsScopeUser, "delete_connection", "connection", wsScopeConnection,
+					dgForcedAuditDetails{}, sqlmock.AnyArg(), wsScopeWS).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+
+			w := dgServeConnectionDelete("?force=true")
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+			}
+			if rel != nil && rel.count() != 1 {
+				t.Fatalf("orchestrator release calls = %d, want 1", rel.count())
+			}
+			if b := dgDecode(t, w); len(b.Warnings) != 2 || len(b.Undropped) != 2 {
+				t.Fatalf("warnings %q, undropped %+v; want both objects still named", b.Warnings, b.Undropped)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("db expectations: %v", err)
+			}
+		})
+	}
+}
+
 // Control: force with nothing undropped deletes and warns about nothing.
 func TestDeleteConnectionCDCGuard_ForceWithNothingUndroppedHasNoWarnings(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT 1 FROM connections WHERE id = \$1`).
 		WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
@@ -337,6 +476,7 @@ func TestDeleteConnectionCDCGuard_ForceOnMissingConnectionIs404(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT 1 FROM connections WHERE id = \$1`).
 		WillReturnRows(sqlmock.NewRows([]string{"?column?"}))
@@ -358,6 +498,7 @@ func TestDeleteConnectionCDCGuard_ForceStillRefusesForPipelines(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT 1 FROM connections WHERE id = \$1`).
 		WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
@@ -404,6 +545,7 @@ func TestDeleteConnectionCDCGuard_OnlyATrueForceValueForces(t *testing.T) {
 			mock, cleanup := wsScopeMockDB(t)
 			defer cleanup()
 			dgExpectGateAndNoPipelines(mock)
+			rel := dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 			mock.ExpectExec(`DELETE FROM connections\s+WHERE id = \$1 AND workspace_id = \$2`).
 				WithArgs(wsScopeConnection, wsScopeWS).
 				WillReturnResult(sqlmock.NewResult(0, 0))
@@ -419,6 +561,9 @@ func TestDeleteConnectionCDCGuard_OnlyATrueForceValueForces(t *testing.T) {
 			if got := dgJSON(t, w)["cdc_resources"]; !reflect.DeepEqual(got, dgUndroppedOnTheWire) {
 				t.Fatalf("cdc_resources = %v, want %v", got, dgUndroppedOnTheWire)
 			}
+			if n := rel.count(); n != 0 {
+				t.Fatalf("orchestrator release calls = %d; only a forced delete releases", n)
+			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("db expectations: %v", err)
 			}
@@ -430,6 +575,7 @@ func TestDeleteConnectionCDCGuard_OnlyATrueForceValueForces(t *testing.T) {
 			mock, cleanup := wsScopeMockDB(t)
 			defer cleanup()
 			dgExpectGateAndNoPipelines(mock)
+			dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 			dgExpectForceDeleteUpToTheDelete(mock, dgUndroppedRows())
 			mock.ExpectCommit()
 			mock.ExpectExec(`INSERT INTO audit_logs`).WillReturnResult(sqlmock.NewResult(0, 1))
@@ -520,6 +666,7 @@ func TestDeleteConnectionCDCGuard_ForceListFailureDeletesNothing(t *testing.T) {
 	defer cleanup()
 	mock.MatchExpectationsInOrder(false)
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT 1 FROM connections WHERE id = \$1 AND workspace_id = \$2`).
 		WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
@@ -548,6 +695,7 @@ func TestDeleteConnectionCDCGuard_ForceCommitFailureIsA500(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	dgExpectGateAndNoPipelines(mock)
+	dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 	dgExpectForceDeleteUpToTheDelete(mock, dgUndroppedRows())
 	mock.ExpectCommit().WillReturnError(errTestDBDown)
 	mock.ExpectExec(`INSERT INTO audit_logs`).WillReturnResult(sqlmock.NewResult(0, 1))
@@ -590,18 +738,22 @@ func TestDeleteConnectionCDCGuard_OtherPostgresErrorsAreA500(t *testing.T) {
 }
 
 // force needs the same role as a normal delete: a viewer is refused before anything is
-// read or deleted. ForceDeletesAndSaysWhatToDrop is the member control.
+// read, released or deleted. ForceDeletesAndSaysWhatToDrop is the member control.
 func TestDeleteConnectionCDCGuard_ViewerCannotForce(t *testing.T) {
 	mock, cleanup := wsScopeMockDB(t)
 	defer cleanup()
 	mock.ExpectQuery(`SELECT wm\.role\s+FROM connections r`).
 		WithArgs(wsScopeConnection, wsScopeUser, wsScopeWS).
 		WillReturnRows(gateRoleRows("viewer"))
+	rel := dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 
 	w := dgServeConnectionDelete("?force=true")
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body %s", w.Code, w.Body.String())
+	}
+	if n := rel.count(); n != 0 {
+		t.Fatalf("orchestrator release calls = %d; a viewer must not reach the source", n)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("db expectations: %v", err)
@@ -636,6 +788,7 @@ func TestDeleteConnectionCDCGuard_ForceFailuresBeforeTheDeleteAreA500(t *testing
 			mock, cleanup := wsScopeMockDB(t)
 			defer cleanup()
 			dgExpectGateAndNoPipelines(mock)
+			dgStubOrchestratorRelease(t, http.StatusOK, dgReleasedNothing, nil)
 			tc.queue(mock)
 
 			w := dgServeConnectionDelete("?force=true")

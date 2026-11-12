@@ -1,0 +1,37 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M29.2 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.2 218.5L560 218.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.2 171.5L560 171.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.2 123.5L560 123.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.2 75.5L560 75.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<path d="M29.2 28.5L560 28.5" fill="none" pointer-events="visible" stroke="#3f3f46" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:Inter;" xml:space="preserve" y="-3.0250000000000004" transform="translate(29.15 13)" fill="#a1a1aa">Order value</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(294.575 288.95)" fill="#a1a1aa">plan</text>
+<path d="M29.2 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#3f3f46" stroke-linecap="round" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 265.95)" fill="#a1a1aa">0</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 218.36)" fill="#a1a1aa">100</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 170.77)" fill="#a1a1aa">200</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 123.18)" fill="#a1a1aa">300</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 75.59)" fill="#a1a1aa">400</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(21.15 28)" fill="#a1a1aa">500</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(117.625 273.95)" fill="#a1a1aa">free</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(294.575 273.95)" fill="#a1a1aa">pro</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(471.525 273.95)" fill="#a1a1aa">team</text>
+<path d="M97.6 254.1L137.6 254.1L137.6 237.4L97.6 237.4ZM117.6 261.2L117.6 254.1M117.6 194.6L117.6 237.4M97.6 261.2L137.6 261.2M97.6 194.6L137.6 194.6M97.6 246.9L137.6 246.9" fill="rgb(80,113,222)" fill-opacity="0.25" stroke="#5071de" stroke-width="1.5" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M274.6 223.1L314.6 223.1L314.6 180.3L274.6 180.3ZM294.6 237.4L294.6 223.1M294.6 123.2L294.6 180.3M274.6 237.4L314.6 237.4M274.6 123.2L314.6 123.2M274.6 208.8L314.6 208.8" fill="rgb(80,113,222)" fill-opacity="0.25" stroke="#5071de" stroke-width="1.5" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M451.5 151.7L491.5 151.7L491.5 113.7L451.5 113.7ZM471.5 170.8L471.5 151.7M471.5 28L471.5 113.7M451.5 170.8L491.5 170.8M451.5 28L491.5 28M451.5 142.2L491.5 142.2" fill="rgb(80,113,222)" fill-opacity="0.25" stroke="#5071de" stroke-width="1.5" ecmeta_series_index="0" ecmeta_data_index="2" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,0.25);
+stroke-width:2;
+}
+
+]]>
+
+</style>
+</svg>

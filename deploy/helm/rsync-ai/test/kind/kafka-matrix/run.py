@@ -189,7 +189,9 @@ def build():
     httpx = _pin(os.path.join(connector_dir(), "requirements.txt"), "httpx")
 
     jobs = {
-        IMG_CONNECT: ["build", "--label", LABEL, "-t", IMG_CONNECT,
+        # The connect Dockerfile copies THIRD_PARTY_NOTICES.md from the `legal`
+        # named context (the repo root); without it docker tries to pull `legal`.
+        IMG_CONNECT: ["build", "--label", LABEL, "-t", IMG_CONNECT, "--build-context", f"legal={ROOT}",
                       os.path.join(ROOT, "shared/internal/infra/kafka-connect")],
         IMG_OIDC: ["build", "--label", LABEL, "-t", IMG_OIDC, os.path.join(HERE, "..", "oidc")],
         IMG_PY: ["build", "--label", LABEL, "-t", IMG_PY, "-f", os.path.join(HERE, "py.Dockerfile"),

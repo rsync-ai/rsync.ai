@@ -40,11 +40,12 @@ from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
 
 logger = logging.getLogger("cdc-config-generator")
 
-# Kept byte-identical to _DEFAULT_HEARTBEAT_INTERVAL_MS in the debezium MCP connector
+# The MongoDB and MySQL heartbeat interval. Kept byte-identical to
+# _DEFAULT_HEARTBEAT_INTERVAL_MS in the debezium MCP connector
 # (shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py), which is the
 # live path. This module is advisory, so a divergence here is wrong advice rather than
 # an outage — but advice that contradicts the connector is still a bug.
-MONGO_HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
+HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
 
 
 @dataclass
@@ -714,6 +715,10 @@ class CDCConfigGenerator:
                 "table.include.list": table_list,
                 "schema.history.internal.kafka.bootstrap.servers": self.kafka_bootstrap_servers,
                 "schema.history.internal.kafka.topic": f"schema-changes.{db_name}",
+                # The connector heartbeats MySQL/MariaDB so an idle binlog is
+                # distinguishable from a stalled stream (the freshness watchdog reads
+                # the heartbeat topic). Advisory, like the MongoDB value below.
+                "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
             },
             
             "postgresql": {
@@ -761,7 +766,7 @@ class CDCConfigGenerator:
                 # ChangeStreamHistoryLost. Kept here only so this advice does not
                 # contradict the connector — the live values (and the product-namespaced
                 # topic prefix) are set in _build_config.
-                "heartbeat.interval.ms": MONGO_HEARTBEAT_INTERVAL_MS,
+                "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
                 **self._mongo_capture_scope(table_list),
             },
             
@@ -878,32 +883,21 @@ class CDCConfigGenerator:
         try:
             db_name = self._extract_database_name(config, tables)
             
-            # Build prompt for LLM
-            prompt = f"""Generate a Debezium Kafka Connect connector configuration for {source_type} database.
-
-Connection details:
-- Host: {config.get('host', 'localhost')}
-- Port: {config.get('port', 'default')}
-- Database: {db_name}
-- Tables to capture: {tables}
-- Snapshot mode: {snapshot_mode}
-
-Requirements:
-1. Return ONLY valid JSON (no markdown, no explanation)
-2. Include the correct "connector.class" for {source_type}
-3. Include all necessary connection and CDC properties
-4. Use "topic.prefix": "{topic(f"cdc-{db_name}")}"
-5. Include schema history configuration if needed
-
-Example format:
-{{
-  "connector.class": "io.debezium.connector.xxx.XxxConnector",
-  "database.hostname": "...",
-  ...
-}}
-"""
-            
-            response = self.llm_client.complete("planner/cdc_config", {"prompt": prompt})
+            # The model gets the database type, name and tables -- never the
+            # host, port or credentials. It writes "${CONNECTION}" for those,
+            # and they are filled in from the saved connection below. (This
+            # prompt used to be a single-brace "{prompt}" placeholder the
+            # registry never rendered, so the model received no request at all.)
+            response = self.llm_client.complete(
+                "planner/cdc_config",
+                {
+                    "source_type": source_type,
+                    "database": db_name,
+                    "tables": list(tables or []),
+                    "snapshot_mode": snapshot_mode,
+                    "topic_prefix": topic(f"cdc-{db_name}"),
+                },
+            )
             content = response.get("content", "{}")
 
             from src.utils.json_extract import loads as _safe_json_loads
@@ -916,6 +910,8 @@ Example format:
                     error="LLM response missing connector.class"
                 )
             
+            self._fill_connection_fields(llm_config, config, source_type)
+
             # Apply overrides
             llm_config.update(overrides)
             
@@ -945,6 +941,24 @@ Example format:
             logger.error(f"LLM-based generation failed: {e}")
             return CDCConfigResult(success=False, error=str(e))
     
+    _CONNECTION_PLACEHOLDER = "${CONNECTION}"
+
+    def _fill_connection_fields(self, llm_config: Dict, config: Dict, source_type: str) -> None:
+        """Put the saved connection's host, port and credentials into an LLM-made config."""
+        values = {
+            "database.hostname": config.get("host") or config.get("db_host"),
+            "database.port": config.get("port") or config.get("db_port") or self.DEFAULT_PORTS.get(source_type),
+            "database.user": config.get("username") or config.get("user") or config.get("db_user"),
+            "database.password": config.get("password") or config.get("db_password"),
+        }
+        for key, value in values.items():
+            if value is not None and (key in llm_config):
+                llm_config[key] = str(value)
+        for key, value in list(llm_config.items()):
+            if value == self._CONNECTION_PLACEHOLDER:
+                # A connection property this code does not know how to fill.
+                del llm_config[key]
+
     def get_supported_databases(self) -> Dict[str, Any]:
         """Get list of supported CDC databases with their capabilities"""
         supported = {}

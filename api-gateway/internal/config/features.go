@@ -20,6 +20,26 @@ type FeatureFlags struct {
 	// and admin Usage pages plus their nav entries. See LoadFeatures for why
 	// its default is derived from BillingEnforced rather than hard-coded.
 	UsagePanel bool
+
+	// AgentGateway serves the MCP route (/api/agent/v1/mcp) and the agent
+	// token routes. On by default in every edition, as cloud runs it;
+	// RSYNC_AGENT_GATEWAY_ENABLED=false turns it off.
+	AgentGateway bool
+
+	// Assistant serves the in-app assistant (/api/v1/assistant/*) and its
+	// admin model keys. On by default in every edition, as cloud runs it;
+	// RSYNC_ASSISTANT_ENABLED=false turns it off.
+	Assistant bool
+
+	// LLMSampleRows is LLMSampleRowsAllowed() at startup, for /features: the
+	// UI hides the sample-rows switches while it is off. The checks that
+	// matter call LLMSampleRowsAllowed() itself.
+	LLMSampleRows bool
+
+	// SingleWorkspace is SingleWorkspace() at startup, for /features: the
+	// header stops offering "New workspace" while it is on. The gateway's
+	// own checks call SingleWorkspace() itself.
+	SingleWorkspace bool
 }
 
 var (
@@ -77,13 +97,23 @@ func LoadFeatures() *FeatureFlags {
 			// to unlimitedQuota, so every number the panel shows is fiction.
 			// FEATURE_USAGE_PANEL overrides in either direction.
 			UsagePanel: resolveUsagePanel(),
+
+			AgentGateway:  getBoolEnv("RSYNC_AGENT_GATEWAY_ENABLED", true),
+			Assistant:     getBoolEnv("RSYNC_ASSISTANT_ENABLED", true),
+			LLMSampleRows: LLMSampleRowsAllowed(),
+
+			SingleWorkspace: SingleWorkspace(),
 		}
 
 		log.WithFields(log.Fields{
 			"monitoring_overview":  features.MonitoringOverview,
 			"monitoring_infra":     features.MonitoringInfra,
 			"monitoring_traces":    features.MonitoringTraces,
-			"usage_panel":          features.UsagePanel,
+			"usage_panel":         features.UsagePanel,
+			"agent_gateway":       features.AgentGateway,
+			"assistant":           features.Assistant,
+			"llm_sample_rows":     features.LLMSampleRows,
+			"single_workspace":    features.SingleWorkspace,
 		}).Info("Feature flags loaded")
 	})
 
@@ -97,13 +127,6 @@ func GetFeatures() *FeatureFlags {
 }
 
 // Helper functions
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
 
 func getBoolEnv(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
@@ -163,6 +186,53 @@ func BillingEnforced() bool {
 	return enforced
 }
 
+// LLMSampleRowsAllowed reports whether this install lets Ask rsync.ai send
+// sample rows to a model at all (docs/security/llm-egress.md, "Sample rows").
+// While it is false, no admin approval or workspace setting can open them: the
+// gateway reports no approved model and refuses to save either switch, and
+// llm-service's egress guard reads the same variable before each send.
+//
+// Unset is the cloud behaviour, allowed. The self-host artifacts
+// (docker-compose.quickstart.yml, the Helm chart) set
+// RSYNC_LLM_SAMPLE_ROWS_ALLOWED=false. Unlike BillingEnforced, an unparseable
+// value counts as false: this flag keeps row values on the install, so a typo
+// must not be what sends them out. It reads the environment on every call, like
+// BillingEnforced, so tests can set it per case.
+func LLMSampleRowsAllowed() bool {
+	v := strings.TrimSpace(os.Getenv("RSYNC_LLM_SAMPLE_ROWS_ALLOWED"))
+	if v == "" {
+		return true
+	}
+	allowed, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return allowed
+}
+
+// SingleWorkspace reports whether this install keeps everyone in one workspace
+// (docs/architecture/multi-tenancy.md, "Single-workspace mode"): the first
+// sign-up owns it, later users join it instead of getting a personal one, and
+// no one can create another.
+//
+// Unset is the cloud behaviour, many workspaces. The self-host artifacts
+// (docker-compose.quickstart.yml, the Helm chart) set RSYNC_SINGLE_WORKSPACE=true.
+// It parses like BillingEnforced, failing toward the cloud behaviour: only an
+// explicit true turns it on. This is a product flag, not an edition gate, and a
+// soft one -- a self-hoster can turn it off. It reads the environment on every
+// call so tests can set it per case.
+func SingleWorkspace() bool {
+	v := strings.TrimSpace(os.Getenv("RSYNC_SINGLE_WORKSPACE"))
+	if v == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return on
+}
+
 // ToAPIResponse returns feature flags in a format safe for API responses
 // Only returns flags that control UI behavior, not sensitive configuration
 func (f *FeatureFlags) ToAPIResponse() map[string]interface{} {
@@ -171,6 +241,10 @@ func (f *FeatureFlags) ToAPIResponse() map[string]interface{} {
 		"monitoring_infra":    f.MonitoringInfra,
 		"monitoring_traces":   f.MonitoringTraces,
 		"usage_panel":         f.UsagePanel,
+		"agent_gateway":       f.AgentGateway,
+		"assistant":           f.Assistant,
+		"llm_sample_rows":     f.LLMSampleRows,
+		"single_workspace":    f.SingleWorkspace,
 	}
 }
 

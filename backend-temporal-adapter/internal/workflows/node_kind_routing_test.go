@@ -5,12 +5,15 @@ package workflows
 // WHAT THIS GUARDS. types/workflow_graph.go declares ten node kinds and
 // types/graph_converter.go gives all ten a stage type, colour, group, icon,
 // description and duration estimate — so a planner can emit, and the UI can
-// draw, a node the runtime has never heard of. The runtime knows three:
-// localNodeOutput resolves `source` and `transform` without an activity, and
-// exactly one dispatch rule (`destination`) forces the task field the executor
-// reads. The census fixes that count in place so it cannot shrink silently, and
-// so a kind cannot be added and left unimplemented without a named failure.
-//
+// draw, a node the runtime has never heard of. The runtime runs six:
+// localNodeOutput resolves `source`, `transform`, `wait`, `merge` and `split`
+// without an activity, and exactly one dispatch rule (`destination`) forces the
+// task field the executor reads. The other four are REFUSED: validateRunnableGraph
+// rejects a graph that contains one before any node runs, and the executor
+// refuses a node task that is not a destination's data_transfer. The census
+// fixes both lists in place, so a kind cannot be added and left unimplemented
+// without a named failure, and cannot silently drift from runnable to refused.
+
 // HOW IT GUARDS — and the correction that matters most in this file's history.
 // "Routed" here means the kind changes something a CONSUMER READS. There is
 // exactly one such field on the dispatch side:
@@ -62,8 +65,8 @@ import (
 
 // executorDispatchOperations is the set of operations the executor actually
 // handles, transcribed from the `switch task.Operation` at
-// backend-orchestrator/internal/agents/executor/executor.go:1534-1553. Its
-// default arm (:1554) returns `unknown operation: %s` as a task failure.
+// backend-orchestrator/internal/agents/executor/executor.go:1497-1516. Its
+// default arm (:1517) returns `unknown operation: %s` as a task failure.
 //
 // It is a transcription because the executor is a different Go module; this
 // package cannot import it. That makes the set the weakest link in the census,
@@ -72,19 +75,19 @@ import (
 // operation that is not here would make the node fail at runtime with
 // `unknown operation`, which is not routing either.
 var executorDispatchOperations = map[string]string{
-	"export":            "executor.go:1535",
-	"import":            "executor.go:1537",
-	"query":             "executor.go:1539",
-	"execute":           "executor.go:1541",
-	"data_transfer":     "executor.go:1543",
-	"start_streaming":   "executor.go:1546",
-	"start_cdc":         "executor.go:1546",
-	"stop_streaming":    "executor.go:1548",
-	"stop_cdc":          "executor.go:1548",
-	"streaming_status":  "executor.go:1550",
-	"cdc_status":        "executor.go:1550",
-	"restart_streaming": "executor.go:1552",
-	"restart_cdc":       "executor.go:1552",
+	"export":            "executor.go:1498",
+	"import":            "executor.go:1500",
+	"query":             "executor.go:1502",
+	"execute":           "executor.go:1504",
+	"data_transfer":     "executor.go:1506",
+	"start_streaming":   "executor.go:1509",
+	"start_cdc":         "executor.go:1509",
+	"stop_streaming":    "executor.go:1511",
+	"stop_cdc":          "executor.go:1511",
+	"streaming_status":  "executor.go:1513",
+	"cdc_status":        "executor.go:1513",
+	"restart_streaming": "executor.go:1515",
+	"restart_cdc":       "executor.go:1515",
 }
 
 // nodeKindExpectation pins the complete observable routing outcome for one kind.
@@ -105,7 +108,7 @@ type nodeKindExpectation struct {
 	// Operation: the value forced onto task["operation"], the ONLY field the
 	// downstream executor branches on
 	// (backend-orchestrator/internal/workers/executor.go:540 ->
-	// internal/agents/executor/executor.go:1534). A non-empty value here — other
+	// internal/agents/executor/executor.go:1497). A non-empty value here — other
 	// than the executor's own default — is what makes a dispatched kind routed.
 	Operation string
 	// ConnectorTypeField: the task key node_config["connector_type"] is copied
@@ -113,28 +116,30 @@ type nodeKindExpectation struct {
 	// destination_type only when the task carries source_config /
 	// destination_config (workers/executor.go:565-577), which this adapter never sets.
 	ConnectorTypeField string
-	// Unrouted must be non-empty exactly when the kind changes nothing a
+	// Refused must be non-empty exactly when the kind changes nothing a
 	// consumer reads — i.e. it is not locally handled and forces no operation.
 	//
-	// It is a record of a known defect, not permission for one. There is no way
-	// to clear it from this table alone: routed-ness is recomputed from what the
-	// functions return, so an entry cleared without a real change fails, and a
-	// real change that is not recorded here fails too. Adding request_type
-	// strings does not move a kind out of this bucket.
-	// See KI-NODE-KINDS-DECLARED-BUT-UNROUTED in CAPABILITIES.md.
-	Unrouted string
+	// A refused kind has no runtime, and the runtime says so instead of
+	// pretending: validateRunnableGraph rejects a graph containing one before
+	// any node runs, the executor refuses a node task that is not a
+	// destination's data_transfer, and the planner is told not to emit it
+	// (shared/workflow_node_kinds_golden.json). There is no way to clear it from
+	// this table alone: routed-ness is recomputed from what the functions return,
+	// so an entry cleared without a real change fails, and a real change that is
+	// not recorded here fails too. Adding request_type strings does not move a
+	// kind out of this bucket.
+	Refused string
 }
 
-// declarationOnlyReason is the shared Unrouted text for the four kinds that get
-// a distinct request_type and nothing else. They are worth distinguishing from
-// wait/merge/split in prose, but not in behaviour: both groups reach the
-// executor with no kind-derived operation.
-const declarationOnlyReason = "declaration only: a distinct request_type, which no consumer reads, " +
-	"and no forced operation. Nothing else in the adapter branches on this kind — outside " +
-	"types/ (declarations and UI presentation) the only NodeKind references are in " +
-	"node_kind_routing.go — and backend-orchestrator has zero references to node_kind. " +
-	"Whatever such a node does comes from a planner-supplied node_config.operation, not " +
-	"from its kind."
+// noRuntimeReason is the shared Refused text for the four kinds that get a
+// distinct request_type and nothing else. Nothing in the adapter branches on
+// them, and backend-orchestrator has zero references to node_kind outside the
+// guard that refuses them. Before that guard, whatever such a node did came
+// from the executor's plan-less fallback — a full source→destination transfer.
+const noRuntimeReason = "no runtime: a distinct request_type, which no consumer reads, " +
+	"and no forced operation. validateRunnableGraph rejects a graph containing this " +
+	"kind before any node runs, and the executor refuses the node task, so it can no " +
+	"longer fall through to a full source-to-destination transfer."
 
 var nodeKindCensus = map[string]nodeKindExpectation{
 	// --- routed: resolved by the scheduler with no activity at all ---
@@ -147,6 +152,12 @@ var nodeKindCensus = map[string]nodeKindExpectation{
 		LocallyHandled: true,
 		RequestType:    "transform",
 	},
+	// wait sleeps on a workflow timer for node_config.wait_seconds, merge is a
+	// fan-in that unions upstream transforms, split is a static fan-out. All
+	// three carry the transform list forward so the destination still sees it.
+	workflowtypes.NodeKindWait:  {LocallyHandled: true},
+	workflowtypes.NodeKindMerge: {LocallyHandled: true},
+	workflowtypes.NodeKindSplit: {LocallyHandled: true},
 
 	// --- routed: the one rule that forces the executor's dispatch key ---
 	workflowtypes.NodeKindDestination: {
@@ -155,24 +166,11 @@ var nodeKindCensus = map[string]nodeKindExpectation{
 		ConnectorTypeField: "destination_type",
 	},
 
-	// --- unrouted: a distinct declaration string, no runtime effect ---
-	workflowtypes.NodeKindAPICall:      {RequestType: "api_call", Unrouted: declarationOnlyReason},
-	workflowtypes.NodeKindCondition:    {RequestType: "evaluate_condition", Unrouted: declarationOnlyReason},
-	workflowtypes.NodeKindLLM:          {RequestType: "llm_process", Unrouted: declarationOnlyReason},
-	workflowtypes.NodeKindNotification: {RequestType: "notification", Unrouted: declarationOnlyReason},
-
-	// --- unrouted: not even a distinct declaration ---
-	workflowtypes.NodeKindWait: {
-		Unrouted: "no timer/delay path anywhere; reaches the executor with the generic " +
-			"request_type and no operation, i.e. the exact payload of a kind the adapter " +
-			"has never heard of",
-	},
-	workflowtypes.NodeKindMerge: {
-		Unrouted: "fan-in is only the scheduler's in-degree bookkeeping; no merge semantics exist",
-	},
-	workflowtypes.NodeKindSplit: {
-		Unrouted: "no fan-out/partition path; reaches the executor as an unrecognised kind",
-	},
+	// --- refused: a distinct declaration string, no runtime ---
+	workflowtypes.NodeKindAPICall:      {RequestType: "api_call", Refused: noRuntimeReason},
+	workflowtypes.NodeKindCondition:    {RequestType: "evaluate_condition", Refused: noRuntimeReason},
+	workflowtypes.NodeKindLLM:          {RequestType: "llm_process", Refused: noRuntimeReason},
+	workflowtypes.NodeKindNotification: {RequestType: "notification", Refused: noRuntimeReason},
 }
 
 // observedNodeRouting is what the two routing seams actually produce for one
@@ -251,8 +249,8 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		if _, ok := nodeKindCensus[kind]; !ok {
 			t.Errorf("node kind %q is declared (workflowtypes.AllNodeKinds) but this "+
 				"census has no entry for it. Add one describing how it is routed — or, "+
-				"if nothing routes it, add it with an Unrouted reason AND a Known-issues "+
-				"entry in CAPABILITIES.md.", kind)
+				"if nothing runs it, add it with a Refused reason AND list it under "+
+				"not_runnable in shared/workflow_node_kinds_golden.json.", kind)
 		}
 	}
 	declaredSet := map[string]bool{}
@@ -288,7 +286,7 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 			if _, handled := executorDispatchOperations[rule.Operation]; !handled {
 				t.Errorf("nodeDispatchRules[%q].Operation is %q, which is not one of the "+
 					"operations the executor dispatches (%v — transcribed from "+
-					"backend-orchestrator/internal/agents/executor/executor.go:1534-1553). A "+
+					"backend-orchestrator/internal/agents/executor/executor.go:1497-1516). A "+
 					"node forcing it fails at runtime with `unknown operation: %s`. Add the "+
 					"handler on the orchestrator side first, then list it in "+
 					"executorDispatchOperations with its file:line.",
@@ -304,14 +302,14 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 	// 2. Observe the real routing for every declared kind and compare against
 	//    the pinned table.
 	var (
-		localCount              int // resolved by the scheduler, no activity
-		operationCount          int // dispatched AND forcing the executor's dispatch key
-		kindSpecificDispatched  int // dispatched AND carrying a distinct request_type
-		genericDispatched       int // dispatched AND carrying the generic request_type
-		routedCount             int
-		unroutedCount           int
-		unroutedDeclarationOnly int
-		unroutedNothing         int
+		localCount             int // resolved by the scheduler, no activity
+		operationCount         int // dispatched AND forcing the executor's dispatch key
+		kindSpecificDispatched int // dispatched AND carrying a distinct request_type
+		genericDispatched      int // dispatched AND carrying the generic request_type
+		routedCount            int
+		refusedCount           int
+		refusedDeclarationOnly int
+		refusedNothing         int
 	)
 	seenRequestTypes := map[string]string{}
 
@@ -359,7 +357,7 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		if got.Operation != want.Operation {
 			t.Errorf("node kind %q: applyNodeKindRouting wrote operation=%q, census pins "+
 				"%q. `operation` is the ONLY field the executor dispatches on "+
-				"(backend-orchestrator/internal/agents/executor/executor.go:1534), so this "+
+				"(backend-orchestrator/internal/agents/executor/executor.go:1497), so this "+
 				"IS a real behaviour change.", kind, got.Operation, want.Operation)
 		}
 		if want.ConnectorTypeField != "" {
@@ -388,24 +386,25 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		//     returned, and only from the two things a consumer reads: the
 		//     scheduler resolving the node, or a forced executor operation.
 		switch {
-		case got.Routed() && want.Unrouted != "":
+		case got.Routed() && want.Refused != "":
 			t.Errorf("node kind %q now routes for real (locally=%v, operation=%q) but the "+
-				"census still records it as unrouted (%q). Confirm the executor handler for "+
-				"that operation does what this kind means, then clear the Unrouted reason "+
+				"census still records it as refused (%q). Confirm the executor handler for "+
+				"that operation does what this kind means, then clear the Refused reason, "+
+				"move the kind to runnable in shared/workflow_node_kinds_golden.json "+
 				"and strike the row in CAPABILITIES.md — a stale record hides the next dead kind.",
-				kind, got.Local, got.Operation, want.Unrouted)
-		case !got.Routed() && want.Unrouted == "":
+				kind, got.Local, got.Operation, want.Refused)
+		case !got.Routed() && want.Refused == "":
 			t.Errorf("node kind %q is declared but nothing routes it: localNodeOutput "+
 				"returns handled=false and applyNodeKindRouting forces no executor "+
 				"operation (request_type=%q is read by nobody). Implement it — a case in "+
 				"localNodeOutput, or a rule whose Operation names a real executor handler — "+
-				"or record it here with an Unrouted reason AND a Known-issues entry in "+
-				"CAPABILITIES.md. Adding a request_type will not clear this.",
+				"or record it here with a Refused reason AND list it under not_runnable in "+
+				"shared/workflow_node_kinds_golden.json. Adding a request_type will not clear this.",
 				kind, got.RequestType)
 		}
 
 		// Counters. Every kind lands in exactly one of local / dispatched, and
-		// exactly one of routed / unrouted; step 3 asserts that they close.
+		// exactly one of routed / refused; step 3 asserts that they close.
 		switch {
 		case got.Local:
 			localCount++
@@ -422,11 +421,11 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		if got.Routed() {
 			routedCount++
 		} else {
-			unroutedCount++
+			refusedCount++
 			if got.KindSpecificRequestType() {
-				unroutedDeclarationOnly++
+				refusedDeclarationOnly++
 			} else {
-				unroutedNothing++
+				refusedNothing++
 			}
 		}
 
@@ -459,18 +458,18 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		t.Fatalf("kind-specific request_type (%d) + generic (%d) != dispatched (%d)",
 			kindSpecificDispatched, genericDispatched, dispatched)
 	}
-	if routedCount+unroutedCount != len(declared) {
-		t.Fatalf("routed(%d) + unrouted(%d) != declared(%d)", routedCount, unroutedCount, len(declared))
+	if routedCount+refusedCount != len(declared) {
+		t.Fatalf("routed(%d) + refused(%d) != declared(%d)", routedCount, refusedCount, len(declared))
 	}
 	if routedCount != localCount+operationCount {
 		t.Fatalf("routed(%d) != local(%d) + forces-operation(%d)", routedCount, localCount, operationCount)
 	}
-	if unroutedDeclarationOnly+unroutedNothing != unroutedCount {
-		t.Fatalf("declaration-only(%d) + nothing(%d) != unrouted(%d)",
-			unroutedDeclarationOnly, unroutedNothing, unroutedCount)
+	if refusedDeclarationOnly+refusedNothing != refusedCount {
+		t.Fatalf("declaration-only(%d) + nothing(%d) != refused(%d)",
+			refusedDeclarationOnly, refusedNothing, refusedCount)
 	}
 
-	// Rules whose kind is answered locally can never run: dag_scheduler.go:289
+	// Rules whose kind is answered locally can never run: dag_scheduler.go:329
 	// returns before dispatching the activity, and that activity is the only
 	// non-test caller of applyNodeKindRouting.
 	reachableRules, unreachableRules := 0, 0
@@ -490,14 +489,14 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		"to the executor activity. Of those %d dispatched: %d force task[\"operation\"] (the "+
 		"only field the executor reads) and %d force none; %d carry a kind-specific "+
 		"request_type (a declaration no consumer reads) and %d carry the generic one. "+
-		"ROUTED = %d (%d local + %d operation). UNROUTED = %d (%d declaration-only + %d "+
+		"ROUTED = %d (%d local + %d operation). REFUSED = %d (%d declaration-only + %d "+
 		"nothing at all). nodeDispatchRules holds %d rules: %d reachable, %d unreachable "+
 		"(localNodeOutput answers those kinds first).",
 		len(declared), localCount, dispatched,
 		dispatched, operationCount, dispatched-operationCount,
 		kindSpecificDispatched, genericDispatched,
 		routedCount, localCount, operationCount,
-		unroutedCount, unroutedDeclarationOnly, unroutedNothing,
+		refusedCount, refusedDeclarationOnly, refusedNothing,
 		len(nodeDispatchRules), reachableRules, unreachableRules)
 }
 
@@ -673,7 +672,7 @@ func TestApplyNodeKindRoutingDestinationOverridesPlannerOperation(t *testing.T) 
 	}
 }
 
-func TestUnroutedKindsReachTheExecutorLikeAnUnknownKind(t *testing.T) {
+func TestRefusedKindsForceNoExecutorOperation(t *testing.T) {
 	// The documented meaning of genericNodeRequestType: what a kind the adapter
 	// has never heard of receives. It is therefore not evidence of routing.
 	unknown := map[string]interface{}{}
@@ -685,33 +684,34 @@ func TestUnroutedKindsReachTheExecutorLikeAnUnknownKind(t *testing.T) {
 		t.Errorf("an unknown kind set task[operation]=%v; it must set none", op)
 	}
 
-	// Every kind the census records as unrouted is indistinguishable from that
-	// unknown kind in the field the executor reads. The list is DERIVED from the
-	// census, so there is no second place to edit: dropping a kind from this
-	// check means clearing its Unrouted reason, which the census then rejects
-	// unless the routing really changed.
+	// Every kind the census records as refused is indistinguishable from that
+	// unknown kind in the field the executor reads — which is what lets the
+	// executor refuse it: only a destination's data_transfer runs there. The
+	// list is DERIVED from the census, so there is no second place to edit:
+	// dropping a kind from this check means clearing its Refused reason, which
+	// the census then rejects unless the routing really changed.
 	checked := 0
 	for _, kind := range sortedCensusKinds(nodeKindCensus) {
-		if nodeKindCensus[kind].Unrouted == "" {
+		if nodeKindCensus[kind].Refused == "" {
 			continue
 		}
 		checked++
 		task := map[string]interface{}{}
 		applyNodeKindRouting(task, kind, nil)
 		if op, present := task["operation"]; present {
-			t.Errorf("the census records node kind %q as unrouted, but "+
+			t.Errorf("the census records node kind %q as refused, but "+
 				"applyNodeKindRouting now forces task[operation]=%v. That IS a runtime "+
 				"change: the executor dispatches on this field "+
-				"(backend-orchestrator/internal/agents/executor/executor.go:1534). Verify a "+
+				"(backend-orchestrator/internal/agents/executor/executor.go:1497). Verify a "+
 				"handler for that operation exists AND does what this kind means, then "+
 				"update the census entry. Do not try to reach this state by adding a "+
 				"request_type: that key is read by nobody.", kind, op)
 		}
 	}
 	if checked == 0 {
-		t.Fatalf("the census records no unrouted kind — either every kind is now routed " +
-			"(in which case update CAPABILITIES.md) or the Unrouted reasons were deleted " +
-			"without a behaviour change")
+		t.Fatalf("the census records no refused kind — if every declared kind now runs, " +
+			"empty not_runnable in shared/workflow_node_kinds_golden.json and delete this " +
+			"test; otherwise the Refused reasons were deleted without a behaviour change")
 	}
 }
 

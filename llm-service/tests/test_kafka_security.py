@@ -13,13 +13,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.utils.kafka_security import (  # noqa: E402
+from src.utils.kafka_security import (
     KafkaSecurityError,
     brokers_from_env,
-    describe,
     kafka_security_kwargs,
     parse_brokers,
-    schema_registry_auth,
 )
 
 
@@ -159,25 +157,6 @@ def test_half_an_mtls_keypair_is_rejected(monkeypatch):
     monkeypatch.setenv("KAFKA_SSL_CERT_LOCATION", "/etc/kafka/client.pem")
     with pytest.raises(KafkaSecurityError):
         kafka_security_kwargs()
-
-
-# --------------------------------------------------------------------------
-# Credential handling
-# --------------------------------------------------------------------------
-
-def test_describe_never_leaks_the_password(monkeypatch):
-    """describe() exists so operators can log the Kafka config when a connection
-    fails. If it printed the password, that need would create the leak."""
-    monkeypatch.setenv("KAFKA_BROKERS", "b1:9093")
-    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
-    monkeypatch.setenv("KAFKA_SASL_MECHANISM", "PLAIN")
-    monkeypatch.setenv("KAFKA_SASL_USERNAME", "svc-rsync")
-    monkeypatch.setenv("KAFKA_SASL_PASSWORD", "hunter2-do-not-log")
-
-    out = describe()
-    assert "hunter2-do-not-log" not in out
-    assert "[redacted]" in out
-    assert "svc-rsync" in out  # the username IS useful in a log
 
 
 # --------------------------------------------------------------------------
@@ -355,60 +334,6 @@ def test_debezium_jaas_quotes_a_password_containing_spaces(monkeypatch):
     assert 'username="svc rsync"' in jaas
     assert 'password="pass word=with=equals"' in jaas
     assert jaas.endswith(";")
-
-
-# --------------------------------------------------------------------------
-# Schema Registry credentials
-# --------------------------------------------------------------------------
-
-
-def test_schema_registry_auth_is_none_when_unset():
-    """Anonymous is correct for an unsecured registry, and is what every
-    existing deployment already gets."""
-    assert schema_registry_auth() is None
-
-
-def test_schema_registry_auth_reads_the_confluent_combined_form(monkeypatch):
-    monkeypatch.setenv("SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO", "sr-user:sr-pass")
-    assert schema_registry_auth() == ("sr-user", "sr-pass")
-
-
-def test_schema_registry_auth_reads_the_split_pair(monkeypatch):
-    monkeypatch.setenv("SCHEMA_REGISTRY_USERNAME", "sr-user")
-    monkeypatch.setenv("SCHEMA_REGISTRY_PASSWORD", "sr-pass")
-    assert schema_registry_auth() == ("sr-user", "sr-pass")
-
-
-def test_schema_registry_combined_form_wins_over_the_split_pair(monkeypatch):
-    """Confluent's own precedence. Silently merging the two would produce a
-    credential the operator never wrote down."""
-    monkeypatch.setenv("SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO", "combined:wins")
-    monkeypatch.setenv("SCHEMA_REGISTRY_USERNAME", "split")
-    monkeypatch.setenv("SCHEMA_REGISTRY_PASSWORD", "loses")
-    assert schema_registry_auth() == ("combined", "wins")
-
-
-def test_schema_registry_auth_fails_closed_on_half_a_pair(monkeypatch):
-    """A username with no password must not degrade to anonymous: the registry
-    answers 401 and the serializer reports it as a schema-registration failure
-    naming the subject, sending the operator to debug the wrong thing."""
-    monkeypatch.setenv("SCHEMA_REGISTRY_USERNAME", "sr-user")
-    with pytest.raises(KafkaSecurityError) as exc:
-        schema_registry_auth()
-    assert "SCHEMA_REGISTRY_PASSWORD" in str(exc.value)
-
-
-def test_schema_registry_auth_rejects_a_combined_value_with_no_colon(monkeypatch):
-    monkeypatch.setenv("SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO", "userpass")
-    with pytest.raises(KafkaSecurityError):
-        schema_registry_auth()
-
-
-def test_schema_registry_password_may_contain_a_colon(monkeypatch):
-    """partition() splits on the FIRST colon; a split on the last (or a naive
-    split into exactly two parts) corrupts any password containing one."""
-    monkeypatch.setenv("SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO", "user:pa:ss:word")
-    assert schema_registry_auth() == ("user", "pa:ss:word")
 
 
 # --------------------------------------------------------------------------

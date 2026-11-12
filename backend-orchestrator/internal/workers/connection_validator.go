@@ -16,6 +16,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 	"github.com/rsync-ai/shared/correlation"
 	"github.com/rsync-ai/shared/crypto"
 )
@@ -538,7 +539,7 @@ func (w *ConnectionValidatorWorker) validateConnection(ctx context.Context, conn
 	// This is generic and works for all connectors
 	configMap := make(map[string]string)
 	for k, v := range configInterface {
-		configMap[k] = fmt.Sprintf("%v", v)
+		configMap[k] = utils.ConfigString(v)
 	}
 
 	// Update connection object with parsed config so it's available in output

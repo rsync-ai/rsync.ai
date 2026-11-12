@@ -1,5 +1,5 @@
 /**
- * The bridge between the Transform Builder's vocabulary and the execution engine's.
+ * The bridge between the transform editor's vocabulary and the execution engine's.
  *
  * It lives outside the page component because it is the part that was wrong: the
  * builder offered 17 operations, the engine has cases for 8 of them, and nothing in
@@ -11,14 +11,26 @@ export type TransformOperation =
   | "type_convert" | "null_handle" | "truncate"
   | "aggregate" | "join" | "enrich" | "deduplicate" | "sort" | "limit" | "sql" | "python_udf";
 
+/**
+ * Where a rule runs. The batch executor reads `producer` rows and the CDC sink reads
+ * `consumer` rows, and a CDC pipeline's initial load can run on the batch path, so a
+ * rule meant to hold for a pipeline has to be on both: "both" is the only kind the
+ * builder and the creation dialog make. "producer"/"consumer" exist only for rows an
+ * older builder saved to one side, which load as they are rather than being widened
+ * behind the operator's back.
+ */
+export type RuleSides = "both" | "producer" | "consumer";
+
 export interface TransformRule {
   id: string;
   order: number;
-  type: "producer" | "consumer";
+  type: RuleSides;
   operation: TransformOperation;
   enabled: boolean;
   config: Record<string, any>;
   description?: string;
+  /** For a "both" rule loaded from the DB: the consumer row's id (`id` is the producer's). */
+  pairId?: string;
 }
 
 /**
@@ -168,7 +180,9 @@ export function fromApiTransforms(raw: unknown, newId: () => string = () => cryp
     return [{
       id: typeof row?.id === "string" && row.id ? row.id : newId(),
       order: typeof row?.transform_order === "number" ? row.transform_order : i,
-      type: row?.transform_type === "consumer" ? "consumer" : "producer",
+      // The parser answers with `transform_type: "producer"` by default; a rule
+      // generated from a sentence is meant for the pipeline, not one of its paths.
+      type: "both",
       operation,
       enabled: row?.enabled !== false,
       config: cfg,

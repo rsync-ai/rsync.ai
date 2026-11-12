@@ -81,12 +81,6 @@ func NewProvider(dbType string, db *sql.DB) (CDCSourceProvider, bool) {
 	return factory(db), true
 }
 
-// IsSupportedDBType reports whether a CDC provider is registered for dbType.
-func IsSupportedDBType(dbType string) bool {
-	_, ok := providerRegistry[NormalizeDBType(dbType)]
-	return ok
-}
-
 // RegisteredDBTypes returns the sorted set of database types that have a
 // registered CDC provider. Cleanup uses this to run teardown for every known
 // family regardless of what cdc_resources holds (each CleanupResources is

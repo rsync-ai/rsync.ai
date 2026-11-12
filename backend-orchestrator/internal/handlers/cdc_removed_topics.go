@@ -35,14 +35,17 @@ import (
 //     thrown away.
 //
 // A job that is still waiting at the deadline gives up and KEEPS the topic, with
-// a warning naming the reason. Jobs live in memory: an orchestrator restart
-// drops them and the topic stays (the pre-fix behaviour, never data loss).
+// a warning naming the reason. Each job is stored (cdc_removed_topic_jobs) until it
+// ends, so one an orchestrator restart interrupts resumes at the next start
+// (Resume) with the deadline it had. Without a store, a restart drops the job and
+// the topic stays (never data loss).
 type RemovedTopicReaper struct {
 	admin      removedTopicAdmin
 	offsets    removedTopicOffsets
 	connect    removedTopicConnect
 	stats      topicExcluder
 	sinkGroups func(ctx context.Context, pipelineID string) []string
+	store      removedTopicJobStore // nil: jobs live in memory only
 
 	poll     time.Duration
 	deadline time.Duration
@@ -79,6 +82,66 @@ type topicExcluder interface {
 	IncludeTopic(topic string)
 }
 
+// removedTopicJob is one table removed from a connector, and the one topic its job
+// may delete.
+type removedTopicJob struct {
+	PipelineID  string
+	Connector   string
+	Table       string
+	Topic       string
+	ScheduledAt time.Time // the job's deadline runs from here, across restarts
+}
+
+func (j removedTopicJob) key() string { return j.PipelineID + "|" + j.Topic }
+
+// removedTopicJobStore keeps the jobs that have not ended across an orchestrator
+// restart.
+type removedTopicJobStore interface {
+	Save(ctx context.Context, job removedTopicJob) error
+	Delete(ctx context.Context, pipelineID, topic string) error
+	List(ctx context.Context) ([]removedTopicJob, error)
+}
+
+// sqlRemovedTopicJobs is the cdc_removed_topic_jobs table (migration 148).
+type sqlRemovedTopicJobs struct{ db *sql.DB }
+
+// Save records the job; a table removed again restarts its deadline.
+func (s sqlRemovedTopicJobs) Save(ctx context.Context, j removedTopicJob) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO cdc_removed_topic_jobs (pipeline_id, topic, connector_name, table_name, scheduled_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (pipeline_id, topic) DO UPDATE
+		SET connector_name = EXCLUDED.connector_name, table_name = EXCLUDED.table_name,
+		    scheduled_at = EXCLUDED.scheduled_at`,
+		j.PipelineID, j.Topic, j.Connector, j.Table, j.ScheduledAt)
+	return err
+}
+
+func (s sqlRemovedTopicJobs) Delete(ctx context.Context, pipelineID, topic string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM cdc_removed_topic_jobs WHERE pipeline_id = $1 AND topic = $2`, pipelineID, topic)
+	return err
+}
+
+func (s sqlRemovedTopicJobs) List(ctx context.Context) ([]removedTopicJob, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT pipeline_id::text, topic, connector_name, table_name, scheduled_at
+		FROM cdc_removed_topic_jobs ORDER BY scheduled_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var jobs []removedTopicJob
+	for rows.Next() {
+		var j removedTopicJob
+		if err := rows.Scan(&j.PipelineID, &j.Topic, &j.Connector, &j.Table, &j.ScheduledAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
 const (
 	removedTopicPoll     = 15 * time.Second
 	removedTopicDeadline = 30 * time.Minute
@@ -94,23 +157,49 @@ func NewRemovedTopicReaper(db *sql.DB, tm *kafka.TopologyManager, km *kafka.Mana
 	if stats != nil {
 		excl = stats
 	}
+	var store removedTopicJobStore
+	if db != nil {
+		store = sqlRemovedTopicJobs{db: db}
+	}
 	return newRemovedTopicReaper(tm, km, cdcsnapshot.NewConnectClient(getKafkaConnectURL()), excl,
 		func(ctx context.Context, pipelineID string) []string {
 			return SinkConsumerGroupsToStop(ctx, db, pipelineID)
 		},
-		removedTopicPoll, removedTopicDeadline)
+		store, removedTopicPoll, removedTopicDeadline)
 }
 
 func newRemovedTopicReaper(admin removedTopicAdmin, offsets removedTopicOffsets, connect removedTopicConnect, stats topicExcluder,
-	sinkGroups func(context.Context, string) []string, poll, deadline time.Duration) *RemovedTopicReaper {
+	sinkGroups func(context.Context, string) []string, store removedTopicJobStore, poll, deadline time.Duration) *RemovedTopicReaper {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &RemovedTopicReaper{
-		admin: admin, offsets: offsets, connect: connect, stats: stats, sinkGroups: sinkGroups,
+		admin: admin, offsets: offsets, connect: connect, stats: stats, sinkGroups: sinkGroups, store: store,
 		poll: poll, deadline: deadline, ctx: ctx, cancel: cancel, jobs: map[string]bool{},
 	}
 }
 
-// Stop cancels every job (their topics are kept) and waits for them to return.
+// Resume starts the jobs a previous orchestrator left unfinished. Call it once, at
+// start.
+func (r *RemovedTopicReaper) Resume() {
+	if r == nil || r.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, 30*time.Second)
+	defer cancel()
+	jobs, err := r.store.List(ctx)
+	if err != nil {
+		log.WithError(err).Warn("cdc removed table: could not read the unfinished topic deletions; their topics stay until the next start reads them")
+		return
+	}
+	for _, j := range jobs {
+		r.start(j, false)
+	}
+	if len(jobs) > 0 {
+		log.WithField("jobs", len(jobs)).Info("cdc removed table: resumed the unfinished topic deletions")
+	}
+}
+
+// Stop ends every job without finishing it — its topic is untouched and it stays
+// stored, so the next start resumes it — and waits for them to return.
 func (r *RemovedTopicReaper) Stop() {
 	if r == nil {
 		return
@@ -158,26 +247,42 @@ func (r *RemovedTopicReaper) Schedule(pipelineID, connectorName string, connCfg 
 		if !ok {
 			continue
 		}
-		key := pipelineID + "|" + topic
-		r.mu.Lock()
-		if r.jobs[key] {
-			r.mu.Unlock()
-			continue
-		}
-		r.jobs[key] = true
-		r.mu.Unlock()
-		r.wg.Add(1)
-		go r.run(key, pipelineID, connectorName, table, topic)
+		r.start(removedTopicJob{PipelineID: pipelineID, Connector: connectorName, Table: table, Topic: topic,
+			ScheduledAt: time.Now()}, true)
 	}
 }
 
-func (r *RemovedTopicReaper) run(key, pipelineID, connectorName, table, topic string) {
+// start runs job unless it already runs; save stores it first. A job the store
+// refuses still runs, in memory only.
+func (r *RemovedTopicReaper) start(job removedTopicJob, save bool) {
+	key := job.key()
+	r.mu.Lock()
+	if r.jobs[key] {
+		r.mu.Unlock()
+		return
+	}
+	r.jobs[key] = true
+	r.mu.Unlock()
+	if save && r.store != nil {
+		ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
+		if err := r.store.Save(ctx, job); err != nil {
+			log.WithError(err).WithFields(log.Fields{"pipeline_id": job.PipelineID, "topic": job.Topic}).
+				Warn("cdc removed table: could not store the topic deletion; an orchestrator restart before it ends keeps the topic")
+		}
+		cancel()
+	}
+	r.wg.Add(1)
+	go r.run(job)
+}
+
+func (r *RemovedTopicReaper) run(job removedTopicJob) {
 	defer r.wg.Done()
 	defer func() {
 		r.mu.Lock()
-		delete(r.jobs, key)
+		delete(r.jobs, job.key())
 		r.mu.Unlock()
 	}()
+	pipelineID, connectorName, table, topic := job.PipelineID, job.Connector, job.Table, job.Topic
 	fields := log.Fields{"pipeline_id": pipelineID, "connector": connectorName, "table": table, "topic": topic}
 	excluded := false
 	release := func() {
@@ -185,7 +290,7 @@ func (r *RemovedTopicReaper) run(key, pipelineID, connectorName, table, topic st
 			r.stats.IncludeTopic(topic)
 		}
 	}
-	deadline := time.Now().Add(r.deadline)
+	deadline := job.ScheduledAt.Add(r.deadline)
 	ticker := time.NewTicker(r.poll)
 	defer ticker.Stop()
 	reason := "not checked yet"
@@ -197,10 +302,12 @@ func (r *RemovedTopicReaper) run(key, pipelineID, connectorName, table, topic st
 			// topic for a while after deleting it, and subscribing to it then would
 			// auto-create it again. Readd lifts this when the table comes back.
 			log.WithFields(fields).Info("cdc removed table: deleted its Kafka topic")
+			r.forget(job)
 			return
 		case reapKeep:
 			log.WithFields(fields).WithField("reason", why).Info("cdc removed table: keeping its Kafka topic")
 			release()
+			r.forget(job)
 			return
 		}
 		reason = why
@@ -208,14 +315,30 @@ func (r *RemovedTopicReaper) run(key, pipelineID, connectorName, table, topic st
 			log.WithFields(fields).WithField("reason", reason).
 				Warn("cdc removed table: its Kafka topic was not deleted in time and is kept; delete it by hand once the sink has applied it")
 			release()
+			r.forget(job)
 			return
 		}
 		select {
 		case <-r.ctx.Done():
+			// Stopped, not ended: the stored job resumes at the next start.
 			release()
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// forget removes an ended job from the store. A row left behind by a failed delete
+// resumes at the next start and ends at its first check.
+func (r *RemovedTopicReaper) forget(job removedTopicJob) {
+	if r.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.store.Delete(ctx, job.PipelineID, job.Topic); err != nil {
+		log.WithError(err).WithFields(log.Fields{"pipeline_id": job.PipelineID, "topic": job.Topic}).
+			Warn("cdc removed table: could not clear the ended topic deletion; the next start checks it again")
 	}
 }
 

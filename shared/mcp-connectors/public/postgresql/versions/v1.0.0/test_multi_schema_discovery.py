@@ -60,14 +60,14 @@ class FakeCursor:
                 ("shop", "orders", "amount", "numeric", "NO", 12, 2),
                 ("shop", "inventory", "sku", "text", "NO", None, None),
             ]
-        elif "PRIMARY KEY" in s:
-            # (table_schema, table_name, column_name)
+        elif "contype = 'p'" in s:
+            # (nspname, relname, attname)
             self._result = [
                 ("public", "orders", "id"),
                 ("public", "users", "uid"),
                 ("shop", "orders", "id"),
             ]
-        elif "FOREIGN KEY" in s:
+        elif "contype = 'f'" in s:
             self._result = []
         elif "pg_indexes" in s:
             self._result = []

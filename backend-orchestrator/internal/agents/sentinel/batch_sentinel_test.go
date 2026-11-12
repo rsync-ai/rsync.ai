@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/rsync-ai/backend-orchestrator/internal/handlers"
 )
 
 func newBatchSentinel(t *testing.T) (*BatchSentinel, sqlmock.Sqlmock, func()) {
@@ -106,8 +108,8 @@ func TestProgressTickEmitsStallIssue(t *testing.T) {
 	mock.ExpectQuery(`FROM pipelines p`).WillReturnRows(
 		sqlmock.NewRows([]string{"id", "name", "execution_id", "last_movement", "status", "stage"}).
 			AddRow("p1", "nightly orders", "e1", time.Now().Add(-45*time.Minute), "running", "executor"))
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	// resolveStaleIssues sees the same issue still open, so nothing is cleared.
 	mock.ExpectQuery(`SELECT id FROM sentinel_active_issues`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(stallIssueID("p1")))
@@ -223,8 +225,8 @@ func TestAckDrainTickEmitsPerTableIssue(t *testing.T) {
 		sqlmock.NewRows([]string{"id", "name", "execution_id", "table_name", "rejected", "sample_error", "last_rejected_at"}).
 			AddRow("p1", "nightly orders", "e1", "orders", int64(12),
 				"invalid input syntax for type bigint", time.Now()))
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	mock.ExpectQuery(`SELECT id FROM sentinel_active_issues`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(batchAckIssuePrefix + "p1:orders"))
 
@@ -246,8 +248,8 @@ func TestProgressTickSurvivesABadRow(t *testing.T) {
 			AddRow("p1", "bad", "e1", "not-a-timestamp", "running", "executor").
 			AddRow("p2", "good", "e2", time.Now().Add(-45*time.Minute), "running", "executor"))
 	// Only the good row produces an issue.
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	noOpenIssues(mock)
 
 	s.progressTick(context.Background())
@@ -326,7 +328,7 @@ func TestResolveSinkConsumerGroupPrefersTheRegisteredGroup(t *testing.T) {
 
 func TestResolveSinkConsumerGroupFallsBack(t *testing.T) {
 	pipelineID := "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
-	want := sinkConsumerGroup(pipelineID)
+	want := handlers.DerivedSinkConsumerGroup(pipelineID)
 
 	tests := []struct {
 		name  string

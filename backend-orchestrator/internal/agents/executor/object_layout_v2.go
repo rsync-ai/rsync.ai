@@ -10,6 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/storage"
+	"github.com/rsync-ai/shared/transforms"
 )
 
 // Object-storage layout v2 (gcs, aws-s3, azure-blob): which pipelines write it, and the
@@ -78,6 +79,14 @@ func objectLayoutV2DestSupported(destType string) bool {
 		return true
 	}
 	return false
+}
+
+// isMongoSourceFamily reports whether connectorType is any MongoDB alias. The
+// alias set mirrors the sink's isDocumentDBConnector ("mongodb", "mongo",
+// "mongodb-atlas", "atlas") plus the chat-handler spelling "mongodbatlas";
+// "_" is folded to "-" the same way the sink canonicalizes.
+func isMongoSourceFamily(connectorType string) bool {
+	return transforms.IsMongoSourceType(connectorType)
 }
 
 // objectLayoutV2SourceFamily maps a source connector type to a layout v2 source

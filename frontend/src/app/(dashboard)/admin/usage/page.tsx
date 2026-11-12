@@ -14,21 +14,15 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
-import { authFetch } from "@/lib/api/auth-fetch"
-import type { AdminUsageResponse } from "@/lib/api/usage"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
+import type { AdminReadFailure } from "@/lib/api/admin"
+import { getAdminUsage, type AdminUsageResponse } from "@/lib/api/usage"
 import { UsagePanelGate } from "@/components/usage/UsagePanelGate"
 import { planOptionsFrom, WorkspacePlanCell } from "@/components/admin/WorkspacePlanCell"
+import { formatDate } from "@/lib/utils"
 
 const nf = new Intl.NumberFormat()
 const fmt = (n: number) => nf.format(n)
-
-function fmtDate(iso?: string | null): string {
-  if (!iso) return "—"
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return "—"
-  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
-}
 
 type Tab = "workspaces" | "users"
 
@@ -46,59 +40,26 @@ export default function AdminUsagePage() {
 function AdminUsagePageContent() {
   const [data, setData] = useState<AdminUsageResponse | null>(null)
   const [loading, setLoading] = useState(true)
-  const [status, setStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
   const [tab, setTab] = useState<Tab>("workspaces")
 
   async function load() {
     setLoading(true)
-    setError(null)
-    setStatus(null)
-    setRetryAfter(null)
-
-    const res = await authFetch("/api/v1/admin/usage", { method: "GET" }).catch(() => null)
-    if (!res) {
-      setError("Network error")
-      setLoading(false)
-      return
-    }
-    if (res.status === 401) {
-      window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`
-      return
-    }
-    if (res.status === 403) {
-      setStatus(403)
-      setLoading(false)
-      return
-    }
-    if (res.status === 429) {
-      setStatus(429)
-      const ra = parseInt(res.headers.get("Retry-After") || "", 10)
-      setRetryAfter(Number.isFinite(ra) ? ra : null)
-      setLoading(false)
-      return
-    }
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "")
-      setError(txt || `HTTP ${res.status}`)
-      setLoading(false)
-      return
-    }
-    const json = (await res.json().catch(() => null)) as AdminUsageResponse | null
-    setData(json)
+    setFailure(null)
+    const r = await getAdminUsage()
+    if (r.ok) setData(r.data)
+    else setFailure(r)
     setLoading(false)
   }
 
   useEffect(() => {
     load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const planOptions = planOptionsFrom(data?.workspaces || [])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Consumption across all workspaces and users (beta)" />
       <AdminNav />
 
@@ -110,20 +71,8 @@ function AdminUsagePageContent() {
 
       {loading ? (
         <LoadingState />
-      ) : status === 403 ? (
-        <AccessDeniedState />
-      ) : status === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
-      ) : error ? (
-        <Card className="border border-red-200 bg-red-50 p-4 dark:border-red-900/40 dark:bg-red-950/20">
-          <div className="font-semibold text-red-800 dark:text-red-200">Failed to load</div>
-          <div className="mt-1 text-sm text-red-700 dark:text-red-300">{error}</div>
-          <div className="mt-3">
-            <Button variant="outline" onClick={load}>
-              Retry
-            </Button>
-          </div>
-        </Card>
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : !data ? (
         <LoadingState label="No data" />
       ) : (
@@ -202,7 +151,7 @@ function AdminUsagePageContent() {
                           <TableCell className="text-right tabular-nums">{fmt(w.records_processed)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(w.rows_read)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(w.rows_written)}</TableCell>
-                          <TableCell className="text-zinc-500 dark:text-zinc-400">{fmtDate(w.last_activity)}</TableCell>
+                          <TableCell className="text-zinc-500 dark:text-zinc-400">{formatDate(w.last_activity)}</TableCell>
                         </TableRow>
                       ))
                     )}
@@ -247,7 +196,7 @@ function AdminUsagePageContent() {
                           <TableCell className="text-right tabular-nums font-medium">{fmt(u.records_processed)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(u.rows_read)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(u.rows_written)}</TableCell>
-                          <TableCell className="text-zinc-500 dark:text-zinc-400">{fmtDate(u.last_activity)}</TableCell>
+                          <TableCell className="text-zinc-500 dark:text-zinc-400">{formatDate(u.last_activity)}</TableCell>
                         </TableRow>
                       ))
                     )}

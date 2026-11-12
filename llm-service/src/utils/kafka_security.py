@@ -90,12 +90,10 @@ ENV_OAUTH_ALLOW_INSECURE_TOKEN_ENDPOINT = (
     "KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT"
 )
 
-# Schema Registry is a separate service with separate credentials — a cluster can
-# require SASL while its registry is open, or the reverse. Confluent's own
-# convention is the single "user:pass" string; the split pair is accepted because
-# it is what Kubernetes secrets naturally produce.
+# Schema Registry credentials. Nothing in llm-service connects to the registry
+# with them; they are named here only so _secret_values() redacts them from a
+# surfaced Kafka error if an operator sets them.
 ENV_SR_BASIC_AUTH = "SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO"
-ENV_SR_USERNAME = "SCHEMA_REGISTRY_USERNAME"
 ENV_SR_PASSWORD = "SCHEMA_REGISTRY_PASSWORD"
 
 PROTOCOL_PLAINTEXT = "PLAINTEXT"
@@ -702,37 +700,6 @@ def reset_failure_cause() -> None:
         _cause_records.clear()
 
 
-def describe() -> str:
-    """A log-safe one-liner describing the profile.
-
-    The password is never included. This function exists so that logging the
-    Kafka configuration — which operators genuinely need when a connection
-    fails — cannot leak the credential.
-    """
-    protocol = _protocol()
-    mechanism = (os.getenv(ENV_SASL_MECHANISM) or "").strip().upper() or "none"
-    ca = (os.getenv(ENV_SSL_CA_LOCATION) or "").strip()
-    if mechanism in _TOKEN_MECHANISMS:
-        # The token endpoint is the one thing worth seeing here -- a wrong one
-        # is the most common OAUTHBEARER misconfiguration. The client id is
-        # shown because it is an identifier, not a credential; the secret is
-        # not shown at all, and neither is the token.
-        endpoint = (os.getenv(ENV_OAUTH_TOKEN_ENDPOINT) or "").strip()
-        client_id = (
-            os.getenv(ENV_OAUTH_CLIENT_ID) or os.getenv(ENV_SASL_USERNAME) or ""
-        ).strip()
-        return (
-            f"kafka{{brokers={brokers_from_env()} protocol={protocol} "
-            f"mechanism={mechanism} token_endpoint={endpoint!r} "
-            f"client_id={client_id!r} client_secret=[redacted] ca={ca!r}}}"
-        )
-    username = os.getenv(ENV_SASL_USERNAME) or ""
-    return (
-        f"kafka{{brokers={brokers_from_env()} protocol={protocol} "
-        f"mechanism={mechanism} user={username!r} password=[redacted] ca={ca!r}}}"
-    )
-
-
 # --------------------------------------------------------------------------
 # Debezium / Kafka Connect
 # --------------------------------------------------------------------------
@@ -921,42 +888,3 @@ def debezium_schema_history_security() -> Dict[str, str]:
                 # (skip-verify with no CA bundle).
                 props[prefix + "ssl.endpoint.identification.algorithm"] = ""
     return props
-
-
-def schema_registry_auth() -> Optional[Tuple[str, str]]:
-    """Return ``(username, password)`` for Schema Registry, or ``None`` if unset.
-
-    ``None`` means anonymous, which is correct for an unsecured registry and is
-    what every existing deployment gets.
-
-    Half a credential pair is an error rather than a downgrade to anonymous: a
-    registry that requires auth answers an unauthenticated request with 401, and
-    the serializer reports that as a schema-registration failure naming the
-    subject. The operator then debugs the schema, not the typo in their secret.
-
-    SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO ("user:pass") wins over the split pair,
-    matching Confluent's own precedence.
-    """
-    combined = os.getenv(ENV_SR_BASIC_AUTH, "").strip()
-    if combined:
-        if ":" not in combined:
-            raise KafkaSecurityError(
-                f"{ENV_SR_BASIC_AUTH} must be 'username:password', got a value with no ':'"
-            )
-        user, _, password = combined.partition(":")
-        if not user or not password:
-            raise KafkaSecurityError(
-                f"{ENV_SR_BASIC_AUTH} must be 'username:password'; one half is empty"
-            )
-        return user, password
-
-    user = os.getenv(ENV_SR_USERNAME, "").strip()
-    password = os.getenv(ENV_SR_PASSWORD, "")
-    if not user and not password:
-        return None
-    if not user or not password:
-        raise KafkaSecurityError(
-            f"Schema Registry auth needs both {ENV_SR_USERNAME} and {ENV_SR_PASSWORD}; "
-            "set both or neither"
-        )
-    return user, password

@@ -1,10 +1,11 @@
 /**
  * Document browse mode (MongoDB) for the Data Explorer — request building, paging and
- * cell formatting for POST /api/v1/explorer/documents/find.
+ * cell formatting for POST /api/v1/explorer/documents/find and /aggregate, and the
+ * sql_text a saved pipeline (a MongoDB model) is stored as.
  *
- * The gateway and the connector both validate the filter against an operator
- * allowlist; this module only checks that each field is well-formed JSON of the right
- * shape so a typo is caught before a round trip. See
+ * The gateway and the connector both validate the filter and the pipeline against an
+ * operator allowlist; this module only checks that each field is well-formed JSON of
+ * the right shape so a typo is caught before a round trip. See
  * docs/explorer/document-browse-mode-plan.md.
  */
 
@@ -105,6 +106,161 @@ export function buildFindBody(input: FindInputs): BuiltFind {
   if (input.cursor) parts.push(`"cursor":${JSON.stringify(input.cursor)}`)
   if (typeof input.skip === "number" && input.skip > 0) parts.push(`"skip":${Math.floor(input.skip)}`)
   return { ok: true, body: `{${parts.join(",")}}` }
+}
+
+export type PipelineField = "collection" | "pipeline"
+
+export interface PipelineInputs {
+  connectionId: string
+  collection: string
+  database?: string
+  /** The pipeline as typed: a JSON array of stages. */
+  pipeline: string
+  limit?: number
+}
+
+export type BuiltPipeline = { ok: true; body: string } | { ok: false; field: PipelineField; error: string }
+
+/** The pipeline text, checked to be a JSON array of objects and returned verbatim. */
+function pipelineRaw(text: string): { ok: true; raw: string } | { ok: false; field: PipelineField; error: string } {
+  const trimmed = (text ?? "").trim()
+  if (!trimmed) return { ok: false, field: "pipeline", error: "Write a pipeline: a JSON array of stages" }
+  let value: unknown
+  try {
+    value = JSON.parse(trimmed)
+  } catch (e) {
+    return { ok: false, field: "pipeline", error: `Pipeline is not valid JSON${e instanceof Error ? `: ${e.message}` : ""}` }
+  }
+  if (!Array.isArray(value)) return { ok: false, field: "pipeline", error: "A pipeline must be a JSON array of stages" }
+  const bad = value.findIndex((s) => !s || typeof s !== "object" || Array.isArray(s))
+  if (bad >= 0) return { ok: false, field: "pipeline", error: `Stage ${bad} must be a JSON object such as {"$match": {…}}` }
+  return { ok: true, raw: trimmed }
+}
+
+/**
+ * Builds the body for POST /api/v1/explorer/documents/aggregate — a read-only preview of
+ * the pipeline's first page. Hand-assembled for the same reason as buildFindBody: the
+ * pipeline reaches the gateway exactly as typed.
+ */
+export function buildAggregateBody(input: PipelineInputs): BuiltPipeline {
+  const collection = (input.collection ?? "").trim()
+  if (!collection) return { ok: false, field: "collection", error: "Pick a collection" }
+  const pipeline = pipelineRaw(input.pipeline)
+  if (!pipeline.ok) return pipeline
+  const parts = [
+    `"connection_id":${JSON.stringify(input.connectionId)}`,
+    `"collection":${JSON.stringify(collection)}`,
+  ]
+  const database = (input.database ?? "").trim()
+  if (database) parts.push(`"database":${JSON.stringify(database)}`)
+  parts.push(`"pipeline":${pipeline.raw}`)
+  parts.push(`"limit":${clampLimit(input.limit)}`)
+  return { ok: true, body: `{${parts.join(",")}}` }
+}
+
+/** What a saved MongoDB query holds: the collection it reads and the pipeline, verbatim. */
+export interface DocumentQuery {
+  database?: string
+  collection: string
+  pipeline: string
+}
+
+/**
+ * The sql_text of a saved MongoDB query — `{"database", "collection", "pipeline"}`, the
+ * shape the gateway's parseDocumentModelQuery reads. The pipeline is spliced in as
+ * typed, never re-stringified. Returns "" when there is nothing valid to save.
+ */
+export function buildDocumentQueryText(q: DocumentQuery): string {
+  const collection = (q.collection ?? "").trim()
+  if (!collection) return ""
+  const pipeline = pipelineRaw(q.pipeline)
+  if (!pipeline.ok) return ""
+  const parts: string[] = []
+  const database = (q.database ?? "").trim()
+  if (database) parts.push(`"database":${JSON.stringify(database)}`)
+  parts.push(`"collection":${JSON.stringify(collection)}`)
+  parts.push(`"pipeline":${pipeline.raw}`)
+  return `{${parts.join(",")}}`
+}
+
+/** The index just past the JSON string that opens at text[i] (a `"`). */
+function skipString(text: string, i: number): number {
+  for (let j = i + 1; j < text.length; j++) {
+    if (text[j] === "\\") j++
+    else if (text[j] === '"') return j + 1
+  }
+  return -1
+}
+
+/** The index just past the JSON value that starts at text[i]. The text is known valid. */
+function skipValue(text: string, i: number): number {
+  if (text[i] === '"') return skipString(text, i)
+  if (text[i] !== "{" && text[i] !== "[") {
+    let j = i
+    while (j < text.length && !/[\s,}\]]/.test(text[j])) j++
+    return j
+  }
+  let depth = 0
+  for (let j = i; j < text.length; j++) {
+    const ch = text[j]
+    if (ch === '"') {
+      j = skipString(text, j) - 1
+      if (j < 0) return -1
+    } else if (ch === "{" || ch === "[") depth++
+    else if (ch === "}" || ch === "]") {
+      depth--
+      if (depth === 0) return j + 1
+    }
+  }
+  return -1
+}
+
+/**
+ * Reads a saved MongoDB query back, or null when the text is not one. The pipeline is
+ * cut out of the stored text rather than parsed and re-printed, so a 64-bit integer or
+ * the order of a $sort's keys comes back exactly as it was saved.
+ */
+export function parseDocumentQueryText(text: string): DocumentQuery | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const obj = parsed as Record<string, unknown>
+  if (typeof obj.collection !== "string" || !Array.isArray(obj.pipeline)) return null
+  if (obj.database !== undefined && typeof obj.database !== "string") return null
+
+  // Walk the top-level object's keys to find the pipeline's own text. With a duplicate
+  // key JSON.parse keeps the last, and so does this.
+  let pipeline: string | null = null
+  let i = text.indexOf("{") + 1
+  const ws = (k: number) => {
+    while (k < text.length && /\s/.test(text[k])) k++
+    return k
+  }
+  for (;;) {
+    i = ws(i)
+    if (text[i] === "}") break
+    if (text[i] === ",") i = ws(i + 1)
+    const keyEnd = skipString(text, i)
+    if (keyEnd < 0) return null
+    const key = JSON.parse(text.slice(i, keyEnd)) as string
+    i = ws(keyEnd)
+    if (text[i] !== ":") return null
+    const start = ws(i + 1)
+    const end = skipValue(text, start)
+    if (end < 0) return null
+    if (key === "pipeline") pipeline = text.slice(start, end)
+    i = end
+  }
+  if (pipeline === null) return null
+  return {
+    ...(obj.database ? { database: obj.database as string } : {}),
+    collection: obj.collection,
+    pipeline,
+  }
 }
 
 /** The paging parameters for the next page, or null when there is none to fetch. */

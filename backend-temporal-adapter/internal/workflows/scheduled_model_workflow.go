@@ -60,6 +60,11 @@ type ScheduledModelRunInput struct {
 	UpstreamRunID string `json:"upstream_run_id,omitempty"`
 	ExecutionID   string `json:"execution_id,omitempty"`
 	Coalesced     int    `json:"coalesced,omitempty"`
+
+	// NextHop is ModelNextHopCaller when the workflow, not the gateway, starts the
+	// models below this run (model_next_hop.go). Set by the workflow before the run;
+	// never stored in a schedule's arguments.
+	NextHop string `json:"next_hop,omitempty"`
 }
 
 // modelRunActivityResult mirrors the endpoint's response envelope.
@@ -70,6 +75,11 @@ type modelRunActivityResult struct {
 	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
 	Reason          string `json:"reason,omitempty"`
 	SkipReason      string `json:"skip_reason,omitempty"`
+	// RunID and NextHop come back only when the gateway left the next hop to this
+	// workflow: the run's history row, and the next_hop it was asked for. A gateway that
+	// fired the hop itself echoes neither, and the workflow then starts nothing.
+	RunID   string `json:"run_id,omitempty"`
+	NextHop string `json:"next_hop,omitempty"`
 }
 
 // ScheduledModelRunWorkflow is the wrapper workflow a model's Temporal schedule runs.
@@ -99,6 +109,9 @@ func ScheduledModelRunWorkflow(ctx workflow.Context, input ScheduledModelRunInpu
 	})
 
 	var result modelRunActivityResult
+	// The models below this run are woken from here, not from the gateway request
+	// (model_next_hop.go). The clock door starts a chain at depth 0, as before.
+	input.NextHop = ModelNextHopCaller
 	// Workflow time, so a replay and every delivery of the failure record below carry
 	// the same instant — it is half of the key the gateway dedupes that record on.
 	runStartedAt := workflow.Now(ctx)
@@ -127,6 +140,9 @@ func ScheduledModelRunWorkflow(ctx workflow.Context, input ScheduledModelRunInpu
 		logger.Warn("❌ model run failed", "saved_query_id", input.SavedQueryID, "error", result.Error)
 	}
 
+	// Every outcome, not only a success: for a failed or auto-paused run the gateway
+	// records the skip rows below it, and that is part of the hop too.
+	startModelNextHop(ctx, input, result)
 	return nil
 }
 
@@ -164,6 +180,9 @@ func RunModelActivity(ctx context.Context, input ScheduledModelRunInput) (*model
 		payload["upstream_run_id"] = input.UpstreamRunID
 		payload["execution_id"] = input.ExecutionID
 		payload["coalesced"] = input.Coalesced
+	}
+	if input.NextHop != "" {
+		payload["next_hop"] = input.NextHop
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

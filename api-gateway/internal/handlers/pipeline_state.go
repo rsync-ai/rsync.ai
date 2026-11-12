@@ -494,6 +494,8 @@ func GetPipelineState(c *gin.Context) {
 		delete(metaObj, "reason")
 		delete(metaObj, "missing_connections")
 		delete(metaObj, "missing_connectors")
+		delete(metaObj, "preselected_tables")
+		delete(metaObj, "review_transforms_only")
 
 		// Reconcile execution_plan current stage status if present.
 		if planAny, ok := metaObj["execution_plan"]; ok && state.CurrentStage != "" {
@@ -562,6 +564,31 @@ func GetPipelineState(c *gin.Context) {
 		if metaObj != nil {
 			state.BlockingReason.Details = metaObj
 
+			// The one-time transform step for tables named in chat
+			// (orchestrator transforms_review_gate.go): the tables are already
+			// chosen, so neither the named-table check nor the AI table ranking
+			// below applies; the chat opens the transform step directly.
+			reviewOnly := isTransformsReviewPark(metaObj)
+			if reviewOnly {
+				desc := "Review transforms for the tables you named before any data moves."
+				if state.Message == "" || state.Message == state.BlockingReason.Description {
+					state.Message = desc
+				}
+				state.BlockingReason.Description = desc
+			}
+
+			// A table-selection wait says why it paused (e.g. a table the request
+			// named is not in the source), in place of the generic stored text
+			// ("Waiting for user input" on a DAG node wait).
+			if !reviewOnly && isTableSelectionPark(state.BlockingReason.Type, metaObj) {
+				if desc := describeTableSelectionPark(c.Request.Context(), database, pipelineID, metaObj); desc != "" {
+					if state.Message == "" || state.Message == state.BlockingReason.Description {
+						state.Message = desc
+					}
+					state.BlockingReason.Description = desc
+				}
+			}
+
 			// Inject JSON Schema for known HITL types (future-proofing for generic form rendering)
 			enrichBlockingReasonWithSchema(state.BlockingReason, metaObj)
 
@@ -572,7 +599,7 @@ func GetPipelineState(c *gin.Context) {
 
 			// AI table suggestions for the table-selection park (P0). Entirely
 			// best-effort: on any error blocking_reason is exactly as above.
-			if isTableSelectionType(state.BlockingReason.Type) {
+			if !reviewOnly && isTableSelectionType(state.BlockingReason.Type) {
 				attachTableSuggestions(c.Request.Context(), database, pipelineID, state.BlockingReason)
 			}
 		}
@@ -1017,17 +1044,18 @@ func attachTableSuggestions(ctx context.Context, database *sql.DB, pipelineID st
 
 	// Compute + persist off the request path so /state stays fast; the next
 	// poll (~3s) picks the persisted result up.
-	go computeAndPersistTableSuggestions(database, pipelineID, tables, intent)
+	go computeAndPersistTableSuggestions(ctx, database, pipelineID, tables, intent)
 }
 
 // computeAndPersistTableSuggestions runs the LLM ranking (metadata + user
 // intent only — no row values, no credentials) and persists the outcome.
 // A failed ranking is persisted as status "failed" and never retried: at most
 // one LLM call per park, by design.
-func computeAndPersistTableSuggestions(database *sql.DB, pipelineID string, tables []TableMetadata, intent string) {
+func computeAndPersistTableSuggestions(parent context.Context, database *sql.DB, pipelineID string, tables []TableMetadata, intent string) {
 	// Detached from the HTTP request: the poll that won the claim has likely
-	// already returned by the time the LLM answers.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// already returned by the time the LLM answers. It keeps the request's
+	// workspace, for the egress log.
+	ctx, cancel := context.WithTimeout(detachedLLMContext(parent), 30*time.Second)
 	defer cancel()
 
 	result := map[string]interface{}{
@@ -1305,18 +1333,28 @@ func applyStreamingLiveness(database *sql.DB, pipelineID string, state *Pipeline
 			if liveness.PendingEvents == 1 {
 				waiting = "1 change is"
 			}
-			state.StaleReason = waiting + " waiting to be written, but nothing has reached the destination for " + formatDuration(quiet) + ". " + checkHealth
+			// The quiet time runs from the last write, not from when these changes were
+			// captured: after a quiet source, "nothing for 1d 11h" read as a day-long stall
+			// for changes made minutes ago.
+			state.StaleReason = waiting + " waiting to be written. The last change reached the destination " +
+				formatDuration(quiet) + " ago. " + checkHealth
 		} else if depHealth == "unknown" {
 			// No dependency manifest (older pipelines): nothing can confirm the stream is
 			// still capturing, so /runtime reads idle too. Say what the user can check.
-			state.StaleReason = "Nothing has reached the destination for " + formatDuration(quiet) +
-				", and this stream has no health checks that confirm it is still picking up changes. " +
+			state.StaleReason = quietSource(quiet) + " This stream has no health checks that confirm it is still picking up changes. " +
 				"Make a change in the source to confirm it arrives. If it does not arrive within a few minutes, the stream has stopped picking up changes."
 		} else {
-			state.StaleReason = "Nothing has reached the destination for " + formatDuration(quiet) +
-				" and the stream's health checks have not all passed, so it may have stopped picking up changes. " + checkHealth
+			state.StaleReason = quietSource(quiet) + " But the stream's health checks have not all passed, so it may have stopped picking up changes. " + checkHealth
 		}
 	}
+}
+
+// quietSource leads with what is known when nothing is waiting: a source with no changes
+// looks the same as a stream that stopped, and "may have stopped" alone read as an
+// outage on a quiet night.
+func quietSource(quiet time.Duration) string {
+	return "No changes have reached the destination for " + formatDuration(quiet) +
+		" and none are waiting, so the source may simply have had no changes."
 }
 
 // computeStaleness determines if a pipeline stage is stale based on last heartbeat
@@ -1348,17 +1386,29 @@ func formatStaleReason(elapsed, threshold time.Duration) string {
 	return "No update for " + elapsedStr + " (expected heartbeat every " + thresholdStr + ")"
 }
 
-// formatDuration formats a duration in a human-readable way
+// formatDuration formats a duration in a human-readable way: "45s", "20m 5s",
+// "3h 12m", "1d 11h". Its two largest units only: "2117m 17s" was a day and a half.
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return strconv.Itoa(int(d.Seconds())) + "s"
 	}
-	minutes := int(d.Minutes())
-	seconds := int(d.Seconds()) - (minutes * 60)
-	if seconds > 0 {
-		return strconv.Itoa(minutes) + "m " + strconv.Itoa(seconds) + "s"
+	pair := func(big int, bigUnit string, small int, smallUnit string) string {
+		if small > 0 {
+			return strconv.Itoa(big) + bigUnit + " " + strconv.Itoa(small) + smallUnit
+		}
+		return strconv.Itoa(big) + bigUnit
 	}
-	return strconv.Itoa(minutes) + "m"
+	switch {
+	case d < time.Hour:
+		minutes := int(d.Minutes())
+		return pair(minutes, "m", int(d.Seconds())-minutes*60, "s")
+	case d < 24*time.Hour:
+		hours := int(d.Hours())
+		return pair(hours, "h", int(d.Minutes())-hours*60, "m")
+	default:
+		days := int(d.Hours()) / 24
+		return pair(days, "d", int(d.Hours())-days*24, "h")
+	}
 }
 
 // normalizeProgress ensures progress values are consistent with pipeline status

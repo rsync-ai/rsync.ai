@@ -12,18 +12,17 @@
 import { authFetch } from "./auth-fetch"
 import { API_GATEWAY_URL } from "@/lib/config/api"
 
-// All tool-generator calls now go through the api-gateway proxy so:
+// All tool-generator calls go through the api-gateway proxy so:
 //   - CORS is solved exactly once at the gateway edge
 //   - tool-generator stays internal (no browser-reachable port 5010)
 //   - auth / rate-limit / observability paths apply uniformly
+//   - the X-Workspace-ID it receives is the membership-checked one the
+//     gateway stamps, never a value the browser picked
 //
 // Gateway exposes /api/v1/tool-generator/<subpath> which forwards to
-// the underlying /v1/<subpath> on tool-generator. The NEXT_PUBLIC_…
-// env is kept as an override for tests / standalone-dev that talks
-// directly to the service.
-const TOOLGEN_BASE =
-  process.env.NEXT_PUBLIC_TOOL_GENERATOR_URL ||
-  `${API_GATEWAY_URL}/api/v1/tool-generator`
+// the underlying /v1/<subpath> on tool-generator. There is no direct-to-
+// service override: the tool-generator allows no browser origin.
+const TOOLGEN_BASE = `${API_GATEWAY_URL}/api/v1/tool-generator`
 
 // ---------------------------------------------------------------------------
 // Wire types — match schemas/contract.py
@@ -196,11 +195,6 @@ export async function listVendors(query?: string): Promise<Vendor[]> {
   return res.vendors
 }
 
-export async function getVendor(id: string): Promise<Vendor> {
-  const res = await call<{ vendor: Vendor }>(`/v1/vendors/${encodeURIComponent(id)}`)
-  return res.vendor
-}
-
 // ---------------------------------------------------------------------------
 // Is the discovery wizard served here?
 // ---------------------------------------------------------------------------
@@ -263,10 +257,6 @@ export async function startDiscovery(input: DiscoverInput): Promise<DiscoverResp
   })
 }
 
-export async function getDiscovery(sessionId: string): Promise<DiscoverResponse> {
-  return call<DiscoverResponse>(`/v1/discover/${encodeURIComponent(sessionId)}`)
-}
-
 export async function confirmDiscovery(
   sessionId: string,
   answers: Partial<Record<Dimension, unknown>>,
@@ -296,6 +286,20 @@ export interface GenerateFromSessionResponse {
   workflow_stages?: Array<{ name: string; status: string }>
   error_message?: string
   error_stage?: string
+  /** The version this save wrote, e.g. "v1.0.1". */
+  version?: string | null
+  /** True when the save rewrote `version` in place instead of adding one. */
+  overwritten?: boolean
+  /** An overwrite was saved but its running container could not be restarted. */
+  restart_error?: string | null
+  /** This workspace's connections pinned to another version of this connector. */
+  pinned_connections?: PinnedConnection[]
+}
+
+export interface PinnedConnection {
+  id: string
+  name: string
+  connector_version: string
 }
 
 /**
@@ -332,6 +336,8 @@ export async function generateFromSession(
   options: {
     description?: string
     forceRegenerate?: boolean
+    /** Rewrite the current version in place instead of adding a new one. */
+    overwrite?: boolean
     apiCategoryHint?: string
   } = {},
 ): Promise<GenerateFromSessionResponse> {
@@ -344,6 +350,7 @@ export async function generateFromSession(
       session_id: sessionId,
       description: options.description ?? "",
       force_regenerate: options.forceRegenerate ?? false,
+      overwrite: options.overwrite ?? false,
       // Pass detect-category result through so the architect picks the
       // right templates + capability defaults (api_saas vs database vs
       // storage etc.). Empty string is safe — backend treats it as unset.
@@ -361,7 +368,6 @@ export async function generateFromSession(
 // ---------------------------------------------------------------------------
 
 export interface GenerateFromSpecResponse extends GenerateFromSessionResponse {
-  version?: string | null
   output_path?: string | null
   suggestions?: string[]
   draft_warnings?: string[]
@@ -398,6 +404,38 @@ export async function generateFromSpec(
     throw await generateError(res)
   }
   return (await res.json()) as GenerateFromSpecResponse
+}
+
+// ---------------------------------------------------------------------------
+// Move pinned connections to a new connector version
+// ---------------------------------------------------------------------------
+
+export interface MoveConnectionsResponse {
+  success: boolean
+  connector_version: string
+  message?: string
+  warning?: string
+}
+
+/**
+ * Pin these connections of the active workspace to one version of a connector,
+ * all or none (api-gateway connector_overwrite.go MoveConnectionsToConnectorVersion).
+ */
+export async function moveConnectionsToConnectorVersion(
+  connectorName: string,
+  version: string,
+  connectionIds: string[],
+): Promise<MoveConnectionsResponse> {
+  const url = `${API_GATEWAY_URL}/api/v1/connectors/${encodeURIComponent(connectorName)}/connections/version`
+  const res = await authFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version, connection_ids: connectionIds }),
+  })
+  if (!res.ok) {
+    throw await generateError(res)
+  }
+  return (await res.json()) as MoveConnectionsResponse
 }
 
 // ---------------------------------------------------------------------------

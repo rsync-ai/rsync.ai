@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 // The usage panel is a BILLING surface: plan, pipeline/query limits, trial
 // expiry, metered transfer GB. Its default therefore follows plan enforcement
@@ -80,4 +83,112 @@ func keysOf(m map[string]interface{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Ask rsync.ai and the agent gateway are on unless an install turns them off:
+// cloud runs both, so per the OSS/cloud rule the code default is cloud's. Their
+// routes exist only while on (main.go), and the frontend shows them only when
+// /features says so.
+func TestAssistantAndAgentGatewayAreOnUnlessDisabled(t *testing.T) {
+	t.Cleanup(func() { featuresOnce, features = sync.Once{}, nil })
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"", true}, {"true", true}, {"false", false}, {"0", false}} {
+		t.Setenv("RSYNC_ASSISTANT_ENABLED", tc.env)
+		t.Setenv("RSYNC_AGENT_GATEWAY_ENABLED", tc.env)
+		featuresOnce, features = sync.Once{}, nil // LoadFeatures reads the env once
+		f := LoadFeatures()
+		if f.Assistant != tc.want || f.AgentGateway != tc.want {
+			t.Fatalf("env=%q: Assistant = %v, AgentGateway = %v, want %v", tc.env, f.Assistant, f.AgentGateway, tc.want)
+		}
+		resp := f.ToAPIResponse()
+		for _, key := range []string{"assistant", "agent_gateway"} {
+			if got, ok := resp[key]; !ok || got != tc.want {
+				t.Fatalf("env=%q: /features %s = %v (present %v), want %v", tc.env, key, got, ok, tc.want)
+			}
+		}
+	}
+}
+
+// Sample rows send row values to a third-party model, so this flag fails
+// closed: only unset (cloud) or an explicit true allows them. A table with
+// only "" and "false" would keep passing if a typo fell back to allowed.
+func TestLLMSampleRowsAllowedFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"", true},         // cloud sets nothing
+		{"true", true},     //
+		{" true ", true},   // trimmed, like BillingEnforced
+		{"false", false},   // the self-host compose and chart
+		{" false ", false}, // whitespace must not re-open them
+		{"0", false},       //
+		{"no", false},      // not a ParseBool value: closed
+		{"flase", false},   // a typo: closed
+	} {
+		t.Setenv("RSYNC_LLM_SAMPLE_ROWS_ALLOWED", tc.env)
+		if got := LLMSampleRowsAllowed(); got != tc.want {
+			t.Fatalf("RSYNC_LLM_SAMPLE_ROWS_ALLOWED=%q: LLMSampleRowsAllowed() = %v, want %v", tc.env, got, tc.want)
+		}
+	}
+}
+
+// The frontend hides the sample-rows switches from llm_sample_rows; a missing
+// key reads as the cloud default there, so its presence is asserted.
+func TestToAPIResponseCarriesLLMSampleRows(t *testing.T) {
+	t.Cleanup(func() { featuresOnce, features = sync.Once{}, nil })
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"", true}, {"false", false}} {
+		t.Setenv("RSYNC_LLM_SAMPLE_ROWS_ALLOWED", tc.env)
+		featuresOnce, features = sync.Once{}, nil
+		got, ok := LoadFeatures().ToAPIResponse()["llm_sample_rows"]
+		if !ok || got != tc.want {
+			t.Fatalf("RSYNC_LLM_SAMPLE_ROWS_ALLOWED=%q: llm_sample_rows = %v (present %v), want %v", tc.env, got, ok, tc.want)
+		}
+	}
+}
+
+// One workspace per install is the self-host shape; cloud sets nothing and must
+// stay multi-workspace, so a typo falls back to the cloud behaviour, as
+// BillingEnforced does. The gate is soft by design (a self-hoster can flip it).
+func TestSingleWorkspaceIsOffUnlessSet(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"", false},        // cloud sets nothing
+		{"true", true},     // the self-host compose and chart
+		{" true ", true},   // trimmed, like BillingEnforced
+		{"1", true},        //
+		{"false", false},   //
+		{" false ", false}, //
+		{"yes", false},     // not a ParseBool value: cloud behaviour
+		{"ture", false},    // a typo: cloud behaviour
+	} {
+		t.Setenv("RSYNC_SINGLE_WORKSPACE", tc.env)
+		if got := SingleWorkspace(); got != tc.want {
+			t.Fatalf("RSYNC_SINGLE_WORKSPACE=%q: SingleWorkspace() = %v, want %v", tc.env, got, tc.want)
+		}
+	}
+}
+
+// The header hides "New workspace" from single_workspace; a missing key reads as
+// the cloud default there, so its presence is asserted.
+func TestToAPIResponseCarriesSingleWorkspace(t *testing.T) {
+	t.Cleanup(func() { featuresOnce, features = sync.Once{}, nil })
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"", false}, {"true", true}} {
+		t.Setenv("RSYNC_SINGLE_WORKSPACE", tc.env)
+		featuresOnce, features = sync.Once{}, nil
+		got, ok := LoadFeatures().ToAPIResponse()["single_workspace"]
+		if !ok || got != tc.want {
+			t.Fatalf("RSYNC_SINGLE_WORKSPACE=%q: single_workspace = %v (present %v), want %v", tc.env, got, ok, tc.want)
+		}
+	}
 }

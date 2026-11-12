@@ -290,6 +290,68 @@ import re  # noqa: E402
 
 _SCRUB_REDACTED = "[redacted]"
 
+# Inside a URL: a long base64-ish blob, a 40+ path blob with no `/`, a 20+ run
+# of letters AND digits, and a credential-named query or fragment parameter.
+# A URL read as one blob became `…HubSpot-public-api-spec-[redacted].json`
+# while a key in a short query value went through. Mirror of masking._scrub_url.
+_SCRUB_B64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+_SCRUB_URL_PATH_BLOB = re.compile(r"[A-Za-z0-9+]{40,}={0,2}")
+_SCRUB_URL_TOKEN = re.compile(r"[A-Za-z0-9_\-]{20,}")
+_SCRUB_URL_QUERY_CRED = re.compile(
+    r"(?i)([?&;#][A-Za-z0-9_.\-]*(?:key|sig|signature|secret|token|password|passwd|pwd|auth|credential|code)=)[^&#\s'\"<>]*"
+)
+_SCRUB_URL_PATH_START = re.compile(r"[/?#]")
+_SCRUB_URL_QUERY_START = re.compile(r"[?#]")
+
+
+def _scrub_mixed_token(m):
+    t = m.group(0)
+    if any(c.isdigit() for c in t) and any(c.isalpha() for c in t):
+        return _SCRUB_REDACTED
+    return t
+
+
+def _scrub_url(url):
+    start = url.find("://") + 3
+    m = _SCRUB_URL_PATH_START.search(url, start)
+    end = m.start() if m else len(url)
+    head, path, query = url[:end], url[end:], ""
+    m = _SCRUB_URL_QUERY_START.search(path)
+    if m:
+        path, query = path[: m.start()], path[m.start():]
+    head = _SCRUB_B64.sub(_SCRUB_REDACTED, head)
+    path = _SCRUB_URL_TOKEN.sub(_scrub_mixed_token, _SCRUB_URL_PATH_BLOB.sub(_SCRUB_REDACTED, path))
+    query = _SCRUB_URL_QUERY_CRED.sub(rf"\1{_SCRUB_REDACTED}", query)
+    query = _SCRUB_URL_TOKEN.sub(_scrub_mixed_token, _SCRUB_B64.sub(_SCRUB_REDACTED, query))
+    return head + path + query
+
+
+class _ScrubRunStartRule:
+    """A rule that opens with a run of one character class, matched in linear
+    time with the output re.sub gives (mirror of masking._RunStartRule). From
+    every start inside a long run, Python's engine reads the rest of the run
+    again before it fails. The leftmost match only starts inside a run where
+    the previous match ended, so that position is tried as it is and every
+    other start must not follow a character of the run."""
+
+    def __init__(self, body, run_class):
+        self.pattern = body
+        self._at = re.compile(body)
+        self._after_run = re.compile(r"(?<!" + run_class + r")(?:" + body + r")")
+
+    def sub(self, repl, string):
+        out, pos = [], 0
+        while True:
+            m = (self._at.match(string, pos) if pos else None) or self._after_run.search(string, pos)
+            if m is None:
+                break
+            out.append(string[pos : m.start()])
+            out.append(m.expand(repl))
+            pos = m.end()
+        out.append(string[pos:])
+        return "".join(out)
+
+
 _SCRUB_PATTERNS = [
     # Postgres not-null/check DETAIL dumps the ENTIRE row — greedy to end of
     # string so a truncated dump can't leak a partial row.
@@ -297,9 +359,15 @@ _SCRUB_PATTERNS = [
     # Everything after a SQL VALUES keyword is row data (multi-tuple included).
     (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
     # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
-    (re.compile(r"(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
-    # Credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(\w+://)[^/\s:@]+:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
+    # The column list stops at the next `Key (`, so a run of `Key (Key (...` is
+    # linear, not quadratic; the output is the same as without the stop, and as
+    # Go's RE2 copy (pkg/llmscrub).
+    (re.compile(r"(\bKey\s*\((?:(?!\bKey\s*\()[^)])*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
+    # Credentials embedded in URLs: scheme://user:pass@host. The user name may
+    # be empty (redis://:pass@host); requiring one left that password in clear.
+    # `(?<!\w)`: without it Python's engine re-read a long word run from each of
+    # its starts (quadratic). The leftmost match starts there anyway.
+    (re.compile(r"(?<!\w)(\w+://)[^/\s:@]*:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
     # HTTP credential headers — must run before the KV rule.
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), f"Bearer {_SCRUB_REDACTED}"),
     # key=value / key: value pairs with credential-bearing key names.
@@ -324,11 +392,13 @@ _SCRUB_PATTERNS = [
     # Bare "key" is deliberately NOT a suffix — it would eat the Postgres
     # "Key (email)=" detail and schema metadata like partition_key. Character
     # classes are spelled out rather than \w because Python's \w is
-    # Unicode-aware and Go's is not.
+    # Unicode-aware and Go's is not. The key starts where its run of key
+    # characters does (a lookbehind, not Go's `\b`): from a `\b` inside a long
+    # run, Python's engine re-read the run from each start (quadratic).
     # MUST stay lockstep with masking.py + Go llmscrub + the sink's scrubLog.
     (
         re.compile(
-            r"\b([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
+            r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
             re.IGNORECASE,
         ),
         rf"\1={_SCRUB_REDACTED}",
@@ -346,10 +416,11 @@ _SCRUB_PATTERNS = [
     # "the user's") from being read as an opening quote — that misread consumed the
     # prose as the literal and left the real value in the clear. One rule, not two
     # passes: a separate `'…$` pass re-read this rule's own `'[redacted]'` output.
+    # `\\?\Z` takes a literal cut right after a backslash ('john\\) too.
     # MUST stay lockstep with masking.py + Go llmscrub.
-    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
+    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\\?\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
     # Email addresses appearing outside quotes.
-    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[email-redacted]"),
+    (_ScrubRunStartRule(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", r"[A-Za-z0-9._%+\-]"), "[email-redacted]"),
     # IPv4 addresses — client/host IPs are personal data under GDPR and aren't
     # needed for diagnosis. Octets validated 0-255 so version strings (8.0.32)
     # and ISO dates survive. MUST stay lockstep with masking + Go llmscrub.
@@ -357,8 +428,22 @@ _SCRUB_PATTERNS = [
         re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b"),
         "[ip-redacted]",
     ),
-    # Long base64-ish blobs (tokens, keys). 40+ keeps 32-hex trace ids.
-    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), _SCRUB_REDACTED),
+    # A dotted host name after lookup / dial tcp / host name "…" / server at "…".
+    # A dotted name elsewhere is kept: schema.table has the same shape.
+    # MUST stay lockstep with masking.py HOST_IN_ERROR_TEXT + Go llmscrub.
+    (
+        re.compile(
+            r'(?i)(\blookup\s+|\bdial\s+(?:tcp|udp)[46]?\s+|\bhost(?:\s+name)?\s+"|\bserver\s+at\s+")'
+            r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+"
+        ),
+        r"\1[host-redacted]",
+    ),
+    # URLs (readable, secrets inside taken), else long base64-ish blobs.
+    # MUST stay lockstep with masking.py + Go llmscrub (reURLOrBase64).
+    (
+        re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s'\"<>]+)|\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+        lambda m: _scrub_url(m.group(1)) if m.group(1) is not None else _SCRUB_REDACTED,
+    ),
     # Dashed SSN / US-phone shapes (ISO dates don't match — timestamps survive).
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[num-redacted]"),
     (re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b"), "[num-redacted]"),
@@ -557,13 +642,6 @@ def normalize_params_for_connector(params: Dict[str, Any], connector_category: s
     return normalized
 
 
-# Load optimization templates
-TEMPLATES_PATH = os.path.join(os.path.dirname(__file__), 'optimization_templates.json')
-OPTIMIZATION_TEMPLATES = {}
-if os.path.exists(TEMPLATES_PATH):
-    with open(TEMPLATES_PATH, 'r') as f:
-        OPTIMIZATION_TEMPLATES = json.load(f)
-
 # =============================================================================
 # CONNECTOR CATEGORY DEFINITIONS (Extensible - no hardcoded connector lists!)
 # =============================================================================
@@ -650,6 +728,76 @@ STANDARD_OPERATION_DESCRIPTIONS = {
 }
 
 
+class _HeldOAuthToken:
+    """The OAuth token a connection config hands a connector -- held, never stored.
+
+    The gateway (connections.go enrichConfigWithOAuthToken) and the
+    orchestrator (connections/manager.go) read the token from the oauth_tokens
+    table and inject it into the connection config; the orchestrator refreshes
+    it on a 401 and re-issues the call (executor.go executeWithOAuthRetry). A
+    connector needs only the access token and when it
+    stops being worth sending, so that is all this holds. There is deliberately
+    no refresh here: no connector image carries a store to persist a refreshed
+    token, and a connector that refreshed would race the gateway's copy
+    (KI-OAUTH-TOKEN-STORE-UNREACHABLE-BY-ITS-ONLY-USERS).
+    """
+
+    def __init__(self, access_token: str, expires_at: Optional[float] = None,
+                 token_type: str = "Bearer", provider: Optional[str] = None):
+        self.access_token = access_token
+        self.expires_at = expires_at  # unix seconds; None = no known expiry
+        self.token_type = token_type
+        self.provider = provider
+
+    @staticmethod
+    def _parse_expiry(value: Any) -> Optional[float]:
+        """Unix seconds from epoch seconds or an RFC3339 string; None if unreadable.
+
+        The gateway writes expires_at as RFC3339; a provider token response
+        carries epoch seconds. An expiry nobody can read is treated as no
+        expiry: the token is sent, and the server's 401 -- which the
+        orchestrator answers with a refresh -- is the authority on it.
+        """
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        from datetime import datetime as _datetime, timezone as _timezone
+        try:
+            parsed = _datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_timezone.utc)
+        return parsed.timestamp()
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "_HeldOAuthToken":
+        expires_at = cls._parse_expiry(data.get("expires_at"))
+        if expires_at is None and data.get("expires_in") is not None:
+            try:
+                expires_at = float(data.get("created_at") or time.time()) + float(data["expires_in"])
+            except (TypeError, ValueError):
+                expires_at = None
+        return cls(
+            access_token=data["access_token"],
+            expires_at=expires_at,
+            token_type=data.get("token_type") or "Bearer",
+            provider=data.get("provider"),
+        )
+
+    def is_expired(self, buffer_seconds: int = 60) -> bool:
+        """True once the token is within `buffer_seconds` of its expiry."""
+        if self.expires_at is None:
+            return False
+        return time.time() >= self.expires_at - buffer_seconds
+
+
 class BaseMCPConnector(ABC):
     """
     Abstract base class for all MCP connectors.
@@ -670,11 +818,15 @@ class BaseMCPConnector(ABC):
     - Included in all log messages automatically
     
     OAUTH SUPPORT:
-    - Set self.auth_type = "oauth" to enable OAuth
-    - Set self.oauth_provider = "hubspot" (or other provider name)
+    - The gateway / orchestrator inject a decrypted access_token into the
+      connection config; configure_from_connection() hands it to
+      set_oauth_token(), and auth_type becomes "oauth"
+    - A connector HOLDS that token -- it never stores or refreshes one. A 401
+      goes back to the caller; the orchestrator refreshes the token and
+      re-issues the call (executor.go executeWithOAuthRetry)
     - Use self._get_access_token() to get the current token
     - Use self._get_auth_headers() to get auth headers for API requests
-    - Falls back to API key if OAuth token not available
+    - Falls back to API key if no unexpired token is held
     """
     
     def __init__(self):
@@ -684,7 +836,6 @@ class BaseMCPConnector(ABC):
         self.supported_operations = []  # Override with actual supported operations
         self.supports_source = True  # Can be used as a source
         self.supports_destination = False  # Can be used as a destination (override if true)
-        self.optimization_category = None  # Auto-detected or manually set
         self._performance_target_ms = 2000  # Target: < 2 seconds
         
         # Capability Stats (standardized for Smart Planner)
@@ -699,7 +850,6 @@ class BaseMCPConnector(ABC):
         self.oauth_provider = None  # Override: "hubspot", "salesforce", etc.
         self.connection_id = None  # Set at runtime from config/env
         self._oauth_token = None  # Cached OAuth token
-        self._token_manager = None  # Lazy-loaded TokenManager instance
         
         # API key fallback (used if OAuth not available)
         self.api_key = os.getenv('MCP_API_KEY', '')
@@ -727,73 +877,33 @@ class BaseMCPConnector(ABC):
     # OAUTH HELPER METHODS (Generic for all connectors)
     # =========================================================================
     
-    def _get_token_manager(self):
-        """
-        Lazy-load the TokenManager instance.
-        Only loaded when OAuth is actually used.
-        """
-        if self._token_manager is None:
-            try:
-                from oauth.token_manager import TokenManager
-                self._token_manager = TokenManager()
-                self.log("TokenManager loaded for OAuth support")
-            except ImportError:
-                self.log("OAuth module not available - using API key fallback", level="warning")
-                return None
-        return self._token_manager
-    
     def _get_access_token(self) -> Optional[str]:
         """
         Get the current access token for API requests.
-        
+
         Priority:
-        1. OAuth token from TokenManager (if auth_type == "oauth")
-        2. API key from environment variable (fallback)
-        
+        1. The OAuth token the connection config handed in, while unexpired
+           (if auth_type == "oauth") -- see set_oauth_token()
+        2. API key (fallback)
+
         Returns:
             Access token string or None if not available
         """
         # If not using OAuth, return API key
         if self.auth_type != "oauth":
             return self.api_key or None
-        
-        # Try to get OAuth token
-        if self.connection_id:
-            manager = self._get_token_manager()
-            if manager:
-                token = manager.get_valid_token(
-                    self.connection_id,
-                    refresh_callback=self._create_refresh_callback()
-                )
-                if token:
-                    self._oauth_token = token
-                    return token.access_token
-        
-        # Check for cached token
+
+        # The held token, while it is current
         if self._oauth_token and not self._oauth_token.is_expired():
             return self._oauth_token.access_token
-        
+
         # Fallback to API key
         if self.api_key:
             self.log("OAuth token not available, falling back to API key", level="warning")
             return self.api_key
-        
+
         return None
-    
-    def _create_refresh_callback(self):
-        """
-        Create a refresh callback for the TokenManager.
-        Uses the oauth_registry to get provider-specific refresh logic.
-        """
-        if not self.oauth_provider:
-            return None
-        
-        try:
-            from oauth.token_manager import create_refresh_callback
-            return create_refresh_callback(self.oauth_provider)
-        except ImportError:
-            return None
-    
+
     def _get_auth_headers(self) -> Dict[str, str]:
         """
         Get authentication headers for API requests.
@@ -858,7 +968,8 @@ class BaseMCPConnector(ABC):
         Behaviors:
         - Rate limiting: default 10 req/s (configurable by env)
         - 429: respects Retry-After and retries boundedly
-        - OAuth: on 401, attempts refresh via TokenManager refresh callback and retries once
+        - OAuth: a 401 is returned to the caller. The connector holds tokens and never
+          refreshes them; the orchestrator refreshes and re-issues the call
         """
         import requests
 
@@ -883,7 +994,6 @@ class BaseMCPConnector(ABC):
 
         attempt = 0
         max_attempts = (getattr(self, "_rate_limiter", None).max_retries if getattr(self, "_rate_limiter", None) else 3) + 1
-        refreshed = False
 
         while attempt < max_attempts:
             attempt += 1
@@ -910,24 +1020,6 @@ class BaseMCPConnector(ABC):
                     if attempt < max_attempts:
                         time.sleep(min(float(wait_time), 60.0))
                         continue
-
-                # 401 handling (OAuth refresh retry once)
-                if resp.status_code == 401 and self.auth_type == "oauth" and not refreshed and self.connection_id:
-                    manager = self._get_token_manager()
-                    refresh_cb = self._create_refresh_callback()
-                    if manager and refresh_cb:
-                        try:
-                            old_token = manager.get_token(self.connection_id)
-                            if old_token and getattr(old_token, "refresh_token", None):
-                                self.log("401 received; forcing OAuth refresh + retry", level="warning")
-                                new_token = refresh_cb(old_token)
-                                manager.store_token(self.connection_id, new_token)
-                                self._oauth_token = new_token
-                                req_headers["Authorization"] = f"Bearer {new_token.access_token}"
-                                refreshed = True
-                                continue
-                        except Exception as e:
-                            self.log(f"OAuth refresh failed: {e}", level="warning")
 
                 data: Any = None
                 try:
@@ -977,20 +1069,20 @@ class BaseMCPConnector(ABC):
     
     def set_oauth_token(self, token_data: Dict[str, Any]) -> None:
         """
-        Set OAuth token directly (e.g., from connection config).
-        
+        Hold the OAuth token a connection config hands in (never stored).
+
         Args:
-            token_data: Token dictionary with access_token, refresh_token, expires_at, etc.
+            token_data: dict with access_token and, optionally, expires_at
+                (epoch seconds or RFC3339) or expires_in.
         """
-        try:
-            from oauth.token_manager import OAuthToken
-            self._oauth_token = OAuthToken.from_dict(token_data)
-            self._oauth_token.provider = self.oauth_provider
-            self.auth_type = "oauth"
-            self.log(f"OAuth token set for {self.oauth_provider}")
-        except ImportError:
-            self.log("OAuth module not available", level="error")
-    
+        if not isinstance(token_data, dict) or not token_data.get("access_token"):
+            self.log("OAuth token data carries no access_token; not set", level="warning")
+            return
+        self._oauth_token = _HeldOAuthToken.from_dict(token_data)
+        self._oauth_token.provider = self.oauth_provider
+        self.auth_type = "oauth"
+        self.log(f"OAuth token set for {self.oauth_provider}")
+
     # Per-connection auth/endpoint state. configure_from_connection() overwrites
     # these, but only conditionally, so they must be reset between connections.
     _CONNECTION_STATE_FIELDS = ('api_key', 'auth_type', 'base_url', '_oauth_token')
@@ -1055,21 +1147,11 @@ class BaseMCPConnector(ABC):
         self.log(f"Configured from connection: {self.connection_id}, auth_type: {self.auth_type}")
     
     def is_oauth_configured(self) -> bool:
-        """Check if OAuth is properly configured."""
+        """Check if OAuth is properly configured: a held, unexpired token."""
         if self.auth_type != "oauth":
             return False
-        
-        if self._oauth_token and not self._oauth_token.is_expired():
-            return True
-        
-        if self.connection_id:
-            manager = self._get_token_manager()
-            if manager:
-                token = manager.get_token(self.connection_id)
-                return token is not None and not token.is_expired()
-        
-        return False
-    
+        return bool(self._oauth_token) and not self._oauth_token.is_expired()
+
     def log(self, message: str, level: str = "info") -> None:
         """
         Log a message with automatic trace_id inclusion.
@@ -1096,7 +1178,7 @@ class BaseMCPConnector(ABC):
         return get_trace_id()
     
     # ============================================================================
-    # OPTIMIZATION HELPERS (Generic for all connectors)
+    # PERFORMANCE HELPERS (Generic for all connectors)
     # ============================================================================
     
     def _measure_performance(self, operation_name: str):
@@ -1119,7 +1201,7 @@ class BaseMCPConnector(ABC):
                 if duration_ms > self.connector._performance_target_ms:
                     logger.warning(
                         f"⚠️ {self.op_name} is SLOW ({duration_ms:.2f}ms > target {self.connector._performance_target_ms}ms). "
-                        f"Consider optimization! Check {self.connector.connector_type} in optimization_templates.json"
+                        "Narrow the request (see _apply_limits) or raise _performance_target_ms."
                     )
         
         return PerformanceMeasurer(self, operation_name)
@@ -1130,11 +1212,6 @@ class BaseMCPConnector(ABC):
         Generic for all connector types.
         """
         defaults = defaults or {}
-        
-        # Get category-specific defaults from templates
-        if self.optimization_category and self.optimization_category in OPTIMIZATION_TEMPLATES:
-            template_params = OPTIMIZATION_TEMPLATES[self.optimization_category].get('parameters', {})
-            defaults.update(template_params)
         
         # Apply defaults
         limits = {
@@ -1147,30 +1224,6 @@ class BaseMCPConnector(ABC):
         }
         
         return limits
-    
-    def _get_optimization_tips(self) -> List[str]:
-        """Get optimization tips for this connector category"""
-        if not self.optimization_category:
-            return ["Set self.optimization_category in __init__ for category-specific tips"]
-        
-        if self.optimization_category not in OPTIMIZATION_TEMPLATES:
-            return [f"No optimization template found for category: {self.optimization_category}"]
-        
-        template = OPTIMIZATION_TEMPLATES[self.optimization_category]
-        return template.get('principles', [])
-    
-    def _check_anti_patterns(self, code_snippet: str = None) -> List[str]:
-        """
-        Check for common anti-patterns that slow down schema discovery.
-        Can be used during development/testing.
-        """
-        if not self.optimization_category or self.optimization_category not in OPTIMIZATION_TEMPLATES:
-            return []
-        
-        template = OPTIMIZATION_TEMPLATES[self.optimization_category]
-        anti_patterns = template.get('anti_patterns', [])
-        
-        return [f"⚠️ Avoid: {pattern}" for pattern in anti_patterns]
     
     @abstractmethod
     def test_connection(self, params: Dict = None) -> Dict[str, Any]:
@@ -1361,7 +1414,6 @@ class BaseMCPConnector(ABC):
             "default_destination_operation": category_info.get("default_dest_op", "import"),
             "terminology": category_info.get("terminology", {}),
             "operations": operations,
-            "optimization_category": self.optimization_category,
             "performance_target_ms": self._performance_target_ms,
             "capabilities": {
                 "max_batch_size": self.max_batch_size,

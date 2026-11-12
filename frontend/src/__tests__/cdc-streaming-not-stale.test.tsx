@@ -9,8 +9,14 @@
  *   - show no destructive "Stale" badge and no destructive "Stop Pipeline" /
  *     "Cancel Pipeline" in the stall banner for a stream,
  *   - still show a real stream stall's reason, so nothing is hidden,
- *   - keep the ordinary header Stop / Cancel, and
- *   - leave batch pipelines exactly as before (the controls below).
+ *   - keep the chat view's ordinary Cancel (the pipeline page's Live Execution card has
+ *     no Stop of its own: the page header's actions stop the pipeline), and
+ *   - leave batch pipelines exactly as before (the controls below), and
+ *   - badge a stream "streaming", not its raw status: /state keeps the id of the run that
+ *     set the stream up (temporal-adapter pipeline_status_activity.go, streaming_active).
+ *     That run is the stream's run on every surface (api-gateway reports it running with
+ *     live_stream, executionLiveCDCStreamSQL, and its page says "Streaming changes"), so
+ *     the card keeps "Execution <id>".
  *
  * Payloads follow api-gateway's PipelineState JSON (pipeline_state.go).
  */
@@ -81,9 +87,9 @@ function mountPanel(state: Record<string, unknown>) {
   return render(<PipelineLiveStatePanel pipelineId="p1" />)
 }
 
-/** The header's ordinary Stop, which appears once a processing /state has loaded. */
-async function headerStop() {
-  return waitFor(() => screen.getByRole("button", { name: "Stop" }))
+/** The card's status badge, once the /state has loaded. */
+async function badge(text: string) {
+  return waitFor(() => screen.getByText(text))
 }
 
 beforeEach(() => authFetch.mockReset())
@@ -93,8 +99,8 @@ describe("PipelineLiveStatePanel — streaming CDC", () => {
   it("a quiet healthy stream shows no Stale badge and no destructive Stop", async () => {
     mountPanel(stateBody({ streaming: true, is_stale: false, cancel_recommended: false }))
 
-    // The state loaded (the ordinary stop is there) ...
-    expect(await headerStop()).toBeInTheDocument()
+    // The state loaded ...
+    expect(await badge("streaming")).toBeInTheDocument()
     // ... and nothing calls the stream stuck.
     expect(screen.queryByText("Stale")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Stop Pipeline" })).not.toBeInTheDocument()
@@ -116,7 +122,7 @@ describe("PipelineLiveStatePanel — streaming CDC", () => {
     expect(screen.getByText("This stream may not be delivering changes.")).toBeInTheDocument()
     expect(screen.queryByText("Stale")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Stop Pipeline" })).not.toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument()
     // The reason already says "for 20m 0s"; no raw seconds counter is appended.
     expect(screen.queryByText(/\(idle \d+s\)/)).not.toBeInTheDocument()
   })
@@ -135,7 +141,37 @@ describe("PipelineLiveStatePanel — streaming CDC", () => {
 
     expect(await screen.findByText("This stream may not be delivering changes.")).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Stop Pipeline" })).not.toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument()
+  })
+})
+
+describe("PipelineLiveStatePanel — a stream's setup run", () => {
+  // /state's status is the stream's; its execution_id is the run that set the stream up,
+  // which the run page and the run lists also show as the live stream's run.
+  // "processing" is the late-progress-event case.
+  it.each(["running", "processing"])(
+    "keeps Execution and reads streaming, never %s",
+    async (status) => {
+      mountPanel(stateBody({ execution_id: "8c93ed6b-run", status, current_stage: "streaming", streaming: true }))
+
+      expect(await badge("streaming")).toBeInTheDocument()
+      const link = screen.getByRole("link", { name: "8c93ed6b" })
+      expect(link).toHaveAttribute("href", "/executions/8c93ed6b-run")
+      expect(link.parentElement).toHaveTextContent(/^Execution 8c93ed6b$/)
+      expect(screen.queryByText(status)).not.toBeInTheDocument()
+    }
+  )
+
+  it.each([
+    ["a batch run", { execution_plan: { mode: "batch", stages: [] } }],
+    ["a CDC run in its initial load", { streaming: false }],
+  ])("%s keeps Execution and its own status", async (_label, over) => {
+    mountPanel(stateBody({ execution_id: "8c93ed6b-run", ...over }))
+
+    expect(await badge("processing")).toBeInTheDocument()
+    const link = screen.getByRole("link", { name: "8c93ed6b" })
+    expect(link.parentElement).toHaveTextContent(/^Execution 8c93ed6b$/)
+    expect(screen.queryByText("streaming")).not.toBeInTheDocument()
   })
 })
 

@@ -96,11 +96,8 @@ def _make_server(cls, columns, rows):
     cursor = FakeCursor(columns, rows)
     srv._get_connection = lambda config: FakeConn()
     srv._get_cursor = lambda conn: cursor
-    # The keyset PK is normally probed from the catalog; the executor supplies
-    # it explicitly in these cases via `cursor_column`, but pin the fallback so
-    # a probe never reaches the fake cursor.
-    srv._get_primary_key_column = lambda cur, table: "id"
-    srv._is_invisible_column = lambda cur, table, col: False
+    # Every case names `cursor_column`, which sql_paging pages by with no
+    # catalog read, so only the page query reaches the fake cursor.
     return srv, cursor
 
 

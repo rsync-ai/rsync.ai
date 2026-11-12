@@ -3,6 +3,7 @@ import { Inter } from "next/font/google"
 import { WebSocketProvider } from "@/contexts/WebSocketContext"
 import { FeatureFlagsBootstrap } from "@/components/providers/FeatureFlagsBootstrap"
 import { ThemedToaster } from "@/components/providers/ThemedToaster"
+import { MotionPreferences } from "@/components/providers/MotionPreferences"
 import { runtimeConfigScript } from "@/lib/config/runtime-env"
 import "./globals.css"
 
@@ -63,7 +64,7 @@ export default function RootLayout({
       <body className={`${inter.variable} font-sans antialiased`}>
         <WebSocketProvider>
           <FeatureFlagsBootstrap />
-          {children}
+          <MotionPreferences>{children}</MotionPreferences>
         </WebSocketProvider>
         {/* Keep toasts away from bottom action bars (e.g. Save buttons) */}
         <ThemedToaster />

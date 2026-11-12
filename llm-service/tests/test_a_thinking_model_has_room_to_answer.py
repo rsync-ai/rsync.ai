@@ -193,6 +193,24 @@ def test_diagnose_parses_a_thinking_models_answer(model):
     assert body["raw"] is None
 
 
+@pytest.mark.parametrize("llm_model", ["google/gemini-2.5-flash", "gemini-3.6-flash"])
+def test_a_gemini_completion_is_charged_for_its_thinking(model, monkeypatch, llm_model):
+    # Google bills the thinking as output, and leaves it out of completion_tokens.
+    gateway_main = _gateway()
+    import src.utils.llm_cost as llm_cost
+
+    charged: list[dict] = []
+    monkeypatch.setattr(llm_cost, "record_usage", lambda **kw: charged.append(kw) or 0)
+    monkeypatch.setattr(gateway_main, "DEFAULT_LLM_MODEL", llm_model)
+    fake = model(HELP_ANSWER, THINKING_TOKENS)
+    body = _complete("chat/help_response")
+    assert fake.requests[0]["model"] == llm_model
+    (usage,) = charged
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (100, len(HELP_ANSWER) + THINKING_TOKENS)
+    # The reply still reports what the provider said.
+    assert body["usage"]["completion_tokens"] == len(HELP_ANSWER)
+
+
 # ---------------------------------------------------------------------------
 # 2. A reply still cut off after the headroom says so.
 
@@ -299,6 +317,20 @@ def _is_helper_call(node: ast.AST) -> bool:
     return name == HELPER
 
 
+# Model calls go through the egress guard (src/egress/guard.py), which passes
+# max_tokens on unchanged; a raw `.create` still counts if one comes back.
+GUARDED_CALLS = frozenset({"guarded_call", "guarded_acall", "_guarded_explorer_call"})
+
+
+def _is_model_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in GUARDED_CALLS
+    return getattr(func, "attr", None) == "create"
+
+
 def _unbudgeted_create_calls(tree: ast.AST) -> tuple[int, list[int]]:
     """(max_tokens= create calls found, lines whose value skips the helper).
 
@@ -326,7 +358,7 @@ def _unbudgeted_create_calls(tree: ast.AST) -> tuple[int, list[int]]:
                     )
         budgeted = {name for name, ok in from_helper.items() if ok}
         for node in ast.walk(func):
-            if not (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "create"):
+            if not _is_model_call(node):
                 continue
             for kw in node.keywords:
                 if kw.arg != "max_tokens":
@@ -375,10 +407,12 @@ def test_every_prompt_call_leaves_room_to_think():
         total += count
         offenders += [f"{rel}:{ln}" for ln in bad]
 
-    # The denominator: a walk that stopped matching would pass on nothing.
-    assert per_file.get("gateway/main.py", 0) >= 15, per_file
+    # The denominator: a walk that stopped matching would pass on nothing. One
+    # guard call covers a chat call and its completion fallback, so main.py has
+    # 10 sites where it had 15 raw `.create` calls.
+    assert per_file.get("gateway/main.py", 0) >= 10, per_file
     assert per_file.get("agents/explorer/api.py", 0) >= 3, per_file
-    assert total >= 20, per_file
+    assert total >= 16, per_file
     assert not offenders, (
         f"completion call(s) at {offenders} pass a max_tokens that has no room for a "
         f"thinking model's reasoning. Wrap the answer budget in {HELPER}(...): on "

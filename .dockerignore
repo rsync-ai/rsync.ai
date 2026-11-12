@@ -1,8 +1,8 @@
 # Build context exclusions for the FOUR images whose context is the repo root:
 # api-gateway, backend-orchestrator, backend-temporal-adapter and
 # shared/mcp-connectors/internal/kafka-mcp-sink. (Census, not memory:
-# `context: .` appears at docker-compose.yml:401, :840, :1002, :1213 and at
-# .github/workflows/docker-publish.yml:44, :49, :54, :122 -- those eight sites
+# `context: .` appears at docker-compose.yml:457, :1001, :1179, :1428 and at
+# .github/workflows/docker-publish.yml:61, :66, :71, :139 -- those eight sites
 # are the same four Dockerfiles.)
 #
 # Docker reads .dockerignore ONLY from the context root. The three nested ones
@@ -28,26 +28,15 @@
 #
 # Nothing excluded here is reachable from those four Dockerfiles. Their COPY
 # lines name only shared/go/*, api-gateway/, backend-orchestrator/,
-# backend-temporal-adapter/ and shared/mcp-connectors/internal/kafka-mcp-sink/.
+# backend-temporal-adapter/, shared/mcp-connectors/internal/kafka-mcp-sink/ and
+# THIRD_PARTY_NOTICES.md.
+#
+# This file also filters the BuildKit named context `legal`, which is the repo
+# root too: the images whose context is a subdirectory take THIRD_PARTY_NOTICES.md
+# from it (`COPY --from=legal`), so that file must never be excluded here.
 # The list below is deliberately a DENY list rather than an allowlist: a new
 # root-context Dockerfile that needs a path nobody denied keeps working, and if
 # one ever does need a denied path it fails loudly at COPY, not silently.
-
-# --- the paid layer, which no community image may contain ---
-# The four root-context builds are the only ones whose context could reach this
-# tree, and this line is what stops it reaching them -- .dockerignore is read
-# only from the context root, so this is the single place it can be said once
-# for all four. `.github/workflows/enterprise-boundary.yml` is the check that
-# this line still does what it says: it inspects the BUILT images, because a
-# deny list is a claim about a build and only the artifact settles it.
-#
-# Written without the trailing slash the entries below use, on purpose. This
-# file ships to the public repository, where the directory does not exist, and
-# `llm-service/tests/test_no_public_file_references_the_enterprise_tree.py`
-# fails any surviving file that names it followed by a slash. That guard is
-# worth more with no exemptions than this block is with a matching style;
-# Docker excludes a directory and everything under it either way.
-enterprise
 
 # --- the two that dominate the context ---
 frontend/

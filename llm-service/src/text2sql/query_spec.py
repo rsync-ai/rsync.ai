@@ -77,12 +77,6 @@ class SelectColumn(BaseModel):
     aggregation: Optional[AggregationType] = None
     table: Optional[str] = None  # Source table (for disambiguation)
 
-    def qualified_name(self) -> str:
-        """Get the fully qualified column name."""
-        if self.table:
-            return f"{self.table}.{self.column}"
-        return self.column
-
 
 class Filter(BaseModel):
     """A WHERE clause filter condition."""
@@ -120,9 +114,6 @@ class TimeRange(BaseModel):
 
     # Or relative range
     relative: Optional[str] = None  # e.g., "last_30_days", "last_calendar_month", "this_year"
-
-    def is_relative(self) -> bool:
-        return self.relative is not None
 
 
 class Ambiguity(BaseModel):
@@ -193,39 +184,3 @@ class QuerySpec(BaseModel):
         for join in self.joins:
             tables.append(join.table)
         return tables
-
-    def get_all_columns(self) -> list[str]:
-        """Get all columns referenced in the query."""
-        columns = []
-        for col in self.select_columns:
-            columns.append(col.qualified_name())
-        for f in self.filters:
-            if f.table:
-                columns.append(f"{f.table}.{f.column}")
-            else:
-                columns.append(f.column)
-        columns.extend(self.group_by)
-        for ob in self.order_by:
-            if ob.table:
-                columns.append(f"{ob.table}.{ob.column}")
-            else:
-                columns.append(ob.column)
-        if self.time_column:
-            columns.append(self.time_column)
-        return columns
-
-
-def create_minimal_query_spec(
-    from_table: str,
-    select_columns: Optional[list[str]] = None,
-    intent: str = "",
-    limit: int = 100,
-) -> QuerySpec:
-    """Create a minimal QuerySpec for simple queries."""
-    cols = select_columns or ["*"]
-    return QuerySpec(
-        intent_description=intent,
-        from_table=from_table,
-        select_columns=[SelectColumn(column=c) for c in cols],
-        limit=limit,
-    )

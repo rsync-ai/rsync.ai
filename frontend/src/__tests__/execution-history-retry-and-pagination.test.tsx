@@ -228,7 +228,7 @@ describe("F-286 — changing the status filter returns to the first page", () =>
     // The two matching rows exist. They must be on screen.
     await waitFor(() => expect(screen.getByText(idCell(101))).toBeInTheDocument())
     expect(screen.getByText(idCell(102))).toBeInTheDocument()
-    expect(screen.queryByText(/no execution history yet/i)).toBeNull()
+    expect(screen.queryByText(/no runs with this status/i)).toBeNull()
   })
 
   // THE BOUND. Paging itself still has to work; the reset must not pin page 1.

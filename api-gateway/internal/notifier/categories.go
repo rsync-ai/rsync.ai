@@ -24,6 +24,7 @@ const (
 	CategoryHealth      = "health"
 	CategoryCredentials = "credentials"
 	CategorySourceSetup = "source_setup"
+	CategoryDataQuality = "data_quality"
 	CategoryOther       = "other"
 )
 
@@ -38,11 +39,12 @@ type Category struct {
 // a reader should think hardest about before muting.
 var categories = []Category{
 	{CategoryDataLoss, "Data loss & integrity", "Rows may be missing, or real-time sync lost its place and needs a fresh sync."},
-	{CategoryRunStatus, "Run failed or stopped", "A pipeline run ended with an error or was stopped before it finished."},
+	{CategoryRunStatus, "Run failed, stopped or waiting", "A pipeline, model or workflow run failed, a pipeline was stopped, or a scheduled run is waiting for an answer."},
 	{CategorySchemaDrift, "Schema changes", "The source schema changed and needs approval, or an approved change was applied."},
 	{CategoryHealth, "Health & capacity", "The destination is out of space, the source is rate limiting, or the network is retrying."},
 	{CategoryCredentials, "Credentials & configuration", "A connection expired or lost a permission, or a pipeline setting needs fixing."},
 	{CategorySourceSetup, "Source setup", "A source database setting or table blocks syncing (replication, CDC, primary keys)."},
+	{CategoryDataQuality, "Data checks", "A data check on a model failed: it held the new table back, or warned and let it go live."},
 	{CategoryOther, "Other alerts", "Anything not classified above, including problems we could not classify."},
 }
 
@@ -59,8 +61,10 @@ var codeCategory = map[string]string{
 	"PIPELINE_RUN_FAILED":  CategoryRunStatus,
 	"PIPELINE_RUN_STOPPED": CategoryRunStatus,
 
-	"SCHEMA_DRIFT_DETECTED": CategorySchemaDrift,
-	codeSchemaChangeApplied: CategorySchemaDrift,
+	"SCHEMA_DRIFT_DETECTED":     CategorySchemaDrift,
+	"SCHEMA_DRIFT_HANDLED":      CategorySchemaDrift,
+	"SCHEMA_DRIFT_APPLY_FAILED": CategorySchemaDrift,
+	codeSchemaChangeApplied:     CategorySchemaDrift,
 
 	"DESTINATION_CAPACITY_EXCEEDED": CategoryHealth,
 	"RATE_LIMIT_EXCEEDED":           CategoryHealth,
@@ -84,6 +88,20 @@ var codeCategory = map[string]string{
 	"MONGODB_NOT_REPLICA_SET":             CategorySourceSetup,
 	"PRE_MIGRATION_ASSESSMENT_ISSUE":      CategorySourceSetup,
 
+	// A model's data checks (api-gateway saved_query_checks.go). Their own category,
+	// not run_status: muting "run failed" is not asking to miss a table held back.
+	CodeCheckBlocked: CategoryDataQuality,
+	CodeCheckWarned:  CategoryDataQuality,
+
+	// A stop, a wait or an unattended failure the gateway raises itself
+	// (handlers/run_notices.go). All run_status: each answers "did my run
+	// finish?", the same question PIPELINE_RUN_FAILED and _STOPPED answer.
+	CodeCDCPipelineStopped:    CategoryRunStatus,
+	CodePipelineAwaitingInput: CategoryRunStatus,
+	CodeModelRunFailed:        CategoryRunStatus,
+	CodeModelSchedulePaused:   CategoryRunStatus,
+	CodeWorkflowRunFailed:     CategoryRunStatus,
+
 	// Instance-level health, raised by healthwatch rather than by a run.
 	"RSYNC_CONNECTOR_VERSION_REGRESSION": CategoryHealth,
 
@@ -93,12 +111,26 @@ var codeCategory = map[string]string{
 	// re-running something, which is what data_loss means here. A down
 	// connector, an absent writer and a wedged writer have everything safely
 	// queued — muting "health & capacity" should not also mute "rows missing".
+	// Parked rows were consumed and set aside, so they are gone from the stream
+	// the same way a rejected write is; a sink that is not draining still has
+	// them queued.
 	"SINK_WRITE_REJECTED":       CategoryDataLoss,
 	"CDC_SOURCE_STREAM_STALLED": CategoryDataLoss,
+	"CDC_ROWS_PARKED":           CategoryDataLoss,
 	"CDC_CONNECTOR_DOWN":        CategoryHealth,
 	"CDC_CAPTURE_STOPPED":       CategoryHealth,
 	"SINK_WORKER_ABSENT":        CategoryHealth,
 	"CDC_SINK_WEDGED":           CategoryHealth,
+	"CDC_SINK_ABSENT":           CategoryHealth,
+	"CDC_SINK_NOT_DRAINING":     CategoryHealth,
+	"CDC_SOURCE_LAG_HIGH":       CategoryHealth,
+	// Retained WAL growing behind a slot: left alone the source disk fills or the
+	// slot is invalidated, and an invalidated slot loses every change it had not
+	// delivered.
+	"CDC_WAL_PRESSURE": CategoryDataLoss,
+	// A stored position about to be purged by the source's log retention, or already
+	// purged: once it is, the changes since only come back through a Reload.
+	"CDC_POSITION_RETENTION": CategoryDataLoss,
 
 	// Sentinel component health. Health, not data_loss, on the same split: a
 	// service that is down, a worker that stopped reporting and a closed queue
@@ -108,6 +140,15 @@ var codeCategory = map[string]string{
 	"WORKER_HEARTBEAT_LOST": CategoryHealth,
 	"CONSUMER_GROUP_CLOSED": CategoryHealth,
 
+	// A cleared alert sits in its alert's category, so whoever muted the alert is not
+	// told it cleared. TestEveryResolvedCodeSharesItsAlertsCategoryAndLink guards the pairing.
+	CodeSourceStreamStalledResolved: CategoryDataLoss,
+	CodeWALPressureResolved:         CategoryDataLoss,
+	CodeCaptureStoppedResolved:      CategoryHealth,
+	CodeConnectorDownResolved:       CategoryHealth,
+	CodeSinkNotDrainingResolved:     CategoryHealth,
+	CodeInfrastructureDownResolved:  CategoryHealth,
+
 	// The classifier gave up. These are still delivered by default: an
 	// unclassified failure is exactly the alert nobody should miss by accident.
 	"UNKNOWN_ERROR":       CategoryOther,
@@ -116,10 +157,12 @@ var codeCategory = map[string]string{
 
 // typeCategory covers producers that publish a bare event type with no code.
 var typeCategory = map[string]string{
-	// sentinel/cdc_wal_watchdog.go: retained WAL is growing behind a slot.
-	// Left alone the source disk fills or the slot is invalidated, and an
-	// invalidated slot loses every change it had not delivered.
+	// sentinel/cdc_wal_watchdog.go: the WAL alert now carries CDC_WAL_PRESSURE;
+	// this covers one raised before it did, still sitting in the queue.
 	"cdc_wal_pressure": CategoryDataLoss,
+	// sentinel/cdc_position_horizon.go: the position alert now carries
+	// CDC_POSITION_RETENTION; this covers one raised before it did.
+	"cdc_position_retention": CategoryDataLoss,
 }
 
 // Categories returns every category in display order.

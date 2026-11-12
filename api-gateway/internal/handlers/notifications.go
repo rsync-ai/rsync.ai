@@ -85,12 +85,35 @@ const audienceFilter = `AND COALESCE(metadata->>'audience', 'user') <> 'develope
 // LEFT JOIN: an inner join drops every NULL-pipeline row on the floor, which
 // would persist those alerts and then hide them.
 //
+// A model's alert (a data check, migration 138) has no pipeline either, but it is
+// not about the install: it is shown only in the model's own workspace, read from
+// saved_queries, the one source of truth. The id is read from the row's metadata, not
+// its saved_query_id column, so a gateway whose migration 138 has not applied keeps a
+// working bell; the text comparison means no stored value can fail a cast and take the
+// whole bell down with it. A model that has since been deleted matches nothing, so its
+// alert is hidden rather than shown everywhere.
+//
+// A workflow run's alert (workflow_run_alert.go) is scoped the same way, through
+// metadata->>'workflow_id' and the workflow's workspace. Its admin fallback reaches
+// an admin who is not in that workspace by Slack only.
+//
 // Fails closed: with no active workspace the middleware leaves the context
 // unset, and callers return an empty inbox rather than every workspace's rows.
 func notificationWorkspace(c *gin.Context) (string, bool) {
 	ws := activeWorkspaceID(c)
 	return ws, ws != ""
 }
+
+// modelAlertInWorkspace admits a model's alert to the bell of the model's workspace
+// ($2). All three bell queries use it, so they show, count and clear the same rows.
+const modelAlertInWorkspace = `EXISTS (SELECT 1 FROM saved_queries sq WHERE sq.id::text = n.metadata->>'saved_query_id' AND sq.workspace_id = $2)`
+
+// workflowAlertInWorkspace is modelAlertInWorkspace for a workflow run's alert.
+const workflowAlertInWorkspace = `EXISTS (SELECT 1 FROM workflows wf WHERE wf.id::text = n.metadata->>'workflow_id' AND wf.workspace_id = $2)`
+
+// instanceAlertArm admits an alert about no pipeline, model or workflow: the
+// install's own, shown in every workspace.
+const instanceAlertArm = `(n.pipeline_id IS NULL AND n.metadata->>'saved_query_id' IS NULL AND n.metadata->>'workflow_id' IS NULL)`
 
 // countUnreadNotifications returns how many unread notifications the user has in
 // the given workspace. Hits the purpose-built partial index
@@ -102,7 +125,10 @@ func countUnreadNotifications(ctx context.Context, database *sql.DB, userID, wor
 		FROM pipeline_notifications n
 		LEFT JOIN pipelines p ON p.id = n.pipeline_id
 		WHERE n.user_id = $1 AND n.read_at IS NULL
-		  AND (n.pipeline_id IS NULL OR p.workspace_id = $2)
+		  AND (`+instanceAlertArm+`
+		       OR p.workspace_id = $2
+		       OR `+modelAlertInWorkspace+`
+		       OR `+workflowAlertInWorkspace+`)
 		  AND COALESCE(n.metadata->>'audience', 'user') <> 'developer'
 	`, userID, workspaceID).Scan(&count)
 	return count, err
@@ -149,7 +175,10 @@ func ListNotifications(c *gin.Context) {
 		FROM pipeline_notifications n
 		LEFT JOIN pipelines p ON p.id = n.pipeline_id
 		WHERE n.user_id = $1
-		  AND (n.pipeline_id IS NULL OR p.workspace_id = $2)
+		  AND (`+instanceAlertArm+`
+		       OR p.workspace_id = $2
+		       OR `+modelAlertInWorkspace+`
+		       OR `+workflowAlertInWorkspace+`)
 		  AND COALESCE(n.metadata->>'audience', 'user') <> 'developer'
 		ORDER BY n.created_at DESC
 		LIMIT $3
@@ -342,8 +371,10 @@ func MarkAllNotificationsRead(c *gin.Context) {
 		SET read_at = NOW()
 		WHERE n.user_id = $1 AND n.read_at IS NULL
 		  AND (
-		        n.pipeline_id IS NULL
+		        `+instanceAlertArm+`
 		     OR EXISTS (SELECT 1 FROM pipelines p WHERE p.id = n.pipeline_id AND p.workspace_id = $2)
+		     OR `+modelAlertInWorkspace+`
+		     OR `+workflowAlertInWorkspace+`
 		      )
 	`, userID, workspaceID)
 	if err != nil {

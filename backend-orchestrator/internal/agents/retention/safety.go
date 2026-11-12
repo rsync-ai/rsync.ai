@@ -100,12 +100,15 @@ func (s *SafetyChecker) checkAllConsumersCaughtUp(
 	checkName := "all_consumers_caught_up"
 	result.ChecksPerformed = append(result.ChecksPerformed, checkName)
 
-	allCaughtUp, progressMap := s.offsetTracker.CheckAllConsumersCaughtUp(
+	allCaughtUp, progressMap, err := s.offsetTracker.CheckAllConsumersCaughtUp(
 		ctx,
 		bulkLoad.Topic,
 		bulkLoad.EndOffset,
 		bulkLoad.ExpectedConsumers,
 	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", checkName, err)
+	}
 
 	if !allCaughtUp {
 		result.FailedChecks = append(result.FailedChecks, checkName)
@@ -133,12 +136,16 @@ func (s *SafetyChecker) checkNoHighLag(
 	checkName := "no_high_lag"
 	result.ChecksPerformed = append(result.ChecksPerformed, checkName)
 
-	_, progressMap := s.offsetTracker.CheckAllConsumersCaughtUp(
+	// A consumer whose lag cannot be read is not one with low lag.
+	_, progressMap, err := s.offsetTracker.CheckAllConsumersCaughtUp(
 		ctx,
 		bulkLoad.Topic,
 		bulkLoad.EndOffset,
 		bulkLoad.ExpectedConsumers,
 	)
+	if err != nil {
+		return fmt.Errorf("%s: %w", checkName, err)
+	}
 
 	for consumer, progress := range progressMap {
 		if progress.Lag > s.config.Safety.MaxLagBeforeCleanup {

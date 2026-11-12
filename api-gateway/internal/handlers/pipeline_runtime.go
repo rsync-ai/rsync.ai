@@ -66,9 +66,8 @@ type RuntimeProgress struct {
 }
 
 type RuntimeLiveness struct {
-	LastEventAt   *time.Time `json:"last_event_at,omitempty"`
-	LastHealthyAt *time.Time `json:"last_healthy_at,omitempty"`
-	StaleSeconds  int64      `json:"stale_seconds,omitempty"`
+	LastEventAt  *time.Time `json:"last_event_at,omitempty"`
+	StaleSeconds int64      `json:"stale_seconds,omitempty"`
 	// PendingEvents is captured-minus-applied summed across the pipeline's CDC
 	// tables: how many change events the source produced that the destination has
 	// not written yet. It is what separates a quiet stream from a wedged one when
@@ -267,6 +266,9 @@ func GetPipelineRuntime(c *gin.Context) {
 	} else if (rt.Phase == "paused" || rt.Phase == "stopped") && rt.Health == "healthy" {
 		rt.Health = "degraded"
 	}
+	// After phase and health, which read the stored verdict: a paused or stopped pipeline is
+	// already degraded, and a frozen unhealthy row still reads as the last known problem.
+	markUnprobedDeps(rt.Deps, pStatus.String)
 
 	// 6) Attach the broker-side sink drain reading, DELIBERATELY after phase and
 	// health are computed.
@@ -600,9 +602,6 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 	defer rows.Close()
 
 	out := []RuntimeDep{}
-	hasUnhealthy := false
-	hasDegraded := false
-	hasChecked := false
 	for rows.Next() {
 		var dep RuntimeDep
 		var lastChecked, lastHealthy sql.NullTime
@@ -622,6 +621,16 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 		if len(detailsRaw) > 0 {
 			_ = json.Unmarshal(detailsRaw, &dep.Details)
 		}
+		out = append(out, dep)
+	}
+	return out, aggregateDepHealth(out)
+}
+
+// aggregateDepHealth folds dependency rows into one verdict: unknown when none was checked
+// (every row unknown, or no rows), else the worst checked status.
+func aggregateDepHealth(deps []RuntimeDep) string {
+	hasUnhealthy, hasDegraded, hasChecked := false, false, false
+	for _, dep := range deps {
 		switch dep.Status {
 		case "unhealthy":
 			hasUnhealthy = true
@@ -632,18 +641,43 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 		case "healthy":
 			hasChecked = true
 		}
-		out = append(out, dep)
 	}
-
 	switch {
 	case !hasChecked:
-		return out, "unknown"
+		return "unknown"
 	case hasUnhealthy:
-		return out, "unhealthy"
+		return "unhealthy"
 	case hasDegraded:
-		return out, "degraded"
+		return "degraded"
 	default:
-		return out, "healthy"
+		return "healthy"
+	}
+}
+
+// markUnprobedDeps withdraws the all-clear from a paused or stopped pipeline's dependency
+// rows. The orchestrator's probe skips those pipelines (dependency_probe.go sweep: the
+// `p.status NOT IN (…)` filter), so their health rows hold the last sweep before Pause or
+// Stop. That is almost always "healthy", because Stop writes pipelines.status in the same
+// request that parks the connector, and the panel showed a STOPPED Debezium connector as
+// healthy. A healthy row reads "unknown" instead, keeping when it was last checked and last
+// healthy; details say why. An unhealthy or degraded row is the last known problem and is
+// kept. A finished run's rows (completed, failed, …) are that run's record and are left as
+// they are.
+func markUnprobedDeps(deps []RuntimeDep, pipelineStatus string) {
+	status := strings.ToLower(strings.TrimSpace(pipelineStatus))
+	if status != "paused" && status != "stopped" {
+		return
+	}
+	for i := range deps {
+		if deps[i].Status != "healthy" {
+			continue
+		}
+		deps[i].Status = "unknown"
+		if deps[i].Details == nil {
+			deps[i].Details = map[string]interface{}{}
+		}
+		deps[i].Details["not_checked_while"] = status
+		deps[i].Details["last_result"] = "healthy"
 	}
 }
 

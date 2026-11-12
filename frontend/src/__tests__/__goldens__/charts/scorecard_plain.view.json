@@ -1,0 +1,7 @@
+{
+  "kind": "scorecard",
+  "label": "Sum of amount",
+  "value": 1234567.5,
+  "format": "compact",
+  "notes": []
+}

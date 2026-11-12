@@ -11,11 +11,18 @@ and the next tool-generator restart deleted it. The spec-upload screen still
 said "Generated" and named the path it was saved to.
 
 The chart now sets ``RSYNC_CONNECTOR_CATALOG_SHARED=false`` on tool-generator,
-and ``DeploymentService.deploy`` -- the one writer every generation path goes
-through -- refuses before it writes anything. The class is "a generated
-connector saved into a catalog only its writer reads", so the guard sits on the
-writer, not on one route; the route test below checks the refusal reaches the
-screen as a readable message rather than as a success.
+and both writers refuse before they write anything. The class is "a generated
+connector saved into a catalog only its writer reads", so the guard sits on each
+writer, not on one route:
+
+  * ``DeploymentService.deploy``: the agentic pipeline and the community route.
+  * ``session_fast_path.try_session_fast_path``: the discovery fast path and
+    spec-first, which reuses it. It writes to disk itself and never reaches
+    ``deploy``, so it was saving past the guard until an agent or Ask rsync.ai
+    could start a generation and it was swept with the rest.
+
+The route test below checks the refusal reaches the screen as a readable message
+rather than as a success.
 
 Unset (every Docker install) keeps today's behaviour, and each accepted spelling
 of "false" is pinned, because a guard that only knew one spelling would let the
@@ -25,6 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -153,3 +162,83 @@ def test_a_dry_run_is_still_allowed_on_a_private_catalog(catalog, client, monkey
     )
     assert res.status_code == 200, res.text
     assert res.json()["status"] == "completed_dry_run"
+
+
+# --------------------------------------------------------------------------- #
+# The second writer: the session fast path
+# --------------------------------------------------------------------------- #
+# Imported the way the fast path imports its siblings (bare ``agents.``,
+# ``deployment.``), with the tool_generator directory on sys.path, as the
+# test_gen_* suites in this process already do. Only dicts and strings cross the
+# boundary, so the second module spelling compares nothing by class.
+#
+# The disk write is replaced by a recorder: a real one needs the package import
+# layout for its protocol-invariant gate, which this flat layout cannot give.
+# The question is only whether the fast path reaches its writer.
+
+_TOOLGEN = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "src", "agents", "tool_generator")
+)
+
+
+def _fast_path_save(monkeypatch) -> tuple[dict, list]:
+    if _TOOLGEN not in sys.path:
+        sys.path.insert(0, _TOOLGEN)
+    from schemas.contract import Dimension, Fact, FactSource, empty_contract
+    import utils.session_store as session_store_mod
+    from agents import session_fast_path
+
+    contract = empty_contract("sess-private-catalog", "pipedrive")
+    for dim, value in (
+        (Dimension.PROTOCOL, "rest"),
+        (Dimension.BASE_URL, "https://api.pipedrive.com/v1"),
+        (Dimension.AUTH_TYPE, "pipedrive"),
+        (Dimension.OPERATIONS, ["list_deals"]),
+    ):
+        contract.set_fact(Fact(dimension=dim, value=value, confidence=1.0, source=FactSource.VENDOR_YAML))
+    contract.evaluate()
+    assert contract.can_generate, contract.refusal_reason
+
+    class _Store:
+        async def get(self, session_id):
+            return contract
+
+    async def _get_store():
+        return _Store()
+
+    writes: list = []
+
+    def _record_write(generated, output_dir, connector_id, spec, *, replace_version=None):
+        writes.append(str(output_dir))
+        return "v1.0.0"
+
+    monkeypatch.setattr(session_store_mod, "get_session_store", _get_store)
+    monkeypatch.setattr(session_fast_path, "write_generated_artifacts", _record_write)
+    result = asyncio.run(
+        session_fast_path.try_session_fast_path(
+            api_name="pipedrive",
+            session_id="sess-private-catalog",
+            canonical_id="pipedrive",
+            save_artifacts=True,
+            output_dir="/nonexistent/public/pipedrive",
+        )
+    )
+    return result, writes
+
+
+@pytest.mark.parametrize("value", ["false", "0"])
+def test_the_fast_path_refuses_on_a_private_catalog(monkeypatch, value):
+    monkeypatch.setenv(FLAG, value)
+    result, writes = _fast_path_save(monkeypatch)
+    assert result["success"] is False, result
+    assert result["error_stage"] == "persist", result
+    assert FLAG in result["error_message"], result["error_message"]
+    assert writes == [], "a refused generation still reached the writer"
+
+
+def test_the_fast_path_still_saves_on_a_shared_catalog(monkeypatch):
+    # Control, as above: the same call reaches the writer when the catalog is shared.
+    monkeypatch.delenv(FLAG, raising=False)
+    result, writes = _fast_path_save(monkeypatch)
+    assert result["success"] is True, result
+    assert writes == ["/nonexistent/public/pipedrive"], writes

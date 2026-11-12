@@ -121,7 +121,9 @@ func (w *ExecutorWorker) processCorrelationRequest(req *correlation.PendingReque
 			execTimeout = d
 		}
 	}
-	ctxExec, cancelExec := context.WithTimeout(w.ctx, execTimeout)
+	// A Stop reaches the run through this context (runcancel), so it ends the
+	// export in flight instead of only the sink behind it.
+	ctxExec, cancelExec := newExecutorRunContext(w.ctx, pipelineID, execTimeout)
 	defer cancelExec()
 
 	// Renew the claim while processing so long-running executions don't get double-claimed,

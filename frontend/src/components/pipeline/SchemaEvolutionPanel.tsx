@@ -1,11 +1,12 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useState } from "react"
 import { AlertTriangle, Check, ChevronDown, ChevronUp, RefreshCw, X } from "lucide-react"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetchOrThrow } from "@/lib/api/auth-fetch"
+import { usePipelineSchemaChanges } from "@/lib/hooks/usePipelineSchemaChanges"
 import { classifyError } from "@/lib/utils/error-handling"
 // SchemaChange is owned by the api client so this panel and the dedicated
 // approval page (SchemaDriftApprovalList) can't drift on the shape.
@@ -16,8 +17,8 @@ interface SchemaEvolutionPanelProps {
 }
 
 const RISK_COLORS: Record<string, string> = {
-  drop_column: "text-red-600 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
-  drop_table: "text-red-600 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
+  drop_column: "text-red-700 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
+  drop_table: "text-red-700 bg-red-50 border-red-200 dark:text-red-400 dark:bg-red-950/30 dark:border-red-900",
   modify_column: "text-amber-600 bg-amber-50 border-amber-200 dark:text-amber-400 dark:bg-amber-950/30 dark:border-amber-900",
   add_column: "text-emerald-600 bg-emerald-50 border-emerald-200 dark:text-emerald-400 dark:bg-emerald-950/30 dark:border-emerald-900",
   create_table: "text-emerald-600 bg-emerald-50 border-emerald-200 dark:text-emerald-400 dark:bg-emerald-950/30 dark:border-emerald-900",
@@ -32,37 +33,16 @@ const CHANGE_LABELS: Record<string, string> = {
 }
 
 export function SchemaEvolutionPanel({ pipelineId }: SchemaEvolutionPanelProps) {
-  const [changes, setChanges] = useState<SchemaChange[]>([])
-  const [loading, setLoading] = useState(true)
+  // Shared with the header's drift badge: one read for both, and the re-read
+  // after an approval updates the badge too.
+  const poll = usePipelineSchemaChanges(pipelineId)
+  const changes: SchemaChange[] = poll.changes ?? []
+  const loading = !poll.settled
+  const loadError = poll.error
+  const fetchChanges = poll.refresh
   const [actioning, setActioning] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [dismissed, setDismissed] = useState(false)
-  const [loadError, setLoadError] = useState<string | null>(null)
-
-  const fetchChanges = useCallback(async () => {
-    try {
-      const res = await authFetchOrThrow(API_ENDPOINTS.PIPELINES.SCHEMA_CHANGES(pipelineId), {
-        cache: "no-store",
-      })
-      const data = await res.json()
-      setChanges(data.schema_changes ?? [])
-      setLoadError(null)
-    } catch (e) {
-      // NOT best-effort: this panel is the only surface that says a pending
-      // schema change is waiting on a human. Rendering nothing when the read
-      // failed is indistinguishable from "there is nothing pending", which is
-      // the answer that makes an operator walk away.
-      setLoadError(classifyError(e, "general").message)
-    } finally {
-      setLoading(false)
-    }
-  }, [pipelineId])
-
-  useEffect(() => {
-    fetchChanges()
-    const iv = setInterval(fetchChanges, 30_000)
-    return () => clearInterval(iv)
-  }, [fetchChanges])
 
   const handleAction = async (changeId: string, action: "approve" | "reject") => {
     setActioning((prev) => ({ ...prev, [changeId]: true }))
@@ -174,6 +154,8 @@ export function SchemaEvolutionPanel({ pipelineId }: SchemaEvolutionPanelProps) 
           {resolved.filter((c) => c.status === "applied").length} applied ·{" "}
           {resolved.filter((c) => c.status === "rejected").length} rejected ·{" "}
           {resolved.filter((c) => c.status === "failed").length} failed
+          {resolved.some((c) => c.status === "withdrawn") &&
+            ` · ${resolved.filter((c) => c.status === "withdrawn").length} withdrawn`}
         </div>
       )}
     </div>

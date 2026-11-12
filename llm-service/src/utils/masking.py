@@ -83,21 +83,6 @@ def mask_dict(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return masked
 
 
-def mask_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Mask sensitive fields in connector configuration.
-    
-    This is the primary function to use before logging any config.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        Masked configuration dictionary
-    """
-    return mask_dict(config)
-
-
 def mask_connection_string(conn_str: str) -> str:
     """
     Mask passwords and secrets in connection strings.
@@ -111,9 +96,9 @@ def mask_connection_string(conn_str: str) -> str:
     if not conn_str:
         return conn_str
     
-    # Mask URL-style passwords: ://user:password@
+    # Mask URL-style passwords: ://user:password@ -- user may be empty; runs to the last @ before the path
     result = re.sub(
-        r'(://[^:]+:)([^@]+)(@)',
+        r'(://[^:/@\s]*:)([^/?#\s]+)(@)',
         rf'\1{MASKED_VALUE}\3',
         conn_str
     )
@@ -130,110 +115,6 @@ def mask_connection_string(conn_str: str) -> str:
     return result
 
 
-def mask_json_string(json_str: str) -> str:
-    """
-    Mask sensitive fields in a JSON-like string.
-    
-    Useful for logging raw payloads without parsing.
-    
-    Args:
-        json_str: JSON string to mask
-        
-    Returns:
-        JSON string with sensitive values masked
-    """
-    if not json_str:
-        return json_str
-    
-    result = json_str
-    for key in SENSITIVE_KEYS:
-        # Match patterns like "password": "value" or "password":"value"
-        pattern = rf'(?i)"{re.escape(key)}"\s*:\s*"[^"]*"'
-        replacement = f'"{key}": "{MASKED_VALUE}"'
-        result = re.sub(pattern, replacement, result)
-    
-    return result
-
-
-def config_summary(config: Optional[Dict[str, Any]]) -> str:
-    """
-    Return a brief summary of config for logging.
-    
-    Shows key names with [REDACTED] for sensitive values.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        String like "host=localhost, port=3306, password=[REDACTED]"
-    """
-    if not config:
-        return "(empty)"
-    
-    parts = []
-    for key, value in config.items():
-        if is_sensitive_key(key):
-            parts.append(f"{key}=[REDACTED]")
-        elif isinstance(value, str):
-            display_value = value[:50] + "..." if len(value) > 50 else value
-            parts.append(f"{key}={display_value}")
-        elif isinstance(value, (dict, list)):
-            parts.append(f"{key}=[complex]")
-        else:
-            parts.append(f"{key}={value}")
-    
-    return ", ".join(parts)
-
-
-def sanitize_for_log(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
-    """
-    Create a log-safe summary of config (key names only, no values).
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        Dictionary with keys and "[REDACTED]" or "[SET]" values
-    """
-    if config is None:
-        return None
-    
-    summary = {}
-    for key in config:
-        if is_sensitive_key(key):
-            summary[key] = "[REDACTED]"
-        else:
-            summary[key] = "[SET]"
-    
-    return summary
-
-
-def mask_headers(headers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    """
-    Mask sensitive HTTP headers.
-    
-    Args:
-        headers: HTTP headers dictionary
-        
-    Returns:
-        Headers with sensitive values masked
-    """
-    if headers is None:
-        return None
-    
-    sensitive_headers = {"authorization", "x-api-key", "x-auth-token", "cookie"}
-    
-    masked = {}
-    for key, value in headers.items():
-        key_lower = key.lower()
-        if key_lower in sensitive_headers or is_sensitive_key(key):
-            masked[key] = MASKED_VALUE
-        else:
-            masked[key] = value
-    
-    return masked
-
-
 # ------------------------------------------------------------------------------
 # LLM privacy scrubber — Python mirror of backend-orchestrator/pkg/llmscrub.
 # Contract (CLAUDE.md "LLM data privacy"): the LLM may see schema metadata and
@@ -244,16 +125,22 @@ def mask_headers(headers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
 
 _SCRUB_REDACTED = "[redacted]"
 
-_SCRUB_PATTERNS = [
-    # Postgres not-null/check DETAIL dumps the ENTIRE row — greedy to end of
-    # string so a truncated dump can't leak a partial row.
-    (re.compile(r"\bFailing row contains\b.*", re.IGNORECASE | re.DOTALL), f"Failing row contains ({_SCRUB_REDACTED})"),
-    # Everything after a SQL VALUES keyword is row data (multi-tuple included).
-    (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
-    # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
-    (re.compile(r"(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
-    # Credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(\w+://)[^/\s:@]+:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
+# The rules that match a credential and nothing else. They are also the
+# first half of what scrub_secrets_for_llm applies to a whole outbound prompt
+# (src/egress), which is why they are named on their own: a prompt holds
+# JSON, SQL placeholders and prose, and the value rules below (quoted
+# strings, JSON numbers, digit runs) would shred it. These are the SAME
+# regex objects the full list uses, in the same relative order, so the
+# Go/Python lockstep is unchanged.
+_SECRET_PATTERNS_HEAD = [
+    # Credentials embedded in URLs: scheme://user:pass@host. The user name may
+    # be empty (redis://:pass@host); requiring one left that password in clear.
+    # `(?<!\w)`: the scheme starts where its word does. Python's engine
+    # backtracks, so without it a long word run was re-read from each of its
+    # starts (quadratic; Go's RE2 is not). The leftmost match starts there
+    # anyway -- \w+ can always reach back to the run's start -- so the output
+    # is the same.
+    (re.compile(r"(?<!\w)(\w+://)[^/\s:@]*:[^/\s@]*@"), rf"\1{_SCRUB_REDACTED}@"),
     # HTTP credential headers — must run before the KV rule, whose \S+ would
     # otherwise consume only the word "Bearer" and leave the token itself.
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), f"Bearer {_SCRUB_REDACTED}"),
@@ -284,16 +171,138 @@ _SCRUB_PATTERNS = [
     # suffix — masking it would eat the Postgres "Key (email)=" detail and
     # schema metadata like partition_key. Character classes are spelled out
     # rather than using \w because Python's \w is Unicode-aware and Go's is not.
+    #
+    # The key starts where its run of key characters does, `(?<![A-Za-z0-9_.\-])`
+    # rather than Go's `\b`: from a `\b` inside a long run, Python's engine read
+    # the run again from each start (quadratic). The key name is kept whole, so
+    # the output is the same, and a key after a non-ASCII letter (éPASSWORD=)
+    # is now taken as Go takes it.
     # MUST stay lockstep with Go llmscrub + the sink worker's scrubLog.
     (
         re.compile(
-            r"\b([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
+            r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_.\-]?key|access[_.\-]?key|private[_.\-]?key))\b\s*[=:]\s*\S+",
             re.IGNORECASE,
         ),
         rf"\1={_SCRUB_REDACTED}",
     ),
     # Bare JWTs (base64url evades the base64 rule's charset/length): eyJ = {"
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{4,}(?:\.[A-Za-z0-9_\-]+){1,2}"), _SCRUB_REDACTED),
+]
+# Long base64-ish blobs (tokens, keys). 40+ chars keeps 32-hex trace ids.
+_B64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+# Inside a URL path: a 40+ blob with no `/` (the path's own slashes are not part
+# of a token), and any 20+ run of letters AND digits (_redact_mixed_token): a
+# sheet id, a webhook secret, a bot token.
+_URL_PATH_BLOB = re.compile(r"[A-Za-z0-9+]{40,}={0,2}")
+_URL_TOKEN = re.compile(r"[A-Za-z0-9_\-]{20,}")
+# The value of a credential-named query or fragment parameter: ?key=,
+# &X-Amz-Signature=, &X-Amz-Credential=, ?code=, #access_token=.
+_URL_QUERY_CRED = re.compile(
+    r"(?i)([?&;#][A-Za-z0-9_.\-]*(?:key|sig|signature|secret|token|password|passwd|pwd|auth|credential|code)=)[^&#\s'\"<>]*"
+)
+_URL_PATH_START = re.compile(r"[/?#]")
+_URL_QUERY_START = re.compile(r"[?#]")
+
+
+def _redact_mixed_token(m: "re.Match[str]") -> str:
+    """A _URL_TOKEN run holding a letter and a digit is a token; a word run
+    like HubSpot-public-api-spec-collection has no digit and stays."""
+    t = m.group(0)
+    if any(c.isdigit() for c in t) and any(c.isalpha() for c in t):
+        return _SCRUB_REDACTED
+    return t
+
+
+def _scrub_url(url: str) -> str:
+    """Keep a URL readable and take what in it can be a secret: a blob in
+    scheme://authority, token-shaped path segments, and credential parameters
+    and blobs in the query or fragment. Userinfo was already taken by the
+    URL-credential rule."""
+    start = url.find("://") + 3
+    m = _URL_PATH_START.search(url, start)
+    end = m.start() if m else len(url)
+    head, path, query = url[:end], url[end:], ""
+    m = _URL_QUERY_START.search(path)
+    if m:
+        path, query = path[: m.start()], path[m.start():]
+    head = _B64.sub(_SCRUB_REDACTED, head)
+    path = _URL_TOKEN.sub(_redact_mixed_token, _URL_PATH_BLOB.sub(_SCRUB_REDACTED, path))
+    query = _URL_QUERY_CRED.sub(rf"\1{_SCRUB_REDACTED}", query)
+    query = _URL_TOKEN.sub(_redact_mixed_token, _B64.sub(_SCRUB_REDACTED, query))
+    return head + path + query
+
+
+def _scrub_url_or_blob(m: "re.Match[str]") -> str:
+    return _scrub_url(m.group(1)) if m.group(1) is not None else _SCRUB_REDACTED
+
+
+# A URL, or else a long base64-ish blob (_B64). Read as one blob, a long URL path
+# became `…HubSpot-public-api-spec-[redacted].json`, while a key in a short query
+# value went through untouched. A URL goes to _scrub_url instead. The scheme is
+# capped at 32 characters so a long dotted run cannot make this engine
+# quadratic. MUST stay lockstep with Go llmscrub (reURLOrBase64 + scrubURL).
+_SECRET_PATTERN_URL_OR_B64 = (
+    re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s'\"<>]+)|\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    _scrub_url_or_blob,
+)
+_SECRET_PATTERNS = _SECRET_PATTERNS_HEAD + [_SECRET_PATTERN_URL_OR_B64]
+
+
+class _RunStartRule:
+    """A rule that opens with a run of one character class, matched in linear
+    time by Python's backtracking engine, with the output ``re.sub`` gives.
+
+    From every start inside a long run, ``re`` reads the rest of the run again
+    before it fails, so a 20 KB run takes seconds (Go's RE2 does not). The
+    leftmost match only starts inside a run right where the previous match
+    ended, so that one position is tried as it is, and every other start must
+    not follow a character of the run. ``body`` must not match the empty
+    string.
+    """
+
+    def __init__(self, body: str, run_class: str) -> None:
+        self.pattern = body
+        self._at = re.compile(body)
+        self._after_run = re.compile(rf"(?<!{run_class})(?:{body})")
+
+    def sub(self, repl: str, string: str) -> str:
+        out, pos = [], 0
+        while True:
+            m = (self._at.match(string, pos) if pos else None) or self._after_run.search(string, pos)
+            if m is None:
+                break
+            out.append(string[pos : m.start()])
+            out.append(m.expand(repl))
+            pos = m.end()
+        out.append(string[pos:])
+        return "".join(out)
+
+
+# A host name, in the places error text puts one: `lookup X`, `dial tcp X`,
+# libpq's `host name "X"`, `host "X"` and `server at "X"`. A bare dotted name has
+# the same shape as schema.table, which a diagnosis needs, so the name is taken
+# only after one of these words, and only when it has a dot: `lookup postgres`
+# (a compose service) and the prose `lookup failed:` stay. `_` is allowed for
+# SRV names (_mongodb._tcp.cluster0...). Runs after the IPv4 rule, so an address
+# is already [ip-redacted]. src.egress.fields.mask_endpoints applies it too.
+# MUST stay lockstep with Go llmscrub + the sink worker's scrubLog.
+HOST_IN_ERROR_TEXT = re.compile(
+    r'(?i)(\blookup\s+|\bdial\s+(?:tcp|udp)[46]?\s+|\bhost(?:\s+name)?\s+"|\bserver\s+at\s+")'
+    r"[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+"
+)
+
+_SCRUB_PATTERNS = [
+    # Postgres not-null/check DETAIL dumps the ENTIRE row — greedy to end of
+    # string so a truncated dump can't leak a partial row.
+    (re.compile(r"\bFailing row contains\b.*", re.IGNORECASE | re.DOTALL), f"Failing row contains ({_SCRUB_REDACTED})"),
+    # Everything after a SQL VALUES keyword is row data (multi-tuple included).
+    (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
+    # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
+    # The column list stops at the next `Key (`, so a run of `Key (Key (...` is
+    # linear, not quadratic; the output is the same as without the stop, and as
+    # Go's RE2 copy (pkg/llmscrub).
+    (re.compile(r"(\bKey\s*\((?:(?!\bKey\s*\()[^)])*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
+    *_SECRET_PATTERNS_HEAD,
     # Double-quoted string directly after a colon — Postgres quotes offending
     # VALUES this way ('invalid input syntax for type integer: "jane"') and it
     # catches JSON string values; identifier quoting never follows a colon.
@@ -313,10 +322,15 @@ _SCRUB_PATTERNS = [
     # `'[redacted]'` this rule had just written and appended another
     # `'[redacted]`, corrupting already-redacted text. `\Z` (not `$`) so this
     # matches Go's `$`, which never matches before a trailing newline.
+    #
+    # `\\?\Z`: a cut can also land right after a backslash ('john\\), where
+    # `\\.` has nothing left to pair with. Without it that literal matched
+    # nowhere and went through whole, and a long run of `'\\` was read again
+    # from every quote (quadratic in Python).
     # MUST stay lockstep with Go llmscrub + base_connector scrub_sensitive.
-    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
+    (re.compile(r"(^|[^A-Za-z0-9_])'(?:[^'\\]|\\.)*(?:'|\\?\Z)", re.DOTALL), rf"\1'{_SCRUB_REDACTED}'"),
     # Email addresses appearing outside quotes.
-    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[email-redacted]"),
+    (_RunStartRule(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", r"[A-Za-z0-9._%+\-]"), "[email-redacted]"),
     # IPv4 addresses — client/host IPs are personal data under GDPR and aren't
     # needed for diagnosis. Octets are validated 0-255, so 3-part version strings
     # (8.0.32) and ISO dates don't match; a 4-part dotted-quad (incl. a rare
@@ -325,8 +339,9 @@ _SCRUB_PATTERNS = [
         re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b"),
         "[ip-redacted]",
     ),
-    # Long base64-ish blobs (tokens, keys). 40+ chars keeps 32-hex trace ids.
-    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), _SCRUB_REDACTED),
+    (HOST_IN_ERROR_TEXT, r"\1[host-redacted]"),
+    # URLs (readable, secrets inside taken), else long base64-ish blobs.
+    _SECRET_PATTERN_URL_OR_B64,
     # Dashed SSN / US-phone shapes (ISO dates \d{4}-\d{2}-\d{2} don't match —
     # timestamps must survive for diagnosis).
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[num-redacted]"),
@@ -351,6 +366,27 @@ def scrub_error_for_llm(text: Optional[str], max_len: int = 0) -> str:
         result = pattern.sub(replacement, result)
     if max_len > 0 and len(result) > max_len:
         result = result[:max_len] + "…"
+    return result
+
+
+def scrub_secrets_for_llm(text: Optional[str]) -> str:
+    """Mask credentials only: URL userinfo, Bearer tokens, credential key=value
+    pairs, JWTs, long base64 blobs, and tokens and credential parameters in URLs.
+
+    The egress guard (src/egress) runs this over every message of every prompt,
+    before and after any added stage. It is the credential half of
+    scrub_error_for_llm and deliberately not the rest: a prompt is made of
+    rsync.ai's own template text, JSON and SQL with its literals already replaced,
+    and the value rules would mangle all three. Row values never reach a prompt
+    in the first place -- each variable is projected by its field class
+    (src/egress/fields.py) -- so this is the backstop for what a user types or
+    pastes.
+    """
+    if not text:
+        return ""
+    result = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -388,11 +424,11 @@ def connections_for_llm(connections: Optional[list]) -> list:
     return out
 
 
-# Convenience function for trace context with masked config
 # Keys in a diagnose-evidence object whose string values are free-form error or log
-# text. Anything NOT named here is treated as metadata and passed to the prompt
-# verbatim, which is what keeps a diagnosis readable: table and column names, stage
-# ids, statuses and counts are exactly what the model needs.
+# text. Anything NOT named here is treated as metadata and kept, which is what keeps
+# a diagnosis readable: table and column names, stage ids and statuses are what the
+# model needs. Counts and sizes are kept only as yes/no -- the egress guard's
+# evidence class does that after this scrub (src/egress/fields.py).
 #
 # The second line of this set is what makes it a backstop rather than a decoration.
 # An audit found the original set naming keys no producer writes while missing the
@@ -434,26 +470,3 @@ def scrub_evidence_for_llm(evidence: Any, _inherited: bool = False) -> Any:
     if isinstance(evidence, list):
         return [scrub_evidence_for_llm(v, _inherited) for v in evidence]
     return evidence
-
-
-def log_context(trace_id: str, config: Optional[Dict[str, Any]] = None, **extra) -> Dict[str, Any]:
-    """
-    Create a log context dictionary with trace_id and masked config.
-    
-    Args:
-        trace_id: Trace ID for correlation
-        config: Optional config to mask and include
-        **extra: Additional fields to include
-        
-    Returns:
-        Dictionary suitable for structured logging
-    """
-    context = {
-        "trace_id": trace_id,
-        **extra
-    }
-    
-    if config is not None:
-        context["config_summary"] = config_summary(config)
-    
-    return context

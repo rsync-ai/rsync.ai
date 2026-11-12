@@ -224,6 +224,37 @@ func TestAttachChecks_MergesRemediationAcrossObjects(t *testing.T) {
 	}
 }
 
+// A gateway finding that carries its fix in details (steps, sql_to_run) shows
+// it on the tab too, whether the details are fresh or read back from JSON.
+func TestAttachChecks_UnconstrainedNumericCarriesItsAlter(t *testing.T) {
+	fresh := assessTable(TableMetadata{
+		Name: "ledger", Schema: "billing", PrimaryKeys: []string{"id"},
+		Columns: []ColumnMetadata{{Name: "id", Type: "integer"}, {Name: "rate", Type: "numeric"}},
+	}, true, nil)
+	body, _ := json.Marshal(fresh)
+	var stored AssessmentTable
+	if err := json.Unmarshal(body, &stored); err != nil {
+		t.Fatal(err)
+	}
+	for name, tbl := range map[string]AssessmentTable{"fresh": fresh, "stored": stored} {
+		report := &AssessmentReport{Tables: []AssessmentTable{tbl}}
+		attachChecks(report, nil)
+		row, ok := findCheckRow(report.Checks, FindingUnconstrainedNumeric, ResultWarning)
+		if !ok || row.Level != LevelMedium || row.Category != CategoryTables {
+			t.Fatalf("%s: row = %+v, ok=%v", name, row, ok)
+		}
+		want := `ALTER TABLE "billing"."ledger" ALTER COLUMN "rate" TYPE numeric(p,s);`
+		if row.Remediation == nil || len(row.Remediation.Steps) == 0 ||
+			strings.Join(row.Remediation.SQLToRun, "\n") != want {
+			t.Fatalf("%s: remediation = %+v, want the steps and %q", name, row.Remediation, want)
+		}
+		// Medium: listed and counted, but no Critical/High alert.
+		if len(alertKeys(report.Checks)) != 0 {
+			t.Fatalf("%s: an unconstrained numeric must not raise an alert", name)
+		}
+	}
+}
+
 func TestAttachChecks_NilSafe(t *testing.T) {
 	attachChecks(nil, nil)
 	report := &AssessmentReport{}

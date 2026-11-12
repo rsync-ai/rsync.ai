@@ -59,7 +59,8 @@ DEST_AUTH_REFUSED_ERROR = (
 
 # Destination-config key for the object-storage CDC flush interval: the longest time
 # changes wait in the worker before they are written as one file. Only object-storage
-# destinations use it; unset keeps the worker's 30-second default. The bounds mirror
+# destinations use it; unset keeps the worker's default (defaultObjectFlushInterval, the
+# 240s ceiling), which the refusal below names. The bounds mirror
 # minObjectFlushIntervalSeconds / maxObjectFlushIntervalSeconds in the worker's main.go,
 # which refuses the same values at startup (see there for why the ceiling is 240s).
 # Both sides are pinned to the worker's testdata/flush_interval_cases.json; change all
@@ -67,6 +68,19 @@ DEST_AUTH_REFUSED_ERROR = (
 FLUSH_INTERVAL_KEY = "max_file_interval_seconds"
 MIN_FLUSH_INTERVAL_SECONDS = 1
 MAX_FLUSH_INTERVAL_SECONDS = 240
+DEFAULT_FLUSH_INTERVAL_SECONDS = 240
+
+# Destination-config batch settings for relational and warehouse CDC: the most rows,
+# the most MB, and the longest wait before the worker writes a batch. Unset keeps the
+# worker's defaults. Each is (key, unit printed after "whole number", lo, hi), mirroring
+# batchSettings in the worker's cdc_batch_apply.go, which refuses the same values at
+# startup. Both sides run the worker's testdata/batch_setting_cases.json; change all
+# three together.
+BATCH_SETTINGS = (
+    ("batch_max_rows", "", 1, 1_000_000),
+    ("batch_max_mb", " of MB", 1, 1024),
+    ("batch_interval_seconds", " of seconds", MIN_FLUSH_INTERVAL_SECONDS, MAX_FLUSH_INTERVAL_SECONDS),
+)
 
 # cgroup files that count kernel OOM kills in THIS container (all workers share it).
 # A kernel OOM kill SIGKILLs the Go worker before it can log anything, so the only
@@ -115,6 +129,40 @@ def _describe_exit(returncode: Optional[int]) -> Dict[str, Any]:
     }
 
 
+def _whole_number(raw: Any) -> "tuple[bool, Optional[int]]":
+    """Read a whole-number setting the way the worker does: (is_set, value or None).
+
+    Accepts what the two callers send: a JSON number from a direct caller, or a string
+    from the orchestrator (which flattens connection config to strings, turning a JSON
+    null into "<nil>"). An unset value is (False, None); a set value the worker cannot
+    read as a whole number is (True, None).
+    """
+    if raw is None:
+        return False, None
+    if isinstance(raw, bool):
+        return True, None
+    if isinstance(raw, int):
+        return True, raw
+    if isinstance(raw, float):
+        return True, (int(raw) if raw.is_integer() else None)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text in ("", "<nil>") or text.lower() == "null":
+            return False, None
+        digits = text[1:] if text[:1] in ("+", "-") else text
+        # ASCII digits only: int() would also take "1_000" and non-ASCII digits,
+        # which the worker's parser refuses.
+        if digits and all("0" <= ch <= "9" for ch in digits):
+            return True, int(text)
+    return True, None
+
+
+def _shown(raw: Any) -> str:
+    """The refused value as a refusal prints it: at most 32 characters."""
+    shown = str(raw)
+    return shown[:32] + "..." if len(shown) > 32 else shown
+
+
 def flush_interval_error(destination_config: Any) -> Optional[str]:
     """Return a plain-words error if the flush interval setting is invalid, else None.
 
@@ -128,39 +176,50 @@ def flush_interval_error(destination_config: Any) -> Optional[str]:
     if not isinstance(destination_config, dict):
         return None
     raw = destination_config.get(FLUSH_INTERVAL_KEY)
-    if raw is None:
+    is_set, value = _whole_number(raw)
+    if not is_set:
         return None
-    value: Optional[int] = None
-    if isinstance(raw, bool):
-        value = None
-    elif isinstance(raw, int):
-        value = raw
-    elif isinstance(raw, float):
-        if raw.is_integer():
-            value = int(raw)
-    elif isinstance(raw, str):
-        text = raw.strip()
-        if text in ("", "<nil>") or text.lower() == "null":
-            return None
-        digits = text[1:] if text[:1] in ("+", "-") else text
-        # ASCII digits only: int() would also take "1_000" and non-ASCII digits,
-        # which the worker's parser refuses.
-        if digits and all("0" <= ch <= "9" for ch in digits):
-            value = int(text)
     if value is not None and MIN_FLUSH_INTERVAL_SECONDS <= value <= MAX_FLUSH_INTERVAL_SECONDS:
         return None
-    shown = str(raw)
-    if len(shown) > 32:
-        shown = shown[:32] + "..."
+    shown = _shown(raw)
     return (
         f"{FLUSH_INTERVAL_KEY} must be a whole number of seconds from "
         f"{MIN_FLUSH_INTERVAL_SECONDS} to {MAX_FLUSH_INTERVAL_SECONDS} (got {shown!r}). "
-        f"Clear the setting to use the 30-second default."
+        f"Clear the setting to use the {DEFAULT_FLUSH_INTERVAL_SECONDS}-second default."
     )
+
+
+def batch_settings_error(destination_config: Any) -> Optional[str]:
+    """Return a plain-words error for the first invalid batch setting, else None.
+
+    Checked before the worker is spawned for the same reason as flush_interval_error:
+    the worker refuses the same values at startup (batchSettingsError) and would exit
+    before it could say why. Refuses rather than clamps.
+    """
+    if not isinstance(destination_config, dict):
+        return None
+    for key, unit, lo, hi in BATCH_SETTINGS:
+        raw = destination_config.get(key)
+        is_set, value = _whole_number(raw)
+        if not is_set or (value is not None and lo <= value <= hi):
+            continue
+        return (
+            f"{key} must be a whole number{unit} from {lo} to {hi} "
+            f"(got {_shown(raw)!r}). Clear the setting to use the default."
+        )
+    return None
 
 
 class KafkaMCPSinkConnector(BaseMCPConnector):
     """Thin Python MCP wrapper that manages Go workers for Kafka → Destination sink"""
+
+    # How long stop_sink gives a worker to exit on SIGTERM before it kills it.
+    _STOP_GRACE_SECONDS = 30
+    # How long start_sink waits for a worker a stop_sink is already stopping (the
+    # stop's grace plus room for its kill). Past it the start fails as "stopping".
+    _STOPPING_WAIT_SECONDS = 35
+    # How long start_sink waits for another start of the same group to finish.
+    _STARTING_WAIT_SECONDS = 75
 
     def __init__(self):
         super().__init__()
@@ -187,6 +246,14 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         # endpoint — a caller polling metrics_url would then cross-read a sibling
         # worker's progress. Guarded by self._lock alongside self.workers.
         self._reserved_ports: set[int] = set()
+
+        # Consumer groups whose start_sink is in flight. start_sink releases the lock
+        # between its registry check and storing the new record (spawn and readiness
+        # take seconds), so two starts for one group used to both spawn, and the
+        # second record overwrote the first: a worker in the group that nothing
+        # listed, stopped or respawned. One start per group at a time; a second one
+        # waits for the first and then sees its worker. Guarded by self._lock.
+        self._starting: set[str] = set()
 
         # Supervisor: a daemon thread that respawns any worker whose process has
         # died unexpectedly (crash / OOM / SIGKILL), so a dead sink does not
@@ -301,7 +368,6 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             "default_destination_operation": "start_sink",
             "terminology": {"entity": "topic", "record": "message", "field": "field"},
             "operations": ops,
-            "optimization_category": self.optimization_category,
             "performance_target_ms": self._performance_target_ms,
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -362,15 +428,42 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         # Metrics port reserved for this worker (released in finally). None until picked.
         metrics_port = None
         previous_exit = None
+        worker_id = None
+        claimed = False
+        # The execution this start is for. The worker records it as its owner, so a
+        # stop can be made conditional on it (stop_sink only_if_execution_id).
+        requested_exec = str(config.get("execution_id") or "").strip()
 
         try:
             worker_id = self._get_worker_id(params)
+            claimed = self._claim_start(worker_id)
+            if not claimed:
+                return {
+                    "success": False,
+                    "status": "starting",
+                    "worker_id": worker_id,
+                    "error": (
+                        f"another start_sink for '{worker_id}' is still in progress; "
+                        f"retry shortly"
+                    ),
+                }
+
+            # Workers to wait out (a stop_sink is already stopping them) or to replace
+            # (restart_on_new_execution and this is a new execution) before starting.
+            stopping = None
+            replacing = None
 
             # Check if already running
             with self._lock:
                 if worker_id in self.workers:
                     worker = self.workers[worker_id]
-                    if self._is_worker_alive(worker_id):
+                    if self._is_worker_alive(worker_id) and worker.get("intentional_stop"):
+                        # A stop_sink is stopping this worker. It is on its way out
+                        # and the supervisor will not respawn it: reporting it as
+                        # already_running would hand this start a worker that exits
+                        # moments later. Wait for it, then start a fresh one.
+                        stopping = self._worker_family(worker_id)
+                    elif self._is_worker_alive(worker_id):
                         # Idempotent re-call is only safe for the SAME topics. A
                         # different topic set under the same worker_id means two
                         # pipelines collided on consumer_group/pipeline_id (e.g.
@@ -402,21 +495,64 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                                     f"consumer_group/pipeline_id per sink."
                                 ),
                             }
-                        return {
-                            "success": True,
-                            "status": "already_running",
-                            "worker_id": worker_id,
-                            "pid": worker.get("pid"),
-                            "restart_attempts": worker.get("restart_attempts", 0),
-                            "consumer_group": config.get("consumer_group"),
-                            "metrics_url": f"http://localhost:{worker['metrics_port']}/status"
-                        }
+                        owner = self._owner_execution_id(worker)
+                        if (
+                            config.get("restart_on_new_execution")
+                            and requested_exec
+                            and requested_exec != owner
+                        ):
+                            # A batch run's worker belongs to that run: its config
+                            # (execution id, destination) is the previous run's. Stop
+                            # it and start this run's own. The same execution asking
+                            # again (a chunked continuation) keeps its worker below.
+                            replacing = self._worker_family(worker_id)
+                            for _, w in replacing:
+                                w["intentional_stop"] = True
+                            self.log(
+                                f"Worker {worker_id} belongs to execution {owner or 'none'}; "
+                                f"replacing it for execution {requested_exec}",
+                                level="info",
+                            )
+                        else:
+                            # The worker now serves this execution.
+                            if requested_exec:
+                                for _, w in self._worker_family(worker_id):
+                                    w["owner_execution_id"] = requested_exec
+                            return {
+                                "success": True,
+                                "status": "already_running",
+                                "worker_id": worker_id,
+                                "pid": worker.get("pid"),
+                                "restart_attempts": worker.get("restart_attempts", 0),
+                                "consumer_group": config.get("consumer_group"),
+                                "metrics_url": f"http://localhost:{worker['metrics_port']}/status"
+                            }
                     else:
                         # Was running but died - clean up and restart. Keep how it
                         # died so the fresh worker's sink_status still shows it.
                         previous_exit = self._record_worker_exit(worker_id, worker)
                         self.log(f"Worker {worker_id} died, restarting", level="warn")
                         self._cleanup_worker(worker_id)
+
+            if stopping is not None:
+                if not self._wait_for_exit(stopping, self._STOPPING_WAIT_SECONDS):
+                    return {
+                        "success": False,
+                        "status": "stopping",
+                        "worker_id": worker_id,
+                        "error": (
+                            f"worker '{worker_id}' is being stopped and has not exited "
+                            f"after {self._STOPPING_WAIT_SECONDS}s; retry once it has"
+                        ),
+                    }
+                with self._lock:
+                    previous_exit = self._record_worker_exit(worker_id, stopping[0][1])
+                    self._forget_workers(stopping)
+            if replacing is not None:
+                self._terminate_workers(replacing)
+                with self._lock:
+                    previous_exit = self._record_worker_exit(worker_id, replacing[0][1])
+                    self._forget_workers(replacing)
 
             # Prepare worker config
             topics_list = self._normalize_topics(config.get("topics"))
@@ -473,7 +609,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
 
             # Supervisor policy: auto-restart a worker that dies unexpectedly
             # (default ON). Set auto_restart=False to leave a fail-closed halt
-            # (DLQ-down, destructive schema change) observable as status=stopped.
+            # (DLQ-down) observable as status=stopped.
             auto_restart = config.get("auto_restart", True)
 
             # Validate required fields
@@ -486,6 +622,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             interval_error = flush_interval_error(worker_config["destination_config"])
             if interval_error:
                 return {"success": False, "status": "invalid_config", "error": interval_error}
+            batch_error = batch_settings_error(worker_config["destination_config"])
+            if batch_error:
+                return {"success": False, "status": "invalid_config", "error": batch_error}
 
             # Start Go worker
             process = self._spawn_worker_process(worker_config)
@@ -501,6 +640,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "intentional_stop": False,
                     "auto_restart": auto_restart,
                     "last_exit": previous_exit,
+                    "owner_execution_id": worker_config["execution_id"],
                 }
 
             # Wait for worker to be ready (best-effort)
@@ -554,6 +694,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                             "restart_attempts": 0,
                             "intentional_stop": False,
                             "auto_restart": auto_restart,
+                            "owner_execution_id": sib_cfg["execution_id"],
                         }
                     self._wait_for_worker_ready(sib_port, timeout=5)
                     replica_urls.append(f"http://localhost:{sib_port}/status")
@@ -587,6 +728,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             if metrics_port is not None:
                 with self._lock:
                     self._reserved_ports.discard(metrics_port)
+            if claimed:
+                with self._lock:
+                    self._starting.discard(worker_id)
 
     def stop_sink(self, params: Dict = None) -> Dict[str, Any]:
         """
@@ -594,43 +738,47 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
 
         Expected params.config:
         - consumer_group: str (or pipeline_id)
+        - only_if_execution_id: str (optional). Stop only if this execution still
+          owns the worker; otherwise answer status "not_owner" and leave it running.
+          The orchestrator's reaper sends it, so a stop it decided on for a finished
+          run cannot stop the worker a newer run has since taken over. A stop with
+          no owner (the user's Stop and Delete) stops whatever runs.
         """
         params = params or {}
 
         try:
             base = self._get_worker_id(params)
+            only_if = str((params.get("config") or {}).get("only_if_execution_id") or "").strip()
 
             with self._lock:
-                ids = self._replica_ids(base)
-                if not ids:
+                targets = self._worker_family(base)
+                if not targets:
                     return {"success": False, "error": f"Worker not found: {base}"}
+                if only_if:
+                    owner = self._owner_execution_id(targets[0][1])
+                    if owner != only_if:
+                        return {
+                            "success": False,
+                            "status": "not_owner",
+                            "worker_id": base,
+                            "execution_id": owner,
+                            "error": f"Worker not owned by that execution: {base} serves "
+                                     f"{owner or 'no recorded execution'}, not {only_if}",
+                        }
                 # Mark ALL replicas intentional BEFORE terminating so the supervisor
                 # (which may observe a dead process before cleanup) does not resurrect
                 # any of them.
-                targets = []
-                for wid in ids:
-                    w = self.workers.get(wid)
-                    if w:
-                        w["intentional_stop"] = True
-                        targets.append((wid, w))
+                for _, w in targets:
+                    w["intentional_stop"] = True
 
-            # Send SIGTERM for graceful shutdown (outside the lock — wait() can take
-            # up to 30s and must not block sink_status / the supervisor poll).
-            for wid, worker in targets:
-                try:
-                    worker["process"].terminate()
-                    try:
-                        worker["process"].wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        self.log(f"Worker {wid} did not stop gracefully, force killing", level="warn")
-                        worker["process"].kill()
-                except Exception as e:
-                    self.log(f"Error stopping worker {wid}: {e}", level="warn")
+            # SIGTERM outside the lock: the wait can take the whole grace and must not
+            # block sink_status or the supervisor poll.
+            self._terminate_workers(targets)
 
-            # Clean up all replicas.
+            # Forget the records this call stopped — only those. A start_sink that
+            # landed during the wait may already hold the key with its new worker.
             with self._lock:
-                for wid, _ in targets:
-                    self._cleanup_worker(wid)
+                self._forget_workers(targets)
 
             return {
                 "success": True,
@@ -651,7 +799,8 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         The orchestrator's orphan reaper (sink_worker_reaper.go) calls this to find
         workers whose pipeline was deleted or stopped while their stop_sink failed.
         pipeline_id is whatever start_sink was given; the reaper ignores a worker
-        whose pipeline_id is not a UUID.
+        whose pipeline_id is not a UUID. execution_id is the execution that last
+        started or reused the worker ("" when none was given).
         """
         with self._lock:
             workers = []
@@ -663,6 +812,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "worker_id": wid,
                     "consumer_group": cfg.get("consumer_group") or wid,
                     "pipeline_id": cfg.get("pipeline_id") or "",
+                    # The execution the worker serves now: the reaper stops a finished
+                    # batch run's worker on the condition that it still does.
+                    "execution_id": self._owner_execution_id(w),
                     "intentional_stop": bool(w.get("intentional_stop")),
                     "crashed": bool(w.get("crashed")),
                 })
@@ -895,6 +1047,71 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         """Clean up a worker"""
         if worker_id in self.workers:
             del self.workers[worker_id]
+
+    def _worker_family(self, base_worker_id: str) -> list:
+        """(worker_id, record) for the base worker and its replicas, base first.
+        Caller holds ``self._lock``."""
+        ids = sorted(self._replica_ids(base_worker_id), key=lambda wid: wid != base_worker_id)
+        return [(wid, self.workers[wid]) for wid in ids if wid in self.workers]
+
+    @staticmethod
+    def _owner_execution_id(worker: Optional[Dict[str, Any]]) -> str:
+        """The execution a worker serves: set at start, moved by each start_sink that
+        reuses it. Falls back to the execution it was started for."""
+        if not worker:
+            return ""
+        owner = worker.get("owner_execution_id")
+        if owner is None:
+            owner = (worker.get("config") or {}).get("execution_id")
+        return str(owner or "")
+
+    def _claim_start(self, worker_id: str) -> bool:
+        """Mark a start of ``worker_id`` in flight, waiting for one already in flight
+        to finish first. False if it did not finish in time."""
+        deadline = time.monotonic() + self._STARTING_WAIT_SECONDS
+        while True:
+            with self._lock:
+                if worker_id not in self._starting:
+                    self._starting.add(worker_id)
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    def _terminate_workers(self, targets: list) -> None:
+        """SIGTERM each worker, wait out the grace, kill what is left. Call it without
+        ``self._lock``: the wait can take the whole grace."""
+        for wid, worker in targets:
+            try:
+                worker["process"].terminate()
+                try:
+                    worker["process"].wait(timeout=self._STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    self.log(f"Worker {wid} did not stop gracefully, force killing", level="warn")
+                    worker["process"].kill()
+            except Exception as e:
+                self.log(f"Error stopping worker {wid}: {e}", level="warn")
+
+    def _wait_for_exit(self, targets: list, timeout: float) -> bool:
+        """Wait, without signalling, for workers another call is stopping. True once
+        every process has exited. Call it without ``self._lock``."""
+        deadline = time.monotonic() + timeout
+        for _, worker in targets:
+            try:
+                worker["process"].wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                return False
+            except Exception:
+                return False
+        return True
+
+    def _forget_workers(self, targets: list) -> None:
+        """Remove exactly these records. A key that now holds a different record (a
+        start that replaced the worker meanwhile) is left alone.
+        Caller holds ``self._lock``."""
+        for wid, record in targets:
+            if self.workers.get(wid) is record:
+                del self.workers[wid]
 
     def _record_worker_exit(self, worker_id: str, worker: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Store and log how a dead worker's process ended, once per process.

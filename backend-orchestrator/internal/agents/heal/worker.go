@@ -104,6 +104,10 @@ type HealWorker struct {
 	Attempts *AttemptStore
 	// Verifier closes the loop. Nil disables the verify loop only.
 	Verifier Verifier
+	// Notifications receives the PIPELINE_RUN_FAILED notice for each run the zombie sweep
+	// reaps. Nil sends nothing. Set it with NotifyRunFailuresVia, which also hands it to
+	// ZombieSweeper, so the 60s and hourly sweeps tell people the same things.
+	Notifications NotificationProducer
 }
 
 // AutoHealHooks lets the caller inject the cleanup + repair callbacks
@@ -361,9 +365,42 @@ const sweepCandidatesQuery = `
 		LIMIT $3
 	`
 
-// sweep queries for executions that have failed since the healer last looked at
-// them and processes each one.
+// sweep runs the healer's passes in turn. None of them reads another's rows, so a
+// failing query skips its own pass and no other: an early return from the first one
+// used to take the zombie sweep, the reaper and the issue sweep down with it.
 func (w *HealWorker) sweep(ctx context.Context) {
+	w.sweepExecutions(ctx)
+
+	// Belt-and-suspenders: close any zombie executions that are still
+	// status='running' with no end_time after ZombieTimeout. These arise from:
+	//   1. CDC runs created before the streaming_active fix (never closed)
+	//   2. Temporal workflow timeouts / worker crashes on batch runs
+	w.sweepZombies(ctx)
+
+	// And the complement of the zombie sweep's HITL guard: runs whose execution
+	// DID end terminally but whose pipeline row was never closed, because the
+	// run ended while parked at a human-in-the-loop step.
+	w.reconcileStaleParks(ctx)
+
+	// Close out issues whose pipeline has been deleted. Ordered BEFORE the issue
+	// sweep, not after: the sweep's CTE is MATERIALIZED, so its LIMIT is applied
+	// to the issue scan and orphans occupy slots in the batch before the join to
+	// pipelines discards them. Reaping first keeps the batch budget spent on
+	// issues the healer can actually act on. See issue_reaper.go.
+	if _, err := w.reapOrphanedIssues(ctx); err != nil {
+		log.WithError(err).Warn("healer: orphaned-issue reap error")
+	}
+
+	// Second candidate source: pipelines the Sentinel has already declared broken
+	// but which have no terminal execution to be swept above — a wedged CDC
+	// stream, a stalled batch run. Runs last so a slow issue query can never
+	// delay the failure-driven path. See issue_sweep.go.
+	w.sweepIssues(ctx)
+}
+
+// sweepExecutions queries for executions that have failed since the healer last
+// looked at them and processes each one.
+func (w *HealWorker) sweepExecutions(ctx context.Context) {
 	rows, err := w.DB.QueryContext(ctx, sweepCandidatesQuery,
 		GracePeriod.String(), RehealCooldown.String(), BatchSize)
 	if err != nil {
@@ -466,32 +503,6 @@ func (w *HealWorker) sweep(ctx context.Context) {
 		}
 		log.WithFields(lf).Info("healer: sweep processed execution")
 	}
-
-	// Belt-and-suspenders: close any zombie executions that are still
-	// status='running' with no end_time after ZombieTimeout. These arise from:
-	//   1. CDC runs created before the streaming_active fix (never closed)
-	//   2. Temporal workflow timeouts / worker crashes on batch runs
-	w.sweepZombies(ctx)
-
-	// And the complement of the zombie sweep's HITL guard: runs whose execution
-	// DID end terminally but whose pipeline row was never closed, because the
-	// run ended while parked at a human-in-the-loop step.
-	w.reconcileStaleParks(ctx)
-
-	// Close out issues whose pipeline has been deleted. Ordered BEFORE the issue
-	// sweep, not after: the sweep's CTE is MATERIALIZED, so its LIMIT is applied
-	// to the issue scan and orphans occupy slots in the batch before the join to
-	// pipelines discards them. Reaping first keeps the batch budget spent on
-	// issues the healer can actually act on. See issue_reaper.go.
-	if _, err := w.reapOrphanedIssues(ctx); err != nil {
-		log.WithError(err).Warn("healer: orphaned-issue reap error")
-	}
-
-	// Second candidate source: pipelines the Sentinel has already declared broken
-	// but which have no terminal execution to be swept above — a wedged CDC
-	// stream, a stalled batch run. Runs last so a slow issue query can never
-	// delay the failure-driven path. See issue_sweep.go.
-	w.sweepIssues(ctx)
 }
 
 // errPrefixStatuses are the executor statuses that are encoded as a prefix on
@@ -626,8 +637,27 @@ const sweepZombiesQuery = `
 		    s.id,
 		    s.pipeline_id,
 		    (SELECT count(*) FROM reconciled),
-		    (SELECT count(*) FROM pipelines_closed)
+		    (SELECT count(*) FROM pipelines_closed),
+		    -- Whether the reap tells the pipeline's owner the run failed. Not for a CDC
+		    -- stream, whose setup run is reaped while the stream runs on, and not for a run
+		    -- or a pipeline the user paused or stopped: they chose that. A park for any
+		    -- other reason that outlived AbandonedParkTimeout is a run whose workflow
+		    -- died, so it does tell. p and pp are read in the statement's one snapshot,
+		    -- so they are the rows as they were before the updates above.
+		    COALESCE(
+		        p.id IS NOT NULL
+		        AND p.sync_mode IS DISTINCT FROM 'cdc'
+		        AND p.cdc_mode IS NULL
+		        AND p.status NOT IN ('paused', 'stopped')
+		        AND NOT EXISTS (
+		            SELECT 1 FROM pipeline_progress pp
+		            WHERE pp.execution_id = s.id
+		              AND pp.blocking_reason_type = 'paused_by_user'
+		        ),
+		        false
+		    ) AS notify_eligible
 		FROM swept s
+		LEFT JOIN pipelines p ON p.id = s.pipeline_id
 	`
 
 // sweepZombies finds executions stuck in status='running' with no end_time for
@@ -672,7 +702,7 @@ const sweepZombiesQuery = `
 //     execution of that pipeline being open, so a newer in-flight run is never
 //     clobbered.
 func (w *HealWorker) sweepZombies(ctx context.Context) {
-	if err := runZombieSweep(ctx, w.DB, ZombieTimeout); err != nil {
+	if err := runZombieSweep(ctx, w.DB, ZombieTimeout, w.Notifications); err != nil {
 		log.WithError(err).Warn("healer: sweepZombies query failed")
 	}
 }
@@ -685,7 +715,10 @@ func (w *HealWorker) sweepZombies(ctx context.Context) {
 // event previously existed only on the hourly path, which loses essentially every race against
 // a sweep running 60x more often, so a user watching a pipeline go Running → Failed almost
 // never saw who did it.
-func runZombieSweep(ctx context.Context, db *sql.DB, age time.Duration) error {
+//
+// Sends a PIPELINE_RUN_FAILED notice for each reap the statement marks notify_eligible (see
+// zombie_notice.go). Nil notify sends none.
+func runZombieSweep(ctx context.Context, db *sql.DB, age time.Duration, notify NotificationProducer) error {
 	if db == nil {
 		return fmt.Errorf("zombie sweep: DB is required")
 	}
@@ -699,16 +732,20 @@ func runZombieSweep(ctx context.Context, db *sql.DB, age time.Duration) error {
 	}
 	defer rows.Close()
 
-	type reap struct{ execID, pipelineID string }
+	type reap struct {
+		execID, pipelineID string
+		notify             bool
+	}
 	var reaped []reap
 	var reconciledCount, pipelinesClosedCount int
 	for rows.Next() {
 		var execID, pipelineID sql.NullString
-		if err := rows.Scan(&execID, &pipelineID, &reconciledCount, &pipelinesClosedCount); err != nil {
+		var notifyEligible bool
+		if err := rows.Scan(&execID, &pipelineID, &reconciledCount, &pipelinesClosedCount, &notifyEligible); err != nil {
 			log.WithError(err).Warn("healer: zombie sweep scan error")
 			continue
 		}
-		reaped = append(reaped, reap{execID: execID.String, pipelineID: pipelineID.String})
+		reaped = append(reaped, reap{execID: execID.String, pipelineID: pipelineID.String, notify: notifyEligible})
 	}
 	if err := rows.Err(); err != nil {
 		// The UPDATEs already committed — the rows we did read are real reaps, so report
@@ -724,6 +761,9 @@ func runZombieSweep(ctx context.Context, db *sql.DB, age time.Duration) error {
 			"healer_zombie_swept",
 			fmt.Sprintf("Healer reaped zombie execution (stuck running >%s with no end_time)", age),
 		)
+		if r.notify {
+			sendZombieRunFailed(notify, r.pipelineID, r.execID, age, time.Now())
+		}
 	}
 
 	if len(reaped) > 0 {

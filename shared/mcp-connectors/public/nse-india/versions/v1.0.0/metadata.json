@@ -1,0 +1,78 @@
+{
+  "id": "nse-india",
+  "name": "NSE India",
+  "display_name": "NSE India",
+  "connector_type": "nse-india",
+  "version": "1.0.0",
+  "description": "End-of-day data from the National Stock Exchange of India: prices from 2016 (old and UDiFF bhavcopy), delivery %, every index close with India VIX, F&O participant open interest and volume, corporate actions, bulk and block deals, FII/DII cash flows, the listed-equity list and the NIFTY 500 / NIFTY COMMODITIES members with their industry. Reads NSE's public archive and two www.nseindia.com APIs; no settings and no credentials. Uses a plain client and does not work around bot protection.",
+  "category": "api_saas",
+  "source": "built_in",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": false,
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auth_type": "none",
+  "production_verified": false,
+  "status": "active",
+  "config_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  },
+  "configuration_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json"],
+    "supports_cdc": false,
+    "supports_source": true,
+    "supports_destination": false,
+    "supports_incremental": true
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Read the NSE equity list once",
+      "method": "nse-india_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "The connection has no settings; always valid",
+      "method": "nse-india_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "List the twelve tables and their columns",
+      "method": "nse-india_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "nse-india_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export rows from one table: the day walks are incremental by trade_date, corporate_actions by ex_date, the rest are read in full each run",
+      "method": "nse-india_export",
+      "parameters": [
+        { "name": "table", "type": "string", "required": true, "description": "One of: bhavcopy_daily, bhavcopy_history, delivery_daily, index_daily, participant_oi_daily, participant_vol_daily, corporate_actions, equity_list, bulk_deals, block_deals, fii_dii_cash, index_constituents" },
+        { "name": "limit", "type": "integer", "required": false, "default": 10000, "description": "Max rows per page" },
+        { "name": "offset", "type": "integer", "required": false, "default": 0, "description": "Row offset for paging (the full-refresh tables only)" },
+        { "name": "cursor", "type": "string", "required": false, "description": "next_cursor from the previous page of an incremental table" },
+        { "name": "since", "type": "string", "required": false, "description": "Last trade_date (or ex_date) already loaded; an incremental table reads the days after it" }
+      ]
+    }
+  ],
+  "aliases": [],
+  "license": "LicenseRef-rsync.ai-SAL-1.0"
+}

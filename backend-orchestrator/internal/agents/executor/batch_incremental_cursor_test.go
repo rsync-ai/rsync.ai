@@ -36,6 +36,27 @@ func TestMaxCursorValue(t *testing.T) {
 		{"string vs numeric falls back to new", "abc", float64(5), float64(5)},
 		{"numeric vs string falls back to new", float64(5), "abc", "abc"},
 		{"unknown type falls back to new", map[string]interface{}{}, float64(5), float64(5)},
+
+		// A composite key's cursor is a list (sql_paging.py), compared column
+		// by column. KI-DB-BATCH-PAGING-CAN-SKIP-ROWS.
+		{"composite ascending on a later column", cursorList(1, 2), cursorList(1, 3), cursorList(1, 3)},
+		{"composite descending keeps high-water", cursorList(2, 1), cursorList(1, 9), cursorList(2, 1)},
+		{"composite equal", cursorList(1, 2), cursorList(1, 2), cursorList(1, 2)},
+		{"composite text column", cursorList("a", 9), cursorList("b", 0), cursorList("b", 0)},
+		{"composite incomparable column falls back to new", cursorList(1, "x"), cursorList(1, 2), cursorList(1, 2)},
+		{"pre-composite scalar checkpoint adopts the list", float64(1), cursorList(1, 2), cursorList(1, 2)},
+		{"list then scalar falls back to new", cursorList(1, 2), float64(1), float64(1)},
+
+		// A keyless table's cursor is a row locator: a position, never a key.
+		{"locator never becomes a high-water", nil, locatorCursor("(0,2)"), nil},
+		{"locator keeps the key high-water", float64(7), locatorCursor("(0,2)"), float64(7)},
+		{"locator incumbent gives way to a key", locatorCursor("(0,2)"), float64(7), float64(7)},
+
+		// A warehouse sweep's cursor is a snapshot point and an offset: a
+		// position, never a key. KI-WAREHOUSE-BATCH-PAGING-UNORDERED.
+		{"snapshot never becomes a high-water", nil, snapshotCursor(1.7e12, 8), nil},
+		{"snapshot keeps the key high-water", float64(7), snapshotCursor(1.7e12, 8), float64(7)},
+		{"unpinned snapshot cursor keeps the key high-water", float64(7), snapshotCursor(nil, 8), float64(7)},
 	}
 
 	for _, tc := range cases {
@@ -78,6 +99,27 @@ func TestCursorAsFloat(t *testing.T) {
 			t.Fatalf("cursorAsFloat(%#v) reported numeric, want false", v)
 		}
 	}
+}
+
+// cursorList and locatorCursor build cursors the way they arrive after the
+// JSON hop.
+func cursorList(vs ...interface{}) []interface{} {
+	out := make([]interface{}, len(vs))
+	for i, v := range vs {
+		if n, ok := v.(int); ok {
+			v = float64(n)
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func locatorCursor(v string) map[string]interface{} {
+	return map[string]interface{}{"locator": v}
+}
+
+func snapshotCursor(point interface{}, offset float64) map[string]interface{} {
+	return map[string]interface{}{"snapshot": point, "offset": offset}
 }
 
 func jsonEqual(a, b interface{}) bool {

@@ -193,6 +193,8 @@ CREATE_PAYLOAD="$(cat <<JSON
   "config": {
     "connector.class": "io.debezium.connector.mysql.MySqlConnector",
     "tasks.max": "1",
+    "topic.creation.default.replication.factor": "-1",
+    "topic.creation.default.partitions": "-1",
     "database.hostname": "${MYSQL_CONTAINER}",
     "database.port": "3306",
     "database.user": "root",

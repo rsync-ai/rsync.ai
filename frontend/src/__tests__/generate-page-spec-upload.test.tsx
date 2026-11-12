@@ -176,7 +176,7 @@ describe("SpecUploadFlow", () => {
     expect(screen.queryByTestId("spec-result-success")).toBeNull()
   })
 
-  it("explains already_exists, and Replace sends force_regenerate", async () => {
+  it("explains already_exists, and the new-version box sends force_regenerate", async () => {
     authFetch.mockResolvedValueOnce(
       json(200, { success: true, status: "already_exists", connector_name: "pet-store-api", metadata: { already_exists: true } }),
     )
@@ -193,5 +193,28 @@ describe("SpecUploadFlow", () => {
     await screen.findByTestId("spec-result-success")
     await waitFor(() => expect(generateCalls()).toHaveLength(2))
     expect(generateBody(1).force_regenerate).toBe(true)
+    // this screen (the community route) can only add a version, never overwrite
+    expect(generateBody(1).overwrite).toBeUndefined()
+    expect(screen.getByTestId("spec-replace").closest("label")!.textContent).toContain("new version")
+  })
+
+  it("offers to move the connections pinned to another version", async () => {
+    authFetch.mockResolvedValueOnce(
+      json(200, {
+        success: true, status: "completed", connector_name: "pet-store-api", version: "v1.0.1",
+        pinned_connections: [{ id: "c1", name: "Pets prod", connector_version: "v1.0.0" }],
+      }),
+    )
+    authFetch.mockResolvedValueOnce(json(200, { success: true, connector_version: "v1.0.1", message: "1 connection(s) now use v1.0.1." }))
+    render(<SpecUploadFlow />)
+    await uploadPetstore()
+    fireEvent.click(screen.getByTestId("spec-generate"))
+    expect((await screen.findByTestId("pinned-connections")).textContent).toContain("Pets prod")
+
+    fireEvent.click(screen.getByTestId("pinned-connections-move"))
+    expect((await screen.findByTestId("pinned-connections-moved")).textContent).toContain("now use v1.0.1")
+    const [url, init] = authFetch.mock.calls.at(-1)!
+    expect(String(url)).toMatch(/\/api\/v1\/connectors\/pet-store-api\/connections\/version$/)
+    expect(JSON.parse(String(init.body))).toEqual({ version: "v1.0.1", connection_ids: ["c1"] })
   })
 })

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -115,14 +116,15 @@ func (c *CleanupManager) reduceRetention(
 ) error {
 	topic := bulkLoad.Topic
 
-	// Get current retention
+	// Get current retention. Without it there is no true value to restore later, so
+	// the retention is left as it is.
 	currentRetention, err := c.getTopicRetention(ctx, topic)
 	if err != nil {
-		log.Printf("[CleanupManager] Warning: could not get current retention for %s: %v", topic, err)
-		currentRetention = c.config.Retention.DefaultRetentionMs
+		return fmt.Errorf("failed to read current retention: %w", err)
 	}
 
-	// Store original retention for later restoration
+	// Store original retention for later restoration. It is stored before the write:
+	// restoring a value that was read is harmless if the write did not land.
 	c.mu.Lock()
 	c.modifiedRetentions[topic] = &TopicRetention{
 		Topic:               topic,
@@ -167,37 +169,19 @@ func (c *CleanupManager) deleteRecords(
 	return nil
 }
 
-// archiveToS3 archives data to S3 before cleanup
+// archiveToS3 would archive the bulk load's data to S3 and then reduce retention. No
+// archiver exists, so it refuses: reducing retention after an archive that was only
+// logged deletes data that the cleanup history says is in S3.
 func (c *CleanupManager) archiveToS3(
-	ctx context.Context,
+	_ context.Context,
 	bulkLoad *BulkLoadInfo,
-	result *CleanupResult,
+	_ *CleanupResult,
 ) error {
 	if !c.config.Archive.Enabled {
 		return fmt.Errorf("S3 archival is not enabled")
 	}
-
-	// Generate archive location
-	archiveLocation := fmt.Sprintf("s3://%s/%s/%s/%s",
-		c.config.Archive.S3Bucket,
-		c.config.Archive.S3Prefix,
-		bulkLoad.Topic,
-		bulkLoad.ID,
-	)
-
-	// In a real implementation, this would use Kafka Connect S3 Sink
-	// or consume and upload data to S3
-	log.Printf("[CleanupManager] Archiving %s to %s (simulated)", bulkLoad.ID, archiveLocation)
-
-	result.ArchiveLocation = archiveLocation
-	bulkLoad.ArchiveLocation = archiveLocation
-
-	// After archiving, reduce retention
-	if err := c.reduceRetention(ctx, bulkLoad, result); err != nil {
-		return fmt.Errorf("archive succeeded but retention reduction failed: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("S3 archival is not implemented: nothing would be written to s3://%s/%s/%s/%s, so the retention of %s is left as it is",
+		c.config.Archive.S3Bucket, c.config.Archive.S3Prefix, bulkLoad.Topic, bulkLoad.ID, bulkLoad.Topic)
 }
 
 // compactTopic triggers log compaction
@@ -286,21 +270,28 @@ func (c *CleanupManager) getTopicRetention(ctx context.Context, topic string) (i
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return c.config.Retention.DefaultRetentionMs, nil // Simulate
+		return 0, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("read the configs of %s: REST proxy returned %d", topic, resp.StatusCode)
+	}
+
 	var configs map[string]string
 	if err := json.NewDecoder(resp.Body).Decode(&configs); err != nil {
-		return c.config.Retention.DefaultRetentionMs, nil
+		return 0, fmt.Errorf("read the configs of %s: %w", topic, err)
 	}
 
 	if retentionStr, ok := configs["retention.ms"]; ok {
-		var retention int64
-		fmt.Sscanf(retentionStr, "%d", &retention)
+		retention, err := strconv.ParseInt(retentionStr, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("retention.ms of %s is %q: %w", topic, retentionStr, err)
+		}
 		return retention, nil
 	}
 
+	// No topic-level retention.ms: the topic follows the broker default.
 	return c.config.Retention.DefaultRetentionMs, nil
 }
 
@@ -325,16 +316,12 @@ func (c *CleanupManager) setTopicConfig(ctx context.Context, topic, key, value s
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Simulate success for testing
-		log.Printf("[CleanupManager] Simulating config set for %s: %s=%s", topic, key, value)
-		return nil
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		// Simulate success for testing
-		log.Printf("[CleanupManager] Simulating config set for %s: %s=%s", topic, key, value)
-		return nil
+		return fmt.Errorf("set %s=%s on %s: REST proxy returned %d", key, value, topic, resp.StatusCode)
 	}
 
 	return nil
@@ -342,9 +329,7 @@ func (c *CleanupManager) setTopicConfig(ctx context.Context, topic, key, value s
 
 // deleteRecordsUpTo deletes records up to a specific offset
 func (c *CleanupManager) deleteRecordsUpTo(ctx context.Context, topic string, offset int64) error {
-	// This would use Kafka Admin API deleteRecords
-	// For now, simulate
-	log.Printf("[CleanupManager] Simulating deleteRecords for %s up to offset %d", topic, offset)
+	// This would use Kafka Admin API deleteRecords, which is not wired.
 	return fmt.Errorf("deleteRecords not implemented, use retention reduction")
 }
 

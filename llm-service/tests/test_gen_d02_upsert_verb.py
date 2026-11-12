@@ -202,3 +202,86 @@ def test_update_method_defaults_to_put_when_unspecified():
     }
     code = _render([res])
     assert _resource_verb_map(code).get("orders") == "PUT"
+
+
+# ---------------------------------------------------------------------------
+# The destination writes reach the record (d08's bug class, on the write path)
+# ---------------------------------------------------------------------------
+#
+# An endpoint ending in its item placeholder (`/pet/{petId}`): upsert_data and
+# delete_data built `{endpoint}/{id}` and left `{petId}` unbound, and every
+# create POSTed to the item path. The CRUD helpers are covered in
+# test_gen_d08_path_param_binding.py.
+
+import importlib.util  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_SHARED = Path(__file__).resolve().parents[2] / "shared" / "mcp-connectors"
+_PET_RES = {
+    "name": "pet", "endpoint": "/pet/{petId}", "id_field": "id",
+    "supports_create": True, "supports_update": True, "supports_delete": True,
+}
+
+
+def _load_generated(code: str):
+    path = Path(tempfile.mkdtemp(prefix="gen_d02_")) / "acme" / "connector.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(code)
+    saved_path, saved_modules = list(sys.path), set(sys.modules)
+    sys.path[:0] = [str(_SHARED / "public"), str(_SHARED)]
+    spec = importlib.util.spec_from_file_location("_gen_d02_acme", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:] = saved_path
+        for added in set(sys.modules) - saved_modules:
+            del sys.modules[added]
+    return mod
+
+
+@pytest.fixture
+def pet_destination(monkeypatch):
+    """The rendered connector with HTTP stubbed: each request is recorded as
+    (method, url); an update of id 7 answers 404 so upsert falls back to create."""
+    mod = _load_generated(_render([_PET_RES]))
+    sent = []
+
+    def fake_send(self, method, url, **kwargs):
+        sent.append((method, url))
+        if method == "PUT" and url.endswith("/7"):
+            return False, 404, {}, {}
+        return True, 200, {}, {}
+
+    monkeypatch.setattr(mod.BaseMCPConnector, "_make_request_v2", fake_send)
+    cls = next(v for k, v in vars(mod).items()
+               if isinstance(v, type) and k.endswith("Connector") and v.__module__ == mod.__name__)
+    return cls(), sent
+
+
+def test_upsert_puts_to_the_item_and_creates_on_the_collection(pet_destination):
+    srv, sent = pet_destination
+    res = srv.upsert_data({"config": {"api_key": "k"}, "object": "pet",
+                           "data": [{"id": 42, "name": "rex"}, {"id": 7}, {"name": "new"}]})
+    assert res.get("success"), res
+    assert sent == [
+        ("PUT", "https://api.acme.example/v1/pet/42"),
+        ("PUT", "https://api.acme.example/v1/pet/7"),
+        ("POST", "https://api.acme.example/v1/pet"),
+        ("POST", "https://api.acme.example/v1/pet"),
+    ]
+
+
+def test_delete_data_deletes_the_item(pet_destination):
+    srv, sent = pet_destination
+    res = srv.delete_data({"config": {"api_key": "k"}, "object": "pet", "data": [{"id": 42}]})
+    assert res.get("success"), res
+    assert sent == [("DELETE", "https://api.acme.example/v1/pet/42")]
+
+
+def test_import_data_creates_on_the_collection(pet_destination):
+    srv, sent = pet_destination
+    res = srv.import_data({"config": {"api_key": "k"}, "object": "pet", "data": [{"name": "rex"}]})
+    assert res.get("success"), res
+    assert sent == [("POST", "https://api.acme.example/v1/pet")]

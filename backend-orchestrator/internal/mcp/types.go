@@ -63,7 +63,9 @@ type ServerConfig struct {
 	// The cold-build deadline extension is also capped at DeployWaitTimeout so the
 	// caller answers within its own HTTP budget. When no deploy was possible at all
 	// (no tool-generator — e.g. Docker-less Helm batch), stdio is still used.
-	// See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER.
+	// Without the opt-in, a caller still gets that error when a deploy is underway and
+	// the connector's dependencies did not install locally; it keeps stdio only when
+	// they did. See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER.
 	NoStdioWhileDeploying bool
 }
 
@@ -102,6 +104,11 @@ type ExecuteRequest struct {
 	// (see there). In-process only; never serialized.
 	NoStdioWhileDeploying bool          `json:"-"`
 	DeployWaitTimeout     time.Duration `json:"-"`
+
+	// LongCall lets this call run until ctx's deadline instead of stopping at the
+	// transport cap (30 s over HTTP, 60 s over stdio). Set only by a caller that put a
+	// deadline on ctx for this one statement, such as a model build. In-process only.
+	LongCall bool `json:"-"`
 }
 
 // ExecuteResponse represents the response from an MCP operation

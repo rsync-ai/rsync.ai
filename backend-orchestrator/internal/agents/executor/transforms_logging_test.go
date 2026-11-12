@@ -82,7 +82,7 @@ func TestApplyTransformsToData_LogsPerTransformBestEffort(t *testing.T) {
 		{"name": "abcdef", "password": "secret"},
 	}
 
-	out, err := applyTransformsToData(context.Background(), db, execID, in, task, tableName)
+	out, err := applyTransformsToData(context.Background(), db, execID, in, task, tableName, nil)
 	if err != nil {
 		t.Fatalf("applyTransformsToData error: %v", err)
 	}

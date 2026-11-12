@@ -39,12 +39,15 @@ type LagIssue = {
  *   cdc-lag-*             Debezium is behind the source's WAL/binlog
  *   cdc-sink-lag-*        changes are captured but not reaching the destination
  *   cdc-connector-down-*  the connector is down and restarts stopped working
+ *   cdc-rows-parked-*     the sink set changes aside in its dead-letter queue; every
+ *                         lag reading is green for these (cdc_rows_parked.go)
  *
  * The panel used to render all of them under "Source Replication Lag", in one
  * shade of amber, which mislabelled two thirds of what it showed.
  */
 export function alertClassLabel(id: string, type: string): string {
   if (id.startsWith("cdc-connector-down-")) return "Connector down"
+  if (id.startsWith("cdc-rows-parked-")) return "Changes set aside (not delivered)"
   if (id.startsWith("cdc-sink-lag-")) return "Not reaching the destination"
   if (id.startsWith("cdc-lag-")) return "Source replication lag"
   return type.replace(/_/g, " ")

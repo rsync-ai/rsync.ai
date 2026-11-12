@@ -143,6 +143,7 @@ type reapHarness struct {
 	offsets *fakeReapOffsets
 	connect *fakeReapConnect
 	stats   *fakeExcluder
+	store   *memReapStore
 	r       *RemovedTopicReaper
 }
 
@@ -160,6 +161,7 @@ func newReapHarness(t *testing.T, deadline time.Duration) *reapHarness {
 		}},
 		connect: &fakeReapConnect{configs: []map[string]interface{}{connectorWithout()}, state: restartedTask()},
 		stats:   &fakeExcluder{},
+		store:   &memReapStore{rows: map[string]removedTopicJob{}},
 	}
 	h.r = newReapedHarnessReaper(h, deadline)
 	t.Cleanup(h.r.Stop)
@@ -170,7 +172,7 @@ func newReapedHarnessReaper(h *reapHarness, deadline time.Duration) *RemovedTopi
 	return newRemovedTopicReaper(h.admin, h.offsets, h.connect, h.stats,
 		func(context.Context, string) []string {
 			return []string{"sink-600b012e-batch", "sink-600b012e-stream"}
-		}, 2*time.Millisecond, deadline)
+		}, h.store, 2*time.Millisecond, deadline)
 }
 
 func (h *reapHarness) step() (reapVerdict, string, bool) {

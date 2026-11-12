@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -46,6 +48,36 @@ func TestShortlistForRanking(t *testing.T) {
 	small := wideTables(4, 1)
 	if got := shortlistForRanking(small, "orders", 5); len(got) != 4 || got[0].Name != "t0000" {
 		t.Fatalf("under the cap: got %d tables starting %q, want the 4 in order", len(got), got[0].Name)
+	}
+}
+
+// A row count describes the customer's data, not its shape: the rank request
+// carries table and column names and types only. The shortlist still orders
+// by size in Go, and the answer's row_count falls back to the discovered one.
+func TestRankTablesByLLM_SendsNoRowCount(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`[{"name":"orders","schema_name":"sales","confidence":0.9}]`))
+	}))
+	defer srv.Close()
+	t.Setenv("LLM_SERVICE_URL", srv.URL)
+
+	tables := []TableMetadata{{Name: "orders", Schema: "sales", RowCount: 81234,
+		Columns: []ColumnMetadata{{Name: "id", Type: "bigint"}}}}
+	got, err := rankTablesByLLM(context.Background(), tables, "orders", "replication", 10)
+	if err != nil {
+		t.Fatalf("rankTablesByLLM: %v", err)
+	}
+	// Control: the table itself was sent.
+	if !strings.Contains(string(raw), `"orders"`) {
+		t.Fatalf("control: the rank request never named the table: %s", raw)
+	}
+	if strings.Contains(string(raw), "row_count") || strings.Contains(string(raw), "81234") {
+		t.Errorf("the rank request carries a row count: %s", raw)
+	}
+	if len(got) != 1 || got[0].RowCount != 81234 {
+		t.Errorf("the answer should keep the discovered row count: %+v", got)
 	}
 }
 

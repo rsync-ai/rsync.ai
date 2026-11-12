@@ -4,17 +4,18 @@
 #
 # Why this exists:
 #   On 2026-08-19 this one table's indexes held 66 MB against ONE live row, and
-#   were 77% of the entire prod database. The cause is structural, not a bug:
-#   the kafka-sink worker inserts an ack per batch and deletes it once the batch
-#   is acknowledged, so the table churns hard and stays tiny. Autovacuum reclaims
-#   the heap fine. It cannot reclaim a btree — emptied index pages go onto the
-#   index's own free list and are reused by that index, never returned to the OS.
-#   Only REINDEX gives the space back. A REINDEX took the indexes to 104 kB and
-#   the database from 86 MB to 20 MB, in 0.6 seconds.
+#   were 77% of the entire prod database. Rows leave the table in bulk: a
+#   pipeline delete cascades its acks, and since migration 146 the api-gateway's
+#   batch-ack janitor (internal/retention/batch_ack_janitor.go) folds CDC acks
+#   into counter tables and prunes finished batch runs past
+#   RSYNC_BATCH_ACK_RETENTION_DAYS. Autovacuum makes the freed pages reusable.
+#   It cannot shrink a btree — emptied index pages go onto the index's own free
+#   list and are reused by that index, never returned to the OS. Only REINDEX
+#   gives the space back. A REINDEX took the indexes to 104 kB and the database
+#   from 86 MB to 20 MB, in 0.6 seconds.
 #
-#   And it WILL come back. unique_batch_ack_kafka had 1.65M scans and the same
-#   number of insert/delete cycles behind them; the growth is the workload, not
-#   an incident. So this is a cadence, not a one-off fix.
+#   And it WILL come back: the deletes are the workload, not an incident. So
+#   this is a cadence, not a one-off fix.
 #
 # Why a repo script and not a crontab on the VM:
 #   A crontab lives on one machine and dies with it. This has to survive the

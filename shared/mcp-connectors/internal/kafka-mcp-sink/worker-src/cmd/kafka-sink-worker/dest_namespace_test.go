@@ -95,7 +95,7 @@ func TestCDCDocumentDBForwardsDestinationNamespace(t *testing.T) {
 		t.Run(op, func(t *testing.T) {
 			client, ct := nsTestClient()
 			cfg, sm, msg := mongoCDCMessage("postgres_test")
-			if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, op); err != nil {
+			if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, op, msg.Offset); err != nil {
 				t.Fatalf("writeCDCToDestination(%s) errored: %v", op, err)
 			}
 			tool, args := ct.lastArgs(t)
@@ -121,7 +121,7 @@ func TestCDCDocumentDBOmitsNamespaceWhenNotReal(t *testing.T) {
 	for _, ns := range []string{"", "   ", "default", "DEFAULT"} {
 		client, ct := nsTestClient()
 		cfg, sm, msg := mongoCDCMessage(ns)
-		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert"); err != nil {
+		if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert", msg.Offset); err != nil {
 			t.Fatalf("writeCDCToDestination(ns=%q) errored: %v", ns, err)
 		}
 		_, args := ct.lastArgs(t)
@@ -159,7 +159,7 @@ func TestCDCObjectStorageStillDoesNotForwardNamespace(t *testing.T) {
 		CDCOp:      "u",
 	}
 	msg := kafka.Message{Topic: "t", Partition: 0, Offset: 7}
-	if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert"); err != nil {
+	if _, _, err := writeCDCToDestination(context.Background(), client, cfg, nil, msg, sm, "upsert", msg.Offset); err != nil {
 		t.Fatalf("writeCDCToDestination(gcs) errored: %v", err)
 	}
 	_, args := ct.lastArgs(t)

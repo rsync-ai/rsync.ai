@@ -46,11 +46,19 @@ except Exception:
 # `COPY --from=shared canonical_types.py` (see Dockerfile). Dev/test resolves it
 # from the public/ root (postgresql lives at public/postgresql/... -> 3 levels up).
 try:
-    from canonical_types import canonical_to_ddl, canonicalize_type  # noqa: E402
+    from canonical_types import UNCONSTRAINED_NUMERIC, canonical_to_ddl, canonicalize_type  # noqa: E402
 except ImportError:  # pragma: no cover - dev/test path
     sys.path.insert(0, os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "..")))
-    from canonical_types import canonical_to_ddl, canonicalize_type  # noqa: E402
+    from canonical_types import UNCONSTRAINED_NUMERIC, canonical_to_ddl, canonicalize_type  # noqa: E402
+
+# Stable batch paging for SQL sources (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS),
+# shipped into the image via `COPY --from=shared sql_paging.py` (see
+# Dockerfile). Without it an export fails loudly instead of paging unstably.
+try:
+    import sql_paging  # type: ignore
+except Exception:  # pragma: no cover
+    sql_paging = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -228,6 +236,25 @@ def _canonical_sql_type(t: Any) -> str:
     keeps a single call shape.
     """
     return canonicalize_type(t, dialect="postgresql")
+
+
+def _discovered_column_type(data_type: Any, precision: Any, scale: Any) -> str:
+    """The type PostgreSQL discovery reports for one information_schema column.
+
+    A numeric/decimal with a declared precision is reported as "numeric(p,s)" so
+    the destination keeps the scale (a bare "decimal" becomes a fixed 38,9). A
+    NUMERIC declared with neither is reported as UNCONSTRAINED_NUMERIC:
+    canonical_to_ddl gives it plain NUMERIC on PostgreSQL and exact text
+    elsewhere. money stays "decimal".
+    """
+    canon = _canonical_sql_type(data_type)
+    if canon != "decimal":
+        return canon
+    if precision is not None:
+        return "numeric(%d,%d)" % (int(precision), int(scale) if scale is not None else 0)
+    if str(data_type or "").strip().lower() == "numeric":
+        return UNCONSTRAINED_NUMERIC
+    return canon
 
 
 def _sqlserver_declared_type(data_type: Any, max_length: Any, precision: Any, scale: Any) -> str:
@@ -1698,14 +1725,9 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                         if key not in by_key:
                             continue
                         _canon = _canonical_sql_type(cr[3])
-                        # Preserve exact precision+scale for numeric/decimal so the
-                        # destination DDL keeps the scale (a bare "decimal" would
-                        # default the sink to DECIMAL(10,0) and silently round).
-                        _emit_type = _canon
-                        if _canon == "decimal" and cr[5] is not None:
-                            _prec = int(cr[5])
-                            _scale = int(cr[6]) if cr[6] is not None else 0
-                            _emit_type = "numeric(%d,%d)" % (_prec, _scale)
+                        # numeric(p,s) keeps its scale; an unconstrained NUMERIC
+                        # is reported as the bare "numeric" (see the helper).
+                        _emit_type = _discovered_column_type(cr[3], cr[5], cr[6])
                         # Declared type, qualifier included. Both sides of a drift
                         # comparison must be qualified for a width change to count,
                         # so an unqualified fallback is never drift, only unknown.
@@ -1740,12 +1762,18 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if include_relationships and table_names and schemas_seen:
                 try:
                     placeholders = ",".join(["%s"] * len(table_names))
+                    # pg_catalog, not information_schema: the constraint views
+                    # show only tables the user owns or holds a non-SELECT
+                    # privilege on, so a read-only source user got no keys.
                     q = (
-                        "SELECT tc.table_schema, tc.table_name, kcu.column_name "
-                        "FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-                        "WHERE tc.table_schema IN (" + sch_ph + ") AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_name IN (" + placeholders + ") "
-                        "ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position"
+                        "SELECT n.nspname, c.relname, a.attname "
+                        "FROM pg_catalog.pg_constraint con "
+                        "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        "CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                        "JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+                        "WHERE con.contype = 'p' AND n.nspname IN (" + sch_ph + ") AND c.relname IN (" + placeholders + ") "
+                        "ORDER BY n.nspname, c.relname, k.ord"
                     )
                     cursor.execute(q, tuple(schemas_seen) + tuple(table_names))
                     pk_rows = cursor.fetchall() or []
@@ -1766,15 +1794,22 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if include_relationships and table_names and schemas_seen:
                 try:
                     placeholders = ",".join(["%s"] * len(table_names))
+                    # pg_catalog for the same reason as the primary keys. The
+                    # referenced column is matched by key position, so a
+                    # composite key yields one row per column pair.
                     q = (
-                        "SELECT tc.table_schema, tc.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_column, tc.constraint_name, "
-                        "rc.update_rule, rc.delete_rule "
-                        "FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-                        "JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
-                        "JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema "
-                        "WHERE tc.table_schema IN (" + sch_ph + ") AND tc.constraint_type = 'FOREIGN KEY' AND tc.table_name IN (" + placeholders + ") "
-                        "ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position"
+                        "SELECT n.nspname, c.relname, a.attname, rc.relname AS ref_table, ra.attname AS ref_column, con.conname, "
+                        "CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END, "
+                        "CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END "
+                        "FROM pg_catalog.pg_constraint con "
+                        "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        "JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid "
+                        "CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                        "JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+                        "JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[k.ord] "
+                        "WHERE con.contype = 'f' AND n.nspname IN (" + sch_ph + ") AND c.relname IN (" + placeholders + ") "
+                        "ORDER BY n.nspname, c.relname, con.conname, k.ord"
                     )
                     cursor.execute(q, tuple(schemas_seen) + tuple(table_names))
                     fk_rows = cursor.fetchall() or []
@@ -2622,85 +2657,6 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return {"schema": parts[-2], "table": parts[-1]}
         return {"schema": None, "table": t or None}
 
-    def _get_primary_key_column(self, cursor, table: str) -> Optional[str]:
-        """
-        Best-effort: return the first PRIMARY KEY column name for keyset pagination.
-        Works across common relational DBs; falls back to None.
-        """
-        module = (self.driver_pattern.get("module", "") or "").lower()
-        table_parts = self._split_qualified_table(table)
-        schema = table_parts.get("schema")
-        tbl = table_parts.get("table")
-        if not tbl:
-            return None
-
-        try:
-            # MySQL
-            if "mysql" in module:
-                safe_tbl = self._safe_column_identifier(tbl)
-                if not safe_tbl:
-                    return None
-                fq = f'`{safe_tbl}`'
-                if schema:
-                    safe_schema = self._safe_column_identifier(schema)
-                    if not safe_schema:
-                        return None
-                    fq = f'`{safe_schema}`.`{safe_tbl}`'
-                cursor.execute(f"SHOW KEYS FROM {fq} WHERE Key_name = 'PRIMARY'")
-                rows = cursor.fetchall() or []
-                if rows and isinstance(rows[0], dict):
-                    rows_sorted = sorted(rows, key=lambda r: int(r.get("Seq_in_index") or 9999))
-                    pk = rows_sorted[0].get("Column_name")
-                    return self._safe_column_identifier(pk)
-                if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 5:
-                    pk = rows[0][4]
-                    return self._safe_column_identifier(str(pk))
-                return None
-
-            # PostgreSQL (psycopg2)
-            if module == "psycopg2":
-                # Default schema is public if not provided
-                schema_val = schema or "public"
-                cursor.execute(
-                    """
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                      ON tc.constraint_name = kcu.constraint_name
-                     AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY'
-                      AND tc.table_schema = %s
-                      AND tc.table_name = %s
-                    ORDER BY kcu.ordinal_position
-                    LIMIT 1
-                    """,
-                    (schema_val, tbl),
-                )
-                r = cursor.fetchone()
-                if isinstance(r, dict):
-                    return self._safe_column_identifier(r.get("column_name"))
-                if isinstance(r, (list, tuple)) and len(r) >= 1:
-                    return self._safe_column_identifier(str(r[0]))
-                return None
-
-            # SQLite
-            if "sqlite" in module:
-                cursor.execute(f"PRAGMA table_info({tbl})")
-                rows = cursor.fetchall() or []
-                # Row shape: cid, name, type, notnull, dflt_value, pk
-                for row in rows:
-                    if isinstance(row, dict):
-                        if int(row.get("pk") or 0) == 1:
-                            return self._safe_column_identifier(row.get("name"))
-                    elif isinstance(row, (list, tuple)) and len(row) >= 6:
-                        if int(row[5] or 0) == 1:
-                            return self._safe_column_identifier(str(row[1]))
-                return None
-        except Exception:
-            return None
-
-        return None
-
     # ------------------------------------------------------------------
     # Incremental sync helpers (T2-6 — see INCREMENTAL.md)
     # ------------------------------------------------------------------
@@ -2740,6 +2696,107 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             s = raw.strip()
             return s if s else None
         return None
+
+    # BEGIN watermark snapshot block
+    # KI-DB-BATCH-PAGING-CAN-SKIP-ROWS cause 3, INCREMENTAL.md §2. Kept
+    # identical in connector_database.py.j2 and the PostgreSQL, MySQL, Oracle
+    # and SQL Server connectors (test_db_watermark_snapshot.py checks it).
+    #
+    # A sweep pages by key, so a row the cursor has already passed can be
+    # updated below a later page's max(updated_at) and fall outside the next
+    # sweep's `updated_at > since`. The sweep's watermark is therefore
+    # max(updated_at) read once before its first page: every row updated
+    # after that read is above it, whatever its key. When that value is
+    # within a few seconds of the database clock it is held back to
+    # `now - lag`, so a transaction that stamped its row earlier but commits
+    # after the read still lands above the next `since`. Rows inside the lag
+    # are read twice (at-least-once); a commit later than the lag is missed.
+    _DEFAULT_INCREMENTAL_LAG_SECONDS = 5.0
+
+    @classmethod
+    def _incremental_lag_seconds(cls, config, params) -> float:
+        """`incremental_lag_seconds` from the export params, then the
+        connection config; the default when neither holds a number."""
+        for source in (params or {}, config or {}):
+            raw = source.get("incremental_lag_seconds") if isinstance(source, dict) else None
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                continue
+        return cls._DEFAULT_INCREMENTAL_LAG_SECONDS
+
+    @staticmethod
+    def _hold_back_watermark(value, utc_now, local_now, lag_seconds):
+        """`now - lag` when ``value`` is within ``lag_seconds`` of the database
+        clock, else ``value``. An aware value is compared with UTC, a naive
+        one with the session's local clock; anything else is returned as is."""
+        from datetime import datetime, timedelta, timezone
+        if not isinstance(value, datetime) or not lag_seconds:
+            return value
+        now = utc_now if value.tzinfo is not None else local_now
+        if not isinstance(now, datetime):
+            return value
+        if value.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if (now.tzinfo is None) != (value.tzinfo is None):
+            return value
+        lag = timedelta(seconds=lag_seconds)
+        if now - lag < value <= now + lag:
+            held = now - lag
+            return held.astimezone(value.tzinfo) if value.tzinfo is not None else held
+        return value
+
+    def _watermark_snapshot(self, conn, cursor, dialect, safe_table, field, since, lag_seconds):
+        """(column, value) for the sweep's watermark, read before its first
+        page; None when the table has no such column or the read fails, and
+        the export then reports its page max as before. The paging dialect
+        supplies the bind style and the clocks, so an engine sharing a
+        driver with another (Redshift over psycopg2) reads its own way."""
+        try:
+            cursor.execute(f"SELECT * FROM {safe_table} WHERE 1 = 0")
+            description = list(cursor.description or [])
+            columns = [d[0] for d in description]
+            try:
+                cursor.fetchall()
+            except Exception:
+                pass
+            column = next((c for c in columns if str(c).lower() == field.lower()), None)
+            if column is None:
+                return None
+            binder = sql_paging.Binder(dialect.paramstyle)
+            ident = dialect.ident(column)
+            clocks = f", {dialect.clocks}" if dialect.clocks else ""
+            query = f"SELECT MAX({ident}) AS wm_max{clocks} FROM {safe_table}"
+            if since:
+                # As the column's type where the engine compares no other
+                # (Athena); unchanged elsewhere.
+                typed = sql_paging.since_value(dialect, since, description[columns.index(column)])
+                query += f" WHERE {ident} > {binder.add(typed)}"
+            bound = binder.params()
+            if bound is None:
+                cursor.execute(query)
+            else:
+                cursor.execute(query, bound)
+            row = cursor.fetchone()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        if row is None:
+            return None
+        values = list(row.values()) if isinstance(row, dict) else list(row)
+        value = values[0] if values else None
+        if value is None:
+            return (column, since) if since else None
+        utc_now = values[1] if len(values) > 1 else None
+        local_now = values[2] if len(values) > 2 else None
+        held = self._hold_back_watermark(value, utc_now, local_now, lag_seconds)
+        return (column, held.isoformat() if hasattr(held, "isoformat") else str(held))
+    # END watermark snapshot block
 
     @staticmethod
     def _max_field_value(rows: List, field: str) -> Optional[str]:
@@ -2862,42 +2919,32 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             cursor = self._get_cursor(conn)
             
             module = (self.driver_pattern.get("module", "") or "").lower()
-            # Prefer keyset paging when requested or when cursor provided.
-            pk = self._safe_column_identifier(str(cursor_column)) if cursor_column else None
-            if (use_keyset or cursor_value is not None) and not pk:
-                pk = self._get_primary_key_column(cursor, table)
-
-            # Choose placeholder style for parameterized queries
-            placeholder = "%s"
-            if "sqlite" in module:
-                placeholder = "?"
-
-            # Choose identifier quoting per driver
-            quote = "`" if "mysql" in module else "\""
+            # Paging order, bind style and page SQL per driver come from the
+            # shared sql_paging module (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS): a
+            # named cursor_column, else the whole primary or unique key, else
+            # the row's physical locator, else ORDER BY every column. A driver
+            # it does not know pages as exports always did.
+            if sql_paging is None:
+                return {"success": False, "error": "sql_paging.py is missing from this connector image; rebuild it"}
+            dialect = sql_paging.dialect_for(module, self.driver_pattern.get("name"))
+            quote = dialect.quote
 
             safe_table = self._safe_qualified_table(table, quote)
             if not safe_table:
                 return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
 
-            # Incremental sync: compose the WHERE clause (see the paging-AND
-            # / delta-OR note just below for how the pieces combine).
-            # `inc_field_safe` is validated through `_safe_column_identifier`
-            # — never interpolated directly. If validation fails, we
-            # drop the incremental filter (degrade to full fetch) rather
-            # than crash on a SQL syntax error.
-            #
+            # Incremental sync: compose the WHERE clause (INCREMENTAL.md §5).
             # Two DIFFERENT fields, deliberately kept apart:
             #   * `inc_field_safe` / `inc_bind_value` drive the WHERE filter,
             #     and only exist once we have a `since` to compare against.
             #   * `watermark_field` drives the stats.watermark we REPORT, and
             #     must be populated on the very first run too.
-            # Collapsing the two deadlocks the contract for DB sources: the
-            # executor only sends `since` once a watermark is in the
-            # checkpoint, and we only emitted a watermark once `since`
-            # arrived — so neither side could ever go first and every run
-            # silently degraded to keyset-by-PK (append-only), which never
-            # propagates an UPDATE to an already-synced row. See
-            # INCREMENTAL.md §5.
+            # Collapsing the two deadlocks the contract: the executor only
+            # sends `since` once a watermark is in the checkpoint, and the
+            # connector would only emit a watermark once `since` arrived — so
+            # neither side can go first and every run silently degrades to
+            # keyset-by-PK (append-only), which never propagates an UPDATE to
+            # an already-synced row.
             inc_field_safe = None
             inc_bind_value = None
             watermark_field = self._safe_column_identifier(incremental_field)
@@ -2905,79 +2952,43 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 inc_field_safe = watermark_field
                 inc_bind_value = normalized_since
 
+            # A sweep's watermark is max(<field>) read before its first page,
+            # not the pages' own max (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS; the
+            # watermark snapshot block above).
+            snapshot = None
+            if watermark_field and (cursor_value is None or cursor_value == "") and not offset:
+                snapshot = self._watermark_snapshot(
+                    conn, cursor, dialect, safe_table, watermark_field,
+                    inc_bind_value, self._incremental_lag_seconds(config, params),
+                )
+
             # `cursor` is this run's PAGING position and always narrows with
-            # AND. The delta predicate below decides which rows this run
-            # cares about at all, and its two halves are OR'ed:
+            # AND. The delta predicate decides which rows this run cares about
+            # at all, and its two halves are OR'ed:
             #
-            #     WHERE pk > <page cursor>
-            #       AND ( updated_at > <watermark> OR pk > <last run's pk> )
+            #     WHERE key > <page cursor>
+            #       AND ( updated_at > <watermark> OR key > <last run's key> )
             #
-            # The OR is the whole fix. Timestamp alone would drop every
-            # INSERT whose incremental column is NULL or hand-maintained.
-            # AND-ing the two halves (the behavior this replaces) dropped
-            # every UPDATE to an already-synced row, because an updated row
-            # keeps its old PK and so can never satisfy `pk > last_pk` —
-            # source and destination diverged silently, with the run still
-            # reporting success. Only the OR catches both shapes.
-            where_parts = []
-            bind_values = []
-            if pk and cursor_value is not None and cursor_value != "":
-                where_parts.append(f"{quote}{pk}{quote} > {placeholder}")
-                bind_values.append(cursor_value)
-
-            delta_parts = []
-            delta_values = []
-            if inc_field_safe is not None and inc_bind_value is not None:
-                delta_parts.append(f"{quote}{inc_field_safe}{quote} > {placeholder}")
-                delta_values.append(inc_bind_value)
-            if pk and since_cursor is not None and since_cursor != "":
-                delta_parts.append(f"{quote}{pk}{quote} > {placeholder}")
-                delta_values.append(since_cursor)
-            if delta_parts:
-                where_parts.append("(" + " OR ".join(delta_parts) + ")")
-                bind_values.extend(delta_values)
-
-            where_clause = ""
-            if where_parts:
-                where_clause = " WHERE " + " AND ".join(where_parts)
-
-            if pk:
-                query = f"SELECT * FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} LIMIT {limit}"
-                cursor.execute(query, tuple(bind_values) if bind_values else None)
-            else:
-                # No PK → fall back to OFFSET paging. Still honors the
-                # incremental WHERE if present.
-                query = f"SELECT * FROM {safe_table}{where_clause} LIMIT {limit} OFFSET {offset}"
-                cursor.execute(query, tuple(bind_values) if bind_values else None)
-            
-            # Convert rows to dicts
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
-            
-            if rows and isinstance(rows[0], dict):
-                data = rows
-            else:
-                data = [dict(zip(columns, row)) for row in rows]
-            
+            # Timestamp alone would drop every INSERT whose incremental column
+            # is NULL or hand-maintained; AND-ing the halves drops every UPDATE
+            # to an already-synced row, since an updated row keeps its old key
+            # and can never satisfy `key > last_key`. Only the OR catches both.
+            #
+            # read_page plans, queries and finishes the page: next_cursor /
+            # paging_mode / cursor_column(s) for the executor, with a projected
+            # hidden key or row locator stripped from the rows. A warehouse
+            # (Snowflake, Databricks) pins a sweep's pages to one snapshot
+            # (KI-WAREHOUSE-BATCH-PAGING-UNORDERED).
+            data, columns, paging = sql_paging.read_page(
+                conn, cursor, dialect, table, safe_table, limit=limit, offset=offset,
+                cursor_value=cursor_value, nominated=cursor_column,
+                stable=bool(use_keyset or cursor_value is not None or cursor_column),
+                since_cursor=since_cursor, inc_field=inc_field_safe, inc_value=inc_bind_value,
+            )
             cursor.close()
-            # Include next_cursor for keyset pagination if we can.
-            next_cursor = None
-            if pk and data:
-                last = data[-1]
-                if isinstance(last, dict):
-                    next_cursor = last.get(pk)
-                else:
-                    try:
-                        idx = columns.index(pk)
-                        next_cursor = last[idx]
-                    except Exception:
-                        next_cursor = None
 
             result = self.finalize_export_result(data, prepared, columns)
-            if next_cursor is not None:
-                result["next_cursor"] = next_cursor
-                result["paging_mode"] = "keyset"
-                result["cursor_column"] = pk
+            result.update(paging)
 
             # Incremental watermark (T2-6). Emitted whenever the
             # incremental field is a REAL column on this table — including
@@ -3017,6 +3028,14 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     # Surface flat too for tooling that doesn't read
                     # stats.watermark (mirrors Shopify connector).
                     result["max_watermark"] = max_val
+            if snapshot is not None:
+                result.setdefault("stats", {})
+                result["stats"]["watermark"] = {
+                    "field": snapshot[0],
+                    "value": snapshot[1],
+                    "snapshot": True,
+                }
+                result["max_watermark"] = snapshot[1]
             return result
             
         except Exception as e:
@@ -3237,8 +3256,9 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
 
           0. an explicit ``numeric(p,s)``/``decimal(p,s)`` is returned VERBATIM so
              the exact scale (and the source's spelling) survives a PG round trip;
-             bare ``decimal``/``numeric`` fall through to the shared authority
-             (-> NUMERIC(38,9), never PG's scale-0 default);
+             a bare ``decimal`` falls through to the shared authority
+             (-> NUMERIC(38,9), never PG's scale-0 default) and a bare ``numeric``,
+             an unconstrained NUMERIC, to plain NUMERIC;
           1. a raw ``uuid`` token -> native ``UUID`` (the canonical vocabulary
              collapses uuid->string; only a non-canonical source still emits the
              raw token, and PG's native UUID beats CHAR(36)/TEXT for `=`/`::uuid`).
@@ -4282,7 +4302,8 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 # silently skipped the DELETE (`if key_values:` on an empty tuple) and
                 # left an orphan row. Fail loud instead: a delete event that lacks its
                 # key columns is a data-integrity problem the caller must see (it will
-                # roll back and route to the DLQ).
+                # roll back and route to the DLQ). Checked for every row BEFORE any
+                # statement, so the bulk path below never sees a keyless row.
                 missing = [k for k in key_fields if k not in row]
                 if missing:
                     raise ValueError(
@@ -4290,6 +4311,35 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                         f"cannot build a safe WHERE clause"
                     )
 
+            # Bulk path: the sink batches CDC deletes, so one call can carry
+            # thousands of keys. One DELETE per key is one network round trip per
+            # key; instead load the keys into a temp table typed like the target
+            # and delete with ONE set-based statement. On ANY failure (a key that
+            # does not parse as the column's type, a missing table, a driver
+            # without execute_values) roll back and fall through to the per-row
+            # loop below, so behaviour never regresses.
+            driver_module = pattern.get("module", "") or ""
+            is_pg = "psycopg2" in driver_module or "asyncpg" in driver_module
+            if is_pg and self.supports_staged_load() and len(data) > 1:
+                try:
+                    rows_deleted = self._bulk_delete_by_keys(cursor, table, data, key_fields)
+                    self._write_cdc_offsets(cursor, params)
+                    conn.commit()
+                    cursor.close()
+                    return {"success": True, "rows_deleted": rows_deleted}
+                except Exception as bulk_err:
+                    logger.warning(
+                        "delete_data: bulk path failed for target=%s, per-row fallback: %s",
+                        table, bulk_err,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    cursor = self._get_cursor(conn, as_dict=False)
+                    rows_deleted = 0
+
+            for row in data:
                 # Cast both sides to text to handle type mismatches (e.g. INT PK in a TEXT column).
                 # Quote the key-column identifiers so case-sensitive PKs match the
                 # case-preserved columns ensure_table() created (same reason the
@@ -4321,6 +4371,47 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 except:
                     pass
     
+    def _bulk_delete_by_keys(self, cursor, table: str, rows: List[Dict[str, Any]],
+                             key_fields: List[str]) -> int:
+        """Delete every row whose key matches one of ``rows`` with ONE statement.
+
+        Runs on the caller's cursor inside the caller's transaction; the caller
+        owns commit/rollback and the per-row fallback. The key columns are
+        copied from the target (``CREATE TEMP TABLE ... AS SELECT ... WITH NO
+        DATA``), so the keys load through each column's own input function and
+        the join compares typed values on the target's index — not the
+        ``::text`` cast of the per-row path, which cannot use it. A key that
+        does not parse as its column's type raises here, and the caller falls
+        back to the per-row compare. Duplicate keys and NULL keys behave as
+        they do per row: a target row is deleted once, and NULL matches nothing.
+        """
+        import uuid
+        from psycopg2.extras import execute_values
+        staging = f'"_rsync_del_{uuid.uuid4().hex[:12]}"'
+        target = self._qualified_quoted_table(table)
+        key_cols = ", ".join(f'"{k}"' for k in key_fields)
+        cursor.execute(
+            f"CREATE TEMP TABLE {staging} ON COMMIT DROP AS "
+            f"SELECT {key_cols} FROM {target} WITH NO DATA"
+        )
+        values = [
+            [str(row.get(k)) if row.get(k) is not None else None for k in key_fields]
+            for row in rows
+        ]
+        execute_values(
+            cursor,
+            f"INSERT INTO {staging} ({key_cols}) VALUES %s",
+            values,
+            template="(" + ", ".join(["%s"] * len(key_fields)) + ")",
+            page_size=1000,
+        )
+        match = " AND ".join(f't."{k}" = s."{k}"' for k in key_fields)
+        cursor.execute(f"DELETE FROM {target} t USING {staging} s WHERE {match}")
+        deleted = getattr(cursor, "rowcount", None)
+        if deleted is None or deleted < 0:
+            return len(rows)
+        return deleted
+
     # JSON-RPC entrypoints for kafka-mcp-sink worker
     def postgresql_import_data(self, params: Dict = None) -> Dict[str, Any]:
         """JSON-RPC entrypoint: import_data (batch sink)."""

@@ -1,12 +1,14 @@
 /**
  * Regression tests for the Data flow tab's event feed: F-274 / F-275 / F-276 /
- * F-284, plus the Activity sub-tab's own polling and alert severity.
+ * F-284, plus the Activity card's own polling and alert severity.
  *
  * These guarded the "Live events" card until it was removed. It and the
  * Monitoring card's "Trace" sub-tab read the same `GET /pipelines/:id/events`
  * stream, so the card was dropped and Trace became "Activity"
- * (`ReasoningTimeline` inside `PipelineMonitoringPanel`). Every defect below was
- * fixed once for the card; the tests now hold Activity to the same bar.
+ * (`ReasoningTimeline` inside `PipelineMonitoringPanel`). The sub-tabs are gone
+ * too: Activity is now its own card at the foot of the Data flow tab
+ * (`variant="activity"`). Every defect below was fixed once for the card; the
+ * tests now hold Activity to the same bar.
  *
  *  F-274  NOISE. `ProgressEmitter.StartStageHeartbeat` emits a STAGE_PROGRESS
  *         every 7 s and stamps it `metadata.heartbeat = true` so the UI can
@@ -38,7 +40,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import "@testing-library/jest-dom"
 
@@ -52,15 +54,7 @@ vi.mock("@/lib/hooks/usePipelineRuntime", () => ({
   usePipelineRuntime: () => ({ runtime: null, loading: false, error: null }),
 }))
 
-// Not under test, and each pulls in its own fetches. The Overview stand-in keeps
-// only its "View in Activity" hook, to prove the panel switches sub-tab on it.
-vi.mock("@/components/pipeline/MonitoringOverviewTab", () => ({
-  MonitoringOverviewTab: ({ onOpenActivity }: { onOpenActivity?: () => void }) => (
-    <button type="button" onClick={onOpenActivity}>
-      View in Activity
-    </button>
-  ),
-}))
+// Not under test, and it pulls in its own fetches.
 vi.mock("@/components/pipeline/TableStatisticsPanel", () => ({ TableStatisticsPanel: () => null }))
 
 const authFetch = vi.fn()
@@ -72,29 +66,12 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 import { ReasoningTimeline } from "@/components/pipeline/ReasoningTimeline"
 import { PipelineMonitoringPanel } from "@/components/pipeline/PipelineMonitoringPanel"
 
-/**
- * Render the panel and open its Activity sub-tab.
- *
- * These tests are about Activity, so they select it rather than relying on which
- * sub-tab happens to open first. That default is a function of
- * NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: with it set (now the default, and what
- * docker-compose.yml and prod have always set) the Monitoring card opens on
- * Overview. Clicking through makes each test independent of that flag.
- */
-async function renderActivity(variant: "monitoring" | "table_stats" = "monitoring") {
-  const out = render(<PipelineMonitoringPanel pipelineId="p1" variant={variant} />)
-  if (variant !== "monitoring") return out
-
-  // Switch through the panel's own affordance rather than by clicking the Radix
-  // trigger: Radix Tabs do not change on a synthetic click, and this is the hook
-  // the Overview mock at the top of this file exists to expose.
-  const open = await screen.findAllByRole("button", { name: "View in Activity" })
-  fireEvent.click(open[0])
-  return out
+/** Render the panel; the Activity card by default. */
+async function renderActivity(variant: "activity" | "table_stats" = "activity") {
+  return render(<PipelineMonitoringPanel pipelineId="p1" variant={variant} />)
 }
 import { EventNormalizer, type PipelineRunEvent } from "@/lib/pipeline/eventNormalizer"
 import { mergeNewestPage } from "@/lib/pipeline/mergeNewestEvents"
-import { featureFlagsManager } from "@/config/features"
 
 let evtId = 0
 function evt(over: Partial<PipelineRunEvent> = {}): PipelineRunEvent {
@@ -456,31 +433,6 @@ describe("Activity does not present a failed read as an empty stream (F-284)", (
 
     expect(await screen.findByText("No events to display yet.")).toBeInTheDocument()
     expect(screen.queryByText(READ_FAILED)).not.toBeInTheDocument()
-  })
-})
-
-describe("The Monitoring sub-tabs are controlled", () => {
-  beforeEach(() => {
-    authFetch.mockReset()
-    eventsCalls.length = 0
-    statusCalls.length = 0
-    featureFlagsManager.updateFlags({ monitoringOverview: true })
-  })
-  afterEach(() => featureFlagsManager.resetFlags())
-
-  it("the Overview's 'View in Activity' opens the Activity sub-tab", async () => {
-    serveEvents(() => page([]))
-    // Rendered directly, not through renderActivity(): this test IS the switch,
-    // so it has to start on the sub-tab the panel opens by default. That is
-    // Overview whenever NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW is set, which is
-    // now the default and what docker-compose.yml and prod have always set.
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
-
-    expect(await screen.findByRole("tab", { name: /Overview/ })).toHaveAttribute("aria-selected", "true")
-    await userEvent.click(screen.getByRole("button", { name: "View in Activity" }))
-
-    expect(screen.getByRole("tab", { name: /Activity/ })).toHaveAttribute("aria-selected", "true")
-    expect(await screen.findByText("No events to display yet.")).toBeInTheDocument()
   })
 })
 

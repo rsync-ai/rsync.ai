@@ -473,14 +473,26 @@ def test_rank_tables_explicit_model_always_wins(monkeypatch):
     assert rank_tables_default_model("openai") == "mixtral:8x7b"
 
 
-def test_rank_tables_refuses_a_per_request_provider_override_when_offline():
-    """The request body carries an optional `provider`. Offline, that is a
-    caller-controlled egress selector — assert the guard exists and precedes the
-    client construction it protects."""
-    src = (REPO_ROOT / "llm-service/src/agents/explorer/rank_tables.py").read_text()
-    guard = src.index("if request.provider and EXPLORER_OFFLINE_ONLY:")
-    build = src.index("client = _create_async_client(provider)")
-    assert guard < build, "the offline guard must run before the override builds a client"
+@pytest.mark.parametrize("offline", ["true", "false"])
+def test_rank_tables_refuses_a_per_request_provider_override(monkeypatch, offline):
+    """The request body carries an optional `provider`. That is a caller-
+    controlled egress selector, offline or not: only the deployment's
+    configuration picks where schema metadata goes. The refusal comes before
+    any client is built or any model is called."""
+    from fastapi.testclient import TestClient
+
+    from src.agents.explorer import rank_tables
+    from src.gateway.main import app
+
+    monkeypatch.setattr(rank_tables, "EXPLORER_OFFLINE_ONLY", offline == "true")
+    built = []
+    monkeypatch.setattr(rank_tables, "_create_async_client", lambda *a, **k: built.append(a))
+    response = TestClient(app).post(
+        "/agents/rank-tables",
+        json={"tables": [{"name": "users"}], "intent": "sync users", "provider": "openai"},
+    )
+    assert response.status_code == 400, response.text
+    assert built == []
 
 
 

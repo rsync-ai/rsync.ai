@@ -1,0 +1,52 @@
+{
+  "kind": "echart",
+  "settings": {
+    "description": "Average amount by region",
+    "x": {
+      "field": "x",
+      "label": "region",
+      "categories": [
+        "APAC",
+        "US",
+        "EU",
+        "(empty)"
+      ]
+    },
+    "y": {
+      "field": "v",
+      "format": "decimal",
+      "title": "Average amount"
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Average amount",
+          "color": "series-1"
+        }
+      ]
+    },
+    "type": "hbar",
+    "stacked": false
+  },
+  "rows": [
+    {
+      "x": "APAC",
+      "v": 41.25
+    },
+    {
+      "x": "US",
+      "v": 57.5
+    },
+    {
+      "x": "EU",
+      "v": 63.125
+    },
+    {
+      "x": "(empty)",
+      "v": 12
+    }
+  ],
+  "series": [],
+  "notes": []
+}

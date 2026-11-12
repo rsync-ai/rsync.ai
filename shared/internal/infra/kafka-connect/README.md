@@ -134,7 +134,7 @@ Example: prod-mysql.public.orders.12345
 
 Use for: Large tables, high throughput, need record-level distribution
 
-The downstream consumer uses `EntityStats` to determine which entities are "hot" and should use the full partition key.
+No consumer reads the `rsync.is.hot.entity` header today. The Python `EntityStats` model that was meant to pick the "hot" entities was never wired in and has been removed.
 
 ## Schema Registry Integration
 

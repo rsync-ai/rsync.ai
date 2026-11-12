@@ -148,13 +148,16 @@ class GoogleSheetsConnector(BaseMCPConnector):
         self.supports_ddl = True
         self.auto_create_destination_tables = True
 
-        # OAuth wiring — declares the provider so the base class's
-        # generic OAuth helpers (set_oauth_token, refresh callback) can
-        # find this connector's entry in oauth/providers.json. We don't
-        # rely on the base's HTTP plumbing (we own our own _request),
-        # but advertising the provider is required for the api-gateway
-        # OAuth callback handler to know which provider's tokens to
-        # store under this connector's connections.
+        # OAuth wiring — advertises the provider so the api-gateway
+        # OAuth callback handler knows which provider's tokens to store
+        # under this connector's connections (oauth/providers.json). The
+        # connector never stores or refreshes a token: the gateway and
+        # orchestrator inject a current access_token into the connection
+        # config, and the orchestrator refreshes on a 401. We don't use the base's
+        # HTTP plumbing either (we own our own _request).
+        # Vocabulary: metadata.json says "oauth2" (catalog/spec terms);
+        # this runtime field says "oauth" (base-connector terms). Same
+        # auth, two vocabularies — don't "fix" one to match the other.
         self.auth_type = "oauth"
         self.oauth_provider = "google"
 
@@ -187,16 +190,18 @@ class GoogleSheetsConnector(BaseMCPConnector):
     def _resolve_token(config: Dict[str, Any]) -> Optional[str]:
         """Pull the OAuth access token out of config (or env fallback).
 
-        Accepts a handful of common spellings the orchestrator might
-        use depending on auth path:
+        Accepts the spellings the orchestrator uses depending on auth path:
           - ``access_token``        — populated post-OAuth callback
           - ``token``               — legacy / manual-paste path
-          - ``oauth_token_id``      — when the orchestrator delegates
-                                      token lookup to TokenManager
         Falls back to ``GOOGLE_ACCESS_TOKEN`` env var for dev / local
         testing where the OAuth flow hasn't been wired yet.
+
+        ``oauth_token_id`` is never a token: it is an oauth_tokens row id
+        the gateway and orchestrator resolve into ``access_token`` before
+        a call gets here, so it is never sent to Google. When that lookup
+        failed, ``_request`` answers 401 itself (see ``_missing_token``).
         """
-        for key in ("access_token", "token", "oauth_token_id"):
+        for key in ("access_token", "token"):
             v = config.get(key)
             if v:
                 return str(v)
@@ -204,6 +209,27 @@ class GoogleSheetsConnector(BaseMCPConnector):
         if env:
             return env
         return None
+
+    @staticmethod
+    def _missing_token(config: Dict[str, Any]) -> Tuple[int, Any, str]:
+        """The ``_request`` result when there is no access token to send.
+
+        With an ``oauth_token_id`` the connection is OAuth and its token
+        lookup failed, so answer as Google would have: a 401 whose text
+        the orchestrator's executor matches ("401"/"unauthorized") to
+        refresh the token and retry with ``access_token`` set. Without
+        one there is nothing to refresh.
+        """
+        if config.get("oauth_token_id"):
+            return 401, None, (
+                "401 unauthorized: no access token for this connection's "
+                "OAuth token; refresh required."
+            )
+        return 0, None, (
+            "Missing OAuth access token. Set config.access_token "
+            "(populated by the Google OAuth callback) or the "
+            "GOOGLE_ACCESS_TOKEN env var."
+        )
 
     @staticmethod
     def _resolve_spreadsheet_id(config: Dict[str, Any]) -> Optional[str]:
@@ -248,11 +274,7 @@ class GoogleSheetsConnector(BaseMCPConnector):
         """
         token = self._resolve_token(config)
         if not token:
-            return 0, None, (
-                "Missing OAuth access token. Set config.access_token "
-                "(populated by the Google OAuth callback) or the "
-                "GOOGLE_ACCESS_TOKEN env var."
-            )
+            return self._missing_token(config)
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -309,7 +331,9 @@ class GoogleSheetsConnector(BaseMCPConnector):
                 "Missing required field 'spreadsheet_id' (copy from the "
                 "Google Sheets URL: docs.google.com/spreadsheets/d/{ID}/edit)."
             )
-        if not self._resolve_token(cfg):
+        # An oauth_token_id is a credential the orchestrator resolves before
+        # a call, so the connection is configured even though it is not a token.
+        if not (self._resolve_token(cfg) or cfg.get("oauth_token_id")):
             errors.append(
                 "Missing required field 'access_token' (obtained via the "
                 "Google OAuth flow with scope "

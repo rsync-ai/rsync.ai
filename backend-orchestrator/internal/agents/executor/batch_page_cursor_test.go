@@ -24,8 +24,8 @@ func decode(t *testing.T, s string) map[string]interface{} {
 }
 
 func TestReadPageCursorOffsetModeIsNotAKeysetCursor(t *testing.T) {
-	// warehouse_adapters / clickhouse / databricks / snowflake without a
-	// cursor_column: next_cursor is the NEXT OFFSET as a string.
+	// A warehouse connector image from before sql_paging (bigquery, redshift,
+	// clickhouse) reported the NEXT OFFSET as a string next_cursor.
 	res := decode(t, `{"paging_mode":"offset","has_more":true,"next_cursor":"10000"}`)
 	pc := readPageCursor(res, rowsWithIDs(1, 2))
 	if !pc.offsetPaged || pc.next != nil || pc.highWater != nil {
@@ -49,6 +49,31 @@ func TestReadPageCursorKeyset(t *testing.T) {
 	// connectors) keep the pre-existing behavior: next_cursor is the cursor.
 	pc = readPageCursor(decode(t, `{"next_cursor":"opaque-abc"}`), nil)
 	if pc.next != "opaque-abc" || pc.offsetPaged {
+		t.Fatalf("%+v", pc)
+	}
+}
+
+func TestReadPageCursorSnapshotSweep(t *testing.T) {
+	// A warehouse sweep pinned to one snapshot (sql_paging.py): the cursor
+	// carries the point and the next offset, and goes back as `cursor` with
+	// offset 0 — it is not an OFFSET page for the executor to step.
+	// KI-WAREHOUSE-BATCH-PAGING-UNORDERED.
+	res := decode(t, `{"paging_mode":"snapshot","has_more":true,"next_cursor":{"snapshot":1700000000000,"offset":8}}`)
+	pc := readPageCursor(res, rowsWithIDs(1, 2))
+	if pc.offsetPaged || !jsonEqual(pc.next, snapshotCursor(1.7e12, 8)) {
+		t.Fatalf("snapshot page misread: %+v", pc)
+	}
+	off, _ := advancePage(0, 0, 8, pc.next != nil)
+	if off != 0 {
+		t.Fatalf("offset stepped while a snapshot cursor is held: %d", off)
+	}
+	// Its point and offset are no key: the PK high-water stays put.
+	if got := maxCursorValue(float64(7), pc.highWater); got != float64(7) {
+		t.Fatalf("snapshot cursor became the high-water: %#v", got)
+	}
+	// The last, short page carries no cursor: the sweep ends.
+	pc = readPageCursor(decode(t, `{"paging_mode":"snapshot","has_more":false}`), rowsWithIDs(3))
+	if pc.offsetPaged || pc.next != nil || pc.highWater != nil {
 		t.Fatalf("%+v", pc)
 	}
 }

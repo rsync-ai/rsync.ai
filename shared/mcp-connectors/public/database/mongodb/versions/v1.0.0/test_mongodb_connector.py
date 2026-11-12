@@ -1458,6 +1458,323 @@ def test_find_dispatches_as_mcp_tool_and_is_declared_in_lockstep():
     assert set(re.findall(r"\$\w+", desc)) == set(mg.FIND_QUERY_OPERATORS | mg.FIND_EXTJSON_WRAPPERS), desc
 
 
+# ================= AGGREGATE + MATERIALIZE: MongoDB models ==================
+
+def _agg(s, pipeline, **params):
+    return s.aggregate({**CFG, "collection": "orders", "pipeline": pipeline, **params})
+
+
+def _mat(s, pipeline, target="paid_orders", **params):
+    return s.materialize({**CFG, "collection": "orders", "pipeline": pipeline, "target": target, **params})
+
+
+PAID = [{"$match": {"status": "paid"}}]
+
+
+def test_aggregate_preview_appends_its_limit_and_returns_extjson():
+    s, client = _find_server(_orders(5))
+    out = _agg(s, PAID + [{"$sort": {"n": -1}}], limit=2)
+    assert out["success"] is True, out
+    assert [d["n"] for d in out["documents"]] == [5, 3] and out["returned"] == 2
+    assert out["has_more"] is True and out["columns"][0] == "_id"
+    assert out["documents"][0]["_id"] == {"$oid": f"{5:024x}"}
+    call = client["appdb"]["orders"].aggregate_calls[-1]
+    assert call["pipeline"][-1] == {"$limit": 3} and call["maxTimeMS"] == mg.FIND_MAX_TIME_MS
+    assert _agg(s, PAID)["has_more"] is False
+    _agg(s, PAID, limit=10 ** 6, max_time_ms=10 ** 9)
+    call = client["appdb"]["orders"].aggregate_calls[-1]
+    assert call["pipeline"][-1] == {"$limit": mg.FIND_MAX_LIMIT + 1} and call["maxTimeMS"] == mg.FIND_MAX_TIME_MS
+    assert client.closed is True
+
+
+def test_aggregate_never_writes():
+    s, client = _find_server(_orders(4))
+    _agg(s, PAID)
+    _agg(s, [{"$count": "total"}])
+    coll = client["appdb"]["orders"]
+    assert coll.insert_calls == [] and coll.bulk_ops == [] and coll.delete_calls == []
+    assert not any("$out" in st or "$merge" in st for c in coll.aggregate_calls for st in c["pipeline"])
+    assert client["appdb"].list_collection_names() == ["orders"] and len(coll.docs()) == 4
+
+
+def test_aggregate_refuses_write_and_code_operators_at_any_depth():
+    # A pipeline is user input that reaches the server: $out/$merge would write
+    # from a read-only preview, $function/$accumulator/$where run JavaScript.
+    secret = "ssn-123-45-6789"
+    cases = [
+        ([{"$out": "x"}], "pipeline[0].$out"),
+        ([{"$merge": {"into": "x"}}], "pipeline[0].$merge"),
+        ([{"$match": {"$where": secret}}], "pipeline[0].$match.$where"),
+        ([{"$match": {"$expr": {"$function": {"body": secret, "args": [], "lang": "js"}}}}],
+         "pipeline[0].$match.$expr.$function"),
+        ([{"$group": {"_id": None, "x": {"$accumulator": {"init": secret}}}}], "pipeline[0].$group.x.$accumulator"),
+        ([{"$facet": {"a": [{"$match": {}}], "b": [{"$out": secret}]}}], "pipeline[0].$facet.b[0].$out"),
+        ([{"$lookup": {"from": "users", "as": "u", "pipeline": [{"$merge": secret}]}}],
+         "pipeline[0].$lookup.pipeline[0].$merge"),
+        ([{"$unionWith": {"coll": "users", "pipeline": [{"$match": {"$where": secret}}]}}],
+         "pipeline[0].$unionWith.pipeline[0].$match.$where"),
+        ([{"$match": {"a": [{"b": {"$function": secret}}]}}], "pipeline[0].$match.a[0].b.$function"),
+    ]
+    for pipeline, path in cases:
+        s, client = _find_server(_orders(1))
+        for call in (lambda: _agg(s, pipeline), lambda: _mat(s, pipeline)):
+            out = call()
+            assert out["success"] is False and out["error_code"] == "operator_not_allowed", (pipeline, out)
+            assert out["path"] == path, (path, out)
+            assert secret not in str(out), f"error echoed a value: {out}"
+        assert client["appdb"]["orders"].aggregate_calls == [], "a refused pipeline reached the server"
+
+
+def test_aggregate_stage_allowlist_and_shape():
+    s, client = _find_server(_orders(1))
+    for stage in ("$currentOp", "$collStats", "$indexStats", "$listSessions", "$changeStream",
+                  "$documents", "$planCacheStats", "$listLocalSessions", "$shardedDataDistribution"):
+        out = _agg(s, [{stage: {}}])
+        assert out["error_code"] == "stage_not_allowed" and out["path"] == f"pipeline[0].{stage}", (stage, out)
+    for bad in (None, {"$match": {}}, ["$match"], [{"$match": {}, "$limit": 1}], [{}],
+                [{"$facet": {}}], [{"$facet": {"$x": []}}], [{"$facet": {"a": {"$match": {}}}}],
+                [{"$lookup": "users"}]):
+        out = _agg(s, bad)
+        assert out["success"] is False and out["error_code"] in ("invalid_pipeline", "invalid_collection"), (bad, out)
+    assert client["appdb"]["orders"].aggregate_calls == []
+    # Every allowlisted stage passes validation (the server checks each one's body).
+    for stage in mg.AGGREGATE_STAGES - {"$lookup", "$graphLookup", "$unionWith", "$facet"}:
+        assert mg._validate_aggregate_pipeline([{stage: {}}]) == [{stage: {}}], stage
+
+
+def test_aggregate_foreign_collections_follow_find_rules():
+    ok = [{"$lookup": {"from": "users", "localField": "u", "foreignField": "_id", "as": "user",
+                       "pipeline": [{"$project": {"name": 1}}]}},
+          {"$graphLookup": {"from": "users", "startWith": "$m", "connectFromField": "m",
+                            "connectToField": "_id", "as": "chain"}},
+          {"$unionWith": "archive"}, {"$unionWith": {"coll": "archive", "pipeline": [{"$limit": 1}]}},
+          {"$facet": {"by_status": [{"$sortByCount": "$status"}], "top": [{"$limit": 1}]}}]
+    assert mg._validate_aggregate_pipeline(ok) == ok
+    cases = [
+        ({"$lookup": {"from": "system.users", "as": "u"}}, "pipeline[0].$lookup.from"),
+        ({"$lookup": {"from": {"db": "admin", "coll": "x"}, "as": "u"}}, "pipeline[0].$lookup.from"),
+        ({"$lookup": {"as": "u", "pipeline": []}}, "pipeline[0].$lookup.from"),
+        ({"$graphLookup": {"from": "system.profile", "as": "g"}}, "pipeline[0].$graphLookup.from"),
+        ({"$unionWith": "system.js"}, "pipeline[0].$unionWith"),
+        ({"$unionWith": {"coll": "a$b"}}, "pipeline[0].$unionWith.coll"),
+    ]
+    s, client = _find_server(_orders(1))
+    for stage, path in cases:
+        out = _agg(s, [stage])
+        assert out["error_code"] == "invalid_collection" and out["path"] == path, (stage, out)
+    assert client["appdb"]["orders"].aggregate_calls == []
+
+
+def test_aggregate_pipeline_limits():
+    s, _ = _find_server(_orders(1))
+    assert _agg(s, [{"$skip": 0}] * mg.AGGREGATE_MAX_STAGES)["success"] is True
+    assert _agg(s, [{"$skip": 0}] * (mg.AGGREGATE_MAX_STAGES + 1))["error_code"] == "pipeline_too_long"
+    deep = 0
+    for _ in range(mg.AGGREGATE_MAX_DEPTH + 5):
+        deep = {"a": deep}
+    assert _agg(s, [{"$match": deep}])["error_code"] == "pipeline_too_deep"
+    facets = [{"$limit": 1}]
+    for _ in range(mg.AGGREGATE_MAX_DEPTH):
+        facets = [{"$facet": {"f": facets}}]
+    assert _agg(s, facets)["error_code"] == "pipeline_too_deep"
+    big = [{"$match": {"status": {"$in": ["x" * 1000] * 140}}}]
+    assert _agg(s, big)["error_code"] == "pipeline_too_large"
+
+
+def test_aggregate_decodes_extended_json_wrappers():
+    s, client = _find_server(_orders(5))
+    out = _agg(s, [{"$match": {"_id": {"$oid": f"{3:024x}"}}}])
+    assert out["success"] is True and [d["n"] for d in out["documents"]] == [3], out
+    sent = client["appdb"]["orders"].aggregate_calls[-1]["pipeline"][0]["$match"]["_id"]
+    assert isinstance(sent, ObjectId)
+    out = _agg(s, [{"$match": {"_id": {"$oid": f"{3:024x}", "x": 1}}}])
+    assert out["error_code"] == "invalid_pipeline" and out["path"] == "pipeline[0].$match._id.$oid", out
+    assert _agg(s, [{"$match": {"_id": {"$oid": "nope"}}}])["success"] is False
+
+
+def test_aggregate_maps_server_errors_without_echoing_values():
+    from pymongo.errors import ConnectionFailure, ExecutionTimeout, OperationFailure
+    secret = "ssn-123-45-6789"
+    cases = [
+        (ExecutionTimeout(f"time limit {secret}", code=50, details={"codeName": "MaxTimeMSExpired"}),
+         "query_timeout", "15000 ms"),
+        (OperationFailure(f"bad value {secret}", code=2, details={"codeName": "BadValue", "errmsg": secret}),
+         "query_failed", "BadValue"),
+        (RuntimeError(secret), "query_failed", "aggregate failed (RuntimeError)"),
+        (ConnectionFailure("no servers"), "connection_failed", "no servers"),
+    ]
+    for err, code, hint in cases:
+        s, client = _find_server(_orders(1))
+        client["appdb"]["orders"].aggregate_error = err
+        out = _agg(s, [{"$match": {"ssn": secret}}])
+        assert out["success"] is False and out["error_code"] == code, (err, out)
+        assert hint in out["error"], out
+        assert secret not in str(out), f"error echoed a value: {out}"
+        assert client.closed is True
+
+
+def test_aggregate_database_scope_collection_and_string_config():
+    import json
+    s, _ = _find_server(_orders(2))
+    assert _agg(s, PAID, database="other")["error_code"] == "invalid_database"
+    for bad in (None, "", "system.users", "a$b"):
+        out = s.aggregate({**CFG, "collection": bad, "pipeline": []})
+        assert out["error_code"] == "invalid_collection", (bad, out)
+    out = s.aggregate({"config": json.dumps(CFG["config"]), "table": "orders", "pipeline": []})
+    assert out["success"] is True and out["returned"] == 2, out
+    assert s.aggregate({"config": "{not json", "collection": "orders", "pipeline": []})["error_code"] == "invalid_config"
+
+
+def test_materialize_first_run_builds_aside_then_renames_onto_the_target():
+    from pymongo import ReadPreference
+    s, client = _find_server(_orders(5))
+    out = _mat(s, PAID)
+    assert out == {**out, "success": True, "executed": True, "rows_affected": 3, "target": "appdb.paid_orders"}, out
+    src = client["appdb"]["orders"]
+    call = src.aggregate_calls[-1]
+    assert call["pipeline"] == PAID + [{"$out": "paid_orders__rsync_new"}]
+    assert call["allowDiskUse"] is True and call["maxTimeMS"] == 1800 * 1000
+    assert src.options_calls[-1] == {"read_preference": ReadPreference.PRIMARY}
+    db = client["appdb"]
+    assert db.rename_calls == [{"from": "paid_orders__rsync_new", "to": "paid_orders", "dropTarget": False}]
+    assert sorted(db.list_collection_names()) == ["orders", "paid_orders"]
+    assert sorted(d["n"] for d in db["paid_orders"].docs()) == [1, 3, 5]
+    assert len(src.docs()) == 5 and client.closed is True
+
+
+def test_materialize_first_run_refuses_a_collection_it_did_not_create():
+    # The SQL engines' guarantee, made by MongoDB itself: rename without
+    # dropTarget fails on an existing collection, so a model's first run can
+    # never replace a collection someone else owns.
+    theirs = [{"_id": 1, "keep": "me"}]
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"orders": _orders(5), "paid_orders": list(theirs)}})
+    out = _mat(s, PAID)
+    assert out["success"] is False and out["error_code"] == "target_exists", out
+    assert "appdb.paid_orders" in out["error"] and "did not create" in out["error"]
+    db = client["appdb"]
+    assert db["paid_orders"].docs() == theirs
+    assert "paid_orders__rsync_new" not in db.list_collection_names(), "the staging collection was left behind"
+    # An empty result that $out does not create: create_collection meets it instead.
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"orders": _orders(5), "paid_orders": list(theirs)}})
+    client["appdb"]["orders"].out_creates_empty = False
+    out = _mat(s, [{"$match": {"status": "void"}}])
+    assert out["error_code"] == "target_exists", out
+    assert client["appdb"]["paid_orders"].docs() == theirs
+
+
+def test_materialize_owned_target_is_replaced_directly():
+    old = [{"_id": 99, "n": 99}]
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"orders": _orders(5), "paid_orders": list(old)}})
+    out = _mat(s, PAID, replace=True)
+    assert out["success"] is True and out["rows_affected"] == 3, out
+    assert client["appdb"]["orders"].aggregate_calls[-1]["pipeline"][-1] == {"$out": "paid_orders"}
+    assert client["appdb"].rename_calls == []
+    assert sorted(d["n"] for d in client["appdb"]["paid_orders"].docs()) == [1, 3, 5]
+    # An owned target someone dropped is simply rebuilt.
+    client["appdb"].drop_collection("paid_orders")
+    out = _mat(s, PAID, replace=True)
+    assert out["success"] is True and out["rows_affected"] == 3, out
+    # replace must be exactly True: a truthy string is not ownership.
+    _mat(s, PAID, replace="true")
+    assert client["appdb"]["orders"].aggregate_calls[-1]["pipeline"][-1] == {"$out": "paid_orders__rsync_new"}
+
+
+def test_materialize_empty_result_still_creates_the_target():
+    for creates_empty in (True, False):
+        s, client = _find_server(_orders(3))
+        client["appdb"]["orders"].out_creates_empty = creates_empty
+        out = _mat(s, [{"$match": {"status": "void"}}])
+        assert out["success"] is True and out["rows_affected"] == 0, (creates_empty, out)
+        db = client["appdb"]
+        assert sorted(db.list_collection_names()) == ["orders", "paid_orders"], creates_empty
+        assert db["paid_orders"].exists is True
+        assert db.create_calls == ([] if creates_empty else ["paid_orders"])
+
+
+def test_materialize_failure_keeps_the_previous_result_and_drops_staging():
+    from pymongo.errors import ExecutionTimeout, OperationFailure
+    secret = "ssn-123-45-6789"
+    old = [{"_id": 99, "n": 99}]
+    # Owned: a failed $out leaves the previous result in place.
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"orders": _orders(5), "paid_orders": list(old)}})
+    client["appdb"]["orders"].aggregate_error = ExecutionTimeout(
+        f"time limit {secret}", code=50, details={"codeName": "MaxTimeMSExpired"})
+    out = _mat(s, [{"$match": {"ssn": secret}}], replace=True, timeout_seconds=60)
+    assert out["error_code"] == "query_timeout" and "60 s" in out["error"], out
+    assert secret not in str(out) and client["appdb"]["paid_orders"].docs() == old
+    assert client.closed is True
+    # First run: a leftover staging collection from a crashed run is dropped.
+    s, client = _mongo_fakes.make_connector(
+        mg, dbs={"appdb": {"orders": _orders(5), "paid_orders__rsync_new": [{"_id": 1}]}})
+    client["appdb"]["orders"].aggregate_error = OperationFailure(
+        f"bad {secret}", code=2, details={"codeName": "BadValue"})
+    out = _mat(s, PAID)
+    assert out["error_code"] == "query_failed" and "BadValue" in out["error"] and secret not in str(out), out
+    assert client["appdb"].list_collection_names() == ["orders"]
+    # A rename the server refuses for another reason is not reported as a collision.
+    s, client = _find_server(_orders(5))
+    client["appdb"]["paid_orders__rsync_new"].rename_error = OperationFailure(
+        "not authorized", code=13, details={"codeName": "Unauthorized"})
+    out = _mat(s, PAID)
+    assert out["error_code"] == "query_failed" and "Unauthorized" in out["error"], out
+    assert "paid_orders__rsync_new" not in client["appdb"].list_collection_names()
+
+
+def test_materialize_target_validation_and_scope():
+    s, client = _find_server(_orders(3))
+    for bad in (None, "", "a.b.c", "1abc", "a-b", "x" * 53, "orders$", ".x", "x.", 5):
+        out = _mat(s, PAID, target=bad)
+        assert out["error_code"] == "invalid_target", (bad, out)
+    out = _mat(s, PAID, target="otherdb.paid")
+    assert out["error_code"] == "invalid_target" and out["path"] == "target", out
+    assert client["appdb"]["orders"].aggregate_calls == []
+    out = _mat(s, PAID, target="appdb.paid")
+    assert out["success"] is True and out["target"] == "appdb.paid", out
+    assert client["appdb"]["orders"].aggregate_calls[-1]["pipeline"][-1] == {"$out": "paid__rsync_new"}
+
+
+def test_materialize_server_level_connection_writes_another_database_in_scope():
+    server = {"host": "localhost", "port": 27017, "user": "u", "password": "p"}
+    s, client = _mongo_fakes.make_connector(mg, dbs={"shop": {"orders": _orders(4)}, "admin": {}})
+    params = {"config": server, "database": "shop", "collection": "orders", "pipeline": PAID}
+    out = s.materialize({**params, "target": "warehouse.paid"})
+    assert out["success"] is True and out["target"] == "warehouse.paid" and out["rows_affected"] == 2, out
+    call = client["shop"]["orders"].aggregate_calls[-1]
+    assert call["pipeline"][-1] == {"$out": {"db": "warehouse", "coll": "paid__rsync_new"}}
+    assert client["warehouse"].rename_calls[-1]["to"] == "paid"
+    assert s.materialize({**params, "target": "admin.paid"})["error_code"] == "invalid_target"
+    assert s.materialize({**params, "database": None, "target": "paid"})["error_code"] == "invalid_database"
+
+
+def test_materialize_timeout_seconds():
+    s, client = _find_server(_orders(1))
+    for given, want in ((60, 60), ("120", 120), (None, 1800), ("abc", 1800), (-5, 1800), (0, 1800), (True, 1800)):
+        _mat(s, PAID, timeout_seconds=given)
+        assert client["appdb"]["orders"].aggregate_calls[-1]["maxTimeMS"] == want * 1000, given
+
+
+def test_aggregate_and_materialize_dispatch_and_are_declared_in_lockstep():
+    import json
+    import re
+    s, client = _find_server(_orders(3))
+    out = s._handle_tool_call({"name": "mongodb_aggregate", "arguments": {
+        **CFG, "collection": "orders", "pipeline": PAID + [{"$sort": {"n": -1}}], "limit": 1}})
+    assert out["success"] is True and out["documents"][0]["n"] == 3, out
+    out = s._handle_tool_call({"name": "mongodb_materialize", "arguments": {
+        **CFG, "collection": "orders", "pipeline": PAID, "target": "paid_orders"}})
+    assert out["success"] is True and out["rows_affected"] == 2, out
+    assert s._resolves_to_handler("mongodb_aggregate") is True
+    assert s._resolves_to_handler("mongodb_materialize") is True
+    cap_ops = {o["name"]: o for o in s.get_capabilities({})["operations"]}
+    with open(os.path.join(_HERE, "metadata.json")) as fh:
+        meta_ops = {o["name"]: o for o in json.load(fh)["operations"]}
+    for name, kind in (("aggregate", "source"), ("materialize", "destination")):
+        assert cap_ops[name]["method"] == meta_ops[name]["method"] == f"mongodb_{name}"
+        assert cap_ops[name]["type"] == meta_ops[name]["type"] == kind
+        desc = next(p for p in meta_ops[name]["parameters"] if p["name"] == "pipeline")["description"]
+        assert set(re.findall(r"\$\w+", desc)) == set(mg.AGGREGATE_STAGES | mg.AGGREGATE_DENIED_OPERATORS), desc
+
+
 # ================================= runner ===================================
 
 def _budget_dbs():

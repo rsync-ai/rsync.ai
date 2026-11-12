@@ -1,0 +1,23 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M284 15A135 135 0 1 1 247.9 280.1L262 229.5A82.5 82.5 0 1 0 284 67.5Z" fill="#039fd4" stroke="#ffffff" stroke-linejoin="round" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-0"></path>
+<path d="M247.9 280.1A135 135 0 0 1 196.3 47.4L230.4 87.3A82.5 82.5 0 0 0 262 229.5Z" fill="#de7b2a" stroke="#ffffff" stroke-linejoin="round" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M196.3 47.4A135 135 0 0 1 284 15L284 67.5A82.5 82.5 0 0 0 230.4 87.3Z" fill="#5071de" stroke="#ffffff" stroke-linejoin="round" ecmeta_series_index="0" ecmeta_data_index="2" ecmeta_ssr_type="chart" class="zr-cls-2"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+cursor:pointer;
+fill:rgba(3,174,233,1);
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(244,135,46,1);
+}
+.zr-cls-2:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+
+]]>
+
+</style>
+</svg>

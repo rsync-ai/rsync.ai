@@ -322,9 +322,10 @@ class HITLInterpreter:
                 
         except Exception as e:
             logger.error(f"LLM interpretation failed: {e}")
+            # Fixed text: an exception can quote the request it failed on.
             return InterpretResult(
                 success=False,
-                error=str(e),
+                error="The LLM call failed. See the llm-service log.",
                 needs_clarification=True,
                 clarification_prompt="Sorry, I had trouble understanding. Could you please try again?",
             )
@@ -367,8 +368,7 @@ def interpret_node_input(
     """
     Convenience function for interpreting HITL node input.
     
-    This is the main entry point for the Temporal activity
-    InterpretNodeInputActivity.
+    Called by the gateway's POST /v1/hitl/interpret route.
     
     Args:
         llm_client: LLMClient instance

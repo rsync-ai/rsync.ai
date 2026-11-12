@@ -30,9 +30,14 @@ export default async function DashboardLayout({
       <div className="relative min-h-screen">
         <Sidebar role={user.role} />
         <Header user={{ email: user.email, name: user.name, avatarUrl: undefined }} />
-        <DashboardShell>
-          <EmailVerificationBanner />
-          <PlanBanner />
+        <DashboardShell
+          banners={
+            <>
+              <EmailVerificationBanner />
+              <PlanBanner />
+            </>
+          }
+        >
           {children}
         </DashboardShell>
         <GlobalConnectorModal />

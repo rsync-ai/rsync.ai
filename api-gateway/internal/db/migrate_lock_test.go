@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -90,5 +92,33 @@ func TestMigrateTakesAnAdvisoryLockBeforeTouchingTheSchema(t *testing.T) {
 		t.Error("Migrate does not discard the connection when pg_advisory_unlock fails. " +
 			"Close() alone pools the connection and the lock survives -- verified against " +
 			"postgres:16 -- so without this the failure path leaks the lock silently.")
+	}
+}
+
+// A migrations directory copied off a Mac (tar, scp, a mounted volume) carries an
+// AppleDouble sidecar per file: "._001_init.sql", binary resource-fork data with a
+// .sql name. Migrate took every *.sql, so it applied the sidecar -- and "._" sorts
+// before every digit, so the sidecar ran FIRST, failed, and Migrate returned before
+// any real migration: markSchemaReady() never ran and /ready served 503. The bug
+// class is a file the runner treats as a migration without it being one, so every
+// dotfile is out, not only the "._" prefix.
+func TestMigrateSkipsDotfilesSuchAsAppleDoubleSidecars(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"002_b.sql", "001_a.sql", "._001_a.sql", ".hidden.sql", "README.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("SELECT 1;"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "003_dir.sql"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"001_a.sql", "002_b.sql"}
+	if got := migrationFileNames(entries); !reflect.DeepEqual(got, want) {
+		t.Fatalf("migrationFileNames = %q, want %q", got, want)
 	}
 }

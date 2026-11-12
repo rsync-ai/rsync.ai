@@ -1,0 +1,55 @@
+# settings: {"version":2,"type":"bullet","roles":{"measure":[{"aggregate":"sum","column":"amount"},{"aggregate":"sum","column":"quota"}]}}
+
+-- postgres
+SELECT SUM(src."amount") AS "amount", SUM(src."quota") AS "quota"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT SUM(src.`amount`) AS `amount`, SUM(src.`quota`) AS `quota`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) SUM(src.[amount]) AS [amount], SUM(src.[quota]) AS [quota]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT SUM(src.`amount`) AS `amount`, SUM(src.`quota`) AS `quota`
+FROM `gold`.`orders` src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT SUM(src."AMOUNT") AS "AMOUNT", SUM(src."QUOTA") AS "QUOTA"
+FROM "GOLD"."ORDERS" src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT SUM(src.`amount`) AS `amount`, SUM(src.`quota`) AS `quota`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT SUM(src.`amount`) AS `amount`, SUM(src.`quota`) AS `quota`
+FROM `gold`.`orders` src
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT SUM(src."AMOUNT") AS "AMOUNT", SUM(src."QUOTA") AS "QUOTA"
+FROM "GOLD"."ORDERS" src
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

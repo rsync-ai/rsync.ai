@@ -13,7 +13,7 @@ than a shut door: the build is dispatched as a detached task
 before docker.from_env() has been attempted. The orchestrator extends its poll on
 that flag (mcp/server_manager.go:827-836) and waits out the entire pre-flight
 timeout, while the build has already failed with a WARNING and returned False
-(docker_builder.py:158). What the operator finally sees is "not reachable --
+(docker_builder.py:148). What the operator finally sees is "not reachable --
 check `docker compose logs`" on a cluster that has no compose in it, with the
 real cause in a tool-generator log line nobody was told to read.
 

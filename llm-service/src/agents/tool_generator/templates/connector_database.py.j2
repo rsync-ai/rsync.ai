@@ -35,8 +35,10 @@ from base_connector import (
 # canonical types so the destination provisions correct columns instead of
 # falling back to all-TEXT. Identity fallback keeps offline/dev from crashing.
 try:
-    from canonical_types import canonicalize_type, canonical_to_ddl  # type: ignore
+    from canonical_types import UNCONSTRAINED_NUMERIC, canonicalize_type, canonical_to_ddl  # type: ignore
 except Exception:  # pragma: no cover
+    UNCONSTRAINED_NUMERIC = "numeric"
+
     def canonicalize_type(t, *, dialect=None, scale=None, precision=None):  # type: ignore
         return t if isinstance(t, str) else "string"
 
@@ -50,6 +52,14 @@ try:
     from warehouse_adapters import get_data_warehouse_adapter  # type: ignore
 except Exception:
     get_data_warehouse_adapter = None  # type: ignore
+
+# Stable batch paging for SQL sources (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS),
+# shipped into the image via `COPY --from=shared sql_paging.py` (see
+# Dockerfile). Without it an export fails loudly instead of paging unstably.
+try:
+    import sql_paging  # type: ignore
+except Exception:  # pragma: no cover
+    sql_paging = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -237,11 +247,14 @@ DRIVER_PATTERNS = {
 
 # Detect driver pattern from connector type
 def _get_driver_pattern(connector_type: str) -> Dict:
-    """Get driver pattern based on connector type"""
+    """Get driver pattern based on connector type. ``name`` is the pattern's
+    key, the engine itself: several engines share a driver (Redshift and
+    PostgreSQL psycopg2, Synapse and SQL Server pyodbc), so paging picks its
+    dialect by this name before the driver module."""
     connector_lower = connector_type.lower()
     for pattern_name, pattern in DRIVER_PATTERNS.items():
         if pattern_name in connector_lower:
-            return pattern
+            return dict(pattern, name=pattern_name)
     return {}
 
 # Global driver detection
@@ -320,6 +333,13 @@ def _canonical_sqlserver_type(t: Any) -> str:
     in exactly one place (`canonical_types.canonicalize_type`).
     """
     return canonicalize_type(t, dialect="sqlserver")
+
+
+def _canonical_sql_type(t: Any) -> str:
+    """Coerce an information_schema ``data_type`` to canonical via the shared
+    authority; ``_discover_postgres_schema_v2`` (every psycopg2 engine) reads
+    its columns through it. Same helper as the PostgreSQL connector's."""
+    return canonicalize_type(t, dialect="postgresql")
 
 
 def _mysql_bind_value(v: Any, canonical_type: Optional[str] = None) -> Any:
@@ -517,6 +537,59 @@ class {{ spec.class_name }}(BaseMCPConnector):
             parts = raw.split(".", 1)
             return parts[0].strip('"').strip("`"), parts[1].strip('"').strip("`")
         return "public", raw
+
+    # ------------------------------------------------------------------
+    # Write SQL by engine. Redshift shares psycopg2 with PostgreSQL and
+    # Synapse shares pyodbc with SQL Server, and neither has all of their
+    # write SQL (ON CONFLICT, SAVEPOINT, unique indexes, MERGE ... USING
+    # (VALUES ...)), so the write path branches on the engine's dialect, not
+    # on the driver module.
+    # ------------------------------------------------------------------
+    _NO_SQL_PAGING = "sql_paging.py is missing from this connector image; rebuild it"
+    # No offsets table that commits with the batch: Athena has no
+    # transactions, and a Synapse dedicated pool no MERGE ... USING (VALUES).
+    _NO_CDC_OFFSETS = ("synapse", "athena")
+
+    def _write_dialect(self):
+        """The engine's sql_paging dialect, or None when the image lacks it."""
+        if sql_paging is None:
+            return None
+        pattern = getattr(self, "driver_pattern", None) or {}
+        return sql_paging.dialect_for(pattern.get("module"), pattern.get("name"))
+
+    @staticmethod
+    def _write_ident(dialect, name: str) -> str:
+        """A validated identifier in the write SQL. Oracle's stay unquoted, as
+        its MERGE names them, so they fold like the table's own DDL."""
+        return name if dialect.name == "oracle" else dialect.ident(name)
+
+    @staticmethod
+    def _bind(dialect, values) -> tuple:
+        """(placeholders, params) in the engine's bind style: pyathena binds
+        only a dict, oracledb only :N."""
+        binder = sql_paging.Binder(dialect.paramstyle)
+        return [binder.add(v) for v in values], binder.params()
+
+    def _generic_write_target(self, table: str, params: Dict, dialect) -> Optional[str]:
+        """The target of an engine with no write branch of its own. A bare
+        table takes the per-pipeline namespace, as PostgreSQL and MySQL do;
+        None for an unsafe identifier."""
+        parts = [p.strip().strip('"').strip("`") for p in str(table or "").strip().split(".")]
+        if len(parts) == 1:
+            ns = str((params or {}).get("namespace") or (params or {}).get("db_or_schema") or "")
+            ns = ns.strip().strip('"').strip("`")
+            if ns and ns.lower() != "default":
+                parts = [ns] + parts
+        if len(parts) > 2 or not all(self._is_safe_ident(p) for p in parts):
+            return None
+        return ".".join(self._write_ident(dialect, p) for p in parts)
+
+    def _cdc_offsets_refusal(self, params: Dict, dialect) -> Optional[Dict[str, Any]]:
+        """Refuse a CDC batch before any write on an engine that cannot commit
+        its offset with it: Athena commits each statement as it runs."""
+        if (params or {}).get("kafka_offset") and dialect.name in self._NO_CDC_OFFSETS:
+            return {"success": False, "error": f"CDC offsets not implemented for {dialect.name}"}
+        return None
 
     def _mk_index_name(self, schema: str, table: str, cols: List[str]) -> str:
         base = f"idx_{schema}_{table}_" + "_".join(cols[:2]) + "_uniq"
@@ -753,7 +826,14 @@ class {{ spec.class_name }}(BaseMCPConnector):
             return ddl
 
         def _ddl_for(c: str) -> str:
-            ddl = self._normalize_ddl_type(ct.get(c, 'TEXT'))
+            raw = str(ct.get(c) or "TEXT").strip()
+            if raw.lower() in ("decimal", "numeric"):
+                # A bare DECIMAL/NUMERIC is DECIMAL(10,0) in MySQL, which drops every
+                # fractional digit. A bare decimal gets DECIMAL(38,9); a bare numeric
+                # is PostgreSQL's unconstrained NUMERIC, stored as exact text.
+                ddl = canonical_to_ddl("mysql", raw, is_key=c in safe_keys, single_key=len(safe_keys) == 1)
+            else:
+                ddl = self._normalize_ddl_type(raw)
             return _key_ddl(ddl) if c in safe_keys else ddl
 
         col_defs = ", ".join([f"`{c}` {_ddl_for(c)}" for c in safe_cols])
@@ -835,18 +915,20 @@ class {{ spec.class_name }}(BaseMCPConnector):
         if not self._is_safe_ident(schema):
             return {"success": False, "error": f"Unsafe schema identifier: {schema}"}
 
-        module = (self.driver_pattern.get("module", "") or "").lower()
+        dialect = self._write_dialect()
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        if dialect.name not in ("postgresql", "redshift", "mysql"):
+            return {"success": False, "error": f"ensure_schema not implemented for {dialect.name}"}
         conn = None
         cursor = None
         try:
             conn = self._get_connection(config)
             cursor = self._get_cursor(conn, as_dict=False)
-            if "psycopg2" in module or "postgres" in module:
-                cursor.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-            elif "mysql" in module:
+            if dialect.name == "mysql":
                 cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{schema}`")
             else:
-                return {"success": False, "error": f"ensure_schema not implemented for driver: {module or 'generic'}"}
+                cursor.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
             try:
                 conn.commit()
             except Exception:
@@ -865,10 +947,19 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 pass
 
     def ensure_table(self, params: Dict = None) -> Dict[str, Any]:
-        if self._is_sqlserver_dialect():
+        dialect = self._write_dialect()
+        # Synapse: a dedicated pool has no unique index for _ss_ensure_table to
+        # back a key with; the table must exist.
+        if self._is_sqlserver_dialect() and (dialect is None or dialect.name == "sqlserver"):
             return self._ss_ensure_table(params)
         if not bool(getattr(self, "supports_ddl", False)):
             return {"success": False, "error": "DDL helpers not supported by this connector"}
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        # PostgreSQL's CDC DDL (unique index, REPLICA IDENTITY, ADD COLUMN IF
+        # NOT EXISTS) is not Redshift's: refuse before any SQL runs.
+        if dialect.name not in ("postgresql", "mysql"):
+            return {"success": False, "error": f"ensure_table not implemented for {dialect.name}"}
         params = params or {}
         config = self._get_config(params)
         table = str(params.get("table") or "").strip()
@@ -901,19 +992,16 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 if kk:
                     column_types[kk] = vv
 
-        module = (self.driver_pattern.get("module", "") or "").lower()
         conn = None
         cursor = None
         try:
             conn = self._get_connection(config)
             cursor = self._get_cursor(conn, as_dict=False)
-            if "psycopg2" in module or "postgres" in module:
+            if dialect.name == "postgresql":
                 norm = self._normalize_table_for_postgresql(config, table, params)
                 self._ensure_table_for_cdc(cursor, norm, columns, key_fields, column_types)
-            elif "mysql" in module:
-                self._ensure_table_for_mysql(cursor, config, table, columns, key_fields, column_types, params)
             else:
-                return {"success": False, "error": f"ensure_table not implemented for driver: {module or 'generic'}"}
+                self._ensure_table_for_mysql(cursor, config, table, columns, key_fields, column_types, params)
             try:
                 conn.commit()
             except Exception:
@@ -963,13 +1051,17 @@ class {{ spec.class_name }}(BaseMCPConnector):
         if params.get("cascade") is False:
             cascade_clause = ""
 
-        module = (self.driver_pattern.get("module", "") or "").lower()
+        dialect = self._write_dialect()
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        if dialect.name not in ("postgresql", "redshift", "mysql"):
+            return {"success": False, "error": f"drop_table not implemented for {dialect.name}"}
         conn = None
         cursor = None
         try:
             conn = self._get_connection(config)
             cursor = self._get_cursor(conn, as_dict=False)
-            if "psycopg2" in module or "postgres" in module:
+            if dialect.name in ("postgresql", "redshift"):
                 parts = table.rsplit(".", 1)
                 if len(parts) == 2:
                     drop_sql = f'DROP TABLE IF EXISTS "{parts[0]}"."{parts[1]}"{cascade_clause}'
@@ -988,7 +1080,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     else:
                         drop_sql = f'DROP TABLE IF EXISTS "{table}"{cascade_clause}'
                 cursor.execute(drop_sql)
-            elif "mysql" in module:
+            else:
                 tbl = table.rsplit(".", 1)[-1] if "." in table else table
                 # MySQL: the database is the namespace. A qualified spec
                 # (db.table) carries it; a bare spec forwards the per-pipeline
@@ -1008,8 +1100,6 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     cursor.execute(f"DROP TABLE IF EXISTS `{ns_db}`.`{tbl}`{cascade_clause}")
                 else:
                     cursor.execute(f"DROP TABLE IF EXISTS `{tbl}`{cascade_clause}")
-            else:
-                return {"success": False, "error": f"drop_table not implemented for driver: {module or 'generic'}"}
             try:
                 conn.commit()
             except Exception:
@@ -2060,6 +2150,11 @@ class {{ spec.class_name }}(BaseMCPConnector):
                             _prec = int(cr[5])
                             _scale = int(cr[6]) if cr[6] is not None else 0
                             _emit_type = "numeric(%d,%d)" % (_prec, _scale)
+                        elif _canon == "decimal" and str(cr[3] or "").strip().lower() == "numeric":
+                            # A NUMERIC with no precision or scale: plain NUMERIC on
+                            # PostgreSQL, exact text elsewhere (canonical_to_ddl).
+                            # money stays "decimal".
+                            _emit_type = UNCONSTRAINED_NUMERIC
                         # Declared type, qualifier included. Both sides of a drift
                         # comparison must be qualified for a width change to count,
                         # so an unqualified fallback is never drift, only unknown.
@@ -2094,12 +2189,18 @@ class {{ spec.class_name }}(BaseMCPConnector):
             if include_relationships and table_names and schemas_seen:
                 try:
                     placeholders = ",".join(["%s"] * len(table_names))
+                    # pg_catalog, not information_schema: the constraint views
+                    # show only tables the user owns or holds a non-SELECT
+                    # privilege on, so a read-only source user got no keys.
                     q = (
-                        "SELECT tc.table_schema, tc.table_name, kcu.column_name "
-                        "FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-                        "WHERE tc.table_schema IN (" + sch_ph + ") AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_name IN (" + placeholders + ") "
-                        "ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position"
+                        "SELECT n.nspname, c.relname, a.attname "
+                        "FROM pg_catalog.pg_constraint con "
+                        "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        "CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                        "JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+                        "WHERE con.contype = 'p' AND n.nspname IN (" + sch_ph + ") AND c.relname IN (" + placeholders + ") "
+                        "ORDER BY n.nspname, c.relname, k.ord"
                     )
                     cursor.execute(q, tuple(schemas_seen) + tuple(table_names))
                     pk_rows = cursor.fetchall() or []
@@ -2120,15 +2221,22 @@ class {{ spec.class_name }}(BaseMCPConnector):
             if include_relationships and table_names and schemas_seen:
                 try:
                     placeholders = ",".join(["%s"] * len(table_names))
+                    # pg_catalog for the same reason as the primary keys. The
+                    # referenced column is matched by key position, so a
+                    # composite key yields one row per column pair.
                     q = (
-                        "SELECT tc.table_schema, tc.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_column, tc.constraint_name, "
-                        "rc.update_rule, rc.delete_rule "
-                        "FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-                        "JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
-                        "JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema "
-                        "WHERE tc.table_schema IN (" + sch_ph + ") AND tc.constraint_type = 'FOREIGN KEY' AND tc.table_name IN (" + placeholders + ") "
-                        "ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position"
+                        "SELECT n.nspname, c.relname, a.attname, rc.relname AS ref_table, ra.attname AS ref_column, con.conname, "
+                        "CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END, "
+                        "CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END "
+                        "FROM pg_catalog.pg_constraint con "
+                        "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                        "JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid "
+                        "CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                        "JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum "
+                        "JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[k.ord] "
+                        "WHERE con.contype = 'f' AND n.nspname IN (" + sch_ph + ") AND c.relname IN (" + placeholders + ") "
+                        "ORDER BY n.nspname, c.relname, con.conname, k.ord"
                     )
                     cursor.execute(q, tuple(schemas_seen) + tuple(table_names))
                     fk_rows = cursor.fetchall() or []
@@ -3167,143 +3275,6 @@ class {{ spec.class_name }}(BaseMCPConnector):
             return {"schema": parts[-2], "table": parts[-1]}
         return {"schema": None, "table": t or None}
 
-    def _is_invisible_column(self, cursor, table: str, column: str) -> bool:
-        """MySQL 8: report whether ``column`` is INVISIBLE (omitted from
-        ``SELECT *``). A table whose ONLY primary key is an invisible generated
-        key (GIPK, e.g. ``my_row_id``) is found by ``SHOW KEYS`` but excluded
-        from ``SELECT *``, so the keyset cursor value can't be read back and
-        pagination silently truncates to the first page. Detecting invisibility
-        lets ``export`` project the column explicitly so the cursor advances.
-        Best-effort: returns False on any error (caller keeps existing behavior).
-        Only meaningful for MySQL — other dialects have no invisible columns.
-        """
-        module = (self.driver_pattern.get("module", "") or "").lower()
-        if "mysql" not in module:
-            return False
-        table_parts = self._split_qualified_table(table)
-        schema = table_parts.get("schema")
-        tbl = table_parts.get("table")
-        if not tbl or not column:
-            return False
-        try:
-            cursor.execute(
-                "SELECT EXTRA FROM information_schema.COLUMNS "
-                "WHERE TABLE_SCHEMA = COALESCE(%s, DATABASE()) "
-                "AND TABLE_NAME = %s AND COLUMN_NAME = %s",
-                (schema, tbl, column),
-            )
-            rows = cursor.fetchall() or []
-            if not rows:
-                return False
-            first = rows[0]
-            extra = first.get("EXTRA") if isinstance(first, dict) else (first[0] if len(first) else "")
-            return "INVISIBLE" in str(extra or "").upper()
-        except Exception:
-            return False
-
-    def _get_primary_key_column(self, cursor, table: str) -> Optional[str]:
-        """
-        Best-effort: return the first PRIMARY KEY column name for keyset pagination.
-        Works across common relational DBs; falls back to None.
-        """
-        module = (self.driver_pattern.get("module", "") or "").lower()
-        table_parts = self._split_qualified_table(table)
-        schema = table_parts.get("schema")
-        tbl = table_parts.get("table")
-        if not tbl:
-            return None
-
-        try:
-            # MySQL
-            if "mysql" in module:
-                safe_tbl = self._safe_column_identifier(tbl)
-                if not safe_tbl:
-                    return None
-                fq = f'`{safe_tbl}`'
-                if schema:
-                    safe_schema = self._safe_column_identifier(schema)
-                    if not safe_schema:
-                        return None
-                    fq = f'`{safe_schema}`.`{safe_tbl}`'
-                cursor.execute(f"SHOW KEYS FROM {fq} WHERE Key_name = 'PRIMARY'")
-                rows = cursor.fetchall() or []
-                if rows and isinstance(rows[0], dict):
-                    rows_sorted = sorted(rows, key=lambda r: int(r.get("Seq_in_index") or 9999))
-                    pk = rows_sorted[0].get("Column_name")
-                    return self._safe_column_identifier(pk)
-                if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 5:
-                    pk = rows[0][4]
-                    return self._safe_column_identifier(str(pk))
-                return None
-
-            # PostgreSQL (psycopg2)
-            if module == "psycopg2":
-                # Default schema is public if not provided
-                schema_val = schema or "public"
-                cursor.execute(
-                    """
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                      ON tc.constraint_name = kcu.constraint_name
-                     AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY'
-                      AND tc.table_schema = %s
-                      AND tc.table_name = %s
-                    ORDER BY kcu.ordinal_position
-                    LIMIT 1
-                    """,
-                    (schema_val, tbl),
-                )
-                r = cursor.fetchone()
-                if isinstance(r, dict):
-                    return self._safe_column_identifier(r.get("column_name"))
-                if isinstance(r, (list, tuple)) and len(r) >= 1:
-                    return self._safe_column_identifier(str(r[0]))
-                return None
-
-            # SQLite
-            if "sqlite" in module:
-                cursor.execute(f"PRAGMA table_info({tbl})")
-                rows = cursor.fetchall() or []
-                # Row shape: cid, name, type, notnull, dflt_value, pk
-                for row in rows:
-                    if isinstance(row, dict):
-                        if int(row.get("pk") or 0) == 1:
-                            return self._safe_column_identifier(row.get("name"))
-                    elif isinstance(row, (list, tuple)) and len(row) >= 6:
-                        if int(row[5] or 0) == 1:
-                            return self._safe_column_identifier(str(row[1]))
-                return None
-
-            # SQL Server (pyodbc): first PK column via sys catalogs. Qmark
-            # paramstyle; schema defaults to dbo when the table is unqualified.
-            # pyodbc.Row is neither dict nor list/tuple but supports r[0].
-            if "pyodbc" in module:
-                schema_val = schema or "dbo"
-                cursor.execute(
-                    "SELECT c.name "
-                    "FROM sys.key_constraints kc "
-                    "JOIN sys.index_columns ic ON kc.parent_object_id = ic.object_id "
-                    "  AND kc.unique_index_id = ic.index_id "
-                    "JOIN sys.columns c ON ic.object_id = c.object_id "
-                    "  AND ic.column_id = c.column_id "
-                    "JOIN sys.tables t ON kc.parent_object_id = t.object_id "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    "WHERE kc.type = 'PK' AND s.name = ? AND t.name = ? "
-                    "ORDER BY ic.key_ordinal",
-                    (schema_val, tbl),
-                )
-                r = cursor.fetchone()
-                if not r:
-                    return None
-                val = r.get("name") if isinstance(r, dict) else r[0]
-                return self._safe_column_identifier(str(val)) if val is not None else None
-        except Exception:
-            return None
-
-        return None
-
     def export(self, params: Dict = None):
         """Export data from database"""
         prepared = self.prepare_export_data(params)
@@ -3372,31 +3343,15 @@ class {{ spec.class_name }}(BaseMCPConnector):
             cursor = self._get_cursor(conn)
             
             module = (self.driver_pattern.get("module", "") or "").lower()
-            # Prefer keyset paging when requested or when cursor provided.
-            pk = self._safe_column_identifier(str(cursor_column)) if cursor_column else None
-            if (use_keyset or cursor_value is not None) and not pk:
-                pk = self._get_primary_key_column(cursor, table)
-
-            # GIPK fix: a MySQL table whose only PK is an INVISIBLE generated key
-            # (my_row_id) is found by SHOW KEYS (so pk is set) but excluded from
-            # `SELECT *`, so the keyset cursor can't advance and pagination
-            # silently truncates. Detect it so we project it explicitly below.
-            pk_is_invisible = self._is_invisible_column(cursor, table, pk) if pk else False
-
-            # Choose placeholder style for parameterized queries.
-            # pyodbc (SQL Server) and sqlite3 use qmark ("?"); mysql-connector /
-            # psycopg2 use pyformat ("%s"); oracledb uses numbered binds (":1").
-            is_sqlserver = "pyodbc" in module
-            is_oracle = "oracledb" in module
-            placeholder = "%s"
-            if "sqlite" in module or is_sqlserver:
-                placeholder = "?"
-            elif is_oracle:
-                placeholder = ":1"  # export binds a single value (cursor_value)
-
-            # Choose identifier quoting per driver. SQL Server and Oracle accept
-            # double-quoted identifiers (Oracle preserves case); MySQL uses backticks.
-            quote = "`" if "mysql" in module else "\""
+            # Paging order, bind style and page SQL per driver come from the
+            # shared sql_paging module (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS): a
+            # named cursor_column, else the whole primary or unique key, else
+            # the row's physical locator, else ORDER BY every column. A driver
+            # it does not know pages as exports always did.
+            if sql_paging is None:
+                return {"success": False, "error": "sql_paging.py is missing from this connector image; rebuild it"}
+            dialect = sql_paging.dialect_for(module, self.driver_pattern.get("name"))
+            quote = dialect.quote
 
             safe_table = self._safe_qualified_table(table, quote)
             if not safe_table:
@@ -3421,113 +3376,43 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 inc_field_safe = watermark_field
                 inc_bind_value = normalized_since
 
-            where_parts = []
-            bind_values = []
-
-            def _ph():
-                # Oracle needs :N positional binds; the number is the current
-                # bind count before appending the next value (so first -> :1).
-                return f":{len(bind_values) + 1}" if is_oracle else placeholder
+            # A sweep's watermark is max(<field>) read before its first page,
+            # not the pages' own max (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS; the
+            # watermark snapshot block above).
+            snapshot = None
+            if watermark_field and (cursor_value is None or cursor_value == "") and not offset:
+                snapshot = self._watermark_snapshot(
+                    conn, cursor, dialect, safe_table, watermark_field,
+                    inc_bind_value, self._incremental_lag_seconds(config, params),
+                )
 
             # `cursor` is this run's PAGING position and always narrows with
-            # AND. The delta predicate below decides which rows this run
-            # cares about at all, and its two halves are OR'ed:
+            # AND. The delta predicate decides which rows this run cares about
+            # at all, and its two halves are OR'ed:
             #
-            #     WHERE pk > <page cursor>
-            #       AND ( updated_at > <watermark> OR pk > <last run's pk> )
+            #     WHERE key > <page cursor>
+            #       AND ( updated_at > <watermark> OR key > <last run's key> )
             #
             # Timestamp alone would drop every INSERT whose incremental column
             # is NULL or hand-maintained; AND-ing the halves drops every UPDATE
-            # to an already-synced row, since an updated row keeps its old PK
-            # and can never satisfy `pk > last_pk`. Only the OR catches both.
-            # Each bind is appended as its placeholder is minted, so the Oracle
-            # :N numbering stays in lockstep with the emitted SQL.
-            if pk and cursor_value is not None and cursor_value != "":
-                where_parts.append(f"{quote}{pk}{quote} > {_ph()}")
-                bind_values.append(cursor_value)
-
-            delta_parts = []
-            if inc_field_safe is not None and inc_bind_value is not None:
-                delta_parts.append(f"{quote}{inc_field_safe}{quote} > {_ph()}")
-                bind_values.append(inc_bind_value)
-            if pk and since_cursor is not None and since_cursor != "":
-                delta_parts.append(f"{quote}{pk}{quote} > {_ph()}")
-                bind_values.append(since_cursor)
-            if delta_parts:
-                where_parts.append("(" + " OR ".join(delta_parts) + ")")
-
-            where_clause = ""
-            if where_parts:
-                where_clause = " WHERE " + " AND ".join(where_parts)
-
-            if pk:
-                # Project the keyset PK explicitly when it is INVISIBLE so it
-                # survives `SELECT *` and yields a usable next_cursor (GIPK fix).
-                # An invisible column is never part of `*`, so no duplicate;
-                # visible PKs keep plain `SELECT *`.
-                projection = f"*, {quote}{pk}{quote}" if pk_is_invisible else "*"
-                if is_sqlserver:
-                    # SQL Server has no LIMIT; keyset page = ORDER BY pk + TOP.
-                    query = f"SELECT TOP ({int(limit)}) {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote}"
-                elif is_oracle:
-                    # Oracle (12c+): ORDER BY pk + FETCH FIRST N ROWS ONLY.
-                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} FETCH FIRST {int(limit)} ROWS ONLY"
-                else:
-                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} LIMIT {limit}"
-                cursor.execute(query, tuple(bind_values) if bind_values else None)
-            else:
-                # No PK → OFFSET paging. Still honors the incremental WHERE.
-                if is_sqlserver:
-                    # OFFSET/FETCH requires an ORDER BY; use a stable no-op order.
-                    query = f"SELECT * FROM {safe_table}{where_clause} ORDER BY (SELECT NULL) OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
-                elif is_oracle:
-                    # Oracle (12c+): OFFSET n ROWS FETCH NEXT m ROWS ONLY.
-                    query = f"SELECT * FROM {safe_table}{where_clause} OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
-                else:
-                    query = f"SELECT * FROM {safe_table}{where_clause} LIMIT {limit} OFFSET {offset}"
-                cursor.execute(query, tuple(bind_values) if bind_values else None)
-            
-            # Convert rows to dicts
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
-            
-            if rows and isinstance(rows[0], dict):
-                data = rows
-            else:
-                data = [dict(zip(columns, row)) for row in rows]
-            
+            # to an already-synced row, since an updated row keeps its old key
+            # and can never satisfy `key > last_key`. Only the OR catches both.
+            #
+            # read_page plans, queries and finishes the page: next_cursor /
+            # paging_mode / cursor_column(s) for the executor, with a projected
+            # hidden key or row locator stripped from the rows. A warehouse
+            # (Snowflake, Databricks) pins a sweep's pages to one snapshot
+            # (KI-WAREHOUSE-BATCH-PAGING-UNORDERED).
+            data, columns, paging = sql_paging.read_page(
+                conn, cursor, dialect, table, safe_table, limit=limit, offset=offset,
+                cursor_value=cursor_value, nominated=cursor_column,
+                stable=bool(use_keyset or cursor_value is not None or cursor_column),
+                since_cursor=since_cursor, inc_field=inc_field_safe, inc_value=inc_bind_value,
+            )
             cursor.close()
-            # Include next_cursor for keyset pagination if we can.
-            next_cursor = None
-            if pk and data:
-                last = data[-1]
-                if isinstance(last, dict):
-                    next_cursor = last.get(pk)
-                else:
-                    try:
-                        idx = columns.index(pk)
-                        next_cursor = last[idx]
-                    except Exception:
-                        next_cursor = None
-
-            # GIPK fix: when we explicitly projected an INVISIBLE keyset PK,
-            # emit next_cursor as a STRING (avoids float64 precision loss for
-            # BIGINT ids beyond 2**53 in the orchestrator's JSON hop) and strip
-            # the injected PK from rows + columns so the invisible column never
-            # reaches the destination. next_cursor is read above before the strip.
-            if pk_is_invisible:
-                if next_cursor is not None:
-                    next_cursor = str(next_cursor)
-                for r in data:
-                    if isinstance(r, dict):
-                        r.pop(pk, None)
-                columns = [c for c in columns if c != pk]
 
             result = self.finalize_export_result(data, prepared, columns)
-            if next_cursor is not None:
-                result["next_cursor"] = next_cursor
-                result["paging_mode"] = "keyset"
-                result["cursor_column"] = pk
+            result.update(paging)
 
             # Incremental watermark (INCREMENTAL.md §3). Emitted whenever the
             # incremental field is a REAL column on this table — INCLUDING the
@@ -3567,6 +3452,14 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     # Surface flat too for tooling that doesn't read
                     # stats.watermark.
                     result["max_watermark"] = max_val
+            if snapshot is not None:
+                result.setdefault("stats", {})
+                result["stats"]["watermark"] = {
+                    "field": snapshot[0],
+                    "value": snapshot[1],
+                    "snapshot": True,
+                }
+                result["max_watermark"] = snapshot[1]
             return result
 
         except Exception as e:
@@ -3613,6 +3506,107 @@ class {{ spec.class_name }}(BaseMCPConnector):
             s = raw.strip()
             return s if s else None
         return None
+
+    # BEGIN watermark snapshot block
+    # KI-DB-BATCH-PAGING-CAN-SKIP-ROWS cause 3, INCREMENTAL.md §2. Kept
+    # identical in connector_database.py.j2 and the PostgreSQL, MySQL, Oracle
+    # and SQL Server connectors (test_db_watermark_snapshot.py checks it).
+    #
+    # A sweep pages by key, so a row the cursor has already passed can be
+    # updated below a later page's max(updated_at) and fall outside the next
+    # sweep's `updated_at > since`. The sweep's watermark is therefore
+    # max(updated_at) read once before its first page: every row updated
+    # after that read is above it, whatever its key. When that value is
+    # within a few seconds of the database clock it is held back to
+    # `now - lag`, so a transaction that stamped its row earlier but commits
+    # after the read still lands above the next `since`. Rows inside the lag
+    # are read twice (at-least-once); a commit later than the lag is missed.
+    _DEFAULT_INCREMENTAL_LAG_SECONDS = 5.0
+
+    @classmethod
+    def _incremental_lag_seconds(cls, config, params) -> float:
+        """`incremental_lag_seconds` from the export params, then the
+        connection config; the default when neither holds a number."""
+        for source in (params or {}, config or {}):
+            raw = source.get("incremental_lag_seconds") if isinstance(source, dict) else None
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                continue
+        return cls._DEFAULT_INCREMENTAL_LAG_SECONDS
+
+    @staticmethod
+    def _hold_back_watermark(value, utc_now, local_now, lag_seconds):
+        """`now - lag` when ``value`` is within ``lag_seconds`` of the database
+        clock, else ``value``. An aware value is compared with UTC, a naive
+        one with the session's local clock; anything else is returned as is."""
+        from datetime import datetime, timedelta, timezone
+        if not isinstance(value, datetime) or not lag_seconds:
+            return value
+        now = utc_now if value.tzinfo is not None else local_now
+        if not isinstance(now, datetime):
+            return value
+        if value.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if (now.tzinfo is None) != (value.tzinfo is None):
+            return value
+        lag = timedelta(seconds=lag_seconds)
+        if now - lag < value <= now + lag:
+            held = now - lag
+            return held.astimezone(value.tzinfo) if value.tzinfo is not None else held
+        return value
+
+    def _watermark_snapshot(self, conn, cursor, dialect, safe_table, field, since, lag_seconds):
+        """(column, value) for the sweep's watermark, read before its first
+        page; None when the table has no such column or the read fails, and
+        the export then reports its page max as before. The paging dialect
+        supplies the bind style and the clocks, so an engine sharing a
+        driver with another (Redshift over psycopg2) reads its own way."""
+        try:
+            cursor.execute(f"SELECT * FROM {safe_table} WHERE 1 = 0")
+            description = list(cursor.description or [])
+            columns = [d[0] for d in description]
+            try:
+                cursor.fetchall()
+            except Exception:
+                pass
+            column = next((c for c in columns if str(c).lower() == field.lower()), None)
+            if column is None:
+                return None
+            binder = sql_paging.Binder(dialect.paramstyle)
+            ident = dialect.ident(column)
+            clocks = f", {dialect.clocks}" if dialect.clocks else ""
+            query = f"SELECT MAX({ident}) AS wm_max{clocks} FROM {safe_table}"
+            if since:
+                # As the column's type where the engine compares no other
+                # (Athena); unchanged elsewhere.
+                typed = sql_paging.since_value(dialect, since, description[columns.index(column)])
+                query += f" WHERE {ident} > {binder.add(typed)}"
+            bound = binder.params()
+            if bound is None:
+                cursor.execute(query)
+            else:
+                cursor.execute(query, bound)
+            row = cursor.fetchone()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        if row is None:
+            return None
+        values = list(row.values()) if isinstance(row, dict) else list(row)
+        value = values[0] if values else None
+        if value is None:
+            return (column, since) if since else None
+        utc_now = values[1] if len(values) > 1 else None
+        local_now = values[2] if len(values) > 2 else None
+        held = self._hold_back_watermark(value, utc_now, local_now, lag_seconds)
+        return (column, held.isoformat() if hasattr(held, "isoformat") else str(held))
+    # END watermark snapshot block
 
     @staticmethod
     def _max_field_value(rows: List, field: str) -> Optional[str]:
@@ -3747,6 +3741,12 @@ class {{ spec.class_name }}(BaseMCPConnector):
 {% endif %}
 
     def import_data(self, params: Dict = None):
+        dialect = self._write_dialect()
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        refused = self._cdc_offsets_refusal(params, dialect)
+        if refused:
+            return refused
         if self._is_sqlserver_dialect():
             return self._ss_import_data(params)
         """Import data into database"""
@@ -3780,17 +3780,14 @@ class {{ spec.class_name }}(BaseMCPConnector):
         # table, then build a backtick-qualified target — mirrors the hand-curated
         # mysql connector. normalize_table_for_postgresql is a no-op for mysql, so
         # `table` is still the original spec here. _col_q quotes columns to match.
-        _mod = (self.driver_pattern.get("module", "") or "").lower()
-        _col_q = '"'
-        if "mysql" in _mod or "pymysql" in _mod:
+        if dialect.name == "mysql":
             _db, _name = self._split_mysql_db_table(config, table, params)
             if not _name or not self._is_safe_ident(_name):
                 return {"success": False, "error": f"Unsafe or missing table identifier: {_name}"}
             if _db and not self._is_safe_ident(_db):
                 return {"success": False, "error": f"Unsafe database identifier: {_db}"}
             table = f"`{_db}`.`{_name}`" if _db else f"`{_name}`"
-            _col_q = '`'
-        elif "psycopg2" in _mod or "postgres" in _mod:
+        elif dialect.name == "postgresql":
             # Postgres: build a double-quoted "schema"."table" so a case-sensitive
             # table (e.g. camelCase from a GraphQL/REST source) matches the
             # case-preserved relation ensure_table() created. Unquoted, Postgres
@@ -3823,7 +3820,12 @@ class {{ spec.class_name }}(BaseMCPConnector):
             if pattern.get("is_nosql"):
                 return self._import_nosql(conn, config, table, data, params)
             
-            # SQL import
+            # SQL import. Every engine bar PostgreSQL and MySQL gets its own
+            # quoting, after the adapter and NoSQL hand-offs took the raw name.
+            if dialect.name not in ("postgresql", "mysql"):
+                table = self._generic_write_target(table, params, dialect)
+                if table is None:
+                    return {"success": False, "error": f"Unsafe table identifier: {prepared.get('table')!r}"}
             cursor = self._get_cursor(conn, as_dict=False)
             
             if data:
@@ -3837,16 +3839,17 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         if _k not in _seen_cols:
                             _seen_cols.add(_k)
                             columns.append(_k)
-                placeholders = ", ".join(["%s"] * len(columns))
                 # Quote column identifiers consistently with table creation
                 # (which quotes via "{col}"). Without quoting, Postgres folds
                 # camelCase columns to lowercase at INSERT time and the column
                 # lookup fails against the quoted-case schema created earlier.
-                # _col_q is backtick for MySQL, double-quote for Postgres.
+                # The dialect quotes with a backtick for MySQL, Databricks and
+                # ClickHouse, and binds as its driver does (pyathena: a dict).
                 for c in columns:
                     if not self._is_safe_ident(c):
                         return {"success": False, "error": f"Unsafe column identifier: {c}"}
-                col_str = ", ".join([f'{_col_q}{c}{_col_q}' for c in columns])
+                col_str = ", ".join(self._write_ident(dialect, c) for c in columns)
+                placeholders = ", ".join(self._bind(dialect, columns)[0])
 
                 insert_query = f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})"
                 
@@ -3856,7 +3859,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 
                 for i in range(0, len(data), batch_size):
                     batch = data[i:i + batch_size]
-                    values = [tuple(row.get(col) for col in columns) for row in batch]
+                    values = [self._bind(dialect, [row.get(col) for col in columns])[1] for row in batch]
                     cursor.executemany(insert_query, values)
                     # Count rows the DB actually wrote (cursor.rowcount), NOT len(batch).
                     # Returning len(batch) unconditionally masks silent data loss: a write
@@ -3941,7 +3944,15 @@ class {{ spec.class_name }}(BaseMCPConnector):
         return fallback
 
     def upsert_data(self, params: Dict = None) -> Dict[str, Any]:
-        if self._is_sqlserver_dialect():
+        dialect = self._write_dialect()
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        refused = self._cdc_offsets_refusal(params, dialect)
+        if refused:
+            return refused
+        # Synapse takes the generic path: a dedicated pool has no MERGE ...
+        # USING (VALUES ...) for _ss_upsert_data to send.
+        if dialect.name == "sqlserver":
             return self._ss_upsert_data(params)
         """
         Upsert data into database (INSERT or UPDATE on conflict).
@@ -3987,15 +3998,14 @@ class {{ spec.class_name }}(BaseMCPConnector):
         # backtick-qualified target before the per-driver upsert below — mirrors
         # import_data and the hand-curated mysql connector. Only one driver is
         # active per connector, so rewriting `table` here is safe for all branches.
-        _mod = (self.driver_pattern.get("module", "") or "").lower()
-        if "mysql" in _mod or "pymysql" in _mod:
+        if dialect.name == "mysql":
             _db, _name = self._split_mysql_db_table(config, table, params)
             if not _name or not self._is_safe_ident(_name):
                 return {"success": False, "error": f"Unsafe or missing table identifier: {_name}"}
             if _db and not self._is_safe_ident(_db):
                 return {"success": False, "error": f"Unsafe database identifier: {_db}"}
             table = f"`{_db}`.`{_name}`" if _db else f"`{_name}`"
-        elif "psycopg2" in _mod or "postgres" in _mod:
+        elif dialect.name == "postgresql":
             # Postgres: double-quote "schema"."table" so case-sensitive table names
             # match the case-preserved relation ensure_table() created (unquoted
             # folds to lowercase → write misses table → DLQ). Mirrors mysql above.
@@ -4029,8 +4039,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         _seen_cols.add(_k)
                         columns.append(_k)
             rows_upserted = 0
-            driver_module = pattern.get("module", "")
-            
+
             # Validate all column identifiers once before building any
             # statement so a row containing a bad identifier doesn't bypass
             # the safety gate via the unquoted-substring path below.
@@ -4044,8 +4053,18 @@ class {{ spec.class_name }}(BaseMCPConnector):
             # Dest-PK-aware conflict key, resolved ONCE before the loop: prefer the
             # destination's real PRIMARY KEY over a surrogate that would collide
             # with a stale PK (Bug A: silent full-table drop on dest schema drift).
-            # One catalog lookup, not one per row.
-            perrow_conflict_keys = self._merge_conflict_keys(cursor, table, columns, key_fields)
+            # One catalog lookup, not one per row. PostgreSQL only: the probe's
+            # SAVEPOINT aborts a Redshift transaction.
+            perrow_conflict_keys = key_fields
+            if dialect.name == "postgresql":
+                perrow_conflict_keys = self._merge_conflict_keys(cursor, table, columns, key_fields)
+            # Every other engine deletes then inserts by key in its own quoting
+            # and bind style.
+            target = table
+            if dialect.name not in ("postgresql", "mysql"):
+                target = self._generic_write_target(table, params, dialect)
+                if target is None:
+                    return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
             for row in data:
                 # Bind this row's OWN columns, never the batch union. A row whose key
                 # set is smaller than the union is not "the same row with NULLs in the
@@ -4066,7 +4085,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         f"upsert_data: a row in the batch for {table} carries no columns; "
                         "refusing to write an all-NULL row"
                     )
-                if "psycopg2" in driver_module or "asyncpg" in driver_module:
+                if dialect.name == "postgresql":
                     # PostgreSQL: INSERT ... ON CONFLICT DO UPDATE.
                     # Quote every identifier so camelCase columns survive
                     # Postgres' default lowercase-folding for unquoted names.
@@ -4105,7 +4124,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         else:
                             raise
                 
-                elif "mysql" in driver_module or "pymysql" in driver_module:
+                elif dialect.name == "mysql":
                     # MySQL: INSERT ... ON DUPLICATE KEY UPDATE
                     col_str = ", ".join(row_cols)
                     placeholders = ", ".join(["%s"] * len(row_cols))
@@ -4125,7 +4144,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(query, values)
                 
-                elif "oracledb" in driver_module or "cx_Oracle" in driver_module:
+                elif dialect.name == "oracle":
                     # Oracle: MERGE statement
                     col_str = ", ".join(row_cols)
                     src_cols = ", ".join([f":{i+1} AS {c}" for i, c in enumerate(row_cols)])
@@ -4136,7 +4155,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         update_str = ", ".join([f"t.{c} = s.{c}" for c in update_cols])
                         insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
-                            MERGE INTO {table} t
+                            MERGE INTO {target} t
                             USING (SELECT {src_cols} FROM dual) s
                             ON ({match_cond})
                             WHEN MATCHED THEN UPDATE SET {update_str}
@@ -4145,7 +4164,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     else:
                         insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
-                            MERGE INTO {table} t
+                            MERGE INTO {target} t
                             USING (SELECT {src_cols} FROM dual) s
                             ON ({match_cond})
                             WHEN NOT MATCHED THEN INSERT ({col_str}) VALUES ({insert_cols})
@@ -4155,23 +4174,21 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     cursor.execute(query, values)
                 
                 else:
-                    # Generic fallback: DELETE + INSERT
-                    # Quote table identifiers (ANSI SQL double-quotes) so reserved words
-                    # and camelCase names survive without errors.
-                    _gf_schema, _gf_name = self._split_schema_table(table)
-                    _gf_quoted = f'"{_gf_schema}"."{_gf_name}"'
-                    where_clause = " AND ".join([f"{k} = %s" for k in key_fields])
-                    key_values = tuple(row.get(k) for k in key_fields)
-                    cursor.execute(f"DELETE FROM {_gf_quoted} WHERE {where_clause}", key_values)
+                    # Generic fallback: DELETE + INSERT, in the engine's quoting and
+                    # bind style. Not atomic where the engine has no transactions
+                    # (Athena); a retry of the batch converges.
+                    marks, key_values = self._bind(dialect, [row.get(k) for k in key_fields])
+                    where_clause = " AND ".join(
+                        f"{self._write_ident(dialect, k)} = {m}" for k, m in zip(key_fields, marks))
+                    cursor.execute(f"DELETE FROM {target} WHERE {where_clause}", key_values)
 
                     # NOTE: this branch cannot honour an absent key the way the upsert
                     # branches above do — it removes the destination row first, so a
                     # column this row does not carry is gone either way. Binding row_cols
                     # at least stops it writing an explicit NULL over a column DEFAULT.
-                    col_str = ", ".join(row_cols)
-                    placeholders = ", ".join(["%s"] * len(row_cols))
-                    values = tuple(row.get(col) for col in row_cols)
-                    cursor.execute(f"INSERT INTO {_gf_quoted} ({col_str}) VALUES ({placeholders})", values)
+                    col_str = ", ".join(self._write_ident(dialect, c) for c in row_cols)
+                    marks, values = self._bind(dialect, [row.get(col) for col in row_cols])
+                    cursor.execute(f"INSERT INTO {target} ({col_str}) VALUES ({', '.join(marks)})", values)
                 
                 rows_upserted += 1
 
@@ -4197,6 +4214,12 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     pass
     
     def delete_data(self, params: Dict = None) -> Dict[str, Any]:
+        dialect = self._write_dialect()
+        if dialect is None:
+            return {"success": False, "error": self._NO_SQL_PAGING}
+        refused = self._cdc_offsets_refusal(params, dialect)
+        if refused:
+            return refused
         if self._is_sqlserver_dialect():
             return self._ss_delete_data(params)
         """
@@ -4272,11 +4295,10 @@ class {{ spec.class_name }}(BaseMCPConnector):
             # namespace — resolve it via _split_mysql_db_table (the executor forwards
             # a BARE table + the per-pipeline namespace separately) and backtick-quote,
             # mirroring import_data/upsert_data; without this a bare table defaults to
-            # the connection DB and the namespaced delete silently no-ops. PG/other:
-            # ANSI double-quotes; `table` is already namespace-normalized above, so a
-            # schema split yields the right schema-qualified target.
-            _del_mod = (self.driver_pattern.get("module", "") or "").lower()
-            if "mysql" in _del_mod or "pymysql" in _del_mod:
+            # the connection DB and the namespaced delete silently no-ops. Others:
+            # the engine's own quoting; PG's `table` is already namespace-normalized
+            # above, so it keeps its schema-qualified target.
+            if dialect.name == "mysql":
                 _del_db, _del_name = self._split_mysql_db_table(config, table, params)
                 if not _del_name or not self._is_safe_ident(_del_name):
                     return {"success": False, "error": f"Unsafe or missing table identifier: {_del_name}"}
@@ -4284,17 +4306,51 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     return {"success": False, "error": f"Unsafe database identifier: {_del_db}"}
                 _del_quoted = f"`{_del_db}`.`{_del_name}`" if _del_db else f"`{_del_name}`"
             else:
-                _del_schema, _del_name = self._split_schema_table(table)
-                _del_quoted = f'"{_del_schema}"."{_del_name}"'
+                _del_quoted = self._generic_write_target(table, params, dialect)
+                if _del_quoted is None:
+                    return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+            for k in key_fields:
+                if not self._is_safe_ident(k):
+                    return {"success": False, "error": f"Unsafe key field identifier: {k}"}
 
+            # Every row is checked BEFORE any statement, so the bulk path below
+            # never sees a keyless row.
             for row in data:
-                where_clause = " AND ".join([f"{k} = %s" for k in key_fields])
                 missing = [k for k in key_fields if k not in row]
                 if missing:
                     return {"success": False, "error": f"Missing required key field(s) for delete: {missing}"}
-                key_values = tuple(row.get(k) for k in key_fields)
-                if any(v is None for v in key_values):
+                if any(row.get(k) is None for k in key_fields):
                     return {"success": False, "error": f"Delete key field(s) contain null value(s): {key_fields}"}
+
+            # Bulk path: the kafka sink batches CDC deletes, so one call can carry
+            # thousands of keys — one DELETE per key is one round trip per key.
+            # PostgreSQL only (Redshift shares psycopg2 but not temp-table-as).
+            # On ANY failure roll back and fall through to the per-row loop.
+            if dialect.name == "postgresql" and len(data) > 1:
+                try:
+                    rows_deleted = self._bulk_delete_by_keys(cursor, _del_quoted, data, key_fields)
+                    self._write_cdc_offsets(cursor, params)
+                    conn.commit()
+                    cursor.close()
+                    return {"success": True, "rows_deleted": rows_deleted}
+                except Exception as bulk_err:
+                    logger.warning(
+                        "delete_data: bulk path failed for target=%s, per-row fallback: %s",
+                        _del_quoted, bulk_err,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    cursor = self._get_cursor(conn, as_dict=False)
+                    rows_deleted = 0
+
+            for row in data:
+                raw_keys = [row.get(k) for k in key_fields]
+                # Oracle binds :N and pyathena a dict; a bare %s fails on both.
+                marks, key_values = self._bind(dialect, raw_keys)
+                where_clause = " AND ".join(
+                    f"{self._write_ident(dialect, k)} = {m}" for k, m in zip(key_fields, marks))
 
                 cursor.execute(f"DELETE FROM {_del_quoted} WHERE {where_clause}", key_values)
                 rows_deleted += cursor.rowcount if hasattr(cursor, 'rowcount') else 1
@@ -4320,6 +4376,36 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 except:
                     pass
     
+    def _bulk_delete_by_keys(self, cursor, target: str, rows: List[Dict[str, Any]],
+                             key_fields: List[str]) -> int:
+        """PostgreSQL: delete every row whose key matches one of ``rows`` with ONE
+        statement, on the caller's cursor and transaction (the caller owns
+        commit/rollback and the per-row fallback). The key columns are copied
+        from the target, so each key is bound as its column's own type and the
+        join uses the target's index. Duplicate keys delete a target row once.
+        """
+        import uuid
+        from psycopg2.extras import execute_values
+        staging = f'"_rsync_del_{uuid.uuid4().hex[:12]}"'
+        key_cols = ", ".join(f'"{k}"' for k in key_fields)
+        cursor.execute(
+            f"CREATE TEMP TABLE {staging} ON COMMIT DROP AS "
+            f"SELECT {key_cols} FROM {target} WITH NO DATA"
+        )
+        execute_values(
+            cursor,
+            f"INSERT INTO {staging} ({key_cols}) VALUES %s",
+            [[row.get(k) for k in key_fields] for row in rows],
+            template="(" + ", ".join(["%s"] * len(key_fields)) + ")",
+            page_size=1000,
+        )
+        match = " AND ".join(f't."{k}" = s."{k}"' for k in key_fields)
+        cursor.execute(f"DELETE FROM {target} t USING {staging} s WHERE {match}")
+        deleted = getattr(cursor, "rowcount", None)
+        if deleted is None or deleted < 0:
+            return len(rows)
+        return deleted
+
     # ------------------------------------------------------------------
     # CDC exactly-once offset tracking (Tier A: transactional).
     # The destination offset table is the sole durable source of truth for
@@ -4336,11 +4422,14 @@ class {{ spec.class_name }}(BaseMCPConnector):
         if not ko:
             return
         offsets = ko if isinstance(ko, list) else [ko]
-        module = self.driver_pattern.get("module", "") if hasattr(self, "driver_pattern") else ""
+        dialect = self._write_dialect()
+        if dialect is None:
+            raise RuntimeError(self._NO_SQL_PAGING)
+        if dialect.name in self._NO_CDC_OFFSETS:
+            raise RuntimeError(f"CDC offsets not implemented for {dialect.name}")
         tbl = self._CDC_OFFSETS_TABLE
         upsert = None
-        ph = "pg"  # "pg" => %s placeholders, "oracle" => :N placeholders
-        if "psycopg2" in module or "asyncpg" in module:
+        if dialect.name == "postgresql":
             cursor.execute(
                 f'CREATE TABLE IF NOT EXISTS "{tbl}" ('
                 ' pipeline_id TEXT NOT NULL, topic TEXT NOT NULL,'
@@ -4352,7 +4441,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 ' VALUES (%s, %s, %s, %s, now())'
                 ' ON CONFLICT (pipeline_id, topic, kafka_partition) DO UPDATE SET'
                 f'  last_offset = GREATEST("{tbl}".last_offset, EXCLUDED.last_offset), updated_at = now()')
-        elif "mysql" in module or "pymysql" in module:
+        elif dialect.name == "mysql":
             cursor.execute(
                 f'CREATE TABLE IF NOT EXISTS `{tbl}` ('
                 ' pipeline_id VARCHAR(255) NOT NULL, topic VARCHAR(255) NOT NULL,'
@@ -4363,8 +4452,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 f'INSERT INTO `{tbl}` (pipeline_id, topic, kafka_partition, last_offset)'
                 ' VALUES (%s, %s, %s, %s)'
                 ' ON DUPLICATE KEY UPDATE last_offset = GREATEST(last_offset, VALUES(last_offset))')
-        elif "oracledb" in module or "cx_Oracle" in module:
-            ph = "oracle"
+        elif dialect.name == "oracle":
             try:
                 cursor.execute(
                     f'CREATE TABLE "{tbl}" ('
@@ -4384,9 +4472,10 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 ' WHEN NOT MATCHED THEN INSERT (pipeline_id, topic, kafka_partition, last_offset)'
                 ' VALUES (s.pipeline_id, s.topic, s.kafka_partition, s.last_offset)')
         else:
-            # Generic ANSI fallback: emulate a monotonic upsert with DELETE+INSERT.
+            # Generic (Redshift, Snowflake, Databricks, SQLite, ...): a monotonic
+            # upsert as DELETE + probe + INSERT, in the engine's quoting and binds.
             cursor.execute(
-                f'CREATE TABLE IF NOT EXISTS "{tbl}" ('
+                f'CREATE TABLE IF NOT EXISTS {dialect.ident(tbl)} ('
                 ' pipeline_id VARCHAR(255) NOT NULL, topic VARCHAR(255) NOT NULL,'
                 ' kafka_partition INTEGER NOT NULL, last_offset BIGINT NOT NULL,'
                 ' PRIMARY KEY (pipeline_id, topic, kafka_partition))')
@@ -4403,17 +4492,24 @@ class {{ spec.class_name }}(BaseMCPConnector):
             vals = (pid, str(topic), int(part), int(off))
             if upsert is not None:
                 cursor.execute(upsert, vals)
-            else:
-                # Generic: only insert/replace when advancing the high-water mark.
+                continue
+            # Generic: only replace a row the new offset advances. A row the
+            # DELETE left holds a higher offset; the probe keeps the INSERT from
+            # landing beside it, where a key is not enforced (Redshift) or a
+            # failed INSERT would abort the batch's transaction.
+            q = dialect.ident(tbl)
+            marks, binds = self._bind(dialect, list(vals))
+            cursor.execute(
+                f'DELETE FROM {q} WHERE pipeline_id = {marks[0]} AND topic = {marks[1]}'
+                f' AND kafka_partition = {marks[2]} AND last_offset <= {marks[3]}', binds)
+            probe, probe_binds = self._bind(dialect, list(vals[:3]))
+            cursor.execute(
+                f'SELECT 1 FROM {q} WHERE pipeline_id = {probe[0]} AND topic = {probe[1]}'
+                f' AND kafka_partition = {probe[2]}', probe_binds)
+            if cursor.fetchone() is None:
                 cursor.execute(
-                    f'DELETE FROM "{tbl}" WHERE pipeline_id = %s AND topic = %s'
-                    ' AND kafka_partition = %s AND last_offset <= %s', vals)
-                try:
-                    cursor.execute(
-                        f'INSERT INTO "{tbl}" (pipeline_id, topic, kafka_partition, last_offset)'
-                        ' VALUES (%s, %s, %s, %s)', vals)
-                except Exception:
-                    pass  # a concurrent/ahead row already holds a higher offset
+                    f'INSERT INTO {q} (pipeline_id, topic, kafka_partition, last_offset)'
+                    f' VALUES ({", ".join(marks)})', binds)
 
     # SQL Server (pyodbc) DESTINATION write path.
     #
@@ -4431,8 +4527,13 @@ class {{ spec.class_name }}(BaseMCPConnector):
     # respect SQL Server's 900-byte index-key limit), DATETIME2 / BIT / BIGINT.
     # ==================================================================
     def _is_sqlserver_dialect(self) -> bool:
+        """The T-SQL family by engine. Synapse keeps these helpers bar
+        upsert_data and ensure_table, which refuse or go generic for it."""
         try:
-            return "pyodbc" in (self.driver_pattern.get("module") or "")
+            dialect = self._write_dialect()
+            if dialect is None:
+                return "pyodbc" in (self.driver_pattern.get("module") or "")
+            return dialect.name in ("sqlserver", "synapse")
         except Exception:
             return False
 
@@ -5165,18 +5266,17 @@ class {{ spec.class_name }}(BaseMCPConnector):
         try:
             config = self._get_config(params) if hasattr(self, "_get_config") else ((params or {}).get("config") or {})
             pipeline_id = str((params or {}).get("pipeline_id") or "")
-            module = self.driver_pattern.get("module", "") if hasattr(self, "driver_pattern") else ""
-            tbl = self._CDC_OFFSETS_TABLE
+            dialect = self._write_dialect()
+            if dialect is None:
+                return {"success": False, "error": self._NO_SQL_PAGING}
+            # The table as _write_cdc_offsets names it: Oracle's CREATE quotes it too.
+            marks, binds = self._bind(dialect, [pipeline_id])
+            q = (f"SELECT topic, kafka_partition, last_offset FROM {dialect.ident(self._CDC_OFFSETS_TABLE)}"
+                 f" WHERE pipeline_id = {marks[0]}")
             conn = self._get_connection(config)
             cursor = self._get_cursor(conn, as_dict=False)
-            if "oracledb" in module or "cx_Oracle" in module:
-                q = f'SELECT topic, kafka_partition, last_offset FROM "{tbl}" WHERE pipeline_id = :1'
-            elif "mysql" in module or "pymysql" in module:
-                q = f'SELECT topic, kafka_partition, last_offset FROM `{tbl}` WHERE pipeline_id = %s'
-            else:
-                q = f'SELECT topic, kafka_partition, last_offset FROM "{tbl}" WHERE pipeline_id = %s'
             try:
-                cursor.execute(q, (pipeline_id,))
+                cursor.execute(q, binds)
                 rows = cursor.fetchall()
             except Exception:
                 # Offset table not provisioned yet => no prior progress.

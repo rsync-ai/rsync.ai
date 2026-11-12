@@ -6,8 +6,24 @@
 // the sink starts, so for its first probe interval every row read "Unknown",
 // which looks like a failure. Never checked means "Checking…"; a probe that ran
 // and could not decide still reads "unknown".
-export function dependencyStatusLabel(dep: { status: string; last_checked_at?: string | null }): string {
-  if (dep.status === "unknown" && !dep.last_checked_at) return "Checking…"
+//
+// The prober skips a pipeline in these statuses (dependency_probe.go: the
+// `p.status NOT IN (…)` filter), so on one of them a row it never reached will
+// stay unchecked, and "Checking…" would never end.
+//
+// A row checked before Pause or Stop holds that sweep's answer. The gateway
+// withdraws a frozen "healthy" one (pipeline_runtime.go markUnprobedDeps): it
+// arrives "unknown" with details.not_checked_while, and reads "Not checked" too.
+const UNPROBED_PIPELINE_STATUSES = new Set(["completed", "failed", "cancelled", "canceled", "paused", "stopped", "archived"])
+
+export function dependencyStatusLabel(
+  dep: { status: string; last_checked_at?: string | null; details?: Record<string, unknown> | null },
+  pipelineStatus?: string | null,
+): string {
+  if (dep.status === "unknown" && dep.details?.not_checked_while) return "Not checked"
+  if (dep.status === "unknown" && !dep.last_checked_at) {
+    return UNPROBED_PIPELINE_STATUSES.has(String(pipelineStatus ?? "").toLowerCase()) ? "Not checked" : "Checking…"
+  }
   return dep.status
 }
 

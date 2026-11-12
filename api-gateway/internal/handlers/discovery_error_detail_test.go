@@ -99,7 +99,7 @@ func TestBuildDocumentSchemaIndex_DiscoveryFailureShowsConnectorMessage(t *testi
 	}
 	docFindOrchestrator(t, "/api/v1/agent/discover-schema", http.StatusUnprocessableEntity, discoveryFailedBody)
 
-	_, err = buildSchemaIndex(t.Context(), docFindConnID, "mongodb", enc, false)
+	_, err = buildSchemaIndex(t.Context(), docFindConnID, "", "mongodb", enc, false)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

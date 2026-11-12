@@ -37,6 +37,12 @@ topics were removed with the agent Kafka bus in
 5) The activity's `WaitForResponse` returns the reply to the workflow
 6) StateUpdateActivity persists authoritative pipeline state transitions
 
+A workflow run (the Workflows page) is `WorkflowRunWorkflow` on its own queue `workflow-runs`,
+started by api-gateway (Run now, after a pipeline) or by a Temporal Schedule per workflow. Its
+four steps — begin, evaluate, send (one per channel), finish — each POST a gateway internal
+endpoint; the query, the message and the transports stay in the gateway
+(workflows-design.md § 4, § 7).
+
 ### Configuration (Env Vars)
 - `TEMPORAL_ADDRESS`
 - `KAFKA_BROKERS` (or `KAFKA_BOOTSTRAP_SERVERS` depending on environment)

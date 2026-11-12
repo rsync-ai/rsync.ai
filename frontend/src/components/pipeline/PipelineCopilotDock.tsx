@@ -12,6 +12,11 @@ import {
   HelpCircle,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { useFeatureFlags } from "@/config/features"
+import { useModKey } from "@/lib/hooks/useModKey"
+import { useSuggestionTab } from "@/hooks/useSuggestionTab"
+import { isUUID } from "@/lib/assistant/page-context"
+import { useAssistantStore } from "@/lib/store/useAssistantStore"
 import type { ExecutionPlanStage } from "./dagTypes"
 import { detectDurationAnomaly } from "./dagHelpers"
 
@@ -24,13 +29,45 @@ interface PipelineCopilotDockProps {
 
 const STORAGE_KEY = "pipeline-copilot-dock-open"
 
-export function PipelineCopilotDock({
+export function PipelineCopilotDock(props: PipelineCopilotDockProps) {
+  const { assistant } = useFeatureFlags()
+  if (assistant) return <AssistantDockTab pipelineId={props.pipelineId} pipelineName={props.pipelineName} />
+  return <ChatCopilotDock {...props} />
+}
+
+// With the assistant on, the tab opens it about this pipeline: the assistant
+// reads the pipeline's state through its own tools, so nothing from the page
+// (stage names, error text) is pasted into the question.
+function AssistantDockTab({ pipelineId, pipelineName }: { pipelineId: string; pipelineName?: string }) {
+  const open = useAssistantStore((s) => s.open)
+  const openWith = useAssistantStore((s) => s.openWith)
+  if (open) return null
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        openWith(isUUID(pipelineId) ? { kind: "pipeline", id: pipelineId.toLowerCase(), name: pipelineName } : null)
+      }
+      className="fixed right-0 top-1/2 -translate-y-1/2 z-30 rounded-l-lg border border-r-0 border-violet-200 dark:border-violet-800 bg-gradient-to-r from-violet-600 to-indigo-600 text-white px-2 py-3 shadow-lg hover:from-violet-700 hover:to-indigo-700 transition-all flex flex-col items-center gap-1"
+      aria-label="Ask rsync.ai about this pipeline"
+    >
+      <Sparkles className="h-4 w-4" />
+      <ChevronLeft className="h-3 w-3" />
+      <span className="text-[9px] font-semibold tracking-wider [writing-mode:vertical-rl]">
+        ASK RSYNC.AI
+      </span>
+    </button>
+  )
+}
+
+function ChatCopilotDock({
   pipelineId,
   pipelineName,
   stages,
   selectedStage,
 }: PipelineCopilotDockProps) {
   const router = useRouter()
+  const modKey = useModKey()
   const [open, setOpen] = useState(false)
   const [input, setInput] = useState("")
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -111,6 +148,9 @@ export function PipelineCopilotDock({
     label: "What should I check next?",
     prompt: `Walk me through what to monitor in my pipeline${pipelineName ? ` "${pipelineName}"` : ""} given its current state. What might break, and what's the most useful thing to check next?`,
   })
+  // Tab writes the first chip's label; Ask adds the pipeline context itself.
+  const suggestion = presetQuestions[0].label
+  const tab = useSuggestionTab({ value: input, suggestion, onAccept: setInput })
 
   if (!open) {
     return (
@@ -221,17 +261,21 @@ export function PipelineCopilotDock({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
+            if (tab.onKeyDown(e)) return
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
               e.preventDefault()
               handleSubmit()
             }
           }}
-          placeholder="Ask about this pipeline…"
+          placeholder={suggestion}
+          aria-label="Ask about this pipeline"
           rows={2}
           className="w-full resize-none text-xs px-2.5 py-2 rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-violet-500"
         />
         <div className="flex items-center justify-between gap-2">
-          <span className="text-[10px] text-zinc-400">⌘+Enter to send</span>
+          <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
+            {modKey}+Enter to send{tab.showHint && " · Tab for the suggestion"}
+          </span>
           <button
             type="button"
             onClick={handleSubmit}

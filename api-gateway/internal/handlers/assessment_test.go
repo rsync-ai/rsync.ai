@@ -186,6 +186,68 @@ func TestAssessTable_JSONCollapseDetailsRecordColumnNames(t *testing.T) {
 	}
 }
 
+// PostgreSQL discovery reports a NUMERIC with no precision or scale as the bare
+// "numeric" (shared/unconstrained_numeric_golden.json). The run warns, says where
+// the value lands, and hands over the ALTER that gives the column a fixed width.
+func TestAssessTable_UnconstrainedNumericWarnsWithTheAlter(t *testing.T) {
+	meta := TableMetadata{
+		Name:        "ledger",
+		Schema:      "billing",
+		PrimaryKeys: []string{"id"},
+		Columns: []ColumnMetadata{
+			{Name: "id", Type: "integer"},
+			{Name: "rate", Type: "numeric"},
+			{Name: "price", Type: "numeric(12,2)"},
+			{Name: "fee", Type: "decimal"},
+			{Name: `odd"name`, Type: " NUMERIC "},
+		},
+	}
+	finding := func(tbl AssessmentTable) AssessmentFinding {
+		for _, x := range tbl.Findings {
+			if x.Code == FindingUnconstrainedNumeric {
+				return x
+			}
+		}
+		return AssessmentFinding{}
+	}
+	got := assessTable(meta, true, nil)
+	if codes := findingCodes(got, AssessmentWarning); len(codes) != 1 || codes[0] != FindingUnconstrainedNumeric {
+		t.Fatalf("warnings = %v, want [%s]", codes, FindingUnconstrainedNumeric)
+	}
+	f := finding(got)
+	cols, _ := f.Details["columns"].([]string)
+	if strings.Join(cols, ",") != `rate,odd"name` {
+		t.Errorf("columns = %v, want only the unconstrained ones, in source order", cols)
+	}
+	sql, _ := f.Details["sql_to_run"].([]string)
+	want := []string{
+		`ALTER TABLE "billing"."ledger" ALTER COLUMN "rate" TYPE numeric(p,s);`,
+		`ALTER TABLE "billing"."ledger" ALTER COLUMN "odd""name" TYPE numeric(p,s);`,
+	}
+	if strings.Join(sql, "\n") != strings.Join(want, "\n") {
+		t.Errorf("sql_to_run = %q, want %q", sql, want)
+	}
+	if steps, _ := f.Details["steps"].([]string); len(steps) == 0 {
+		t.Error("steps missing: the modal renders them as the fix")
+	}
+	for _, s := range []string{"rate", "PostgreSQL", "NUMERIC", "text", "already exists"} {
+		if !strings.Contains(f.Message, s) {
+			t.Errorf("message %q does not mention %q", f.Message, s)
+		}
+	}
+	// The ack key hashes the message, so it must not change between runs.
+	if again := assessTable(meta, true, nil); assessmentWarningKey(again, finding(again)) != assessmentWarningKey(got, f) {
+		t.Error("the warning's ack key changed between two identical runs")
+	}
+
+	// A table with no unconstrained numeric has no such finding.
+	meta.Columns = meta.Columns[:4]
+	meta.Columns[1].Type = "numeric(10,4)"
+	if codes := findingCodes(assessTable(meta, true, nil), AssessmentWarning); len(codes) != 0 {
+		t.Errorf("warnings = %v, want none", codes)
+	}
+}
+
 func TestHasBlockingFindings(t *testing.T) {
 	clean := []AssessmentTable{{Findings: []AssessmentFinding{{Severity: AssessmentInfo, Code: "X"}}}}
 	if hasBlockingFindings(clean) {

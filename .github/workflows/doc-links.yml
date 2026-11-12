@@ -213,6 +213,10 @@ jobs:
           # those globs ran the whole llm-service suite on every PR; the globs are
           # gone and this unfiltered job runs the six instead (~12 s). The census in
           # test_ci_filter_covers_every_guard_subject.py counts this list as coverage.
+          # test_llm_egress_doc_is_current.py is the same shape as the connector
+          # reference: docs/security/llm-egress.md is generated from llm-service's
+          # egress census and prompt files, so a prompt change leaves it stale and a
+          # hand edit touches no code. Stdlib + PyYAML, like that one.
           # NOT test_shipped_images_are_publishable.py: it fails without release tags,
           # and this list also runs against the published tree, which has none. It
           # stays in llm-service-unit, which fetches tags, with README.md in the filter.
@@ -228,6 +232,7 @@ jobs:
             tests/test_no_infrastructure_ips_in_docs.py \
             tests/test_pii_policies_are_not_advertised_as_enforced.py \
             tests/test_connector_reference_matches_disk.py \
+            tests/test_llm_egress_doc_is_current.py \
             tests/test_no_doc_claims_a_live_prod_environment.py \
             tests/test_ci_python_version_claims_match_workflows.py \
             tests/test_archive_entry_count_is_measured.py \

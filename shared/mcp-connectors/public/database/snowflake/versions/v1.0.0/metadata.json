@@ -63,7 +63,25 @@
       "warehouse": {"type": "string", "description": "Virtual warehouse to run queries on"},
       "database": {"type": "string", "description": "Database name"},
       "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "PUBLIC"},
-      "role": {"type": "string", "description": "Role to assume for the session"}
+      "role": {"type": "string", "description": "Role to assume for the session"},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["account", "user", "database"]
   },
@@ -78,7 +96,25 @@
       "warehouse": {"type": "string", "description": "Virtual warehouse to run queries on"},
       "database": {"type": "string", "description": "Database name"},
       "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "PUBLIC"},
-      "role": {"type": "string", "description": "Role to assume for the session"}
+      "role": {"type": "string", "description": "Role to assume for the session"},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["account", "user", "database"]
   },
@@ -111,6 +147,10 @@
       {"name": "table", "type": "string", "required": true},
       {"name": "data", "type": "array", "required": true},
       {"name": "page_size", "type": "integer", "required": false, "default": 1000}
+    ]},
+    {"name": "execute", "type": "destination", "description": "Run exactly one SQL statement verbatim (models DDL/DML); returns rows_affected", "method": "snowflake_execute", "parameters": [
+      {"name": "query", "type": "string", "required": true, "description": "The statement; 'sql' and 'statement' are accepted aliases"},
+      {"name": "timeout_seconds", "type": "integer", "required": false, "description": "Server-side abort deadline for the statement"}
     ]}
   ],
   "license": "LicenseRef-rsync.ai-SAL-1.0",

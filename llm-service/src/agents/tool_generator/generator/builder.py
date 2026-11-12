@@ -24,7 +24,6 @@ import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, TemplateError, select_autoescape
 
@@ -46,40 +45,6 @@ try:
 except Exception:
     from contracts.python_literal_sanitizer import sanitize_python_json_literals
 
-def _get_logo_downloader():
-    """
-    Lazily import logo downloader to handle various import contexts.
-    Returns the download_logo function or None if unavailable.
-    """
-    import sys
-    
-    # Try direct import first
-    try:
-        from utils.logo_downloader import download_logo
-        return download_logo
-    except ImportError:
-        pass
-    
-    # Try with computed path
-    try:
-        src_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        if src_dir not in sys.path:
-            sys.path.insert(0, src_dir)
-        from utils.logo_downloader import download_logo
-        return download_logo
-    except ImportError:
-        pass
-    
-    # Try with absolute Docker path
-    try:
-        if '/app/src' not in sys.path:
-            sys.path.insert(0, '/app/src')
-        from utils.logo_downloader import download_logo
-        return download_logo
-    except ImportError:
-        pass
-    
-    return None
 
 # Import schemas (package-first to avoid duplicate class definitions)
 import sys
@@ -129,84 +94,6 @@ class GeneratedConnector:
             "generated_at": self.generated_at,
             "spec_version": self.spec_version,
         }
-    
-    def save_to_directory(self, output_dir: str) -> Dict[str, str]:
-        """
-        Save all artifacts to a directory.
-
-        Refuses to write when the GeneratedConnector is not valid OR has
-        an empty code body. Both conditions are how ConnectorBuilder.build()
-        signals a hard fail (security lint reject, manifest validation
-        reject, template error). Without this guard, callers that don't
-        explicitly check is_valid (session_fast_path, orchestrator, qa)
-        would silently write empty connector.py / metadata.json to disk.
-
-        Returns dict mapping filename -> filepath.
-        """
-        if not self.is_valid:
-            raise ValueError(
-                "Refusing to persist invalid connector "
-                f"({self.name}): {self.validation_errors!r}"
-            )
-        if not self.code or not self.code.strip():
-            raise ValueError(
-                f"Refusing to persist empty connector body ({self.name})"
-            )
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        files = {}
-
-        # Save connector.py
-        connector_path = output_path / "connector.py"
-        connector_path.write_text(self.code)
-        files["connector.py"] = str(connector_path)
-        
-        # Save metadata.json
-        metadata_path = output_path / "metadata.json"
-        metadata_path.write_text(self.metadata)
-        files["metadata.json"] = str(metadata_path)
-        
-        # Save requirements.txt
-        requirements_path = output_path / "requirements.txt"
-        requirements_path.write_text(self.requirements)
-        files["requirements.txt"] = str(requirements_path)
-        
-        # Save Dockerfile if present
-        if self.dockerfile:
-            dockerfile_path = output_path / "Dockerfile"
-            dockerfile_path.write_text(self.dockerfile)
-            files["Dockerfile"] = str(dockerfile_path)
-        
-        # Download logo for the connector
-        logo_downloader = _get_logo_downloader()
-        if logo_downloader is not None:
-            try:
-                # Extract connector name from metadata
-                metadata_dict = json.loads(self.metadata)
-                connector_name = (
-                    metadata_dict.get("id")
-                    or metadata_dict.get("connector_type")
-                    or metadata_dict.get("name", "")
-                )
-                
-                if connector_name:
-                    logger.info(f"🎨 Downloading logo for {connector_name}...")
-                    success, logo_filename = logo_downloader(connector_name, str(output_path))
-                    if success:
-                        logo_path = output_path / logo_filename
-                        files[logo_filename] = str(logo_path)
-                        logger.info(f"✅ Logo downloaded: {logo_filename}")
-                    else:
-                        logger.warning(f"⚠️ Could not download logo for {connector_name}")
-            except Exception as e:
-                logger.warning(f"⚠️ Logo download failed: {e}")
-        else:
-            logger.warning("⚠️ Logo downloader not available")
-        
-        logger.info(f"Saved connector artifacts to {output_dir}")
-        return files
 
 
 class ConnectorBuilder:
@@ -405,6 +292,9 @@ class ConnectorBuilder:
         # Select appropriate template for the connector type
         connector_template = self._select_connector_template(spec)
         logger.info(f"Using template: {connector_template}")
+        # metadata.json.j2 declares record_ids only for the template whose
+        # get_capabilities reports it.
+        context["connector_template"] = connector_template
         
         # Render all templates
         try:
@@ -522,35 +412,7 @@ class ConnectorBuilder:
         """Render a single template"""
         template = self.env.get_template(template_name)
         return template.render(**context)
-    
-    def _validate_spec(self, spec: ConnectorSpec) -> List[str]:
-        """
-        Validate spec against requirements.
-        
-        Returns list of error/warning messages.
-        """
-        errors = []
-        
-        # Check required operations
-        operation_names = {op.name for op in spec.operations}
-        required = {'test_connection', 'validate_config', 'discover_schema', 'get_capabilities'}
-        missing = required - operation_names
-        
-        if missing:
-            errors.append(f"Missing required operations: {missing}")
-        
-        # Check category-specific requirements
-        if spec.category.value == 'api_saas':
-            if not spec.base_url:
-                errors.append("API connectors require base_url")
-        
-        # Check auth configuration
-        if spec.auth.type.value == 'oauth2':
-            if not spec.auth.oauth_provider:
-                errors.append("OAuth2 auth requires oauth_provider")
-        
-        return errors
-    
+
     def build_from_dict(self, spec_dict: Dict[str, Any], **kwargs) -> GeneratedConnector:
         """
         Build from a dictionary (e.g., loaded from JSON/YAML).
@@ -588,6 +450,7 @@ def generate_metadata(spec: ConnectorSpec) -> str:
     context = {
         "spec": spec,
         "generation_timestamp": datetime.now().isoformat(),
+        "connector_template": builder._select_connector_template(spec),
     }
     return builder._render_template("metadata.json.j2", context)
 
@@ -849,50 +712,3 @@ def validate_metadata(metadata_str: str) -> Tuple[List[str], List[str]]:
                 warnings.append(f"Operation '{op.get('name', 'unknown')}' missing 'type' field")
     
     return errors, warnings
-
-
-# =============================================================================
-# BATCH GENERATION
-# =============================================================================
-
-def build_connectors_batch(specs: List[ConnectorSpec], output_dir: str) -> Dict[str, GeneratedConnector]:
-    """
-    Build multiple connectors in batch.
-    
-    Args:
-        specs: List of connector specs
-        output_dir: Base output directory
-    
-    Returns:
-        Dict mapping connector name -> GeneratedConnector
-    """
-    builder = ConnectorBuilder()
-    results = {}
-    
-    for spec in specs:
-        try:
-            result = builder.build(spec, include_dockerfile=True)
-            
-            # Save to subdirectory
-            connector_dir = os.path.join(output_dir, spec.name)
-            result.save_to_directory(connector_dir)
-            
-            results[spec.name] = result
-            
-        except Exception as e:
-            logger.error(f"Failed to build {spec.name}: {e}")
-            results[spec.name] = GeneratedConnector(
-                name=spec.name,
-                code="",
-                metadata="",
-                requirements="",
-                is_valid=False,
-                validation_errors=[str(e)],
-            )
-    
-    # Summary
-    valid_count = sum(1 for r in results.values() if r.is_valid)
-    logger.info(f"Batch build complete: {valid_count}/{len(specs)} valid")
-    
-    return results
-

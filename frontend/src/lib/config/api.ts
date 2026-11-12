@@ -110,13 +110,6 @@ function rebaseLeakedLocalhost(baked: string): string {
 }
 
 export const API_GATEWAY_URL = resolveClientApiBase()
-export const ORCHESTRATOR_URL = rebaseLeakedLocalhost(
-  process.env.NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL || "http://localhost:8081"
-)
-// Note: in `docker compose`, the Planner service is exposed on host port 5011.
-export const LLM_SERVICE_URL = rebaseLeakedLocalhost(
-  process.env.NEXT_PUBLIC_LLM_SERVICE_URL || "http://localhost:5011"
-)
 
 // True when `url` points at a loopback host while the current page is on a real
 // (non-localhost) origin — i.e. a build-time-baked localhost value that would be
@@ -196,6 +189,108 @@ export const API_ENDPOINTS = {
     ADMIN_TEST: `${API_GATEWAY_URL}/api/v1/admin/notifications/test`,
   },
 
+  // Connect your AI app: the caller's agent tokens (an admin sees the workspace's)
+  // and the MCP endpoint an agent calls with one. handlers/agent_tokens.go,
+  // internal/agentgw. Registered only when RSYNC_AGENT_GATEWAY_ENABLED is on.
+  AGENT_TOKENS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/agent-tokens`,
+    BY_ID: (id: string) => `${API_GATEWAY_URL}/api/v1/agent-tokens/${encodeURIComponent(id)}`,
+    MCP: `${API_GATEWAY_URL}/api/agent/v1/mcp`,
+  },
+
+  // In-app assistant ("Ask rsync.ai"): one question in, one answer out, Stop for
+  // a question on its way, and the models with a key. The ADMIN_* routes set
+  // the model keys (platform admins only). internal/assistant; registered only
+  // when RSYNC_ASSISTANT_ENABLED is on.
+  ASSISTANT: {
+    MESSAGES: `${API_GATEWAY_URL}/api/v1/assistant/messages`,
+    CANCEL: (requestId: string) =>
+      `${API_GATEWAY_URL}/api/v1/assistant/messages/${encodeURIComponent(requestId)}/cancel`,
+    MODELS: `${API_GATEWAY_URL}/api/v1/assistant/models`,
+    ADMIN_MODELS: `${API_GATEWAY_URL}/api/v1/admin/assistant/models`,
+    ADMIN_MODEL: (entry: string) =>
+      `${API_GATEWAY_URL}/api/v1/admin/assistant/models/${encodeURIComponent(entry)}`,
+    ADMIN_MODEL_TEST: (entry: string) =>
+      `${API_GATEWAY_URL}/api/v1/admin/assistant/models/${encodeURIComponent(entry)}/test`,
+    ADMIN_MODEL_SAMPLE_ROWS: (entry: string) =>
+      `${API_GATEWAY_URL}/api/v1/admin/assistant/models/${encodeURIComponent(entry)}/sample-rows`,
+    // Whether Ask rsync.ai may read sample rows in the active workspace.
+    WORKSPACE_LLM_DATA: `${API_GATEWAY_URL}/api/v1/workspace/llm-data`,
+  },
+
+  // A pipeline Ask rsync.ai or an agent token proposed (plan_pipeline): only the
+  // person it was proposed for reads it, and creates it with their session.
+  // handlers/pipeline_plans.go.
+  PIPELINE_PLANS: {
+    GET: (id: string) => `${API_GATEWAY_URL}/api/v1/pipeline-plans/${encodeURIComponent(id)}`,
+    APPLY: (id: string) => `${API_GATEWAY_URL}/api/v1/pipeline-plans/${encodeURIComponent(id)}/apply`,
+  },
+
+  // Workflows (handlers/workflows.go): Ask rsync.ai or an agent drafts one
+  // (plan_workflow); the person tests it, turns it on, runs, pauses or deletes
+  // it here. Delivery channels are where workflows send (owners and admins add
+  // them); no route returns a webhook URL.
+  WORKFLOWS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/workflows`,
+    GET: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}`,
+    RUNS: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/runs`,
+    TEST: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/test`,
+    ACTIVATE: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/activate`,
+    PAUSE: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/pause`,
+    RUN: (id: string) => `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/run`,
+    STOP: (id: string, runId: string) =>
+      `${API_GATEWAY_URL}/api/v1/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/stop`,
+  },
+  // A change Ask rsync.ai proposed to a saved workflow (plan_workflow_change):
+  // only the person it was proposed for reads it; an owner or admin applies it.
+  // handlers/workflow_changes.go.
+  WORKFLOW_CHANGES: {
+    GET: (id: string) => `${API_GATEWAY_URL}/api/v1/workflow-changes/${encodeURIComponent(id)}`,
+    APPLY: (id: string) => `${API_GATEWAY_URL}/api/v1/workflow-changes/${encodeURIComponent(id)}/apply`,
+  },
+  DELIVERY_CHANNELS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/delivery-channels`,
+    ITEM: (id: string) => `${API_GATEWAY_URL}/api/v1/delivery-channels/${encodeURIComponent(id)}`,
+    TEST: (id: string) => `${API_GATEWAY_URL}/api/v1/delivery-channels/${encodeURIComponent(id)}/test`,
+  },
+  // Charts and dashboards (handlers/charts_api.go, dashboards_api.go,
+  // dashboard_proposals.go, dashboard_changes.go): every member views and draws
+  // them, owners and admins save, change and delete them. A tile reads its rows
+  // live with the viewer's rights. A dashboard Ask rsync.ai drafted (plan_dashboard),
+  // or a change to one tile (plan_dashboard_change), is read and saved only by its
+  // person. Every save keeps the dashboard as it was; VERSIONS lists them.
+  CHARTS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/charts`,
+    ITEM: (id: string) => `${API_GATEWAY_URL}/api/v1/charts/${encodeURIComponent(id)}`,
+    DRAW: (id: string) => `${API_GATEWAY_URL}/api/v1/charts/${encodeURIComponent(id)}/draw`,
+    PREVIEW: `${API_GATEWAY_URL}/api/v1/charts/preview`,
+    SOURCES: `${API_GATEWAY_URL}/api/v1/charts/sources`,
+    SOURCE_COLUMNS: (id: string) => `${API_GATEWAY_URL}/api/v1/charts/sources/${encodeURIComponent(id)}/columns`,
+  },
+  DASHBOARDS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/dashboards`,
+    ITEM: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboards/${encodeURIComponent(id)}`,
+    DRAW_TILE: (id: string, tileId: string) =>
+      `${API_GATEWAY_URL}/api/v1/dashboards/${encodeURIComponent(id)}/tiles/${encodeURIComponent(tileId)}/draw`,
+    FILTER_VALUES: (id: string, filterId: string) =>
+      `${API_GATEWAY_URL}/api/v1/dashboards/${encodeURIComponent(id)}/filters/${encodeURIComponent(filterId)}/values`,
+    VERSIONS: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboards/${encodeURIComponent(id)}/versions`,
+  },
+  DASHBOARD_PROPOSALS: {
+    GET: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboard-proposals/${encodeURIComponent(id)}`,
+    SAVE: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboard-proposals/${encodeURIComponent(id)}/save`,
+  },
+  DASHBOARD_CHANGES: {
+    GET: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboard-changes/${encodeURIComponent(id)}`,
+    APPLY: (id: string) => `${API_GATEWAY_URL}/api/v1/dashboard-changes/${encodeURIComponent(id)}/apply`,
+  },
+  // The workspace's own model layers (Silver, Gold, Marts…): anyone in the
+  // workspace lists them, an owner or admin edits them. handlers/workspace_layers.go.
+  MODEL_LAYERS: {
+    LIST: `${API_GATEWAY_URL}/api/v1/model-layers`,
+    ITEM: (id: string) => `${API_GATEWAY_URL}/api/v1/model-layers/${encodeURIComponent(id)}`,
+  },
+
   // Chat (multi-turn conversation with slot-filling)
   CHAT: {
     MESSAGE: `${API_GATEWAY_URL}/api/v1/chat/message`,
@@ -211,6 +306,8 @@ export const API_ENDPOINTS = {
     DELETE: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}`,
     TEST: `${API_GATEWAY_URL}/api/v1/connections/test`,
     TEST_BY_ID: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}/test`,
+    // Reads one page of every table of an API connection (no row kept) and stores the answer.
+    CHECK_TABLES: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}/check-tables`,
     // The databases or schemas a connection reaches (the Scope step's preview).
     NAMESPACES: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}/namespaces`,
     NAMESPACES_PREVIEW: `${API_GATEWAY_URL}/api/v1/connections/namespaces`,
@@ -245,9 +342,9 @@ export const API_ENDPOINTS = {
     LIST: `${API_GATEWAY_URL}/api/v1/pipelines`,
     LIST_INTERNAL: `${API_GATEWAY_URL_INTERNAL}/api/v1/pipelines`,
     CREATE: `${API_GATEWAY_URL}/api/v1/pipelines`,
-    STATS: `${API_GATEWAY_URL}/api/v1/pipelines/stats`,
     COMPARE: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/compare`,
     TRENDS: (id: string, limit = 10) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/trends?limit=${limit}`,
+    TRENDS_INTERNAL: (id: string, limit = 10) => `${API_GATEWAY_URL_INTERNAL}/api/v1/pipelines/${id}/trends?limit=${limit}`,
     CDC_RECOVER: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/recover`,
     CDC_BACKFILL: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/backfill`,
     // The latest (≤ 10, newest first) queued/sent snapshot loads of this CDC
@@ -312,6 +409,14 @@ export const API_ENDPOINTS = {
     FEATURES: `${API_GATEWAY_URL}/api/v1/features`,
   },
   
+  // Runs page (handlers/activity.go): pipeline, scheduled-query and workflow
+  // runs in one list, newest first, paged by cursor.
+  ACTIVITY: {
+    LIST: `${API_GATEWAY_URL}/api/v1/activity`,
+    // Its charts (handlers/activity_metrics.go): runs, run time, rows and checks per day.
+    METRICS: `${API_GATEWAY_URL}/api/v1/activity/metrics`,
+  },
+
   // Executions
   EXECUTIONS: {
     LIST: `${API_GATEWAY_URL}/api/v1/executions`,
@@ -340,7 +445,6 @@ export const API_ENDPOINTS = {
 // origin (ws→wss under https) so it can never leak to the browser on a real
 // deployment. Correct real-domain bakes pass through untouched.
 export const WS_ENDPOINTS = {
-  ORCHESTRATOR: rebaseLeakedLocalhost(process.env.NEXT_PUBLIC_WS_ORCHESTRATOR_URL || `ws://localhost:8081/ws`),
   // Same build-time-vs-runtime problem as the HTTP base above: on a published
   // image NEXT_PUBLIC_WS_URL is whatever CI baked, so the running container's
   // value has to win. Without this the live pipeline feed silently opens a
@@ -348,18 +452,4 @@ export const WS_ENDPOINTS = {
   API_GATEWAY: rebaseLeakedLocalhost(
     runtimeConfig("wsUrl") || process.env.NEXT_PUBLIC_WS_URL || `ws://localhost:5001/ws`
   ),
-}
-
-// Helper to get the right base URL for a service
-export function getServiceURL(service: 'gateway' | 'orchestrator' | 'llm'): string {
-  switch (service) {
-    case 'gateway':
-      return API_GATEWAY_URL
-    case 'orchestrator':
-      return ORCHESTRATOR_URL
-    case 'llm':
-      return LLM_SERVICE_URL
-    default:
-      return API_GATEWAY_URL
-  }
 }

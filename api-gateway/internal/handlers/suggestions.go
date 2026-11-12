@@ -57,6 +57,7 @@ func GenerateSuggestions(c *gin.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(req)
 	for k, v := range telemetry.InjectTraceToHeaders(c.Request.Context()) {
 		req.Header.Set(k, v)
 	}
@@ -78,5 +79,9 @@ func GenerateSuggestions(c *gin.Context) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respondLLMUpstreamFailed(c, "GenerateSuggestions", resp.StatusCode, respBody, "Suggestions failed")
+		return
+	}
 	c.Data(browserStatusForUpstream(resp.StatusCode), "application/json", respBody)
 }

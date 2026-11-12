@@ -89,6 +89,11 @@ export type TableStatsSummaryPayload = {
   tables_completed?: number
   tables_failed?: number
   tables_degraded?: number
+  /**
+   * Of tables_degraded, the batch tables the run rewound (table_stats.go
+   * rewoundSQL). Absent from gateways older than migration 141.
+   */
+  tables_rewound?: number
   tables_running?: number
   /** Absent from gateways older than the waiting_for_data table status. */
   tables_waiting_for_data?: number
@@ -149,7 +154,47 @@ export function rollupFromSummary(s: TableStatsSummaryPayload | null | undefined
   }
 }
 
-export type TableStatusKey = "completed" | "failed" | "degraded" | "running" | "waiting_for_data" | "other"
+export type TableStatusKey =
+  | "completed"
+  | "failed"
+  | "rewound"
+  | "degraded"
+  | "running"
+  | "waiting_for_data"
+  | "other"
+
+/** What a "degraded" table's badge says, and the counts behind it on hover. */
+export type DegradedTableLabel = { label: "Rewound" | "Rows not written"; title: string }
+
+const fmtCount = (n: number | null | undefined) => (n ?? 0).toLocaleString("en-US")
+const fmtRows = (n: number | null | undefined) => `${fmtCount(n)} row${(n ?? 0) === 1 ? "" : "s"}`
+
+/**
+ * A "degraded" table is one whose rows fell short of the destination: a batch
+ * table that wrote fewer rows than it read, or any table that dead-lettered a
+ * row. The word said nothing about what to do. A batch run that lost rows
+ * puts the table back to where it started (orchestrator
+ * RewindCheckpointsOfExecution), so the next run reads them again — that table
+ * is "Rewound". Every other one is "Rows not written", with the written, read
+ * and dead-letter counts that make it so.
+ */
+export function degradedTableLabel(t: {
+  mode?: string
+  rewound?: boolean
+  read_rows?: number | null
+  inserted_rows?: number | null
+  dlq_rows?: number | null
+}): DegradedTableLabel {
+  const dlq = `${fmtRows(t.dlq_rows)} in the dead-letter queue`
+  const counts = t.mode === "batch" ? `Wrote ${fmtCount(t.inserted_rows)} of ${fmtRows(t.read_rows)} read · ${dlq}` : dlq
+  if (t.rewound) {
+    return {
+      label: "Rewound",
+      title: `The destination lost rows, so the run put this table back to where it started; the next run reads them again. ${counts}`,
+    }
+  }
+  return { label: "Rows not written", title: counts }
+}
 
 export type TableStatusCount = { key: TableStatusKey; label: string; count: number }
 
@@ -181,15 +226,20 @@ export function tableStatusBreakdown(
     | "tables_completed"
     | "tables_failed"
     | "tables_degraded"
+    | "tables_rewound"
     | "tables_running"
     | "tables_waiting_for_data"
   >,
 ): TableStatusBreakdown {
   const total = Math.max(0, s.total_tables ?? 0)
   const completed = Math.max(0, s.tables_completed ?? 0)
+  // Rewound tables are a part of the degraded ones, split out (degradedTableLabel).
+  const degraded = Math.max(0, s.tables_degraded ?? 0)
+  const rewound = Math.min(degraded, Math.max(0, s.tables_rewound ?? 0))
   const named: TableStatusCount[] = [
     { key: "failed", label: "Tables failed", count: Math.max(0, s.tables_failed ?? 0) },
-    { key: "degraded", label: "Tables degraded", count: Math.max(0, s.tables_degraded ?? 0) },
+    { key: "rewound", label: "Tables rewound", count: rewound },
+    { key: "degraded", label: "Tables with rows not written", count: degraded - rewound },
     { key: "running", label: "Tables running", count: Math.max(0, s.tables_running ?? 0) },
     {
       key: TABLE_STATUS_WAITING_FOR_DATA,

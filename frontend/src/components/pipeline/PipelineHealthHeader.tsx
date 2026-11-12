@@ -3,13 +3,19 @@
 import { useEffect, useId, useState } from "react"
 
 import { usePipelineRuntime, type PipelineRuntime, type RuntimeHealth } from "@/lib/hooks/usePipelineRuntime"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DiagnosePanel } from "@/components/pipeline/DiagnosePanel"
 import { LoadStatusBadge } from "@/components/pipeline/LoadStatusBadge"
 import { backlogIncludesLoadRows, describeLoadStatus, isSettingUp } from "@/lib/pipeline/loadStatus"
-import { RUNTIME_PHASE_WAITING_FOR_DATA, runtimePhaseLabel } from "@/lib/pipeline/statusNormalization"
-import { cn } from "@/lib/utils"
+import {
+  RUNTIME_PHASE_WAITING_FOR_DATA,
+  isTerminalPipelineStatus,
+  pipelineStatusLabel,
+  runtimePhaseLabel,
+} from "@/lib/pipeline/statusNormalization"
+import { cn, formatAgeMs, formatRelativeTime } from "@/lib/utils"
 
 // green / amber / red / gray for healthy / degraded / unhealthy / unknown.
 function healthDot(health: RuntimeHealth): string {
@@ -23,18 +29,6 @@ function healthDot(health: RuntimeHealth): string {
     default:
       return "bg-muted-foreground/40"
   }
-}
-
-// Whole-seconds "Ns ago" / "Nm ago" — finer than utils.formatRelativeTime,
-// which collapses sub-minute values to "Just now".
-function relativeFromSeconds(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds))
-  if (s < 60) return `${s}s ago`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
 }
 
 const compactCount = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 })
@@ -91,6 +85,7 @@ export function backlogVital(runtime: PipelineRuntime): BacklogVital | null {
 
 export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
   const { runtime, loading, error } = usePipelineRuntime(pipelineId)
+  const { status: stateStatus, error: stateError } = usePipelineStatePoll(pipelineId)
   const [showDiagnose, setShowDiagnose] = useState(false)
   const diagnosePanelId = useId()
   // Tick so the "Ns ago" vital stays current between runtime polls without
@@ -114,6 +109,21 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
   // Issue #20: a CDC stream that set up but has delivered nothing used to read
   // "Streaming · Streaming pipeline active" here indefinitely.
   const waitingForData = runtime.phase === RUNTIME_PHASE_WAITING_FOR_DATA
+  // /runtime's phase is pipelines.status, /state's is pipeline_progress.status,
+  // and after a batch run they can disagree: the status pill said Completed while
+  // this header kept "Syncing 99%". A finished /state wins, as it does in
+  // reconcilePipelineStatus. Not for CDC: a stream's runtime phase is its verdict.
+  const settled =
+    runtime.mode !== "cdc" && stateStatus !== null && isTerminalPipelineStatus(stateStatus) ? stateStatus : null
+  // This pill is the page's only status. While the pipeline waits on the user,
+  // /runtime's phase is "validating"; /state says what the user has to do.
+  const label = settled
+    ? pipelineStatusLabel(settled)
+    : stateStatus === "waiting_for_user"
+      ? pipelineStatusLabel(stateStatus)
+      : runtimePhaseLabel(runtime.phase)
+  // The last answer is kept when a read fails, but it is no longer a live one.
+  const stale = error !== null || stateError !== null
 
   // One-line vital.
   let vital: string
@@ -121,10 +131,9 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
     const stale = runtime.liveness?.stale_seconds
     const lastAt = runtime.liveness?.last_event_at
     if (typeof stale === "number") {
-      vital = `last event ${relativeFromSeconds(stale)}`
+      vital = `last event ${formatAgeMs(stale * 1000, { seconds: true })}`
     } else if (lastAt) {
-      const secs = (now - new Date(lastAt).getTime()) / 1000
-      vital = `last event ${relativeFromSeconds(secs)}`
+      vital = `last event ${formatRelativeTime(lastAt, { now, seconds: true })}`
     } else if (waitingForData) {
       vital = runtime.message || "no data has reached the destination yet"
     } else {
@@ -138,10 +147,10 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
     // Clamp to 100 always (a >100% is never right) and force 100% once completed.
     //
     // No "step n/m" here: runtime.progress counts steps against a total the
-    // executor fixes, while the Overview timeline and the Monitoring header count
-    // the run's own stages (stepInfoFromEvents) — "step 7/8" sat above "7/7" on
-    // one screen (item 33). The timeline owns the step.
-    const done = runtime.phase === "completed"
+    // executor fixes, while the Overview timeline counts the run's own stages
+    // (deriveStepInfo) — "step 7/8" sat above "7/7" on one screen (item 33).
+    // The timeline owns the step.
+    const done = settled ? settled === "completed" : runtime.phase === "completed"
     if (p && typeof p.percent === "number") {
       vital = `${done ? 100 : Math.min(100, Math.round(p.percent))}%`
     } else if (done) {
@@ -168,10 +177,13 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
         <Badge
           variant="outline"
           className={cn(
-            waitingForData && "border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300"
+            waitingForData && "border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300",
+            stale && "gap-1 opacity-60"
           )}
+          title={stale ? "Status may be out of date — the last refresh failed" : undefined}
         >
-          {runtimePhaseLabel(runtime.phase)}
+          {label}
+          {stale && <span aria-hidden="true">·&nbsp;stale</span>}
         </Badge>
         {loadStatus && <LoadStatusBadge status={loadStatus} testId="pipeline-load-status" />}
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">

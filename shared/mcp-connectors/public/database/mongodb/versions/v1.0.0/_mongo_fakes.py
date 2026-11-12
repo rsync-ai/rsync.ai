@@ -13,6 +13,9 @@ of pymongo methods:
   * ``coll.with_options(read_preference=...).find(filter, projection)
     .sort([(k, d), ...]).skip(n).limit(n).max_time_ms(ms)``   (find — Data Explorer)
   * ``coll.count_documents({})``                               (discover_schema)
+  * ``coll.aggregate(pipeline, maxTimeMS=...)``                (aggregate / materialize)
+  * ``coll.rename(new, dropTarget=False)`` / ``db.create_collection(name)``
+                                                               (materialize's first run)
   * ``client.close()``
 
 Tests swap ``_get_client`` for :class:`FakeMongoClient`. The fakes honour the one
@@ -25,6 +28,12 @@ MongoDB is ALSO a destination (``supports_destination=True``): it writes via
 write path can be exercised offline — ``bulk_write`` introspects real
 ``pymongo.ReplaceOne`` ops (``_filter``/``_doc``/``_upsert``) and ``insert_many``
 raises a real ``BulkWriteError`` on a duplicate ``_id`` (the CDC-redelivery case).
+A model run (``materialize``) is the third write path: ``aggregate`` honours a
+small stage set ending in ``$out``, and ``rename`` / ``create_collection`` raise
+the real pymongo errors MongoDB raises when the target already exists (code 48 /
+``CollectionInvalid``) or the source is missing (code 26). A collection reached
+only through ``db[name]`` does not EXIST until something writes it, as in
+MongoDB, which is what makes those two errors reachable.
 The connector still does NOT capture CDC itself — Debezium change streams do that
 out-of-process — so there is no ``watch`` to fake. The connector's only
 CDC-readiness surface is replica-set detection in ``test_connection``;
@@ -314,10 +323,36 @@ def _matches(doc: Dict[str, Any], flt: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
+def _run_stages(docs: List[Dict[str, Any]], pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The read stages the tests use. Anything else is a test bug, so it raises."""
+    for stage in pipeline:
+        (name, body), = stage.items()
+        if name == "$match":
+            docs = [d for d in docs if _match_query(d, body)]
+        elif name == "$project":
+            docs = [_project(d, body) for d in docs]
+        elif name == "$sort":
+            for field, d in reversed(list(body.items())):
+                docs = sorted(docs, key=lambda doc, f=field: _sort_key(doc, f), reverse=d < 0)
+        elif name == "$skip":
+            docs = docs[body:]
+        elif name == "$limit":
+            docs = docs[:body]
+        elif name == "$count":
+            docs = [{body: len(docs)}] if docs else []
+        else:
+            raise NotImplementedError(f"fake aggregate does not model {name}")
+    return docs
+
+
 class FakeCollection:
     def __init__(self, docs: Optional[List[Dict[str, Any]]] = None,
-                 name: Optional[str] = None, database: Optional[Any] = None):
+                 name: Optional[str] = None, database: Optional[Any] = None,
+                 exists: bool = True):
         self._docs = list(docs or [])
+        # False for a handle reached only through db[name]: MongoDB creates a
+        # collection on its first write, so rename/create_collection see it as absent.
+        self.exists = exists
         self.name = name                 # coll.name — used by _ensure_key_index cache key
         self.database = database         # coll.database.name — parent FakeDatabase
         # call logs so tests can assert the emitted filters / ops.
@@ -330,6 +365,12 @@ class FakeCollection:
         self.find_error: Optional[Exception] = None     # raised when a find cursor iterates
         self.bulk_error: Optional[Exception] = None     # raised by bulk_write (offset-write failure)
         self.last_cursor: Optional[FakeCursor] = None
+        self.aggregate_calls: List[Dict[str, Any]] = []  # {"pipeline": [...], **kwargs}
+        self.aggregate_error: Optional[Exception] = None  # raised by aggregate
+        self.rename_error: Optional[Exception] = None     # raised by rename, before the checks
+        # $out of an empty result: True creates an empty collection; False writes
+        # nothing, so the following rename meets NamespaceNotFound (code 26).
+        self.out_creates_empty = True
 
     def create_index(self, keys, **kw):
         self.index_calls.append(keys)
@@ -360,6 +401,47 @@ class FakeCollection:
     def estimated_document_count(self, **kw):
         return len(self._docs)
 
+    def aggregate(self, pipeline, **kw):
+        """Run the modelled stages. A final ``$out`` (a name in this database, or
+        ``{"db", "coll"}``) replaces that collection's documents and returns no
+        documents, as MongoDB does."""
+        self.aggregate_calls.append({"pipeline": list(pipeline), **kw})
+        if self.aggregate_error is not None:
+            raise self.aggregate_error
+        out = None
+        if pipeline and "$out" in pipeline[-1]:
+            out = pipeline[-1]["$out"]
+            pipeline = pipeline[:-1]
+        result = _run_stages([dict(d) for d in self._docs], pipeline)
+        if out is None:
+            return iter(result)
+        if isinstance(out, dict):
+            target = self.database.client[out["db"]][out["coll"]]
+        else:
+            target = self.database[out]
+        if result or self.out_creates_empty:
+            target._docs = result
+            target.exists = True
+        return iter([])
+
+    def rename(self, new_name, dropTarget=False, **kw):
+        from pymongo.errors import OperationFailure
+        db = self.database
+        db.rename_calls.append({"from": self.name, "to": new_name, "dropTarget": dropTarget})
+        if self.rename_error is not None:
+            raise self.rename_error
+        if not self.exists:
+            raise OperationFailure("source namespace does not exist", code=26,
+                                   details={"codeName": "NamespaceNotFound"})
+        existing = db._colls.get(new_name)
+        if existing is not None and existing.exists and not dropTarget:
+            raise OperationFailure("target namespace exists", code=48,
+                                   details={"codeName": "NamespaceExists"})
+        db._colls.pop(self.name, None)
+        self.name = new_name
+        db._colls[new_name] = self
+        return {"ok": 1}
+
     # ----------------------------- writes -------------------------------- #
     def insert_many(self, docs, ordered=True, **kw):
         """Insert docs, auto-assigning ObjectId _id when absent. A doc whose _id
@@ -368,6 +450,7 @@ class FakeCollection:
         ordered=False."""
         from bson import ObjectId
         self.insert_calls.append({"docs": list(docs), "ordered": ordered})
+        self.exists = True
         inserted: List[Any] = []
         write_errors: List[Dict[str, Any]] = []
         for i, d in enumerate(docs):
@@ -406,6 +489,7 @@ class FakeCollection:
         if self.bulk_error is not None:
             raise self.bulk_error
         self.bulk_ops.append({"ops": list(ops), "ordered": ordered})
+        self.exists = True
         matched = upserted = modified = 0
         for op in ops:
             flt = getattr(op, "_filter", None)
@@ -458,6 +542,9 @@ class FakeDatabase:
     def __init__(self, colls: Dict[str, Any], name: str = "testdb"):
         self.name = name                 # db.name — used by _ensure_key_index cache key
         self.watch_hook = None           # set by FakeMongoClient: records + raises
+        self.client = None               # set by FakeMongoClient: $out {"db", "coll"} resolves through it
+        self.rename_calls: List[Dict[str, Any]] = []
+        self.create_calls: List[str] = []
         self._colls: Dict[str, FakeCollection] = {}
         for cname, c in colls.items():
             coll = c if isinstance(c, FakeCollection) else FakeCollection(c)
@@ -466,11 +553,21 @@ class FakeDatabase:
 
     def __getitem__(self, name):
         if name not in self._colls:
-            self._colls[name] = FakeCollection([], name=name, database=self)
+            self._colls[name] = FakeCollection([], name=name, database=self, exists=False)
         return self._colls[name]
 
     def list_collection_names(self):
-        return list(self._colls)
+        return [name for name, coll in self._colls.items() if coll.exists]
+
+    def create_collection(self, name, **kw):
+        from pymongo.errors import CollectionInvalid
+        self.create_calls.append(name)
+        coll = self._colls.get(name)
+        if coll is not None and coll.exists:
+            raise CollectionInvalid(f"collection {name} already exists")
+        coll = self[name]
+        coll.exists = True
+        return coll
 
     def drop_collection(self, name):
         self._colls.pop(name, None)
@@ -528,6 +625,7 @@ class FakeMongoClient:
         }
         for d in self._dbs.values():
             d.watch_hook = self._watch
+            d.client = self
         self.admin = FakeAdmin(set_name=set_name, ping_error=ping_error,
                                hello_reply=hello_reply, topology_error=topology_error)
         self._version = version
@@ -551,6 +649,7 @@ class FakeMongoClient:
         if name not in self._dbs:
             self._dbs[name] = FakeDatabase({}, name=name)
             self._dbs[name].watch_hook = self._watch
+            self._dbs[name].client = self
         return self._dbs[name]
 
     def server_info(self):

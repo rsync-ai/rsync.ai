@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { cleanup, render, screen, within } from "@testing-library/react"
-import ModelSchedulePage from "@/app/(dashboard)/explorer/schedules/[id]/page"
+import ModelSchedulePage from "@/app/(dashboard)/models/[id]/page"
 import { authFetch } from "@/lib/api/auth-fetch"
 
 // Run history used to print only trigger_source, so a model rebuilt by a chain and one
@@ -11,12 +11,16 @@ import { authFetch } from "@/lib/api/auth-fetch"
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn(), replace: vi.fn() }),
-  usePathname: () => "/explorer/schedules/q-1",
+  usePathname: () => "/models/q-1",
   useParams: () => ({ id: "q-1" }),
   useSearchParams: () => new URLSearchParams(),
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: "admin",
@@ -104,7 +108,7 @@ async function openHistory() {
     return res(404, {})
   })
   render(<ModelSchedulePage />)
-  await screen.findByText("manual")
+  await screen.findByText("Manual")
 }
 
 describe("model page: run history provenance", () => {
@@ -118,16 +122,16 @@ describe("model page: run history provenance", () => {
     expect(screen.getByText("After all of orders_sync, customer_dim run")).toBeInTheDocument()
   })
 
-  it("says what woke a chained rebuild, how deep, and how many it absorbed", async () => {
+  it("says what woke a chained rebuild and how many it absorbed, in plain words", async () => {
     await openHistory()
-    expect(screen.getByText("after customer_dim (depth 2, 3 coalesced)")).toBeInTheDocument()
+    expect(screen.getByText("After customer_dim (one rebuild for 3 upstream runs)")).toBeInTheDocument()
   })
 
   it("says why a rebuild was skipped, and does not paint its message as a failure", async () => {
     await openHistory()
     const reason = screen.getByText("not rebuilt: its upstream failed")
     // Scoped to the run's row: the page's status filter offers "skipped" too.
-    expect(within(reason.closest("tr")!).getByText("skipped")).toBeInTheDocument()
+    expect(within(reason.closest("tr")!).getByText("Skipped")).toBeInTheDocument()
     const message = screen.getByText("orders_sync failed")
     expect(message.className).not.toMatch(/text-red/)
   })

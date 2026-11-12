@@ -37,9 +37,39 @@ describe("connectionTestState", () => {
     expect(connectionTestState({})).toBe("untested")
   })
 
-  it("a passing test beats an expired token; an expired token beats a failed test", () => {
-    expect(connectionTestState({ is_connected: true, last_test_status: "success", is_expired: true })).toBe("connected")
+  it("an expired token beats a failed test", () => {
     expect(connectionTestState({ ...failed, is_expired: true })).toBe("expired")
+  })
+
+  // KI-CONNECTION-BADGE-OUTRANKS-EXPIRED-TOKEN: a stored success only proves
+  // the token worked when the test ran. A token that expired after that test
+  // is the newer fact, so it wins.
+  it("a token that expired after the last passing test beats it", () => {
+    expect(
+      connectionTestState({
+        is_connected: true,
+        last_test_status: "success",
+        last_tested_at: minutesAgo(3 * 24 * 60),
+        is_expired: true,
+        token_expires_at: minutesAgo(60),
+      })
+    ).toBe("expired")
+  })
+
+  it("an expired token with no test time to compare beats a stored success", () => {
+    expect(connectionTestState({ is_connected: true, last_test_status: "success", is_expired: true })).toBe("expired")
+  })
+
+  it("a test that passed after the token's expiry still reads connected", () => {
+    expect(
+      connectionTestState({
+        is_connected: true,
+        last_test_status: "success",
+        last_tested_at: minutesAgo(5),
+        is_expired: true,
+        token_expires_at: minutesAgo(60),
+      })
+    ).toBe("connected")
   })
 })
 
@@ -48,6 +78,30 @@ describe("ConnectionTestBadge", () => {
     render(<ConnectionTestBadge connection={failed} />)
     expect(screen.getByText("Test failed")).toBeInTheDocument()
     expect(screen.queryByText("Not tested")).toBeNull()
+  })
+
+  it("says how old a passing test is", () => {
+    const at = minutesAgo(3 * 24 * 60)
+    render(<ConnectionTestBadge connection={{ is_connected: true, last_test_status: "success", last_tested_at: at }} />)
+    const badge = screen.getByTestId("connection-test-badge")
+    expect(badge).toHaveTextContent("Connected · 3d ago")
+    expect(badge.getAttribute("title")).toMatch(/^Last tested /)
+  })
+
+  it("says Token expired, not Connected, once the token outlives the last passing test", () => {
+    render(
+      <ConnectionTestBadge
+        connection={{
+          is_connected: true,
+          last_test_status: "success",
+          last_tested_at: minutesAgo(3 * 24 * 60),
+          is_expired: true,
+          token_expires_at: minutesAgo(60),
+        }}
+      />
+    )
+    expect(screen.getByTestId("connection-test-badge")).toHaveTextContent("Token expired")
+    expect(screen.queryByText(/Connected/)).toBeNull()
   })
 })
 

@@ -181,7 +181,8 @@ run_image() {
   head2 "$tag  ($dockerfile)"
 
   say "BUILD"
-  docker build -f "$CTX/$dockerfile" -t "$img" "$CTX" >/dev/null || { bad "build failed"; return; }
+  # `legal` = the repo root (the cwd, see the cd above), for `COPY --from=legal THIRD_PARTY_NOTICES.md`.
+  docker build --build-context legal=. -f "$CTX/$dockerfile" -t "$img" "$CTX" >/dev/null || { bad "build failed"; return; }
   ok "built $img"
 
   # Every scan below runs --user root ON PURPOSE.
@@ -335,7 +336,7 @@ run_image Dockerfile.community community src.gateway.main absent \
 run_image Dockerfile.oss lifecycle src.lifecycle.main present \
   'src/gateway src/agents/planner prompts' \
   'src/lifecycle src/agents/tool_generator/deployment src/utils/connector_paths.py
-   src/agents/tool_generator/contracts src/agents/tool_generator/generator
+   src/utils/spec_limits.py src/agents/tool_generator/contracts src/agents/tool_generator/generator
    src/agents/tool_generator/scaffold src/agents/tool_generator/schemas
    src/agents/tool_generator/templates src/agents/tool_generator/validation'
 

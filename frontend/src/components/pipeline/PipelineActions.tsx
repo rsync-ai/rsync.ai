@@ -57,6 +57,9 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
   // Destructive-reload confirm dialog. Reload wipes the destination tables (or folders)
   // and re-copies all data, so we gate it behind an explicit confirmation (parity with CDC).
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
+  // An app's API as the destination (reverse ETL) has no Reload: the gateway refuses
+  // one, so neither button offers it.
+  const [reloadSupported, setReloadSupported] = useState(true)
 
   // Pre-migration assessment modal state
   const [assessmentReport, setAssessmentReport] = useState<AssessmentReport | null>(null)
@@ -83,6 +86,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
         if (!cancelled && (drm === "resume" || drm === "reload")) setDefaultRunMode(drm)
         if (!cancelled && p.destination_namespace) setDestinationNamespace(p.destination_namespace)
         if (!cancelled) setDestIsObjectStorage(isObjectStorageDestination(p.destination_connection?.connector_type))
+        if (!cancelled) setReloadSupported(p.reload_supported !== false)
       } catch {
         // ignore; default stays resume
       }
@@ -93,7 +97,10 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
     }
   }, [pipelineId])
 
-  const primaryMode: "resume" | "reload" = useMemo(() => defaultRunMode, [defaultRunMode])
+  const primaryMode: "resume" | "reload" = useMemo(
+    () => (reloadSupported ? defaultRunMode : "resume"),
+    [defaultRunMode, reloadSupported]
+  )
   const secondaryMode: "resume" | "reload" = useMemo(
     () => (primaryMode === "resume" ? "reload" : "resume"),
     [primaryMode]
@@ -243,6 +250,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       <div className="flex items-center gap-2">
         <Button
           variant="outline"
+          size="sm"
           onClick={handlePause}
           disabled={isActing}
           title="Pause the pipeline (best-effort between steps)."
@@ -250,7 +258,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
         <Pause className="h-4 w-4 mr-2" />
         Pause
       </Button>
-        <Button variant="outline" onClick={handleStop} disabled={isActing} title="Stop the current execution.">
+        <Button variant="outline" size="sm" onClick={handleStop} disabled={isActing} title="Stop the current execution.">
           <Square className="h-4 w-4 mr-2" />
           Stop
         </Button>
@@ -263,7 +271,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       <Button
         onClick={handleResume}
         disabled={isActing}
-        className="bg-gradient-to-r from-violet-600 to-indigo-600"
+        size="sm"
       >
         {isActing ? (
           <>
@@ -285,7 +293,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       <Button
         onClick={() => handleRun(primaryMode)}
         disabled={isRunning}
-        className="bg-gradient-to-r from-violet-600 to-indigo-600"
+        size="sm"
         title={
           primaryMode === "reload"
             ? "Run (Default: Reload): rebuild from scratch (may re-copy full history)."
@@ -307,26 +315,29 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
           </>
         )}
       </Button>
-      <Button
-        variant="outline"
-        onClick={() => handleRun(secondaryMode)}
-        disabled={isRunning}
-        title={
-          secondaryMode === "reload"
-            ? "Reload: rebuild from scratch (may re-copy full history)."
-            : "Resume: continue from the last checkpoint when available."
-        }
-        aria-label={secondaryMode === "reload" ? "Reload pipeline (rebuild from scratch)" : "Resume pipeline"}
-      >
-        {isRunning && runMode === secondaryMode ? (
-          <>
-            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-            {secondaryMode === "reload" ? "Reloading..." : "Resuming..."}
-          </>
-        ) : (
-          <>{secondaryMode === "reload" ? "Reload" : "Resume"}</>
-        )}
-      </Button>
+      {(reloadSupported || secondaryMode !== "reload") && (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => handleRun(secondaryMode)}
+          disabled={isRunning}
+          title={
+            secondaryMode === "reload"
+              ? "Reload: rebuild from scratch (may re-copy full history)."
+              : "Resume: continue from the last checkpoint when available."
+          }
+          aria-label={secondaryMode === "reload" ? "Reload pipeline (rebuild from scratch)" : "Resume pipeline"}
+        >
+          {isRunning && runMode === secondaryMode ? (
+            <>
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              {secondaryMode === "reload" ? "Reloading..." : "Resuming..."}
+            </>
+          ) : (
+            <>{secondaryMode === "reload" ? "Reload" : "Resume"}</>
+          )}
+        </Button>
+      )}
 
       {/* Reload confirm — destructive: DROP + recreate the tables (or empty the folders), full re-copy. */}
       <AlertDialog open={reloadConfirmOpen} onOpenChange={setReloadConfirmOpen}>

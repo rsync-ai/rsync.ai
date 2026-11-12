@@ -269,8 +269,8 @@ func TestBatchSinkPresenceRaisesAnIssueWhenTheWorkerIsGone(t *testing.T) {
 
 	mock.ExpectQuery(`FROM pipelines p`).
 		WillReturnRows(batchSinkRows("p1", "nightly orders", "e1", "sink-abcd1234-batch"))
-	mock.ExpectExec(`INSERT INTO sentinel_active_issues`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`INSERT INTO sentinel_active_issues`).
+		WillReturnRows(detectedAtRow())
 	mock.ExpectQuery(`SELECT id FROM sentinel_active_issues`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(batchSinkAbsentIssueID("p1")))
 

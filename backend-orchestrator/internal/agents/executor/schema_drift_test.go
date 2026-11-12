@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -107,13 +109,13 @@ func TestDiffSchemas(t *testing.T) {
 			want:    []string{"add_column:public.orders:total"},
 		},
 		{
-			name:    "drop column (approve)",
+			name:    "drop column (recorded)",
 			prior:   base,
 			current: []TableMetadata{tbl("public", "orders", col("id", "int"))},
 			want:    []string{"drop_column:public.orders:name"},
 		},
 		{
-			name:    "modify column type (approve)",
+			name:    "modify column type (applied)",
 			prior:   base,
 			current: []TableMetadata{tbl("public", "orders", col("id", "bigint"), col("name", "text"))},
 			want:    []string{"modify_column:public.orders:id"},
@@ -125,7 +127,7 @@ func TestDiffSchemas(t *testing.T) {
 			want:    []string{"create_table:public.shipments:"},
 		},
 		{
-			name:    "drop table (approve)",
+			name:    "drop table (waits for a decision)",
 			prior:   []TableMetadata{tbl("public", "orders", col("id", "int")), tbl("public", "legacy", col("id", "int"))},
 			current: []TableMetadata{tbl("public", "orders", col("id", "int"))},
 			want:    []string{"drop_table:public.legacy:"},
@@ -226,10 +228,12 @@ func TestFilterChangesBySchemaDriftPolicy(t *testing.T) {
 			map[string]int{"add_column": 1, "create_table": 1, "drop_column": 1, "drop_table": 1, "modify_column": 1}},
 		{"notify_on_add=false drops additive only", SchemaDriftPolicy{Enabled: true, NotifyOnAdd: false, NotifyOnDrop: true},
 			map[string]int{"drop_column": 1, "drop_table": 1, "modify_column": 1}},
-		{"notify_on_drop=false drops drop drift only", SchemaDriftPolicy{Enabled: true, NotifyOnAdd: true, NotifyOnDrop: false},
-			map[string]int{"add_column": 1, "create_table": 1, "modify_column": 1}},
-		{"both off still keeps modify_column", SchemaDriftPolicy{Enabled: true, NotifyOnAdd: false, NotifyOnDrop: false},
-			map[string]int{"modify_column": 1}},
+		// drop_table is the one change that waits for a decision, and the run leaves the
+		// table out until it is made: opting out of it would drop the table silently.
+		{"notify_on_drop=false drops dropped columns only", SchemaDriftPolicy{Enabled: true, NotifyOnAdd: true, NotifyOnDrop: false},
+			map[string]int{"add_column": 1, "create_table": 1, "drop_table": 1, "modify_column": 1}},
+		{"both off still keeps modify_column and drop_table", SchemaDriftPolicy{Enabled: true, NotifyOnAdd: false, NotifyOnDrop: false},
+			map[string]int{"drop_table": 1, "modify_column": 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,6 +361,37 @@ func TestDiffSchemas_DeclaredTypeNarrowingIsAdvisoryModifyColumn(t *testing.T) {
 	}
 }
 
+// PostgreSQL discovery used to report a NUMERIC with no precision or scale as
+// "decimal" and now reports the bare "numeric" (shared/unconstrained_numeric_golden.json).
+// The first run after that upgrade must not see drift: a modify_column is applied
+// without asking, and it would retype a destination table that is meant to stay as
+// it is. A different declared type under the fold is still an advisory.
+func TestDiffSchemas_UnconstrainedNumericIsTheSameTypeAsDecimal(t *testing.T) {
+	tbl := func(canonical, declared string) map[string]TableMetadata {
+		return tableMapByKey([]TableMetadata{{
+			Schema:  "public",
+			Name:    "orders",
+			Columns: []ColumnMetadata{{Name: "amount", Type: canonical, SourceType: declared}},
+		}})
+	}
+	for _, tc := range [][2]string{{"decimal", "numeric"}, {"numeric", "decimal"}, {"DECIMAL", "Numeric"}} {
+		if got := diffSchemas(tbl(tc[0], "numeric"), tbl(tc[1], "numeric"), ""); len(got) != 0 {
+			t.Errorf("%q -> %q must not drift, got %+v", tc[0], tc[1], got)
+		}
+	}
+
+	money := diffSchemas(tbl("decimal", "money"), tbl("numeric", "numeric"), "")
+	if len(money) != 1 || money[0].ChangeType != "modify_column" || !strings.HasPrefix(strings.TrimSpace(money[0].DDL), "--") {
+		t.Fatalf("money -> numeric must be one advisory modify_column, got %+v", money)
+	}
+
+	// A precision added in the source is a real change and stays executable.
+	fixed := diffSchemas(tbl("numeric", "numeric"), tbl("numeric(12,2)", "numeric"), "")
+	if len(fixed) != 1 || strings.HasPrefix(strings.TrimSpace(fixed[0].DDL), "--") {
+		t.Fatalf("numeric -> numeric(12,2) must be one executable modify_column, got %+v", fixed)
+	}
+}
+
 // A column dropped on an out-of-scope table must produce ZERO drift once filtered.
 func TestDiffSchemas_OutOfScopeTableNoEvent(t *testing.T) {
 	selected := selectedTableSet([]interface{}{"orders"})
@@ -370,11 +405,12 @@ func TestDiffSchemas_OutOfScopeTableNoEvent(t *testing.T) {
 	}
 }
 
-// The drop DDL is the one string in this file the product tells a human to RUN, and it
-// runs against the DESTINATION. Built from the source key it read
-// `DROP TABLE public.legacy` — and `public.legacy` is a real, different table on the
-// destination, because the pipeline writes into rsync_public_<id8>. This pins the
-// qualifier to the destination namespace.
+// The drop_table statement and the dropped-column note are read as being about the
+// DESTINATION. Built from the source key the statement read `DROP TABLE public.legacy`
+// — and `public.legacy` is a real, different table on the destination, because the
+// pipeline writes into rsync_public_<id8>. This pins the qualifier to the destination
+// namespace. It also makes the note the CDC sink's report produces, so one dropped
+// column is one row whichever path saw it.
 func TestDiffSchemas_DropDDLNamesTheDestinationObject(t *testing.T) {
 	prior := []TableMetadata{
 		tbl("public", "orders", col("id", "int"), col("name", "text")),
@@ -394,7 +430,7 @@ func TestDiffSchemas_DropDDLNamesTheDestinationObject(t *testing.T) {
 		}
 	}
 
-	if got, want := ddl["drop_column"], "ALTER TABLE rsync_public_a1b2c3d4.orders DROP COLUMN name"; got != want {
+	if got, want := ddl["drop_column"], healer.DroppedColumnNote("rsync_public_a1b2c3d4.orders", "name"); got != want {
 		t.Errorf("drop_column DDL = %q, want %q", got, want)
 	}
 	if got, want := ddl["drop_table"], "DROP TABLE rsync_public_a1b2c3d4.legacy"; got != want {
@@ -421,7 +457,7 @@ func TestDiffSchemas_DropDDLFallsBackToBareTableWithoutNamespace(t *testing.T) {
 		for _, d := range diffSchemas(tableMapByKey(prior), tableMapByKey(current), ns) {
 			got[d.ChangeType] = d.DDL
 		}
-		if want := "ALTER TABLE orders DROP COLUMN name"; got["drop_column"] != want {
+		if want := healer.DroppedColumnNote("orders", "name"); got["drop_column"] != want {
 			t.Errorf("ns=%q drop_column DDL = %q, want %q", ns, got["drop_column"], want)
 		}
 		if want := "DROP TABLE legacy"; got["drop_table"] != want {
@@ -442,4 +478,229 @@ func TestDiffSchemas_AppliableDDLKeepsTheSourceKey(t *testing.T) {
 			t.Errorf("%s DDL should still carry the source key, got %q", d.ChangeType, d.DDL)
 		}
 	}
+}
+
+// A dropped column is a note, never a statement: no path may run it, and the healer
+// routes it to "recorded" rather than to a decision.
+func TestDiffSchemas_DroppedColumnIsANoteNotAStatement(t *testing.T) {
+	deltas := diffSchemas(
+		tableMapByKey([]TableMetadata{tbl("public", "orders", col("id", "int"), col("note", "text"))}),
+		tableMapByKey([]TableMetadata{tbl("public", "orders", col("id", "int"))}), "rsync_public_a1b2c3d4",
+	)
+	if len(deltas) != 1 || deltas[0].ChangeType != "drop_column" {
+		t.Fatalf("want one drop_column, got %+v", deltas)
+	}
+	d := deltas[0]
+	if !strings.HasPrefix(d.DDL, "--") || strings.Contains(strings.ToUpper(d.DDL), "DROP COLUMN") {
+		t.Errorf("a dropped column must be recorded as a note, got %q", d.DDL)
+	}
+	if d.Table != "public.orders" || d.ColumnName != "note" {
+		t.Errorf("identity must stay the source's, got table=%q column=%q", d.Table, d.ColumnName)
+	}
+}
+
+func TestPlanSchemaDrift(t *testing.T) {
+	prior := tableMapByKey([]TableMetadata{
+		tbl("public", "orders", col("id", "int"), col("note", "text")),
+		tbl("public", "legacy", col("id", "int")),
+	})
+	current := tableMapByKey([]TableMetadata{tbl("public", "orders", col("id", "int"))})
+
+	types := func(changes []healer.SchemaChange) []string {
+		out := make([]string, 0, len(changes))
+		for _, c := range changes {
+			out = append(out, c.ChangeType)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	t.Run("a vanished table waits for a decision and leaves the run", func(t *testing.T) {
+		deltas, awaiting, unconfirmed := planSchemaDrift(prior, current, "", defaultSchemaDriftPolicy(), false)
+		if got := strings.Join(types(deltas), ","); got != "drop_column,drop_table" {
+			t.Errorf("deltas = %s, want drop_column,drop_table", got)
+		}
+		if len(awaiting) != 1 || awaiting[0] != "public.legacy" {
+			t.Errorf("awaiting = %v, want [public.legacy]", awaiting)
+		}
+		if len(unconfirmed) != 0 {
+			t.Errorf("a complete discovery confirms every drop, got unconfirmed %v", unconfirmed)
+		}
+	})
+
+	// Approve on a drop_table drops the destination table. A table missing from a
+	// list the connector cut short may only be past the cap, so it must be neither
+	// reported nor left out of the run.
+	t.Run("a truncated discovery reports no dropped table", func(t *testing.T) {
+		deltas, awaiting, unconfirmed := planSchemaDrift(prior, current, "", defaultSchemaDriftPolicy(), true)
+		if got := strings.Join(types(deltas), ","); got != "drop_column" {
+			t.Errorf("deltas = %s, want drop_column only", got)
+		}
+		if len(awaiting) != 0 {
+			t.Errorf("no table may leave the run on a truncated discovery, got %v", awaiting)
+		}
+		if len(unconfirmed) != 1 || unconfirmed[0] != "public.legacy" {
+			t.Errorf("unconfirmed = %v, want [public.legacy]", unconfirmed)
+		}
+	})
+
+	t.Run("notify_on_drop=false still asks about a dropped table", func(t *testing.T) {
+		policy := SchemaDriftPolicy{Enabled: true, NotifyOnAdd: true, NotifyOnDrop: false}
+		deltas, awaiting, _ := planSchemaDrift(prior, current, "", policy, false)
+		if got := strings.Join(types(deltas), ","); got != "drop_table" {
+			t.Errorf("deltas = %s, want drop_table only", got)
+		}
+		if len(awaiting) != 1 {
+			t.Errorf("awaiting = %v, want the dropped table", awaiting)
+		}
+	})
+}
+
+func TestWithoutTablesAwaitingDrop(t *testing.T) {
+	cases := []struct {
+		name        string
+		tables      []interface{}
+		awaiting    []string
+		wantKept    []string
+		wantRemoved []string
+	}{
+		{"nothing awaiting keeps the list", []interface{}{"public.orders", "public.legacy"}, nil,
+			[]string{"public.orders", "public.legacy"}, nil},
+		{"qualified selection, qualified key", []interface{}{"public.orders", "public.legacy"}, []string{"public.legacy"},
+			[]string{"public.orders"}, []string{"public.legacy"}},
+		{"bare selection, qualified key", []interface{}{"orders", "legacy"}, []string{"public.legacy"},
+			[]string{"orders"}, []string{"legacy"}},
+		{"qualified selection, bare key", []interface{}{"public.orders", "public.legacy"}, []string{"legacy"},
+			[]string{"public.orders"}, []string{"public.legacy"}},
+		// Two schemas holding a same-named table: only the one that vanished leaves.
+		{"same name in another schema stays", []interface{}{"sales.legacy", "public.legacy"}, []string{"public.legacy"},
+			[]string{"sales.legacy"}, []string{"public.legacy"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kept, removed := withoutTablesAwaitingDrop(tc.tables, tc.awaiting)
+			var keptS []string
+			for _, k := range kept {
+				keptS = append(keptS, k.(string))
+			}
+			if strings.Join(keptS, ",") != strings.Join(tc.wantKept, ",") {
+				t.Errorf("kept = %v, want %v", keptS, tc.wantKept)
+			}
+			if strings.Join(removed, ",") != strings.Join(tc.wantRemoved, ",") {
+				t.Errorf("removed = %v, want %v", removed, tc.wantRemoved)
+			}
+		})
+	}
+}
+
+// The pre-flight downgrades a missing table only when the next run will leave it
+// out and file a drop decision, i.e. when a baseline exists for it. A same-named
+// table in another schema must not match.
+func TestTablesWithBaseline(t *testing.T) {
+	baseline := map[string]TableMetadata{
+		"public.orders": {Schema: "public", Name: "orders"},
+		"legacy":        {Name: "legacy"},
+	}
+	got := tablesWithBaseline(baseline, []string{"public.orders", "sales.orders", "public.legacy", "public.new_table", " "})
+	want := map[string]bool{"public.orders": true, "public.legacy": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k := range want {
+		if !got[k] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// Drift off means nothing leaves the table out of the run, so nothing may be
+// reported as awaiting a decision, whatever the baseline holds.
+func TestTablesAwaitingDropDecision_DriftOffReportsNothing(t *testing.T) {
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "false")
+	if got := TablesAwaitingDropDecision(context.Background(), nil, "p1", []string{"public.orders"}); len(got) != 0 {
+		t.Fatalf("got %v with drift off", got)
+	}
+}
+
+// A generated REST connector leaves a table out of discovery while a path ID it
+// needs (a list_id, a team_id) is empty on the connection, and reports it under
+// tables_needing_settings. The table is still in the source: a pipeline that
+// syncs it must ask for the setting, never read the table as dropped — Approve
+// on that drop deletes the destination table (prod t-clickup, 2026-10-05).
+func TestTablesNeedingSettings(t *testing.T) {
+	got := tablesNeedingSettings(map[string]interface{}{
+		"tables_needing_settings": []interface{}{
+			map[string]interface{}{"name": "list_task", "missing_settings": []interface{}{"list_id"}},
+			map[string]interface{}{"name": " view_task ", "missing_settings": []interface{}{"team_Id", "list_id"}},
+			map[string]interface{}{"name": "", "missing_settings": []interface{}{"list_id"}},
+			"not an object",
+		},
+	})
+	want := map[string][]string{"list_task": {"list_id"}, "view_task": {"team_Id", "list_id"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("tablesNeedingSettings = %v, want %v", got, want)
+	}
+	if got := tablesNeedingSettings(map[string]interface{}{"tables": []interface{}{}}); len(got) != 0 {
+		t.Errorf("a connector that reports nothing needs no setting, got %v", got)
+	}
+}
+
+func TestCarryTablesNeedingSettings(t *testing.T) {
+	prior := tableMapByKey([]TableMetadata{
+		tbl("", "list_task", col("id", "text")),
+		tbl("", "team", col("id", "text")),
+		tbl("", "legacy", col("id", "text")),
+	})
+	current := tableMapByKey([]TableMetadata{tbl("", "team", col("id", "text"))})
+	needing := map[string][]string{"list_task": {"list_id"}}
+
+	t.Run("a table left out for a missing setting is not a dropped table", func(t *testing.T) {
+		merged, carried := carryTablesNeedingSettings(prior, current, needing)
+		deltas, awaiting, _ := planSchemaDrift(prior, merged, "", defaultSchemaDriftPolicy(), false)
+		if len(awaiting) != 1 || awaiting[0] != "legacy" {
+			t.Errorf("awaiting = %v, want only the table that really vanished [legacy]", awaiting)
+		}
+		for _, d := range deltas {
+			if d.Table == "list_task" {
+				t.Errorf("a table that only needs a setting reported a %s", d.ChangeType)
+			}
+		}
+		if len(carried) != 1 || carried[0] != "list_task" {
+			t.Errorf("carried = %v, want [list_task]", carried)
+		}
+		if _, ok := current["list_task"]; ok {
+			t.Error("current was modified; the carried table must stay out of the stored baseline")
+		}
+	})
+
+	// Control: the same discovery without the connector's report is the bug.
+	t.Run("control: without the report the table reads as dropped", func(t *testing.T) {
+		_, awaiting, _ := planSchemaDrift(prior, current, "", defaultSchemaDriftPolicy(), false)
+		sort.Strings(awaiting)
+		if strings.Join(awaiting, ",") != "legacy,list_task" {
+			t.Errorf("awaiting = %v, want [legacy list_task]", awaiting)
+		}
+	})
+
+	t.Run("a schema-qualified baseline matches the connector's bare name", func(t *testing.T) {
+		qualified := tableMapByKey([]TableMetadata{tbl("app", "list_task", col("id", "text"))})
+		merged, carried := carryTablesNeedingSettings(qualified, map[string]TableMetadata{}, needing)
+		if len(carried) != 1 || carried[0] != "app.list_task" {
+			t.Errorf("carried = %v, want [app.list_task]", carried)
+		}
+		if _, ok := merged["app.list_task"]; !ok {
+			t.Error("the qualified baseline table was not carried")
+		}
+	})
+
+	t.Run("a table the connector listed is never replaced by its old baseline", func(t *testing.T) {
+		listed := tableMapByKey([]TableMetadata{tbl("", "team", col("id", "text"), col("name", "text"))})
+		merged, carried := carryTablesNeedingSettings(prior, listed, map[string][]string{"team": {"team_id"}})
+		if len(carried) != 0 {
+			t.Errorf("carried = %v, want none", carried)
+		}
+		if len(merged["team"].Columns) != 2 {
+			t.Errorf("team = %+v, want this run's metadata", merged["team"])
+		}
+	})
 }

@@ -248,7 +248,7 @@ func TestProduceFailureStopsTheTableBeforeItsCheckpoint(t *testing.T) {
 	stop := strings.Index(batch, "if batchUndelivered > 0 {")
 	// LastIndex: the earlier advancePage is the all-rows-filtered path, which sends nothing.
 	advance := strings.LastIndex(batch, "advancePage(offset, keyOrdinal")
-	save := strings.Index(batch, "\"table_complete\": sourceRowCount < exportBatchSize")
+	save := strings.Index(batch, "\"table_complete\": pageEndsTable(sourceRowCount, exportBatchSize, moreFollows)")
 	if stop < 0 || advance < 0 || save < 0 {
 		t.Fatalf("stop=%d advance=%d checkpoint=%d: a marker is missing; if the loop was restructured, update this test", stop, advance, save)
 	}

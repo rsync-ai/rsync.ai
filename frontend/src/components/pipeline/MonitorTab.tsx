@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
-import { Activity, CheckCircle2, ChevronRight, HeartPulse, Users } from "lucide-react"
+import { Activity, ChevronRight, HeartPulse, Users } from "lucide-react"
 
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
@@ -12,13 +12,13 @@ import {
   type RuntimeDep,
   type RuntimeHealth,
 } from "@/lib/hooks/usePipelineRuntime"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { DiagnosePanel } from "@/components/pipeline/DiagnosePanel"
-import { LoadStatusBadge } from "@/components/pipeline/LoadStatusBadge"
+import { RowsSkeleton } from "@/components/kit/PageSkeleton"
+import { Sparkline } from "@/components/kit/Sparkline"
 import { describeLoadStatus, type LoadStatus } from "@/lib/pipeline/loadStatus"
 import { tableStatusBreakdown } from "./executionSummary"
-import { cn, formatDateTime } from "@/lib/utils"
-import { formatAge } from "@/lib/transform-format"
+import { cn, formatDateTime, formatRelativeTime } from "@/lib/utils"
 import { dependencyStatusLabel, dependencyStreak } from "@/lib/pipeline/dependencyStatus"
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,8 @@ interface TableStatsSummary {
   tables_completed?: number
   tables_failed?: number
   tables_degraded?: number
+  // Of tables_degraded, the ones the run rewound (shown apart by tableStatusBreakdown).
+  tables_rewound?: number
   tables_running?: number
   // A selected CDC table that has reported nothing yet (table_stats.go). It is
   // not in tables_running, so the footer must show it or the counts don't add up.
@@ -194,8 +196,12 @@ function usePolledJson<T>(url: string | null): { data: T | null; error: string |
 function DependenciesCard({
   runtime,
   error,
+  pipelineStatus,
 }: {
   runtime: PipelineRuntime | null
+  // The /state status: the prober skips a finished, stopped or paused pipeline,
+  // so a row it never reached reads "Not checked" there, not "Checking…".
+  pipelineStatus?: string | null
   // The read either failed or it didn't. Without this the card cannot tell
   // "this pipeline has no registered dependencies" apart from "we could not
   // ask", and it rendered the former for both.
@@ -229,7 +235,7 @@ function DependenciesCard({
         ) : (
           <ul className="space-y-1.5">
             {deps.map((dep) => {
-              const streak = dependencyStreak(dep, formatAge)
+              const streak = dependencyStreak(dep, formatRelativeTime)
               return (
               <li key={`${dep.kind}:${dep.identifier}`} className="flex items-start gap-2 text-xs">
                 <span className={cn("mt-1.5 h-2 w-2 rounded-full shrink-0", statusDot(dep.status))} />
@@ -241,7 +247,7 @@ function DependenciesCard({
                         <span className="ml-1.5 text-muted-foreground">{dep.identifier}</span>
                       ) : null}
                     </span>
-                    <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep)}</span>
+                    <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep, pipelineStatus)}</span>
                   </div>
                   {streak ? (
                     <p
@@ -308,11 +314,15 @@ type RateSample = { t: number; v: number }
  * The rate window plus the first reading this page took (`origin`), so the card
  * can say how much moved while the reader watched. The server serves lifetime
  * totals only, with no history, so this is the one honest window
- * longer than a minute.
+ * longer than a minute. `trend` is the rate after each reading since then, for
+ * the card's sparkline: the newest TREND_POINTS of them (10 minutes at one read
+ * every 5 s).
  */
-export type RateWindow = { at: number | null; samples: RateSample[]; origin: RateSample | null }
+export type RateWindow = { at: number | null; samples: RateSample[]; origin: RateSample | null; trend: number[] }
 
-export const EMPTY_RATE_WINDOW: RateWindow = { at: null, samples: [], origin: null }
+export const EMPTY_RATE_WINDOW: RateWindow = { at: null, samples: [], origin: null, trend: [] }
+
+const TREND_POINTS = 120
 
 export function nextRateWindow(w: RateWindow, total: number | null | undefined, at: number | null): RateWindow {
   const samples = at === null ? [] : appendRateSample(w.samples, total, at)
@@ -322,7 +332,10 @@ export function nextRateWindow(w: RateWindow, total: number | null | undefined, 
   // so a re-seeded counter never reads as a negative move.
   if (!last) origin = null
   else if (!origin || last.v < origin.v) origin = samples[0]
-  return { at, samples, origin }
+  // Unmeasured drops the trend too; a reading with no rate yet adds no point.
+  const rate = computeRatePerMin(samples)
+  const trend = !last ? [] : rate === null ? w.trend : [...w.trend, rate].slice(-TREND_POINTS)
+  return { at, samples, origin, trend }
 }
 
 /** How far the counter moved since the page's first reading, and over how long. */
@@ -364,14 +377,14 @@ export function appendRateSample(
 function useCounterRate(
   total: number | null | undefined,
   at: number | null,
-): { rate: number | null; sinceOpen: { delta: number; spanMs: number } | null } {
+): { rate: number | null; sinceOpen: { delta: number; spanMs: number } | null; trend: number[] } {
   const [window_, setWindow] = useState<RateWindow>(EMPTY_RATE_WINDOW)
   let w = window_
   if (at !== window_.at) {
     w = nextRateWindow(window_, total, at)
     setWindow(w)
   }
-  return { rate: computeRatePerMin(w.samples), sinceOpen: movedSinceOpen(w) }
+  return { rate: computeRatePerMin(w.samples), sinceOpen: movedSinceOpen(w), trend: w.trend }
 }
 
 /** Sum of two optional counters; unmeasured only when BOTH are. */
@@ -486,20 +499,35 @@ function RateRows({
   first,
   second,
   rates,
+  trend,
   idleDetail,
   sinceOpen,
 }: {
   first: string
   second: string
   rates: [number | null, number | null]
+  /** The written side's rate after each reading since the page opened. */
+  trend: readonly number[]
   idleDetail?: string | null
   sinceOpen?: string | null
 }) {
-  const since = sinceOpen ? (
-    <p className="text-[11px] text-muted-foreground" data-testid="throughput-since-open">
-      {sinceOpen}
-    </p>
-  ) : null
+  // The rate is a minute's average; the line is how it moved while the page was
+  // open. The server keeps no history, so the line starts when the page did.
+  const since = (
+    <>
+      {trend.length >= 2 && (
+        <div data-testid="throughput-trend" className="pt-1">
+          <Sparkline values={trend} />
+          <p className="text-[11px] text-muted-foreground">{second} per minute, since this page opened</p>
+        </div>
+      )}
+      {sinceOpen && (
+        <p className="text-[11px] text-muted-foreground" data-testid="throughput-since-open">
+          {sinceOpen}
+        </p>
+      )}
+    </>
+  )
   // A measured standstill on both sides is one line, not "0 / min" twice. Until
   // both are measured, each side keeps its own row ("measuring…").
   if (rates[0] === 0 && rates[1] === 0) {
@@ -525,8 +553,20 @@ function RateRows({
   )
 }
 
-/** Batch: one run's totals. A CDC pipeline gets FlowCard instead. */
-function ThroughputCard({ pipelineId, executionId }: { pipelineId: string; executionId?: string }) {
+/**
+ * Batch: one run's totals. A CDC pipeline gets FlowCard instead.
+ *
+ * `pending`: /runtime has not answered yet, so "no execution" is not known.
+ */
+function ThroughputCard({
+  pipelineId,
+  executionId,
+  pending,
+}: {
+  pipelineId: string
+  executionId?: string
+  pending: boolean
+}) {
   const url = tableStatsUrl(pipelineId, executionId, "batch")
   const { data, error, at } = usePolledJson<TableStatsResponse>(url)
   const s = data?.summary
@@ -534,7 +574,7 @@ function ThroughputCard({ pipelineId, executionId }: { pipelineId: string; execu
   // Derived from the cumulative counters, so undefined exactly when those are —
   // "not measured" never becomes a confident 0 / min.
   const readRate = useCounterRate(s?.total_read_rows, at).rate
-  const writtenRate = useCounterRate(s?.total_inserted_rows, at).rate
+  const written = useCounterRate(s?.total_inserted_rows, at)
 
   return (
     <Card>
@@ -546,9 +586,13 @@ function ThroughputCard({ pipelineId, executionId }: { pipelineId: string; execu
       </CardHeader>
       <CardContent className="space-y-3">
         {!url ? (
-          <p className="text-xs text-muted-foreground">
-            No execution yet — throughput appears once this pipeline runs.
-          </p>
+          pending ? (
+            <RowsSkeleton rows={3} label="Loading throughput…" />
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No execution yet — throughput appears once this pipeline runs.
+            </p>
+          )
         ) : error && !s ? (
           // "Loading throughput…" forever is the same pixels as a run that has
           // simply not reported yet. A failed read has to say so.
@@ -556,7 +600,7 @@ function ThroughputCard({ pipelineId, executionId }: { pipelineId: string; execu
             Couldn&apos;t load throughput ({error}). Retrying.
           </p>
         ) : !s ? (
-          <p className="text-xs text-muted-foreground">Loading throughput…</p>
+          <RowsSkeleton rows={3} label="Loading throughput…" />
         ) : (
           <>
             <p className="text-[11px] text-muted-foreground">Totals for this run</p>
@@ -570,7 +614,7 @@ function ThroughputCard({ pipelineId, executionId }: { pipelineId: string; execu
                 <ThroughputRow label="Rows inserted" value={fmtNum(s.total_inserted_rows)} />
               </div>
             </div>
-            <RateRows first="Read" second="Written" rates={[readRate, writtenRate]} />
+            <RateRows first="Read" second="Written" rates={[readRate, written.rate]} trend={written.trend} />
             <div className="border-t border-border/60 pt-2">
               <ThroughputRow
                 label="Tables completed"
@@ -605,9 +649,11 @@ function FlowCell({ value }: { value: number | null | undefined }) {
  * Per-table detail stays on Table statistics; this card is the pipeline-wide
  * answer, so it links there rather than repeating it.
  *
- * It opens with where the pipeline is, the way AWS DMS reports a task ("Load
- * completed, replication ongoing"), from the initial load the orchestrator
- * recorded. No record, no line: it never infers a finished load from row counts.
+ * It opens with when the initial load started or finished, from the load the
+ * orchestrator recorded. No record, no line: it never infers a finished load
+ * from row counts. The load's state chip and the reason a load failed are the
+ * page header's (PipelineHealthHeader), shown on every tab; this card used to
+ * repeat both.
  */
 function FlowCard({ pipelineId, loadStatus }: { pipelineId: string; loadStatus: LoadStatus | null }) {
   const { data, error, at } = usePolledJson<TableStatsResponse>(tableStatsUrl(pipelineId, undefined, "cdc"))
@@ -655,27 +701,17 @@ function FlowCard({ pipelineId, loadStatus }: { pipelineId: string; loadStatus: 
         </Link>
       </CardHeader>
       <CardContent className="space-y-3">
-        {loadStatus && (
-          <div data-testid="flow-load-status" className="space-y-1 text-xs">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <LoadStatusBadge status={loadStatus} />
-              {loadStatus.since && (
-                <span className="text-muted-foreground">
-                  Full load {loadStatus.since.label} {formatDateTime(loadStatus.since.at)}
-                </span>
-              )}
-            </div>
-            {/* The chip's tooltip is mouse-only; the reason a load failed is
-                worth reading, so the card says it in words. */}
-            {loadStatus.title && <p className="text-muted-foreground">{loadStatus.title}</p>}
-          </div>
+        {loadStatus?.since && (
+          <p data-testid="flow-load-status" className="text-xs text-muted-foreground">
+            Full load {loadStatus.since.label} {formatDateTime(loadStatus.since.at)}
+          </p>
         )}
         {error && !s ? (
           <p className="text-xs text-amber-600 dark:text-amber-400">
             Couldn&apos;t load throughput ({error}). Retrying.
           </p>
         ) : !s ? (
-          <p className="text-xs text-muted-foreground">Loading throughput…</p>
+          <RowsSkeleton rows={3} label="Loading throughput…" />
         ) : (
           <>
             <table className="w-full text-xs">
@@ -743,7 +779,8 @@ function FlowCard({ pipelineId, loadStatus }: { pipelineId: string; loadStatus: 
               first="Captured"
               second="Written"
               rates={[captured.rate, written.rate]}
-              idleDetail={lastMovedDetail(data?.tables, data?.total, formatAge)}
+              trend={written.trend}
+              idleDetail={lastMovedDetail(data?.tables, data?.total, formatRelativeTime)}
               sinceOpen={sinceOpenLine(["captured", "written"], [captured.sinceOpen, written.sinceOpen])}
             />
             <div className="border-t border-border/60 pt-2 space-y-1" data-testid="flow-tables">
@@ -755,22 +792,6 @@ function FlowCard({ pipelineId, loadStatus }: { pipelineId: string; loadStatus: 
             </div>
           </>
         )}
-      </CardContent>
-    </Card>
-  )
-}
-
-function DiagnoseCard({ pipelineId }: { pipelineId: string }) {
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <CheckCircle2 className="h-4 w-4" />
-          Diagnose
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <DiagnosePanel pipelineId={pipelineId} />
       </CardContent>
     </Card>
   )
@@ -788,9 +809,9 @@ function DiagnoseCard({ pipelineId }: { pipelineId: string }) {
  * that actually move this customer's rows to the destination.
  *
  * It lives in MonitorTab rather than in MonitoringOverviewTab on purpose: the
- * Overview sub-tab is hidden entirely unless NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW
- * is set (PipelineMonitoringPanel renders neither its trigger nor its content), and
- * staging sets that to false. A consumer view that vanished with an infrastructure
+ * Overview tiles are hidden entirely unless NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW
+ * is set (PipelineDetailTabsClient does not render them), and staging sets that
+ * to false. A consumer view that vanished with an infrastructure
  * flag would repeat the mistake that hid the lag alerts.
  */
 interface ConsumerTopicLag {
@@ -1040,7 +1061,7 @@ function ConsumersCard({ pipelineId }: { pipelineId: string }) {
           Consumers
         </CardTitle>
         {/* formatAge already ends in "ago". */}
-        {measuredAt && <span className="text-[11px] text-muted-foreground">measured {formatAge(measuredAt)}</span>}
+        {measuredAt && <span className="text-[11px] text-muted-foreground">measured {formatRelativeTime(measuredAt)}</span>}
       </CardHeader>
       <CardContent className="space-y-3">
         {error && !data ? (
@@ -1050,7 +1071,7 @@ function ConsumersCard({ pipelineId }: { pipelineId: string }) {
             Couldn&apos;t load consumers ({error}). Retrying.
           </p>
         ) : !data ? (
-          <p className="text-xs text-muted-foreground">Loading consumers…</p>
+          <RowsSkeleton rows={2} label="Loading consumers…" />
         ) : !data.measured ? (
           <p className="text-xs text-muted-foreground">
             No consumer readings yet — this pipeline&apos;s sink has not been measured.
@@ -1078,26 +1099,32 @@ function ConsumersCard({ pipelineId }: { pipelineId: string }) {
   )
 }
 
-export function MonitorTab({ pipelineId }: { pipelineId: string }) {
+export function MonitorTab({ pipelineId, pipelineType }: { pipelineId: string; pipelineType?: "etl" | "cdc" }) {
   // One runtime poller for the whole tab: DependenciesCard needs the dependency
   // list and health, the flow cards need the mode and execution id.
-  const { runtime, error: runtimeError } = usePipelineRuntime(pipelineId)
-  const isCDC = runtime?.mode === "cdc"
+  const { runtime, loading: runtimeLoading, error: runtimeError } = usePipelineRuntime(pipelineId)
+  const { status: stateStatus } = usePipelineStatePoll(pipelineId)
+  // Until /runtime answers, the mode the page resolved on the server: a CDC
+  // pipeline otherwise drew the batch Throughput card ("No execution yet") and
+  // swapped it for the Flow card a moment later. /runtime wins once it answers.
+  const isCDC = runtime ? runtime.mode === "cdc" : pipelineType === "cdc"
 
   return (
     <div className="space-y-4">
       {isCDC ? (
         <FlowCard pipelineId={pipelineId} loadStatus={describeLoadStatus(runtime)} />
       ) : (
-        <ThroughputCard pipelineId={pipelineId} executionId={runtime?.execution_id} />
+        <ThroughputCard
+          pipelineId={pipelineId}
+          executionId={runtime?.execution_id}
+          pending={!runtime && runtimeLoading}
+        />
       )}
       {/* CDC only: a batch pipeline moves its rows through the executor, not
           through a consumer group, so it has nothing to show here. */}
       {isCDC && <ConsumersCard pipelineId={pipelineId} />}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <DiagnoseCard pipelineId={pipelineId} />
-        <DependenciesCard runtime={runtime} error={runtimeError} />
-      </div>
+      {/* No Diagnose card: the page header's Diagnose opens the same panel. */}
+      <DependenciesCard runtime={runtime} error={runtimeError} pipelineStatus={stateStatus} />
     </div>
   )
 }

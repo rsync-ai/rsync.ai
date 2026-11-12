@@ -321,3 +321,116 @@ def test_generated_connector_has_no_undefined_names():
     assert not undefined, (
         f"generated connector references undefined name(s): {sorted(undefined)}"
     )
+
+# ---------------------------------------------------------------------------
+# The item routes reach the record: a trailing `{petId}` takes the record id
+# ---------------------------------------------------------------------------
+#
+# Bug class: an item route built by appending the id to an endpoint that ends in
+# the item placeholder. `/pet/{petId}` + `/42` leaves `{petId}` for
+# _sub_path_param, which finds it in neither config nor params and raises
+# before any request; create POSTs to the item path. Every route that builds an
+# item or collection path from a resource endpoint is driven here: the CRUD
+# helpers below, and the destination writes in test_gen_d02_upsert_verb.py.
+
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_SHARED = Path(__file__).resolve().parents[2] / "shared" / "mcp-connectors"
+
+
+def _pet_contract():
+    contract = empty_contract(session_id="d08-pet", api_name="petstore_like")
+    for dim, value in ((Dimension.BASE_URL, "https://petstore.test/v2"),
+                       (Dimension.AUTH_TYPE, "bearer")):
+        contract.set_fact(Fact(dimension=dim, value=value, confidence=1.0,
+                               source=FactSource.VENDOR_YAML, evidence="test"))
+    contract.metadata["vendor_rest_resources"] = [{
+        "name": "pet", "endpoint": "/pet/{petId}", "id_field": "id",
+        "supports_create": True, "supports_update": True, "supports_delete": True,
+    }]
+    return contract
+
+
+def _load_generated(code: str):
+    """Import rendered connector code next to base_connector.py, the way its
+    image runs it; sys.path and sys.modules are put back afterwards."""
+    path = Path(tempfile.mkdtemp(prefix="gen_d08_")) / "petstore" / "connector.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(code)
+    saved_path, saved_modules = list(sys.path), set(sys.modules)
+    sys.path[:0] = [str(_SHARED / "public"), str(_SHARED)]
+    spec = importlib.util.spec_from_file_location("_gen_d08_petstore", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:] = saved_path
+        for added in set(sys.modules) - saved_modules:
+            del sys.modules[added]
+    return mod
+
+
+@pytest.fixture
+def pet_connector(monkeypatch):
+    """The rendered petstore connector with HTTP stubbed: every request is
+    recorded as (method, url) and answered 200."""
+    code = ConnectorBuilder().build(build_rest_spec(_pet_contract()), include_dockerfile=False).code
+    mod = _load_generated(code)
+    sent = []
+
+    def fake_send(self, method, url, **kwargs):
+        sent.append((method, url))
+        return True, 200, {"id": 42}, {}
+
+    monkeypatch.setattr(mod.BaseMCPConnector, "_make_request_v2", fake_send)
+    cls = next(v for k, v in vars(mod).items()
+               if isinstance(v, type) and k.endswith("Connector") and v.__module__ == mod.__name__)
+    return cls(), sent
+
+
+def test_item_routes_put_the_record_id_in_the_trailing_placeholder(pet_connector):
+    srv, sent = pet_connector
+    cfg = {"config": {"api_key": "k"}}
+    assert srv.get_pet({**cfg, "id": 42}).get("success"), sent
+    assert srv.update_pet({**cfg, "id": 42, "data": {"name": "rex"}}).get("success"), sent
+    assert srv.delete_pet({**cfg, "id": 42}).get("success"), sent
+    assert srv.create_pet({**cfg, "data": {"name": "rex"}}).get("success"), sent
+    assert sent == [
+        ("GET", "https://petstore.test/v2/pet/42"),
+        ("PATCH", "https://petstore.test/v2/pet/42"),
+        ("DELETE", "https://petstore.test/v2/pet/42"),
+        ("POST", "https://petstore.test/v2/pet"),
+    ]
+
+
+def test_a_trailing_selector_bound_by_config_keeps_the_id_appended(pet_connector):
+    """A trailing placeholder the connection config fills is a selector the
+    route needs (Spotify `/me/top/{type}`), not the item id."""
+    srv, sent = pet_connector
+    assert srv.get_pet({"config": {"api_key": "k", "petId": "dogs"}, "id": 42}).get("success"), sent
+    assert sent == [("GET", "https://petstore.test/v2/pet/dogs/42")]
+
+
+_TEMPLATE = Path(_TOOLGEN) / "templates" / "connector.py.j2"
+_HELPERS_START = "    @staticmethod\n    def _trailing_item_placeholder("
+_HELPERS_END = "    def _make_request(self, method: str, endpoint: str, config: Dict,"
+REST_COPIES = ["stripe", "notion-rest", "github-rest"]
+
+
+def _item_route_helpers(text: str) -> str:
+    start = text.index(_HELPERS_START)
+    return text[start:text.index(_HELPERS_END, start)]
+
+
+@pytest.mark.parametrize("name", REST_COPIES)
+def test_shipped_rest_copies_build_item_routes_like_the_template(name):
+    """The shipped REST connectors came from this template; their item-route
+    helpers stay identical so a fix to one is a fix to all."""
+    root = _SHARED / "public" / name
+    current = json.loads((root / "latest.json").read_text())["current_version"]
+    shipped = (root / "versions" / current / "connector.py").read_text()
+    assert _item_route_helpers(shipped) == _item_route_helpers(_TEMPLATE.read_text())
+    assert 'f"/{record_id}"' not in shipped and 'f"{endpoint}/{rec_id}"' not in shipped

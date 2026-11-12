@@ -17,11 +17,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// schemaTableRef is one discovered table: the part of the schema-cache envelope
+// (and of a live discovery) that name matching reads.
+type schemaTableRef struct {
+	Name   string `json:"name"`
+	Schema string `json:"schema,omitempty"`
+}
+
 type cachedSchemaPayload struct {
-	Tables []struct {
-		Name   string `json:"name"`
-		Schema string `json:"schema,omitempty"`
-	} `json:"tables"`
+	Tables []schemaTableRef `json:"tables"`
 }
 
 func normalizeTableKeyForLookup(raw string) string {
@@ -47,10 +51,19 @@ func validateAndQualifySelectedTablesFromCache(ctx context.Context, sourceConnec
 	if len(payload.Tables) == 0 {
 		return nil, nil, nil, false
 	}
+	qualified, missing, ambiguous = qualifyNamedTables(payload.Tables, tables)
+	return qualified, missing, ambiguous, true
+}
 
-	exact := make(map[string]string, len(payload.Tables)) // lower -> canonical
-	byUnqualified := make(map[string][]string, 256)       // table -> []qualified
-	for _, t := range payload.Tables {
+// qualifyNamedTables resolves each requested name against a source's table list:
+// a qualified name must match exactly, a bare name must match one table in one
+// schema. It returns the canonical schema.table names (deduplicated, in request
+// order), the names that match nothing, and the bare names found in more than
+// one schema.
+func qualifyNamedTables(known []schemaTableRef, tables []string) (qualified []string, missing []string, ambiguous map[string][]string) {
+	exact := make(map[string]string, len(known))    // lower -> canonical
+	byUnqualified := make(map[string][]string, 256) // table -> []qualified
+	for _, t := range known {
 		name := strings.TrimSpace(t.Name)
 		if name == "" {
 			continue
@@ -108,7 +121,7 @@ func validateAndQualifySelectedTablesFromCache(ctx context.Context, sourceConnec
 		dedup = append(dedup, t)
 	}
 
-	return dedup, miss, amb, true
+	return dedup, miss, amb
 }
 
 func isWorkflowAlreadyCompletedError(err error) bool {
@@ -119,68 +132,14 @@ func isWorkflowAlreadyCompletedError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "workflow execution already completed")
 }
 
+// isWorkflowNotFoundError matches Temporal's NotFound and nothing else. It used to
+// match any "not found" text — a missing connection, a missing table, sql.ErrNoRows
+// — and each of those then wrote the run down as failed (pipeline a3b07ece).
 func isWorkflowNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	// Temporal can surface various not-found strings depending on server/persistence layer.
-	return strings.Contains(msg, "workflow execution not found") ||
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "sql: no rows in result set")
-}
-
-// bestEffortMarkWorkflowEnded updates DB rows so the UI doesn't keep showing stale HITL state.
-func bestEffortMarkWorkflowEnded(database *sql.DB, pipelineID, executionID, finalStatus, message string) {
-	if database == nil || pipelineID == "" {
-		return
-	}
-
-	stageState := "failed"
-	switch finalStatus {
-	case "completed":
-		stageState = "succeeded"
-	case "stopped":
-		stageState = "failed"
-	case "failed":
-		stageState = "failed"
-	}
-
-	// Clear HITL blocking fields so UI doesn't keep showing table selection modal.
-	if _, err := database.Exec(`
-		UPDATE pipeline_progress
-		SET status = $1,
-		    stage_state = $2,
-		    blocking_reason_type = NULL,
-		    blocking_reason_description = NULL,
-		    blocking_reason_estimated_seconds = NULL,
-		    message = $3,
-		    updated_at = NOW()
-		WHERE pipeline_id = $4
-	`, finalStatus, stageState, message, pipelineID); err != nil {
-		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("bestEffortMarkWorkflowEnded: pipeline_progress update failed (ignored)")
-	}
-
-	if executionID != "" {
-		if _, err := database.Exec(`
-			UPDATE executions
-			SET status = $1,
-			    end_time = NOW(),
-			    error_message = $2
-			WHERE id = $3
-		`, finalStatus, message, executionID); err != nil {
-			log.WithError(err).WithFields(log.Fields{
-				"pipeline_id":  pipelineID,
-				"execution_id": executionID,
-				"final_status": finalStatus,
-			}).Warn("bestEffortMarkWorkflowEnded: executions update failed (ignored)")
-		}
-	}
-
-	// Keep pipelines.status in sync with the workflow outcome (best-effort).
-	if _, err := database.Exec(`UPDATE pipelines SET status = $1, updated_at = NOW() WHERE id = $2`, finalStatus, pipelineID); err != nil {
-		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("bestEffortMarkWorkflowEnded: pipelines status update failed (ignored)")
-	}
+	return isNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "workflow execution not found")
 }
 
 // ResumeConnectionsRequest signals Temporal that required connections are configured.
@@ -297,6 +256,18 @@ func ResumePipelineConnections(c *gin.Context) {
 		}
 	}
 
+	// From here the answer outlives its caller. On the request's context, a tab closed
+	// during the signal failed it and failed the claim's release too, so every retry
+	// got hitl_answer_in_flight.
+	ctx := context.WithoutCancel(c.Request.Context())
+
+	// Ask the run before acting on the answer: the dialog it came from may have
+	// outlived the pause (answered in another tab), or the run itself.
+	pauseKey, ok := gateHITLResume(c, database, pipelineID, execID, hitlKindConnections)
+	if !ok {
+		return
+	}
+
 	payload := map[string]interface{}{
 		"pipeline_id": pipelineID,
 		"timestamp":   time.Now().UTC().Format(time.RFC3339),
@@ -346,6 +317,20 @@ func ResumePipelineConnections(c *gin.Context) {
 		}
 	}
 
+	// One answer per receive: a second tab that also passed the gate loses here.
+	if pauseKey != "" {
+		won, err := claimHITLPause(ctx, database, pipelineID, execID, hitlKindConnections, pauseKey)
+		if err != nil {
+			log.WithError(err).WithField("pipeline_id", pipelineID).Error("HITL: could not claim the pause")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "claim_failed", "message": "Could not record the answer. Try again."})
+			return
+		}
+		if !won {
+			respondHITLAnswerInFlight(c, pipelineID, execID)
+			return
+		}
+	}
+
 	// Best-effort audit log for intent suggestion usage (only if metadata provided)
 	if req.Metadata != nil {
 		logAudit(c, "intent_resolution", "pipeline", pipelineID, map[string]interface{}{
@@ -357,26 +342,9 @@ func ResumePipelineConnections(c *gin.Context) {
 		payload["metadata"] = req.Metadata
 	}
 
-	err := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "connections_configured", payload)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"pipeline_id":  pipelineID,
-			"execution_id": execID,
-		}).Error("Failed to signal workflow: connections_configured")
-		if isWorkflowAlreadyCompletedError(err) {
-			msg := "This pipeline run is no longer active (workflow already completed). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_already_completed", "message": msg, "execution_id": execID})
-			return
-		}
-		if isWorkflowNotFoundError(err) {
-			msg := "This pipeline run is no longer active (workflow not found). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_not_found", "message": msg, "execution_id": execID})
-			return
-		}
-		log.Errorf("failed to signal Temporal workflow: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_signal_workflow", "message": "workflow signaling failed; please try again"})
+	if err := signalPipelineWorkflowWithFallback(ctx, pipelineID, execID, "connections_configured", payload); err != nil {
+		releaseHITLPauseClaim(ctx, database, pipelineID, pauseKey)
+		respondHITLSignalFailed(c, database, pipelineID, execID, "connections_configured", err)
 		return
 	}
 
@@ -425,6 +393,16 @@ func ResumePipelineConnectors(c *gin.Context) {
 		}
 	}
 
+	// From here the answer outlives its caller, as in ResumePipelineConnections.
+	ctx := context.WithoutCancel(c.Request.Context())
+
+	// Ask the run before acting on the answer: the dialog it came from may have
+	// outlived the pause (answered in another tab), or the run itself.
+	pauseKey, ok := gateHITLResume(c, database, pipelineID, execID, hitlKindConnectors)
+	if !ok {
+		return
+	}
+
 	payload := map[string]interface{}{
 		"pipeline_id": pipelineID,
 		"timestamp":   time.Now().UTC().Format(time.RFC3339),
@@ -436,26 +414,23 @@ func ResumePipelineConnectors(c *gin.Context) {
 		payload["metadata"] = req.Metadata
 	}
 
-	err := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "connector_generated", payload)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"pipeline_id":  pipelineID,
-			"execution_id": execID,
-		}).Error("Failed to signal workflow: connector_generated")
-		if isWorkflowAlreadyCompletedError(err) {
-			msg := "This pipeline run is no longer active (workflow already completed). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_already_completed", "message": msg, "execution_id": execID})
+	// One answer per receive: a second tab that also passed the gate loses here.
+	if pauseKey != "" {
+		won, err := claimHITLPause(ctx, database, pipelineID, execID, hitlKindConnectors, pauseKey)
+		if err != nil {
+			log.WithError(err).WithField("pipeline_id", pipelineID).Error("HITL: could not claim the pause")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "claim_failed", "message": "Could not record the answer. Try again."})
 			return
 		}
-		if isWorkflowNotFoundError(err) {
-			msg := "This pipeline run is no longer active (workflow not found). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_not_found", "message": msg, "execution_id": execID})
+		if !won {
+			respondHITLAnswerInFlight(c, pipelineID, execID)
 			return
 		}
-		log.Errorf("failed to signal Temporal workflow: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_signal_workflow", "message": "workflow signaling failed; please try again"})
+	}
+
+	if err := signalPipelineWorkflowWithFallback(ctx, pipelineID, execID, "connector_generated", payload); err != nil {
+		releaseHITLPauseClaim(ctx, database, pipelineID, pauseKey)
+		respondHITLSignalFailed(c, database, pipelineID, execID, "connector_generated", err)
 		return
 	}
 
@@ -494,6 +469,29 @@ func ResumePipelineTables(c *gin.Context) {
 		return
 	}
 
+	execID := req.ExecutionID
+	if execID == "" {
+		var err error
+		execID, err = resolveExecutionIDForPipeline(database, pipelineID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "execution_not_found"})
+			return
+		}
+	}
+
+	// From here the answer outlives its caller. On the request's context, a tab closed
+	// during the collision probe failed it, and the chosen namespace was locked for
+	// good, unverified.
+	ctx := context.WithoutCancel(c.Request.Context())
+
+	// Ask the run before anything below writes: a dialog that outlived its pause
+	// (answered in another tab, or the run finished) must change nothing — not
+	// the pipeline's saved selection, not its namespace, not the run's outcome.
+	pauseKey, ok := gateHITLResume(c, database, pipelineID, execID, hitlKindTables)
+	if !ok {
+		return
+	}
+
 	tables := normalizeSelectedTables(req.SelectedTables)
 	// The selection as the user confirmed it, captured before expansion: a
 	// first run confirmed as "this whole database" must keep matching tables
@@ -506,7 +504,7 @@ func ResumePipelineTables(c *gin.Context) {
 	// and cache validation below.
 	var sourceConnID sql.NullString
 	if err := database.QueryRow(`SELECT source_connection_id FROM pipelines WHERE id = $1::uuid`, pipelineID).Scan(&sourceConnID); err != nil && err != sql.ErrNoRows {
-		log.WithContext(c.Request.Context()).WithError(err).Warn("HITL: could not fetch source_connection_id for table validation")
+		log.WithContext(ctx).WithError(err).Warn("HITL: could not fetch source_connection_id for table validation")
 	}
 
 	sentinelExpanded := false
@@ -520,13 +518,13 @@ func ResumePipelineTables(c *gin.Context) {
 			return
 		}
 		resolved, expanded, rerr := resolveSelectionSentinels(
-			c.Request.Context(), connID, tables,
+			ctx, connID, tables,
 			func(_ context.Context, id string, max int) ([]TableMetadata, error) {
 				return discoverConnectionTablesForResolve(c, id, max)
 			},
 		)
 		if rerr != nil {
-			log.WithContext(c.Request.Context()).WithError(rerr).Warn("HITL: failed to resolve select-all sentinel")
+			log.WithContext(ctx).WithError(rerr).Warn("HITL: failed to resolve select-all sentinel")
 			c.JSON(http.StatusBadGateway, gin.H{
 				"error":   "table_resolution_failed",
 				"message": "Could not enumerate tables for a whole-database selection. Please retry or select tables explicitly.",
@@ -604,10 +602,10 @@ func ResumePipelineTables(c *gin.Context) {
 	// This prevents "table not found" failures much later in the executor stage when the user
 	// typed a wrong/ambiguous table name in the manual input flow.
 	// Skipped when the list was sentinel-expanded: those names come straight from
-	// discovery (authoritative) and would spuriously fail against the 100-table cache.
+	// discovery, which is authoritative, so checking them against the cache adds nothing.
 	if !sentinelExpanded && sourceConnID.Valid && strings.TrimSpace(sourceConnID.String) != "" {
 		if qualified, missing, ambiguous, used := validateAndQualifySelectedTablesFromCache(
-			c.Request.Context(),
+			ctx,
 			strings.TrimSpace(sourceConnID.String),
 			tables,
 		); used {
@@ -635,16 +633,6 @@ func ResumePipelineTables(c *gin.Context) {
 		}
 	}
 
-	execID := req.ExecutionID
-	if execID == "" {
-		var err error
-		execID, err = resolveExecutionIDForPipeline(database, pipelineID)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "execution_not_found"})
-			return
-		}
-	}
-
 	// -------------------------------------------------------------------------
 	// Atomic idempotency claim.
 	//
@@ -655,8 +643,9 @@ func ResumePipelineTables(c *gin.Context) {
 	// and DB-to-DB pipelines double-write at the destination.
 	//
 	// We collapse the check + claim into a single UPDATE that only writes
-	// hitl_tables_selected when it isn't already set, then key all
-	// subsequent decisions on RowsAffected:
+	// hitl_tables_selected when no claim exists for THIS pause (the gate's
+	// pauseKey), then key all subsequent decisions on RowsAffected. A claim
+	// left by an earlier pause or run does not block this one:
 	//   - rows == 1 → we won the race; proceed to signal.
 	//   - rows == 0 → someone else claimed first; load their claim and
 	//     return 200 "already_submitted" if their tables match ours, or
@@ -664,6 +653,7 @@ func ResumePipelineTables(c *gin.Context) {
 	// -------------------------------------------------------------------------
 	claimPayload, marshalErr := json.Marshal(map[string]interface{}{
 		"execution_id":    execID,
+		"pause":           pauseKey,
 		"selected_tables": tables,
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 		"status":          "pending",
@@ -673,16 +663,16 @@ func ResumePipelineTables(c *gin.Context) {
 		return
 	}
 
-	res, claimErr := database.ExecContext(c.Request.Context(), `
+	res, claimErr := database.ExecContext(ctx, `
 		UPDATE pipeline_progress
 		SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hitl_tables_selected}', $1::jsonb, true),
 		    stage_last_heartbeat_at = NOW(),
 		    updated_at = NOW()
 		WHERE pipeline_id = $2
-		  AND COALESCE(metadata->'hitl_tables_selected', 'null'::jsonb) = 'null'::jsonb
-	`, string(claimPayload), pipelineID)
+		  AND COALESCE(metadata->'hitl_tables_selected'->>'pause', '') <> $3
+	`, string(claimPayload), pipelineID, pauseKey)
 	if claimErr != nil {
-		log.WithContext(c.Request.Context()).WithError(claimErr).Error("HITL tables: atomic claim UPDATE failed")
+		log.WithContext(ctx).WithError(claimErr).Error("HITL tables: atomic claim UPDATE failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "claim_failed", "message": claimErr.Error()})
 		return
 	}
@@ -693,7 +683,7 @@ func ResumePipelineTables(c *gin.Context) {
 		// this is a benign retry (same tables) or a real conflict.
 		var meta sql.NullString
 		if err := database.QueryRow(`SELECT metadata FROM pipeline_progress WHERE pipeline_id = $1`, pipelineID).Scan(&meta); err != nil && err != sql.ErrNoRows {
-			log.WithContext(c.Request.Context()).WithError(err).Warn("HITL tables: failed to read claim after losing race")
+			log.WithContext(ctx).WithError(err).Warn("HITL tables: failed to read claim after losing race")
 		}
 		var existingTables []string
 		var existingExec string
@@ -753,7 +743,7 @@ func ResumePipelineTables(c *gin.Context) {
 		// (or is about to receive) the first signal. Changing the
 		// selection at this point would require a workflow-level reset
 		// flow that does not yet exist; surface the conflict instead.
-		c.JSON(http.StatusConflict, gin.H{
+		respondHITLConflict(c, pipelineID, execID, gin.H{
 			"error":           "table_selection_in_flight",
 			"message":         "A table selection is already being applied for this pipeline. Wait for it to complete before submitting a new one.",
 			"execution_id":    existingExec,
@@ -799,11 +789,11 @@ func ResumePipelineTables(c *gin.Context) {
 	// single namespace would itself be wrong, i.e. when source schemas are being
 	// mirrored.
 	if cfg := req.DestinationConfig; cfg != nil {
-		lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, *cfg, tables, nil, "ResumeTables")
+		lockFirstRunNamespace(ctx, database, c.GetString("workspace_id"), pipelineID, *cfg, tables, nil, "ResumeTables")
 	} else {
 		persisted, schemaMode := pipelineDestinationState(database, pipelineID)
 		if seeded, probe := serverSideFirstRunNamespace(clientSentDestinationConfig, persisted, schemaMode); probe {
-			lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, seeded, tables, nil, "ResumeTables")
+			lockFirstRunNamespace(ctx, database, c.GetString("workspace_id"), pipelineID, seeded, tables, nil, "ResumeTables")
 		}
 	}
 
@@ -816,64 +806,61 @@ func ResumePipelineTables(c *gin.Context) {
 		payload["metadata"] = req.Metadata
 	}
 
-	signalErr := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "tables_selected", payload)
+	signalErr := signalPipelineWorkflowWithFallback(ctx, pipelineID, execID, "tables_selected", payload)
 	if signalErr != nil {
 		// Release the claim so the caller can retry — without this, a
 		// transient Temporal blip would permanently lock the pipeline
-		// into "table_selection_in_flight" 409s.
+		// into "table_selection_in_flight" 409s. Only this answer's claim.
 		if _, releaseErr := database.Exec(`
 			UPDATE pipeline_progress
 			SET metadata = metadata - 'hitl_tables_selected',
 			    updated_at = NOW()
 			WHERE pipeline_id = $1
 			  AND metadata->'hitl_tables_selected'->>'status' = 'pending'
-		`, pipelineID); releaseErr != nil {
+			  AND metadata->'hitl_tables_selected'->>'pause' = $2
+		`, pipelineID, pauseKey); releaseErr != nil {
 			log.WithError(releaseErr).WithField("pipeline_id", pipelineID).Warn("ResumeTables: failed to release claim after signal failure (ignored)")
 		}
-
-		log.WithError(signalErr).WithFields(log.Fields{
-			"pipeline_id":  pipelineID,
-			"execution_id": execID,
-		}).Error("Failed to signal workflow: tables_selected")
-		if isWorkflowAlreadyCompletedError(signalErr) {
-			msg := "This pipeline run is no longer active (workflow already completed). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_already_completed", "message": msg, "execution_id": execID})
-			return
-		}
-		if isWorkflowNotFoundError(signalErr) {
-			msg := "This pipeline run is no longer active (workflow not found). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_not_found", "message": msg, "execution_id": execID})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_signal_workflow", "message": signalErr.Error()})
+		respondHITLSignalFailed(c, database, pipelineID, execID, "tables_selected", signalErr)
 		return
 	}
 
-	// Signal landed — promote the claim from "pending" to "submitted" and
-	// clear the HITL blocking_reason so the UI doesn't keep showing the
-	// table-selection modal while Temporal propagates to the next stage.
+	// Signal landed — promote the claim from "pending" to "submitted"…
 	if b, marshalErr := json.Marshal(map[string]interface{}{
 		"execution_id":    execID,
+		"pause":           pauseKey,
 		"selected_tables": tables,
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 		"status":          "submitted",
 	}); marshalErr == nil {
 		if _, err := database.Exec(`
 			UPDATE pipeline_progress
-			SET status = 'processing',
-			    blocking_reason_type = NULL,
-			    blocking_reason_description = NULL,
-			    blocking_reason_estimated_seconds = NULL,
-			    message = 'Resuming after table selection...',
-			    stage_last_heartbeat_at = NOW(),
-			    metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hitl_tables_selected}', $1::jsonb, true),
+			SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hitl_tables_selected}', $1::jsonb, true),
 			    updated_at = NOW()
 			WHERE pipeline_id = $2
-		`, string(b), pipelineID); err != nil {
+			  AND metadata->'hitl_tables_selected'->>'pause' = $3
+		`, string(b), pipelineID, pauseKey); err != nil {
 			log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumeTables: failed to mark HITL submitted (ignored)")
 		}
+	}
+	// …and clear the pause so the UI stops showing the table-selection modal
+	// while Temporal moves to the next stage — only if the row still shows THIS
+	// run at THIS pause. The run may already have written its next state.
+	if _, err := database.Exec(`
+		UPDATE pipeline_progress
+		SET status = 'processing',
+		    blocking_reason_type = NULL,
+		    blocking_reason_description = NULL,
+		    blocking_reason_estimated_seconds = NULL,
+		    message = 'Resuming after table selection...',
+		    stage_last_heartbeat_at = NOW(),
+		    updated_at = NOW()
+		WHERE pipeline_id = $1
+		  AND execution_id = $2
+		  AND status = 'waiting_for_user'
+		  AND blocking_reason_type IN ('table_selection', 'needs_tables', 'needs_table_selection')
+	`, pipelineID, execID); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumeTables: failed to clear the table-selection pause (ignored)")
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1045,6 +1032,49 @@ func pipelineDestinationState(database *sql.DB, pipelineID string) (*Destination
 // DAG NODE INPUT HITL HANDLER
 // ==============================================================================
 
+// persistNodeInputTableSelection saves the tables a DAG node's input answer
+// picked (config_patch.selected_tables) to pipelines.config.selected_tables,
+// with the selection rule behind them, as ResumePipelineTables does for the
+// linear table step. An answer that picks no tables, or names one that is not
+// a string, saves nothing. Best-effort: a failed write is logged, never
+// returned, because the run already has its tables. Returns what it saved.
+func persistNodeInputTableSelection(database *sql.DB, pipelineID string, patch map[string]interface{}) []string {
+	raw, ok := patch["selected_tables"].([]interface{})
+	if !ok {
+		return nil
+	}
+	tables := make([]string, 0, len(raw))
+	for _, v := range raw {
+		name, ok := v.(string)
+		if !ok {
+			return nil
+		}
+		if name = strings.TrimSpace(name); name != "" {
+			tables = append(tables, name)
+		}
+	}
+	if len(tables) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(tables)
+	if err != nil {
+		return nil
+	}
+	if _, err := database.Exec(`
+		UPDATE pipelines
+		SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{selected_tables}', $1::jsonb, true),
+		    updated_at = NOW()
+		WHERE id = $2::uuid
+	`, string(b), pipelineID); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumePipelineNodeInput: failed to persist selected_tables (ignored)")
+		return nil
+	}
+	if err := persistTableSelectionRule(database, pipelineID, tables); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumePipelineNodeInput: failed to persist table_selection_rule (ignored)")
+	}
+	return tables
+}
+
 // ResumePipelineNodeInput signals the running DAG workflow to continue after user provides NL input for a node.
 // Signal: node_input_provided
 //
@@ -1104,6 +1134,15 @@ func ResumePipelineNodeInput(c *gin.Context) {
 		}
 	}
 
+	// From here the answer outlives its caller: a tab closed during the signal lost an
+	// answer the user had already given.
+	ctx := context.WithoutCancel(c.Request.Context())
+
+	// A dialog can outlive its run: ask before signalling or writing anything.
+	if _, ok := gateHITLResume(c, database, pipelineID, execID, hitlKindNodeInput); !ok {
+		return
+	}
+
 	// -------------------------------------------------------------------------
 	// Idempotency guard (similar to table selection)
 	// -------------------------------------------------------------------------
@@ -1111,7 +1150,7 @@ func ResumePipelineNodeInput(c *gin.Context) {
 	{
 		var meta sql.NullString
 		if err := database.QueryRow(`SELECT metadata FROM pipeline_progress WHERE pipeline_id = $1`, pipelineID).Scan(&meta); err != nil && err != sql.ErrNoRows {
-			log.WithContext(c.Request.Context()).WithError(err).Warn("HITL: idempotency guard DB query failed — proceeding without dedup protection")
+			log.WithContext(ctx).WithError(err).Warn("HITL: idempotency guard DB query failed — proceeding without dedup protection")
 		}
 		if meta.Valid && strings.TrimSpace(meta.String) != "" {
 			var metaObj map[string]interface{}
@@ -1165,31 +1204,16 @@ func ResumePipelineNodeInput(c *gin.Context) {
 	}
 
 	// Signal the workflow
-	err := signalPipelineWorkflowWithFallback(c.Request.Context(), pipelineID, execID, "node_input_provided", payload)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"pipeline_id":  pipelineID,
-			"execution_id": execID,
-			"node_id":      req.NodeID,
-		}).Error("Failed to signal workflow: node_input_provided")
-		if isWorkflowAlreadyCompletedError(err) {
-			msg := "This pipeline run is no longer active (workflow already completed). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_already_completed", "message": msg, "execution_id": execID})
-			return
-		}
-		if isWorkflowNotFoundError(err) {
-			msg := "This pipeline run is no longer active (workflow not found). Please run the pipeline again."
-			bestEffortMarkWorkflowEnded(database, pipelineID, execID, "failed", msg)
-			c.JSON(http.StatusConflict, gin.H{"error": "workflow_not_found", "message": msg, "execution_id": execID})
-			return
-		}
-		log.Errorf("failed to signal Temporal workflow: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_signal_workflow", "message": "workflow signaling failed; please try again"})
+	if err := signalPipelineWorkflowWithFallback(ctx, pipelineID, execID, "node_input_provided", payload); err != nil {
+		respondHITLSignalFailed(c, database, pipelineID, execID, "node_input_provided", err)
 		return
 	}
 
-	// Best-effort: mark HITL as submitted
+	// Save a table pick, as the linear table step does, so the next run reuses it.
+	// After the signal: a pick the workflow never received is not saved.
+	persistNodeInputTableSelection(database, pipelineID, req.ConfigPatch)
+
+	// Best-effort: mark HITL as submitted…
 	if b, err := json.Marshal(map[string]interface{}{
 		"execution_id": execID,
 		"node_id":      req.NodeID,
@@ -1197,19 +1221,29 @@ func ResumePipelineNodeInput(c *gin.Context) {
 	}); err == nil {
 		if _, err := database.Exec(`
 			UPDATE pipeline_progress
-			SET status = 'processing',
-			    blocking_reason_type = NULL,
-			    blocking_reason_description = NULL,
-			    blocking_reason_estimated_seconds = NULL,
-			    message = 'Processing node input...',
+			SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hitl_node_input_submitted}', $1::jsonb, true),
 			    -- Bump heartbeat so UI doesn't mark the pipeline as stale while resuming.
 			    stage_last_heartbeat_at = NOW(),
-			    metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hitl_node_input_submitted}', $1::jsonb, true),
 			    updated_at = NOW()
 			WHERE pipeline_id = $2
 		`, string(b), pipelineID); err != nil {
 			log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumePipelineNodeInput: failed to mark HITL submitted (ignored)")
 		}
+	}
+	// …and clear the pause only while the row still shows this run waiting for it.
+	if _, err := database.Exec(`
+		UPDATE pipeline_progress
+		SET status = 'processing',
+		    blocking_reason_type = NULL,
+		    blocking_reason_description = NULL,
+		    blocking_reason_estimated_seconds = NULL,
+		    message = 'Processing node input...',
+		    updated_at = NOW()
+		WHERE pipeline_id = $1
+		  AND execution_id = $2
+		  AND status = 'waiting_for_user'
+	`, pipelineID, execID); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumePipelineNodeInput: failed to clear the pause (ignored)")
 	}
 
 	c.JSON(http.StatusOK, gin.H{

@@ -177,6 +177,46 @@ func AdminRotateEncryptionKeys(c *gin.Context) {
 		},
 	)
 
+	// assistant_model_keys (migration 125): one row per assistant entry,
+	// keyed by the entry name.
+	rotateTable(
+		"assistant_model_keys.key_encrypted",
+		`SELECT entry, key_encrypted FROM assistant_model_keys WHERE key_encrypted <> ''`,
+		`UPDATE assistant_model_keys SET key_encrypted = $1 WHERE entry = $2`,
+		func(rows *sql.Rows) (string, string, error) {
+			var id string
+			var sec string
+			return id, sec, rows.Scan(&id, &sec)
+		},
+	)
+
+	// delivery_channels (migration 130): a workflow's Slack channel. The
+	// incoming-webhook URL is itself the credential.
+	rotateTable(
+		"delivery_channels.slack_webhook_encrypted",
+		`SELECT id::text, slack_webhook_encrypted FROM delivery_channels WHERE slack_webhook_encrypted <> ''`,
+		`UPDATE delivery_channels SET slack_webhook_encrypted = $1, updated_at = NOW() WHERE id = $2::uuid`,
+		func(rows *sql.Rows) (string, string, error) {
+			var id string
+			var sec string
+			return id, sec, rows.Scan(&id, &sec)
+		},
+	)
+
+	// openlineage_targets (migration 153): a workspace's OpenLineage push target. The
+	// auth header's value is the credential. updated_at is left: it is when an admin
+	// last changed the target.
+	rotateTable(
+		"openlineage_targets.auth_header_enc",
+		`SELECT workspace_id::text, auth_header_enc FROM openlineage_targets WHERE auth_header_enc <> ''`,
+		`UPDATE openlineage_targets SET auth_header_enc = $1 WHERE workspace_id = $2::uuid`,
+		func(rows *sql.Rows) (string, string, error) {
+			var id string
+			var sec string
+			return id, sec, rows.Scan(&id, &sec)
+		},
+	)
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":  true,
 		"dry_run":  req.DryRun,

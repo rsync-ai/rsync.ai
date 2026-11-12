@@ -593,3 +593,246 @@ def test_list_sinks_reports_each_group_once_with_its_pipeline():
     finally:
         for p in procs:
             p.kill()
+
+
+# --- Batch sink workers: the run that owns a worker, and stopping it safely -----------
+# The bug class: nothing stopped a batch worker once its run ended, and the orphan
+# reaper (sink_worker_reaper.go) could not stop one safely, because a worker is reused
+# by the next run under the same consumer group. These tests hold the sink-side half:
+# the worker records the execution that owns it, a stop can be made conditional on
+# that owner, and nothing a stop does can remove a successor's record.
+
+_SINK_CFG = {
+    "topics": "pipeline.59bd3130.data",
+    "consumer_group": "rsync.sink-59bd3130-batch",
+    "pipeline_id": "59bd3130-0000-4000-8000-000000000001",
+    "destination_connector": "postgresql",
+    "destination_config": {"table": "x"},
+}
+
+
+def _live_sink(monkeypatch):
+    """A connector whose start_sink spawns a real, idle child process per worker."""
+    c = C()
+    c._supervisor_stop.set()
+    spawned = []
+
+    def spawn(wc):
+        p = subprocess.Popen(["sleep", "30"])
+        spawned.append((p, dict(wc)))
+        return p
+
+    monkeypatch.setattr(c, "_spawn_worker_process", spawn)
+    monkeypatch.setattr(c, "_wait_for_worker_ready", lambda port, timeout=5: None)
+    return c, spawned
+
+
+def _kill_all(spawned):
+    for p, _ in spawned:
+        if p.poll() is None:
+            p.kill()
+
+
+def test_stop_sink_leaves_a_worker_a_newer_execution_owns(monkeypatch):
+    c, spawned = _live_sink(monkeypatch)
+    group = _SINK_CFG["consumer_group"]
+    try:
+        assert c.start_sink({"config": dict(_SINK_CFG, execution_id="e-1")})["status"] == "started"
+        # The next run reuses the idle worker: it now owns it.
+        again = c.start_sink({"config": dict(_SINK_CFG, execution_id="e-2")})
+        assert again["status"] == "already_running", again
+
+        stale = c.stop_sink({"config": {"consumer_group": group, "only_if_execution_id": "e-1"}})
+        assert stale["success"] is False and stale["status"] == "not_owner", stale
+        assert stale["execution_id"] == "e-2", stale
+        assert c._is_worker_alive(group), "a stop for the previous run must not stop the current one"
+
+        owned = c.stop_sink({"config": {"consumer_group": group, "only_if_execution_id": "e-2"}})
+        assert owned["success"] is True and owned["status"] == "stopped", owned
+        assert group not in c.workers
+    finally:
+        _kill_all(spawned)
+
+
+def test_stop_sink_without_an_owner_is_unconditional(monkeypatch):
+    # The user's Stop and Delete send no owner: they stop whatever runs.
+    c, spawned = _live_sink(monkeypatch)
+    group = _SINK_CFG["consumer_group"]
+    try:
+        c.start_sink({"config": dict(_SINK_CFG, execution_id="e-1")})
+        res = c.stop_sink({"config": {"consumer_group": group}})
+        assert res["success"] is True and res["status"] == "stopped", res
+    finally:
+        _kill_all(spawned)
+
+
+def test_list_sinks_reports_the_execution_that_owns_each_worker(monkeypatch):
+    c, spawned = _live_sink(monkeypatch)
+    try:
+        c.start_sink({"config": dict(_SINK_CFG, execution_id="e-1")})
+        c.start_sink({"config": dict(_SINK_CFG, execution_id="e-2")})
+        c.start_sink({"config": dict(_SINK_CFG, execution_id="")})  # no id: owner kept
+        (w,) = c.list_sinks({})["workers"]
+        assert w["execution_id"] == "e-2", w
+    finally:
+        _kill_all(spawned)
+
+
+def test_restart_on_new_execution_replaces_the_worker(monkeypatch):
+    # A batch run must not inherit the previous run's worker config: with the flag, a
+    # new execution gets a fresh worker; the same execution (a chunked continuation)
+    # keeps the one it has.
+    c, spawned = _live_sink(monkeypatch)
+    group = _SINK_CFG["consumer_group"]
+    flagged = dict(_SINK_CFG, restart_on_new_execution=True)
+    try:
+        first = c.start_sink({"config": dict(flagged, execution_id="e-1")})
+        assert first["status"] == "started", first
+        second = c.start_sink({"config": dict(flagged, execution_id="e-2")})
+        assert second["status"] == "started", second
+        assert second["pid"] != first["pid"]
+        assert spawned[0][0].wait(timeout=5) is not None, "the previous run's worker must be stopped"
+        assert spawned[1][1]["execution_id"] == "e-2", "the new worker must carry the new run's config"
+        assert c.list_sinks({})["workers"][0]["execution_id"] == "e-2"
+
+        cont = c.start_sink({"config": dict(flagged, execution_id="e-2")})
+        assert cont["status"] == "already_running" and cont["pid"] == second["pid"], cont
+        assert len(spawned) == 2
+        assert c._is_worker_alive(group)
+    finally:
+        _kill_all(spawned)
+
+
+class _SlowExitProcess:
+    """A worker process whose wait() runs a hook while stop_sink is outside the lock."""
+
+    def __init__(self, on_wait):
+        self.pid = 424242
+        self._on_wait = on_wait
+        self._exited = False
+
+    def poll(self):
+        return 0 if self._exited else None
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        self._exited = True
+
+    def wait(self, timeout=None):
+        self._on_wait()
+        self._exited = True
+        return 0
+
+
+def test_stop_sink_cleanup_leaves_a_successor_record(monkeypatch):
+    # stop_sink waits for the process outside the lock. A start_sink that lands in that
+    # window stores a new worker under the same group; the cleanup that follows must not
+    # delete it, or the new worker runs with no record: unlisted, unstoppable, and
+    # never respawned.
+    c = C()
+    c._supervisor_stop.set()
+    group = _SINK_CFG["consumer_group"]
+    successor_proc = subprocess.Popen(["sleep", "30"])
+    successor = {
+        "process": successor_proc, "pid": successor_proc.pid, "config": {"consumer_group": group},
+        "metrics_port": 2, "restart_attempts": 0, "intentional_stop": False, "auto_restart": True,
+    }
+
+    def successor_arrives():
+        with c._lock:
+            c.workers[group] = successor
+
+    with c._lock:
+        c.workers[group] = {
+            "process": _SlowExitProcess(successor_arrives), "pid": 424242,
+            "config": {"consumer_group": group}, "metrics_port": 1, "restart_attempts": 0,
+            "intentional_stop": False, "auto_restart": True,
+        }
+    try:
+        res = c.stop_sink({"config": {"consumer_group": group}})
+        assert res["success"] is True, res
+        assert c.workers.get(group) is successor, "stop_sink deleted the successor's record"
+    finally:
+        successor_proc.kill()
+
+
+def test_start_sink_waits_out_a_worker_that_is_being_stopped(monkeypatch):
+    # A worker marked intentional_stop is on its way out. Reporting it as
+    # already_running hands the new run a worker that exits a moment later, and the
+    # supervisor will not respawn it. start_sink waits for it and starts a fresh one.
+    c, spawned = _live_sink(monkeypatch)
+    group = _SINK_CFG["consumer_group"]
+    dying = subprocess.Popen(["sleep", "30"])
+    with c._lock:
+        c.workers[group] = {
+            "process": dying, "pid": dying.pid, "config": {"consumer_group": group,
+                                                            "topics": [_SINK_CFG["topics"]]},
+            "metrics_port": 1, "restart_attempts": 0, "intentional_stop": True, "auto_restart": True,
+        }
+    import threading
+    threading.Timer(0.3, dying.terminate).start()  # the stop_sink in flight
+    try:
+        res = c.start_sink({"config": dict(_SINK_CFG, execution_id="e-2")})
+        assert res["status"] == "started", res
+        assert res["pid"] != dying.pid
+        assert c.workers[group]["pid"] == res["pid"]
+        assert c.workers[group]["intentional_stop"] is False
+    finally:
+        dying.kill()
+        _kill_all(spawned)
+
+
+def test_start_sink_gives_up_on_a_worker_that_will_not_stop(monkeypatch):
+    c, spawned = _live_sink(monkeypatch)
+    monkeypatch.setattr(C, "_STOPPING_WAIT_SECONDS", 0.2, raising=False)
+    group = _SINK_CFG["consumer_group"]
+    stuck = subprocess.Popen(["sleep", "30"])
+    with c._lock:
+        c.workers[group] = {
+            "process": stuck, "pid": stuck.pid, "config": {"consumer_group": group},
+            "metrics_port": 1, "restart_attempts": 0, "intentional_stop": True, "auto_restart": True,
+        }
+    try:
+        res = c.start_sink({"config": dict(_SINK_CFG, execution_id="e-2")})
+        assert res["success"] is False and res["status"] == "stopping", res
+        assert spawned == [], "no second worker may join the group while the first is still in it"
+    finally:
+        stuck.kill()
+        _kill_all(spawned)
+
+
+def test_concurrent_start_sinks_for_one_group_spawn_one_worker(monkeypatch):
+    # start_sink checks the registry, releases the lock, spawns, then stores the record.
+    # Two calls for one group in that window (a caller's retry after a client timeout,
+    # or a start behind a replace that is still stopping the old worker) both spawned,
+    # and the second record overwrote the first: a worker in the group with no record,
+    # which nothing lists, stops or respawns. One start per group at a time.
+    import threading
+    import time as _time
+
+    c, spawned = _live_sink(monkeypatch)
+    real_spawn = c._spawn_worker_process
+
+    def slow_spawn(wc):
+        _time.sleep(0.3)
+        return real_spawn(wc)
+
+    monkeypatch.setattr(c, "_spawn_worker_process", slow_spawn)
+    results = []
+
+    def start():
+        results.append(c.start_sink({"config": dict(_SINK_CFG, execution_id="e-1")}))
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+        assert len(spawned) == 1, f"two workers spawned for one group: {results}"
+        assert sorted(r["status"] for r in results) == ["already_running", "started"], results
+        assert c.workers[_SINK_CFG["consumer_group"]]["pid"] == spawned[0][0].pid
+    finally:
+        _kill_all(spawned)

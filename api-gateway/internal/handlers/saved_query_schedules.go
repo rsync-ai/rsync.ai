@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/robfig/cron"
+	"github.com/rsync-ai/shared/pgdriver"
 	log "github.com/sirupsen/logrus"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -67,6 +67,10 @@ import (
 const (
 	upstreamKindPipeline = "pipeline"
 	upstreamKindModel    = "model"
+	// upstreamKindWorkflow is a model run a workflow's refresh_model step asked for
+	// (migration 140): upstream_id is the workflow, origin_execution_id its run. Never a
+	// trigger's upstream; only a run's.
+	upstreamKindWorkflow = "workflow"
 )
 
 // scheduleUpstream is one thing a model rebuilds after. Name is joined for display and
@@ -125,6 +129,52 @@ func (s *SavedQuerySchedule) EventDriven() bool { return s.ScheduleType == sched
 type setMaterializationRequest struct {
 	Materialization string `json:"materialization" binding:"required"`
 	TargetTable     string `json:"target_table"`
+	// Layer is the name of one of the workspace's layers (workspace_layers.go), in any
+	// case, or "" to clear it. Absent keeps the stored value, so a caller that predates
+	// layers does not wipe one an admin set.
+	Layer *string `json:"layer"`
+}
+
+// resolveModelLayer finds the layer a model asks for among its own workspace's
+// layers, by name ignoring case. "" resolves to no layer (nil). refusal is set
+// when the workspace has no layer by that name, and lists the ones it has.
+func resolveModelLayer(ctx context.Context, database *sql.DB, savedQueryID, raw string) (id *string, name, refusal string, err error) {
+	want, ok := cleanLayerText(raw)
+	if !ok {
+		return nil, "", "a layer name cannot contain control characters", nil
+	}
+	if want == "" {
+		return nil, "", "", nil
+	}
+	rows, err := database.QueryContext(ctx, `
+		SELECT wl.id, wl.name FROM workspace_layers wl
+		JOIN saved_queries sq ON sq.workspace_id = wl.workspace_id
+		WHERE sq.id = $1
+		ORDER BY wl.position`, savedQueryID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var lid, lname string
+		if err := rows.Scan(&lid, &lname); err != nil {
+			return nil, "", "", err
+		}
+		if strings.EqualFold(lname, want) {
+			return &lid, lname, "", nil
+		}
+		names = append(names, lname)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", "", err
+	}
+	if len(names) == 0 {
+		return nil, "", fmt.Sprintf("This workspace has no layers yet, so a model cannot go in %q. "+
+			"An owner or admin adds layers in Workspace settings.", want), nil
+	}
+	return nil, "", fmt.Sprintf("This workspace has no layer named %q. Its layers are %s.",
+		want, strings.Join(names, ", ")), nil
 }
 
 // scheduleAfterUpstream is the third schedule_type and the only one that is not a
@@ -182,8 +232,7 @@ func normalizeUpstreamPolicy(scheduleType, policy string) (string, error) {
 //
 // A backstop, not the cycle check: a loop is refused at write time by checkUpstreamCycle,
 // and this is for the loop that gets in some other way. The depth rides along on the
-// signal payload as well as the in-process call, so a chain that hops through Temporal is
-// bounded by the same number as one that does not.
+// signal payload and on every model run, so each hop through Temporal adds to one count.
 const maxTriggerChainDepth = 8
 
 // chainDepthExceeded is the bound itself, named so a test can walk a ring against it
@@ -225,9 +274,8 @@ type internalModelRunRequest struct {
 	Trigger string `json:"trigger"`
 
 	// Depth is how many rebuilds already stand between the thing that started this chain
-	// and this one. Carried on the wire because a chain that hops through Temporal leaves
-	// no in-process frame to count: without it, maxTriggerChainDepth would bound only the
-	// fallback path and not the durable one.
+	// and this one. Carried on the wire because every hop goes through Temporal and leaves
+	// no in-process frame to count: without it, maxTriggerChainDepth would bound nothing.
 	Depth int `json:"depth,omitempty"`
 
 	// Provenance of an event-path run (migration 104): the upstream completion that woke
@@ -239,6 +287,11 @@ type internalModelRunRequest struct {
 	UpstreamRunID string `json:"upstream_run_id,omitempty"`
 	ExecutionID   string `json:"execution_id,omitempty"`
 	Coalesced     int    `json:"coalesced,omitempty"`
+
+	// NextHop is modelNextHopCaller when the calling workflow, not this request, wakes
+	// the models below the run (model_next_hop.go). Empty from an adapter that predates
+	// it, which then gets the hop fired from here as before.
+	NextHop string `json:"next_hop,omitempty"`
 }
 
 // ============================================================================
@@ -274,19 +327,36 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": `materialization must be "none", "table" or "statement"`})
 		return
 	}
-
 	if mode == matNone {
 		// Leave target_table as it was. The model stops rebuilding; whatever table it
 		// last produced stays exactly where it is, because deleting a user's data is
-		// not something turning a toggle off should do.
+		// not something turning a toggle off should do. The layer goes: a query that
+		// builds nothing is in no layer.
 		if _, err := database.ExecContext(c.Request.Context(),
-			`UPDATE saved_queries SET materialization = 'none', updated_at = NOW() WHERE id = $1`, id); err != nil {
+			`UPDATE saved_queries SET materialization = 'none', layer_id = NULL, updated_at = NOW() WHERE id = $1`, id); err != nil {
 			log.WithError(err).Error("failed to clear materialization")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update saved query"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"materialization": matNone})
 		return
+	}
+
+	// keepLayer is true when the request leaves the layer as it is. Resolved only
+	// for a model: turning one off drops its layer, whatever the request names.
+	var layerID *string
+	layerName, keepLayer := "", req.Layer == nil
+	if !keepLayer {
+		var refusal string
+		var err error
+		if layerID, layerName, refusal, err = resolveModelLayer(c.Request.Context(), database, id, *req.Layer); err != nil {
+			log.WithError(err).Error("failed to load the workspace's layers")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update saved query"})
+			return
+		} else if refusal != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": refusal})
+			return
+		}
 	}
 
 	// Only table mode has a destination to name. Asking a statement model for one was
@@ -315,7 +385,7 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "this saved query's connection is no longer available in this workspace"})
 		return
 	}
-	if dialect := modelDialect(m.ConnectorType); dialect == "" {
+	if !modelSupported(m.ConnectorType) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "materialized models are not supported for " + m.ConnectorType + " connections yet",
 		})
@@ -345,15 +415,26 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 		SET materialization = $3,
 		    target_table    = NULLIF($2, ''),
 		    target_owned    = (target_table IS NOT DISTINCT FROM NULLIF($2, '')) AND target_owned,
+		    layer_id        = CASE WHEN $4 THEN layer_id ELSE $5::uuid END,
 		    updated_at      = NOW()
 		WHERE id = $1
-	`, id, target, mode); err != nil {
+	`, id, target, mode, keepLayer, layerID); err != nil {
+		if isForeignKeyViolation(err) {
+			// The layer was deleted between the lookup above and this write.
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(
+				"The layer %q was just deleted. Reload and pick another.", layerName)})
+			return
+		}
 		log.WithError(err).Error("failed to set materialization")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update saved query"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"materialization": mode, "target_table": target})
+	resp := gin.H{"materialization": mode, "target_table": target}
+	if !keepLayer {
+		resp["layer"] = layerName
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // ============================================================================
@@ -414,22 +495,12 @@ func RunSavedQueryModel(c *gin.Context) {
 		return
 	}
 
-	startedAt := time.Now()
-	res, err := runSavedQueryModel(c.Request.Context(), database, id, userID)
+	res, err := runManualModel(c.Request.Context(), database, id, userID)
 	if err != nil {
 		log.WithError(err).WithField("model_id", id).Error("model run could not be attempted")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to run model"})
 		return
 	}
-	runID := recordModelRunOutcome(c.Request.Context(), database, id, res, modelRunAudit{
-		Trigger:   triggerManual,
-		ActorID:   userID,
-		StartedAt: startedAt,
-	})
-
-	// A hand-run rebuild wakes what depends on it, exactly as a scheduled one does. All
-	// three doors go through this one helper so none of them can quietly stop doing it.
-	fireDownstreamModelsAfterRun(res, id, runID, "", 0)
 
 	switch res.Status {
 	case "succeeded":
@@ -442,6 +513,105 @@ func RunSavedQueryModel(c *gin.Context) {
 		// The statement reached the engine and the engine rejected it. 422 rather than
 		// 500: rsync.ai did its job, the SQL did not.
 		c.JSON(http.StatusUnprocessableEntity, res)
+	}
+}
+
+// runManualModel is one run started by a person or an agent rather than a schedule:
+// run, record, and continue the chain. Both manual doors — the request that waits for
+// the result and the one that does not — go through it, so neither can stop recording
+// its run or waking what depends on it.
+func runManualModel(ctx context.Context, database *sql.DB, id, userID string) (*modelRunResult, error) {
+	startedAt := time.Now()
+	res, err := runSavedQueryModel(ctx, database, id, userID)
+	if err != nil {
+		return nil, err
+	}
+	runID := recordModelRunOutcome(ctx, database, id, res, modelRunAudit{
+		Trigger:   triggerManual,
+		ActorID:   userID,
+		StartedAt: startedAt,
+	})
+
+	// A hand-run rebuild wakes what depends on it, exactly as a scheduled one does. Both
+	// manual doors go through this one helper so neither can quietly stop doing it.
+	fireDownstreamModelsAfterRun(res, id, runID, "", 0)
+	return res, nil
+}
+
+// StartSavedQueryModelRun is RunSavedQueryModel for a caller that cannot hold a request
+// open for the length of a rebuild — the agent gateway's run_model, whose MCP client
+// times a tool call out long before a model's 30-minute budget runs out. It answers 202
+// once the run has been handed to the background, and the outcome lands in the run
+// history exactly as a waited-for run's does, so the caller reads it there.
+//
+// Everything that can be refused is refused here, synchronously, with the same gates
+// and the same dry-run CreateSavedQuerySchedule does: a caller told "started" should
+// find a run in the history, not discover that the model never could have run. What it
+// cannot promise is the one transient refusal — another run of the model in flight —
+// which the background run records as a skip.
+//
+// Not routed: the UI waits for its runs, and the only caller is in-process.
+//
+// A gateway that stops mid-run loses the run's outcome, as it would for a waiting
+// caller whose connection the restart cut; the target table is never left half-built
+// (the swap is atomic), and the next run sweeps the staging table.
+func StartSavedQueryModelRun(c *gin.Context) {
+	database := db.GetDB()
+	if database == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
+		return
+	}
+	if !requireVisibleSavedQuery(c, id, modelRunMinRole) {
+		return
+	}
+	userID, ok := resolveUserID(c)
+	if !ok {
+		return
+	}
+
+	m, err := loadSavedQueryModel(c.Request.Context(), database, id)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "this saved query's connection is no longer available in this workspace"})
+		return
+	}
+	if m.Materialization == matNone {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "this saved query is not a model; choose what a run should do before running it",
+		})
+		return
+	}
+	if _, refusal, err := authorizeModelRun(c.Request.Context(), database, m, userID); err != nil {
+		log.WithError(err).Error("failed to authorize a background model run")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify this model can run; try again"})
+		return
+	} else if refusal != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": refusal})
+		return
+	}
+
+	launchModelRun(database, id, userID)
+	c.JSON(http.StatusAccepted, gin.H{"status": "started", "model_id": id})
+}
+
+// launchModelRun is a seam so the handler can be tested without a goroutine racing the
+// test's mock.
+var launchModelRun = func(database *sql.DB, id, userID string) {
+	go runModelInBackground(database, id, userID)
+}
+
+func runModelInBackground(database *sql.DB, id, userID string) {
+	// Not the request's context: the request is over by the time this matters. Its own
+	// budget instead, a minute past the run's.
+	ctx, cancel := context.WithTimeout(context.Background(), modelRunTimeout+time.Minute)
+	defer cancel()
+	if _, err := runManualModel(ctx, database, id, userID); err != nil {
+		log.WithError(err).WithField("model_id", id).Error("background model run could not be attempted")
 	}
 }
 
@@ -697,6 +867,8 @@ type ScheduledQuerySummary struct {
 
 	Materialization string `json:"materialization"`
 	TargetTable     string `json:"target_table,omitempty"`
+	// Layer is the name of the model's workspace layer, or "" (workspace_layers.go).
+	Layer string `json:"layer,omitempty"`
 
 	// StatementClass is the class stored for the query's SQL. Advisory, exactly as it is
 	// everywhere else — the fire path re-classifies the live SQL — but the Scheduled
@@ -791,10 +963,11 @@ func ListSavedQuerySchedules(c *gin.Context) {
 		       s.created_by::text, s.created_at, s.updated_at,
 		       s.paused_at, COALESCE(s.paused_reason, ''),
 		       s.auto_paused_at, COALESCE(s.auto_paused_reason, ''),
-		       s.upstream_policy
+		       s.upstream_policy, COALESCE(wl.name, '')
 		FROM saved_query_schedules s
 		JOIN saved_queries sq ON sq.id = s.saved_query_id
 		LEFT JOIN connections cn ON cn.id = sq.connection_id
+		LEFT JOIN workspace_layers wl ON wl.id = sq.layer_id
 		WHERE sq.workspace_id = $1
 		  AND (sq.visibility = 'workspace' OR sq.created_by = $2)
 		  AND s.status != 'deleted'
@@ -823,7 +996,7 @@ func ListSavedQuerySchedules(c *gin.Context) {
 			&s.CreatedBy, &s.CreatedAt, &s.UpdatedAt,
 			&pausedAt, &s.PausedReason,
 			&autoPausedAt, &s.AutoPausedReason,
-			&s.UpstreamPolicy); err != nil {
+			&s.UpstreamPolicy, &s.Layer); err != nil {
 			log.WithError(err).Error("scan saved query schedule")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list schedules"})
 			return
@@ -941,15 +1114,16 @@ func ListSavedQueryRuns(c *gin.Context) {
 	// The upstream's name is joined rather than stored, so a rename shows the current
 	// name. A model upstream is named only when the caller could see it: a private model
 	// belongs to its author, and this is the one place its name would otherwise reach
-	// another member. Both joins also require the upstream to still be in this model's
-	// workspace, so one moved away since does not report its new tenant's name here.
+	// another member. Every join also requires the upstream to still be in this model's
+	// workspace, so one moved away since does not report its new tenant's name here. A
+	// workflow upstream is a refresh_model step's run (migration 140).
 	rows, err := database.QueryContext(c.Request.Context(), `
 		SELECT r.run_id, r.saved_query_id, COALESCE(r.schedule_id::text, ''), r.trigger_source, r.status,
 		       r.statement_class, r.target_table, r.rows_affected, COALESCE(r.error, ''),
 		       COALESCE(r.auto_pause_reason, ''), r.started_at, r.finished_at,
 		       COALESCE(r.ran_as_user_id::text, ''),
 		       COALESCE(r.upstream_kind, ''), COALESCE(r.upstream_id::text, ''),
-		       COALESCE(up.name, um.name, ''),
+		       COALESCE(up.name, um.name, uw.name, ''),
 		       COALESCE(r.upstream_run_id::text, ''), COALESCE(r.origin_execution_id, ''),
 		       COALESCE(r.trigger_depth, 0), COALESCE(r.coalesced_count, 0),
 		       COALESCE(r.skip_reason, '')
@@ -960,6 +1134,8 @@ func ListSavedQueryRuns(c *gin.Context) {
 		LEFT JOIN saved_queries um ON r.upstream_kind = 'model' AND um.id = r.upstream_id
 		     AND um.workspace_id = sq.workspace_id
 		     AND (um.visibility = 'workspace' OR um.created_by = $2)
+		LEFT JOIN workflows uw ON r.upstream_kind = 'workflow' AND uw.id = r.upstream_id
+		     AND uw.workspace_id = sq.workspace_id
 		WHERE r.saved_query_id = $1
 		  AND ($3 = '' OR r.status = $3)
 		  AND ($4::timestamptz IS NULL OR (r.finished_at, r.run_id) < ($4::timestamptz, $5::uuid))
@@ -1429,6 +1605,14 @@ func RunSavedQueryModelInternal(c *gin.Context) {
 	var req internalModelRunRequest
 	_ = c.ShouldBindJSON(&req)
 
+	// A workflow's refresh_model step comes through the model's own refresh workflow,
+	// whose commands step 5 left unchanged, so it carries the event door's trigger. It
+	// has no schedule: the workflow run is its authority (workflow_step_models.go).
+	if req.UpstreamKind == upstreamKindWorkflow {
+		runWorkflowStepModel(c, database, id, req)
+		return
+	}
+
 	if req.Trigger != "" && req.Trigger != scheduleAfterUpstream {
 		// Refuse rather than fall through to the clock door. An unrecognised trigger is a
 		// version skew between the adapter and this gateway, and quietly serving it from
@@ -1478,8 +1662,8 @@ func RunSavedQueryModelInternal(c *gin.Context) {
 		}, req.Coalesced)
 
 		// A fan-in on policy 'all' does not rebuild until every sibling is fresh. A lookup
-		// error is a 500 so Temporal retries it: unlike the in-process path, this door
-		// has a retry, and guessing either way would be wrong on a real fan-in.
+		// error is a 500 so Temporal retries it: guessing either way would be wrong on a
+		// real fan-in.
 		//
 		// The firing upstream is excluded by id alone, which the query matches against
 		// either column, so an unknown kind (an adapter older or newer than this gateway)
@@ -1532,18 +1716,12 @@ func RunSavedQueryModelInternal(c *gin.Context) {
 	if res.AutoPauseReason != "" {
 		// Naturally empty for an event trigger, which has nothing registered to pause, so
 		// the status write is the whole pause.
-		autoPauseModelSchedule(c.Request.Context(), database, scheduleID, temporalID.String, res.AutoPauseReason)
+		autoPauseModelSchedule(c.Request.Context(), database, id, scheduleID, temporalID.String, res.AutoPauseReason)
 	}
-
-	// The durable door's half of the chain. req.Depth is what the signal carried, so a
-	// chain that runs entirely through Temporal is bounded by the same number as one that
-	// falls back in-process. The execution id rides along too: dropping it here is what
-	// used to make every hop past the first forget the pipeline run that started it.
-	fireDownstreamModelsAfterRun(res, id, runID, req.ExecutionID, req.Depth)
 
 	// 200 even for a failed run: the activity did its job, and a non-2xx would make
 	// Temporal retry a statement the engine already rejected on its merits.
-	c.JSON(http.StatusOK, res)
+	answerInternalModelRun(c, req, res, id, runID)
 }
 
 // modelRunScheduleLookup builds the schedule lookup for one of the internal run
@@ -1571,10 +1749,10 @@ func modelRunScheduleLookup(eventPath bool) (string, modelRunTrigger) {
 		op = "="
 		trigger = triggerTriggered
 		// The same tenancy check the fire path makes when it looks the models up, made
-		// again when the rebuild actually runs. It belongs in both places: the in-process
-		// path ran milliseconds after its lookup, but a signal can wait through a task
-		// queue and up to three activity attempts, so the workspace an upstream was in
-		// when it completed is not necessarily the one it is in when the model rebuilds.
+		// again when the rebuild actually runs. It belongs in both places: a signal can wait
+		// through a task queue and up to three activity attempts between the two, so the
+		// workspace an upstream was in when it completed is not necessarily the one it is
+		// in when the model rebuilds.
 		//
 		// Stated as "no upstream is outside this model's workspace" rather than as a check
 		// on the one that fired, because the signal does not name which one that was and a
@@ -1653,14 +1831,15 @@ type upstreamFanOut struct {
 type upstreamFanOutDispatch func(ctx context.Context, f upstreamFanOut) error
 
 // newUpstreamFanOutDispatch resolves the dispatcher for this deployment, returning nil
-// when there is no Temporal to dispatch to. Replaced in tests.
+// when there is no Temporal client. Replaced in tests.
 var newUpstreamFanOutDispatch = temporalUpstreamFanOutDispatch
 
 // temporalUpstreamFanOutDispatch starts one workflow per completion.
 //
-// Returning nil rather than an error when there is no client is the whole reason this is
-// a constructor: a deployment with no Temporal is a supported mode, not a fault, and it
-// must keep running rebuilds on the goroutine path in silence.
+// A constructor because getTemporalClient dials when there is no client yet, and a nil
+// return is that dial failing. That is a start that did not happen — there is no
+// in-process path to fall back to any more (workflows-design.md § 4.2) — so
+// startUpstreamFanOut retries it and records what was lost when it gives up.
 //
 // This used to be N signal-with-starts issued from a detached goroutine, one per model.
 // It is one ExecuteWorkflow because that is what makes the fan-out durable: the gateway
@@ -1679,13 +1858,6 @@ func temporalUpstreamFanOutDispatch() upstreamFanOutDispatch {
 		return nil
 	}
 	return func(ctx context.Context, f upstreamFanOut) error {
-		targets := make([]map[string]interface{}, 0, len(f.Targets))
-		for _, t := range f.Targets {
-			targets = append(targets, map[string]interface{}{
-				"schedule_id":    t.ScheduleID,
-				"saved_query_id": t.ModelID,
-			})
-		}
 		id := upstreamFanOutWorkflowID(f)
 		_, err := tc.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 			ID:        id,
@@ -1698,18 +1870,32 @@ func temporalUpstreamFanOutDispatch() upstreamFanOutDispatch {
 			WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 			// No run timeout: the children own their own budget, and a timeout here would
 			// only cut short a fan-out that was still delivering.
-		}, upstreamFanOutWorkflowType, map[string]interface{}{
-			// map[string]any rather than a struct: the adapter is a separate Go module, so
-			// this is the wire contract with its UpstreamFanOutInput and there is no shared
-			// type to marshal. depth is a number and the adapter decodes it into an int.
-			"upstream_kind":   f.Source.Kind,
-			"upstream_id":     f.Source.ID,
-			"execution_id":    f.Source.ExecutionID,
-			"upstream_run_id": f.Source.RunID,
-			"depth":           f.Source.Depth,
-			"targets":         targets,
-		})
+		}, upstreamFanOutWorkflowType, upstreamFanOutArgs(f))
 		return err
+	}
+}
+
+// upstreamFanOutArgs is the argument UpstreamFanOutWorkflow is started with: here, and in
+// the /downstream answer a model run's own workflow starts it from (model_next_hop.go).
+//
+// map[string]any rather than a struct: the adapter is a separate Go module, so this is
+// the wire contract with its UpstreamFanOutInput and there is no shared type to marshal.
+// depth is a number and the adapter decodes it into an int.
+func upstreamFanOutArgs(f upstreamFanOut) map[string]interface{} {
+	targets := make([]map[string]interface{}, 0, len(f.Targets))
+	for _, t := range f.Targets {
+		targets = append(targets, map[string]interface{}{
+			"schedule_id":    t.ScheduleID,
+			"saved_query_id": t.ModelID,
+		})
+	}
+	return map[string]interface{}{
+		"upstream_kind":   f.Source.Kind,
+		"upstream_id":     f.Source.ID,
+		"execution_id":    f.Source.ExecutionID,
+		"upstream_run_id": f.Source.RunID,
+		"depth":           f.Source.Depth,
+		"targets":         targets,
 	}
 }
 
@@ -1744,49 +1930,112 @@ func fanOutOccurrence(src modelRefreshSource) string {
 	return uuid.NewString()
 }
 
-// startUpstreamFanOut hands the completion to Temporal and returns the targets that still
-// have to be rebuilt in this process.
+// fanOutRetryBudget is how long a completion keeps trying to hand its fan-out to Temporal
+// before the models below it are recorded as trigger_lost. A Temporal restart or rollout
+// is seconds; past this it is an outage, and a row saying so beats a goroutine that
+// holds a database connection waiting for it. Variables so a test can shrink the clock.
+var (
+	fanOutRetryBudget     = 30 * time.Second
+	fanOutRetryFirstPause = time.Second
+)
+
+var (
+	// errNoTemporalClient is getTemporalClient returning nil: its dial failed.
+	errNoTemporalClient = errors.New("no Temporal client to hand the fan-out to")
+	// errFanOutBreakerOpen is a start refused without dialling, inside the window after
+	// one failed (G11).
+	errFanOutBreakerOpen = errors.New("Temporal failed recently; not dialling it again yet")
+)
+
+// startUpstreamFanOut hands one completion's fan-out to Temporal, retrying inside
+// fanOutRetryBudget, and returns nil once Temporal has it.
 //
-// All or nothing, unlike the per-model loop it replaces: there is one call now, so a
-// half-dispatched batch is not a state that can exist. A failure sends the whole batch to
-// the in-process path rather than dropping it — Temporal being unreachable must not mean
-// models that silently stop updating, because the rebuild is the point and the durability
-// is the improvement on top of it.
-func startUpstreamFanOut(ctx context.Context, dispatch upstreamFanOutDispatch, f upstreamFanOut) []modelRefreshTarget {
-	if dispatch == nil {
-		return f.Targets
+// All or nothing: there is one call, so a half-dispatched batch is not a state that can
+// exist. There is no in-process path behind it any more (workflows-design.md § 4.2): an
+// error here means the models below did not get this trigger, and the caller records
+// that rather than dropping it. resolve is called on every attempt because
+// getTemporalClient does not cache a failed dial, so the next attempt can reconnect.
+func startUpstreamFanOut(ctx context.Context, b *fanOutBreaker, resolve func() upstreamFanOutDispatch, f upstreamFanOut) error {
+	fields := log.Fields{"upstream_id": f.Source.ID, "occurrence": f.Occurrence, "models": len(f.Targets)}
+	if !b.acquire() {
+		return errFanOutBreakerOpen
 	}
-	if err := dispatch(ctx, f); err != nil {
-		if isFanOutAlreadyStarted(err) {
-			// This completion has already been fanned out. Running it locally as well would
-			// undo exactly the duplicate suppression the workflow id buys, and would do it
-			// on the path with no coalescing.
-			log.WithFields(log.Fields{"upstream_id": f.Source.ID, "occurrence": f.Occurrence}).
-				Info("upstream trigger: this completion was already fanned out, not repeating it")
-			return nil
+	ctx, cancel := context.WithTimeout(ctx, fanOutRetryBudget)
+	defer cancel()
+
+	var err error
+	for pause := fanOutRetryFirstPause; ; pause *= 2 {
+		if dispatch := resolve(); dispatch == nil {
+			err = errNoTemporalClient
+		} else {
+			err = dispatch(ctx, f)
 		}
-		log.WithError(err).WithFields(log.Fields{"upstream_id": f.Source.ID, "models": len(f.Targets)}).
-			Warn("upstream trigger: could not reach Temporal, rebuilding in-process")
-		return f.Targets
+		if err == nil || isFanOutAlreadyStarted(err) {
+			break
+		}
+		log.WithError(err).WithFields(fields).Warn("upstream trigger: could not reach Temporal")
+		if !waitOrDone(ctx, pause) {
+			break
+		}
 	}
-	log.WithFields(log.Fields{"upstream_id": f.Source.ID, "models": len(f.Targets)}).
-		Info("⏩ handed the fan-out to Temporal")
-	return nil
+	b.observe(err)
+
+	switch {
+	case err == nil:
+		log.WithFields(fields).Info("⏩ handed the fan-out to Temporal")
+		return nil
+	case isFanOutAlreadyStarted(err):
+		// This completion has already been fanned out. "Already done", not "did not
+		// happen": no trigger_lost row about models that are being rebuilt.
+		log.WithFields(fields).Info("upstream trigger: this completion was already fanned out, not repeating it")
+		return nil
+	}
+	return err
+}
+
+// waitOrDone waits d, and reports false instead when ctx ends first.
+func waitOrDone(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// deliverFanOut starts one completion's fan-out and, when that fails, records every
+// model below it as skipped with trigger_lost, so a model whose trigger never arrived
+// says so instead of reading "nothing happened". Blocks for up to the retry budget; the
+// callers run it on its own goroutine.
+func deliverFanOut(database *sql.DB, b *fanOutBreaker, resolve func() upstreamFanOutDispatch, f upstreamFanOut) {
+	err := startUpstreamFanOut(context.Background(), b, resolve, f)
+	if err == nil {
+		return
+	}
+	log.WithError(err).WithFields(log.Fields{"upstream_id": f.Source.ID, "occurrence": f.Occurrence, "models": len(f.Targets)}).
+		Error("upstream trigger: could not hand the fan-out to Temporal; recording the models below as trigger_lost")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := recordSkippedDownstream(ctx, database, f.Source, skipTriggerLost); err != nil {
+		log.WithError(err).WithField("upstream_id", f.Source.ID).
+			Error("upstream trigger: could not record the models whose trigger was lost")
+	}
 }
 
 // fanOutBreaker stops the fan-out re-dialling a Temporal that just failed (G11).
 //
-// Without it every hop of a chain paid the full dial deadline before falling back, so an
-// N-deep chain with Temporal down took roughly 10·N seconds and nothing was remembered
-// between hops. One failure opens it for window. After that ONE dispatch is let through as
-// the probe while the rest keep taking the in-process path; otherwise every completion that
-// queued up during the window would dial the still-down Temporal at once and each pay the
-// full deadline. The probe's answer closes the breaker or reopens it. "Already started" is
-// Temporal answering, not failing, so it closes the breaker too.
+// A failed dial holds the client mutex for its whole deadline, so without it every
+// completion during an outage paid that deadline in turn. One failed start opens it for
+// window, and inside the window a start is refused at once — the caller records it as
+// trigger_lost without dialling. After the window ONE start is let through as the probe
+// while the rest are still refused; otherwise every completion that queued up would dial
+// the still-down Temporal at once. The probe's answer closes the breaker or reopens it.
+// "Already started" is Temporal answering, not failing, so it closes the breaker too.
 //
-// A probe that never reports (its dispatcher could not be built) is released at once, and
-// one that hangs is given up on after another window, so a lost probe cannot keep Temporal
-// bypassed for good.
+// A probe that hangs is given up on after another window, so a lost probe cannot keep
+// Temporal bypassed for good.
 type fanOutBreaker struct {
 	mu           sync.Mutex
 	until        time.Time
@@ -1798,15 +2047,7 @@ type fanOutBreaker struct {
 
 var fanOutTemporalBreaker = &fanOutBreaker{window: time.Minute, now: time.Now}
 
-// allow reports whether the breaker is closed or its window has passed. It claims nothing;
-// acquire is what hands out the probe.
-func (b *fanOutBreaker) allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return !b.now().Before(b.until)
-}
-
-// acquire says whether this dispatch may dial Temporal. Closed: always. Open: never.
+// acquire says whether this start may dial Temporal. Closed: always. Open: never.
 // Window passed: only if no other probe is out.
 func (b *fanOutBreaker) acquire() bool {
 	b.mu.Lock()
@@ -1825,12 +2066,6 @@ func (b *fanOutBreaker) acquire() bool {
 	return true
 }
 
-func (b *fanOutBreaker) releaseProbe() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.probing = false
-}
-
 func (b *fanOutBreaker) observe(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1842,46 +2077,16 @@ func (b *fanOutBreaker) observe(err error) {
 	b.until = b.now().Add(b.window)
 }
 
-// guard resolves the dispatcher only while the breaker lets this dispatch through, and
-// wraps it so its outcome is observed. A nil return sends the batch to the in-process path,
-// which is exactly what startUpstreamFanOut already does for a deployment with no Temporal.
-func (b *fanOutBreaker) guard(resolve func() upstreamFanOutDispatch) upstreamFanOutDispatch {
-	if !b.acquire() {
-		log.Info("upstream trigger: Temporal failed recently, rebuilding in-process without dialling it")
-		return nil
-	}
-	d := resolve()
-	if d == nil {
-		b.releaseProbe()
-		return nil
-	}
-	return func(ctx context.Context, f upstreamFanOut) error {
-		err := d(ctx, f)
-		b.observe(err)
-		return err
-	}
-}
-
 // isFanOutAlreadyStarted reports whether Temporal refused the start because this
 // completion already has a fan-out.
 //
 // Separate and named because it is the difference between "already done" and "did not
-// happen", and those two take opposite actions: the first must not fall back, the second
-// must.
+// happen", and those two take opposite actions: the first is success, the second is
+// retried and then recorded as trigger_lost.
 func isFanOutAlreadyStarted(err error) bool {
 	var already *serviceerror.WorkflowExecutionAlreadyStarted
 	return errors.As(err, &already)
 }
-
-// eventFireSlots bounds how many upstream completions can be rebuilding models at once.
-//
-// The trigger is something upstream finishing, and those finish in bursts — a nightly
-// load of thirty tables lands thirty completions inside a minute. Without a bound, each
-// of those spawns a goroutine holding a database connection and a warehouse session, and
-// the first symptom is the connection pool starving the API that users are looking at.
-// Four is well under any pool size here and still drains a burst quickly, because the
-// work is warehouse-bound rather than local.
-var eventFireSlots = make(chan struct{}, 4)
 
 // downstreamModelLookup builds the query that finds every model waiting on one upstream.
 //
@@ -1941,12 +2146,10 @@ func FireModelsAfterPipeline(ctx context.Context, pipelineID, executionID string
 	})
 }
 
-// fireDownstreamModelsAfterRun continues a rebuild chain past a model that just finished.
-//
-// Called from all three doors a model run can come through — manual, the internal
-// endpoint that Temporal drives, and the in-process fallback below — because a model is
-// an upstream regardless of what caused it to rebuild, and a chain that only continued
-// from some of those would be a rule nobody could hold in their head.
+// fireDownstreamModelsAfterRun continues a rebuild chain past a model that just finished,
+// from the gateway: for Run now, and for an internal run whose caller did not take the
+// hop itself (leavesHopToCaller). A run whose workflow takes the hop continues the chain
+// through ListSavedQueryModelDownstreamInternal instead, by the same rules.
 //
 // Only a succeeded run propagates. A model whose rebuild failed has the data it had
 // before, so firing its consumers would rebuild them on a snapshot that is one refresh
@@ -1971,15 +2174,22 @@ func fireDownstreamModelsAfterRun(res *modelRunResult, modelID, runID, execution
 	if _, err := uuid.Parse(modelID); err != nil {
 		return
 	}
-	// Its own goroutine for the same reason the rebuild path has one: this is reached
-	// from request handlers and from the projector's consume loop.
-	go recordSkippedDownstream(database, modelRefreshSource{
+	// Its own goroutine: this is reached from request handlers, which answer first.
+	root := modelRefreshSource{
 		Kind:        upstreamKindModel,
 		ID:          modelID,
 		RunID:       runID,
 		ExecutionID: executionID,
 		Depth:       depth + 1,
-	}, reason)
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := recordSkippedDownstream(ctx, database, root, reason); err != nil {
+			log.WithError(err).WithField("upstream_id", modelID).
+				Warn("upstream trigger: could not record the models a stopped upstream did not rebuild")
+		}
+	}()
 }
 
 // cascadeSkipReason is what a finished run that did not succeed tells the models below
@@ -1993,6 +2203,8 @@ func cascadeSkipReason(res *modelRunResult) string {
 	switch {
 	case res == nil:
 		return ""
+	case res.Status == "failed" && res.CheckBlocked:
+		return skipUpstreamCheckFailed
 	case res.Status == "failed":
 		return skipUpstreamFailed
 	case res.Status == "skipped" && res.AutoPauseReason != "":
@@ -2010,10 +2222,10 @@ func cascadeSkipReason(res *modelRunResult) string {
 // because a fan-in reachable along two paths is one model that did not rebuild once, not
 // twice. Only active event triggers are reached (downstreamModelLookup), so a paused
 // model below the failure records nothing — its pause is already its explanation.
-func recordSkippedDownstream(database *sql.DB, root modelRefreshSource, reason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
+//
+// A failed lookup is returned: /downstream answers 500 on it so the workflow retries,
+// where an empty answer would read as "nothing below". Rows written before it stay.
+func recordSkippedDownstream(ctx context.Context, database *sql.DB, root modelRefreshSource, reason string) error {
 	type hop struct {
 		src    modelRefreshSource
 		reason string
@@ -2028,9 +2240,7 @@ func recordSkippedDownstream(database *sql.DB, root modelRefreshSource, reason s
 		}
 		targets, err := lookupDownstreamModels(ctx, database, h.src.Kind, h.src.ID)
 		if err != nil {
-			log.WithError(err).WithField("upstream_id", h.src.ID).
-				Warn("upstream trigger: could not record the models a stopped upstream did not rebuild")
-			return
+			return fmt.Errorf("look up the models below %s: %w", h.src.ID, err)
 		}
 		for _, t := range targets {
 			if visited[t.ModelID] {
@@ -2048,25 +2258,23 @@ func recordSkippedDownstream(database *sql.DB, root modelRefreshSource, reason s
 			}, skipUpstreamSkipped})
 		}
 	}
+	return nil
 }
 
 // recordChainDepthSkips records the models a chain stopped short of at its depth bound
 // (G7). The bound used to be a log line only, so the model past it simply never had a
 // row, and its owner had no way to learn the chain was too deep rather than idle.
-func recordChainDepthSkips(database *sql.DB, src modelRefreshSource) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func recordChainDepthSkips(ctx context.Context, database *sql.DB, src modelRefreshSource) error {
 	targets, err := lookupDownstreamModels(ctx, database, src.Kind, src.ID)
 	if err != nil {
-		log.WithError(err).WithField("upstream_id", src.ID).
-			Warn("upstream trigger: could not record the models past the depth bound")
-		return
+		return fmt.Errorf("look up the models below %s: %w", src.ID, err)
 	}
 	msg := fmt.Sprintf("the rebuild chain reached its limit of %d hops", maxTriggerChainDepth)
 	for _, t := range targets {
 		recordModelRunSkip(ctx, database, t.ModelID, t.ScheduleID, t.RunAsUserID,
 			skipChainDepthExceeded, msg, provenanceFor(src, 0))
 	}
+	return nil
 }
 
 // lookupDownstreamModels runs downstreamModelLookup.
@@ -2090,59 +2298,274 @@ func lookupDownstreamModels(ctx context.Context, database *sql.DB, kind, id stri
 // unsatisfiedUpstreams returns the ids of the upstreams a policy='all' fan-in is still waiting on
 // (G4), or returns none when the schedule is 'any' or every upstream is fresh.
 //
-// Fresh means completed since this model's last successful rebuild STARTED — started,
-// not finished, because a sibling that landed while that build was running was not read
-// by it. The upstream that is firing right now is fresh by definition and is excluded by
+// Fresh is measured from this model's last successful rebuild STARTED — started, not
+// finished, because a sibling that landed while that build was running was not read by
+// it. The upstream that is firing right now is fresh by definition and is excluded by
 // id, since its completion may not have reached either table yet (a pipeline completion
 // fires from the projector, and a model's run row is committed by a different request).
 //
-// A model upstream is fresh on a succeeded run; a pipeline upstream on a stored
-// PIPELINE_COMPLETED event, the same event that fires it. With no successful rebuild of
-// this model yet, any upstream that has ever completed counts.
+// The query gathers each upstream's facts and upstreamIsFresh judges them: a model on a
+// succeeded run; a pipeline on a stored PIPELINE_COMPLETED event, the same event that
+// fires it; a CDC pipeline, which never completes, also on its watermark or a drained
+// sink. With no successful rebuild of this model yet, any of them counts.
 //
-// "Ever" is bounded by retention for a pipeline: its events are deleted after
-// PIPELINE_RUN_RETENTION_DAYS (90 by default, retention/pipeline_run_retention.go), so a
-// pipeline upstream whose last completion is older than that reads as never completed and
-// holds an 'all' model until the pipeline runs again. Model upstreams have no such bound.
+// A stale model upstream still does not hold the fan-in when nothing is pending above it
+// (modelAncestry.settled): it will not rebuild again until its own sources move, so
+// waiting for it skipped the fan-in on every fire, forever. Seen on prod: two gold models
+// skipped hourly for a week behind silver models on an idle CDC pipeline. The extra
+// lookup runs only when a model upstream is stale.
+//
+// "Ever" survives retention: the run-history sweep deletes a batch run's events after
+// PIPELINE_RUN_RETENTION_DAYS (90 by default) but keeps the run holding each pipeline's
+// newest PIPELINE_COMPLETED (retention/pipeline_run_retention.go runIsKeptSQL), so a
+// batch upstream idle for longer still reads as completed. The completion lookup keeps
+// the baseline as its lower bound, so a CDC pipeline's many events are scanned no
+// further back than the old NOT EXISTS scanned them.
 func unsatisfiedUpstreams(ctx context.Context, database *sql.DB, scheduleID, firingUpstreamID string) ([]string, error) {
 	rows, err := database.QueryContext(ctx, `
 		WITH me AS (
 			SELECT s.schedule_id,
-			       COALESCE((SELECT MAX(r.started_at) FROM saved_query_runs r
-			                 WHERE r.saved_query_id = s.saved_query_id AND r.status = 'succeeded'),
-			                '-infinity'::timestamptz) AS baseline
+			       (SELECT MAX(r.started_at) FROM saved_query_runs r
+			        WHERE r.saved_query_id = s.saved_query_id AND r.status = 'succeeded') AS baseline
 			FROM saved_query_schedules s
 			WHERE s.schedule_id = $1::uuid AND s.upstream_policy = 'all'
 		)
-		SELECT COALESCE(u.upstream_pipeline_id, u.upstream_saved_query_id)::text
+		SELECT COALESCE(u.upstream_pipeline_id, u.upstream_saved_query_id)::text,
+		       u.upstream_saved_query_id IS NOT NULL,
+		       me.baseline,
+		       (SELECT MAX(ur.finished_at) FROM saved_query_runs ur
+		        WHERE ur.saved_query_id = u.upstream_saved_query_id AND ur.status = 'succeeded'),
+		       (SELECT MAX(e.received_at) FROM pipeline_run_events e
+		        WHERE e.pipeline_id = u.upstream_pipeline_id AND e.event_type = 'PIPELINE_COMPLETED'
+		          AND e.received_at > COALESCE(me.baseline, '-infinity'::timestamptz)),
+		       (p.id IS NOT NULL AND `+pipelineRowIsCDCSQL+`),
+		       (SELECT MAX(w.source_time) FROM cdc_table_watermarks w WHERE w.pipeline_id = u.upstream_pipeline_id),
+		       (SELECT l.measured_at FROM pipeline_sink_lag l
+		        WHERE l.pipeline_id = u.upstream_pipeline_id AND l.total_lag = 0)
 		FROM me
 		JOIN saved_query_schedule_upstreams u ON u.schedule_id = me.schedule_id
+		LEFT JOIN pipelines p ON p.id = u.upstream_pipeline_id
 		WHERE COALESCE(u.upstream_pipeline_id, u.upstream_saved_query_id) IS DISTINCT FROM NULLIF($2, '')::uuid
-		  AND NOT EXISTS (
-			SELECT 1 FROM saved_query_runs ur
-			WHERE ur.saved_query_id = u.upstream_saved_query_id
-			  AND ur.status = 'succeeded' AND ur.finished_at > me.baseline
-		  )
-		  AND NOT EXISTS (
-			SELECT 1 FROM pipeline_run_events e
-			WHERE e.pipeline_id = u.upstream_pipeline_id
-			  AND e.event_type = 'PIPELINE_COMPLETED' AND e.received_at > me.baseline
-		  )
 		ORDER BY 1
 	`, scheduleID, firingUpstreamID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var stale []upstreamFacts
+	var roots []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var f upstreamFacts
+		var baseline sql.NullTime
+		if err := rows.Scan(&f.ID, &f.IsModel, &baseline, &f.ModelSucceededAt, &f.PipelineCompletedAt,
+			&f.IsCDC, &f.WatermarkSourceTime, &f.SinkCaughtUpAt); err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		if upstreamIsFresh(f, baseline) {
+			continue
+		}
+		stale = append(stale, f)
+		if f.IsModel && f.ModelSucceededAt.Valid {
+			roots = append(roots, f.ID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	// A stale model upstream that has nothing pending above it will not rebuild again, so
+	// waiting for it would skip this fan-in on every sibling's fire, forever. Its last
+	// build is the newest its upstreams can give, so it counts as satisfied
+	// (modelAncestry.settled). A model that has never built has nothing to read, and waits.
+	var ancestry modelAncestry
+	if len(roots) > 0 {
+		if ancestry, err = loadModelAncestry(ctx, database, roots); err != nil {
+			return nil, err
+		}
+	}
+	var out []string
+	for _, f := range stale {
+		if f.IsModel && f.ModelSucceededAt.Valid && ancestry.settled(f.ID) {
+			continue
+		}
+		out = append(out, f.ID)
+	}
+	return out, nil
+}
+
+// loadModelAncestry reads every model above roots (themselves included) along
+// after_upstream schedules, with each one's baseline and its upstreams' newest output.
+// A model with no upstreams to wait on (a cron, interval or manual model, or a deleted
+// schedule) comes back with no edges, which settled reads as "unknown, so pending".
+// UNION, not UNION ALL, so a ring ends the walk instead of looping (checkUpstreamCycle
+// refuses one on save; this does not rely on it).
+func loadModelAncestry(ctx context.Context, database *sql.DB, roots []string) (modelAncestry, error) {
+	rows, err := database.QueryContext(ctx, `
+		WITH RECURSIVE closure(model_id) AS (
+			SELECT unnest($1::uuid[])
+			UNION
+			SELECT u.upstream_saved_query_id
+			FROM closure c
+			JOIN saved_query_schedules s ON s.saved_query_id = c.model_id
+			     AND s.status <> 'deleted' AND s.schedule_type = 'after_upstream'
+			JOIN saved_query_schedule_upstreams u ON u.schedule_id = s.schedule_id
+			WHERE u.upstream_saved_query_id IS NOT NULL
+		), node AS (
+			SELECT c.model_id,
+			       (SELECT MAX(r.started_at) FROM saved_query_runs r
+			        WHERE r.saved_query_id = c.model_id AND r.status = 'succeeded') AS baseline
+			FROM closure c
+		)
+		SELECT n.model_id::text,
+		       n.baseline,
+		       COALESCE(u.upstream_pipeline_id, u.upstream_saved_query_id)::text,
+		       u.upstream_saved_query_id IS NOT NULL,
+		       (SELECT MAX(ur.finished_at) FROM saved_query_runs ur
+		        WHERE ur.saved_query_id = u.upstream_saved_query_id AND ur.status = 'succeeded'),
+		       (SELECT MAX(e.received_at) FROM pipeline_run_events e
+		        WHERE e.pipeline_id = u.upstream_pipeline_id AND e.event_type = 'PIPELINE_COMPLETED'
+		          AND e.received_at > COALESCE(n.baseline, '-infinity'::timestamptz)),
+		       (p.id IS NOT NULL AND `+pipelineRowIsCDCSQL+`),
+		       (SELECT MAX(w.landed_at) FROM cdc_table_watermarks w WHERE w.pipeline_id = u.upstream_pipeline_id)
+		FROM node n
+		LEFT JOIN saved_query_schedules s ON s.saved_query_id = n.model_id
+		     AND s.status <> 'deleted' AND s.schedule_type = 'after_upstream'
+		LEFT JOIN saved_query_schedule_upstreams u ON u.schedule_id = s.schedule_id
+		LEFT JOIN pipelines p ON p.id = u.upstream_pipeline_id
+		ORDER BY 1, 3
+	`, pgdriver.StringArray(roots))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := modelAncestry{}
+	for rows.Next() {
+		var id string
+		var n ancestryNode
+		var edgeID sql.NullString
+		var e ancestryEdge
+		if err := rows.Scan(&id, &n.Baseline, &edgeID, &e.IsModel, &e.ModelSucceededAt,
+			&e.PipelineCompletedAt, &e.IsCDC, &e.LandedAt); err != nil {
+			return nil, err
+		}
+		n.Edges = out[id].Edges
+		if edgeID.Valid {
+			e.ID = edgeID.String
+			n.Edges = append(n.Edges, e)
+		}
+		out[id] = n
 	}
 	return out, rows.Err()
+}
+
+// upstreamFacts is what the database knows about one upstream of a policy='all' fan-in:
+// the newest moment of each kind that could make it fresh. unsatisfiedUpstreams reads
+// them and upstreamIsFresh judges them, so the rule is testable without a database.
+type upstreamFacts struct {
+	ID      string
+	IsModel bool
+	// ModelSucceededAt is a model upstream's newest succeeded run, finished_at.
+	ModelSucceededAt sql.NullTime
+	// PipelineCompletedAt is a pipeline upstream's newest stored PIPELINE_COMPLETED.
+	PipelineCompletedAt sql.NullTime
+	// IsCDC: the pipeline streams (pipelineRowIsCDCSQL), so it never completes.
+	IsCDC bool
+	// WatermarkSourceTime is the newest source time the sink has landed across the
+	// pipeline's tables (cdc_table_watermarks, migration 137), on the SOURCE clock.
+	WatermarkSourceTime sql.NullTime
+	// SinkCaughtUpAt is when the sentinel last measured the sink's lag at 0
+	// (pipeline_sink_lag, migration 116), NULL while it is behind.
+	SinkCaughtUpAt sql.NullTime
+}
+
+// upstreamIsFresh says whether an upstream has rebuilt since this model's last
+// successful build started (baseline; NULL when there is none, so anything counts).
+//
+// A CDC pipeline never emits PIPELINE_COMPLETED, so it counts as fresh on either of two
+// stand-ins: its watermark is past the baseline (new source data landed), or its sink
+// was measured fully drained after the baseline (an idle source, whose last change the
+// model can read). Without them an idle CDC source held an 'all' model forever
+// (KI-CDC-UPSTREAM-ALL-NEVER-FRESH).
+//
+// Two limits, both accepted: the watermark is on the source's clock and the baseline on
+// this database's, so skew between them moves the edge by that much; and a lag of 0
+// cannot tell an idle source from a dead Debezium worker, whose topics drain to 0 too
+// (that death raises its own capture_stopped issue, #1251).
+func upstreamIsFresh(f upstreamFacts, baseline sql.NullTime) bool {
+	after := func(t sql.NullTime) bool { return t.Valid && (!baseline.Valid || t.Time.After(baseline.Time)) }
+	if f.IsModel {
+		return after(f.ModelSucceededAt)
+	}
+	if after(f.PipelineCompletedAt) {
+		return true
+	}
+	return f.IsCDC && (after(f.WatermarkSourceTime) || after(f.SinkCaughtUpAt))
+}
+
+// modelAncestry is every model above a fan-in's stale model upstreams, keyed by id, as
+// loadModelAncestry reads it. settled judges it, so the rule is testable without a database.
+type modelAncestry map[string]ancestryNode
+
+// ancestryNode is one model above a fan-in: its own baseline and its upstreams.
+type ancestryNode struct {
+	// Baseline is this model's newest succeeded run, started_at; NULL when it has none.
+	Baseline sql.NullTime
+	Edges    []ancestryEdge
+}
+
+// ancestryEdge is one upstream of an ancestryNode and the newest output it has given.
+type ancestryEdge struct {
+	ID      string
+	IsModel bool
+	// ModelSucceededAt is a model upstream's newest succeeded run, finished_at.
+	ModelSucceededAt sql.NullTime
+	// PipelineCompletedAt is a pipeline upstream's newest PIPELINE_COMPLETED after the
+	// node's baseline.
+	PipelineCompletedAt sql.NullTime
+	IsCDC               bool
+	// LandedAt is a CDC pipeline's newest landing across its tables, on this database's
+	// clock (cdc_table_watermarks.landed_at): the signal the trailing edge rebuilds on.
+	LandedAt sql.NullTime
+}
+
+// settled says whether nothing is pending anywhere above model id: none of its upstreams
+// has given output since its last build started, and the same holds for each model
+// upstream, all the way up. Such a model will not rebuild until a new event arrives, and
+// its last build is already the newest its sources can give.
+//
+// A CDC pipeline is pending on a landing after the baseline, not on a drained sink: an
+// idle source's sink stays drained, and that would read as pending forever. A lagging
+// sink is not pending either, or one wedged sink would hold the fan-in. A model with no
+// upstreams to watch, one missing from the ancestry, and a ring are all unknown, so not
+// settled: that keeps the old rule, which waited.
+func (a modelAncestry) settled(id string) bool {
+	memo := map[string]bool{}
+	var walk func(id string) bool
+	walk = func(id string) bool {
+		if v, seen := memo[id]; seen {
+			return v
+		}
+		memo[id] = false // in progress, so a ring reads as not settled
+		n, ok := a[id]
+		if !ok || len(n.Edges) == 0 {
+			return false
+		}
+		after := func(t sql.NullTime) bool { return t.Valid && (!n.Baseline.Valid || t.Time.After(n.Baseline.Time)) }
+		for _, e := range n.Edges {
+			if e.IsModel && after(e.ModelSucceededAt) ||
+				!e.IsModel && (after(e.PipelineCompletedAt) || e.IsCDC && after(e.LandedAt)) {
+				return false
+			}
+		}
+		for _, e := range n.Edges {
+			if e.IsModel && !walk(e.ID) {
+				return false
+			}
+		}
+		memo[id] = true
+		return true
+	}
+	return walk(id)
 }
 
 // waitingOnMessage says how many upstreams a fan-in is still waiting for, and not which.
@@ -2175,19 +2598,17 @@ func nextChainSource(res *modelRunResult, modelID, runID, executionID string, de
 	}
 }
 
-// fireDownstreamModels rebuilds every model waiting on whatever just finished.
+// fireDownstreamModels hands every model waiting on whatever just finished to Temporal.
 //
-// Returns immediately. The rebuild happens on its own goroutine, and that is not an
+// Returns immediately. The start happens on its own goroutine, and that is not an
 // optimization — the pipeline door reaches this from the projector's consume loop,
-// before committing the Kafka offset. A model rebuild is a warehouse DDL that can run
-// for minutes; blocking there stops the projector fetching, and a consumer that stops
-// fetching past the session timeout is evicted from the group, which stalls telemetry
-// for every pipeline in the deployment and then redelivers the batch to whoever takes
-// the partition.
+// before committing the Kafka offset, and a start retries for up to fanOutRetryBudget.
+// Blocking there stops the projector fetching, and a consumer that stops fetching past
+// the session timeout is evicted from the group, which stalls telemetry for every
+// pipeline in the deployment and then redelivers the batch to whoever takes the partition.
 //
 // The passed context belongs to the caller and is cancelled at shutdown, so it is used
-// for the lookup only. The runs themselves get their own budget: a rebuild that has
-// already started is better finished than abandoned halfway through a DROP/CREATE.
+// for the lookup only.
 func fireDownstreamModels(ctx context.Context, src modelRefreshSource) {
 	database := db.GetDB()
 	if database == nil {
@@ -2210,7 +2631,14 @@ func fireDownstreamModels(ctx context.Context, src modelRefreshSource) {
 			"upstream_id":   src.ID,
 			"depth":         src.Depth,
 		}).Warn("upstream trigger: rebuild chain hit its depth bound, stopping here")
-		go recordChainDepthSkips(database, src)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := recordChainDepthSkips(ctx, database, src); err != nil {
+				log.WithError(err).WithField("upstream_id", src.ID).
+					Warn("upstream trigger: could not record the models past the depth bound")
+			}
+		}()
 		return
 	}
 
@@ -2230,246 +2658,15 @@ func fireDownstreamModels(ctx context.Context, src modelRefreshSource) {
 		"execution_id":  src.ExecutionID,
 		"depth":         src.Depth,
 		"models":        len(toFire),
-	}).Info("⚡ upstream completed: rebuilding downstream models")
+	}).Info("⚡ upstream completed: waking downstream models")
 
-	go func() {
-		// Resolved here rather than in the caller because getTemporalClient may dial, and
-		// not blocking the projector's consume loop is this function's whole contract.
-		// Behind the breaker: once a dispatch has failed, the next hops go straight to the
-		// in-process path for a while instead of each spending the full dial deadline on a
-		// Temporal that just proved unreachable.
-		dispatch := fanOutTemporalBreaker.guard(newUpstreamFanOutDispatch)
-
-		// Its own budget: starting the fan-out is one RPC, and a Temporal that has gone
-		// away should reach the fallback in seconds rather than at the rebuild timeout.
-		sigCtx, cancelSig := context.WithTimeout(context.Background(), 30*time.Second)
-		local := startUpstreamFanOut(sigCtx, dispatch, upstreamFanOut{
-			Occurrence: fanOutOccurrence(src),
-			Source:     src,
-			Targets:    toFire,
-		})
-		cancelSig()
-		if len(local) == 0 {
-			return
-		}
-
-		// Taken inside the goroutine, which is what keeps a chain from deadlocking against
-		// its own bound: a model rebuilt here fires its own consumers, and that nested
-		// goroutine blocks on this same channel while this one still holds a token. It
-		// blocks rather than deadlocks because nothing here waits on the child — this
-		// loop finishes, releases, and the child proceeds.
-		eventFireSlots <- struct{}{}
-		defer func() { <-eventFireSlots }()
-
-		// Sequential within one completion. Models downstream of the same producer
-		// frequently read the same tables, and running them one at a time keeps a
-		// thirty-table nightly load from opening thirty warehouse sessions at once.
-		for _, f := range local {
-			if waitingOnUpstreamPolicyFn(database, f, src, 1) {
-				continue
-			}
-			rebuildLocally(database, f, src)
-		}
-	}()
-}
-
-// localRebuilds is the in-process half of what the per-model Temporal workflow does:
-// a completion that arrives while this process is already rebuilding the model is
-// handed to that run instead of racing it for the advisory lock.
-//
-// Without it, the fallback dropped rebuilds (found live, B10b). A fan-in model under
-// 'any' is woken twice in quick succession — once by the root, once by its sibling
-// upstream one hop later — and those arrive on different goroutines. The second lost
-// acquireModelRunLock, recorded "already in progress", and was gone: if the surviving
-// build had read the sibling's table before the sibling finished writing it, the model
-// kept serving that stale snapshot until the next completion. The G11 breaker made
-// this likelier, because it removed the ten-second dial that used to keep hops apart.
-//
-// Coalescing, not queueing, for the reason model_refresh_workflow.go gives: a rebuild
-// replaces the target from the current upstream state, so one more rebuild after the
-// burst produces what running every absorbed completion would have.
-//
-// In-process only. A run held by another replica, or by the Temporal path, still
-// refuses through the lock as before — that holder finishes and wakes the same
-// consumers itself.
-var localRebuilds = struct {
-	sync.Mutex
-	m map[string]*localRebuild
-}{m: map[string]*localRebuild{}}
-
-type localRebuild struct {
-	pending  *modelRefreshSource // latest completion absorbed while the run was in flight
-	absorbed int                 // completions absorbed since the last rebuild started
-}
-
-// claimLocalRebuild reports whether the caller should run the model now. False means a
-// rebuild of it is already in flight in this process and has taken src over.
-func claimLocalRebuild(modelID string, src modelRefreshSource) bool {
-	localRebuilds.Lock()
-	defer localRebuilds.Unlock()
-	if r, ok := localRebuilds.m[modelID]; ok {
-		// Latest wins: its provenance names the completion whose data the rebuild reads.
-		r.pending = &src
-		r.absorbed++
-		return false
-	}
-	localRebuilds.m[modelID] = &localRebuild{}
-	return true
-}
-
-// nextLocalRebuild hands over what arrived during the run that just finished, or
-// releases the claim when nothing did. Both happen under one lock, so a completion can
-// never land between "nothing pending" and the release and be lost.
-func nextLocalRebuild(modelID string) (modelRefreshSource, int, bool) {
-	localRebuilds.Lock()
-	defer localRebuilds.Unlock()
-	r, ok := localRebuilds.m[modelID]
-	if !ok || r.pending == nil {
-		delete(localRebuilds.m, modelID)
-		return modelRefreshSource{}, 0, false
-	}
-	src, n := *r.pending, r.absorbed
-	r.pending, r.absorbed = nil, 0
-	return src, n, true
-}
-
-// releaseLocalRebuild drops a claim whose run never reached nextLocalRebuild (a recovered
-// panic), or one being handed on past maxLocalRebuildRuns.
-// Without it one crashed rebuild would silently absorb every later completion of that
-// model for the life of the process.
-func releaseLocalRebuild(modelID string) {
-	localRebuilds.Lock()
-	delete(localRebuilds.m, modelID)
-	localRebuilds.Unlock()
-}
-
-// maxLocalRebuildRuns bounds how many rebuilds one rebuildLocally call runs back to back.
-//
-// The caller holds an eventFireSlots token for the whole call, and an upstream that keeps
-// completing faster than the model rebuilds would otherwise keep that token forever and
-// starve every other model's fallback rebuild. Past the bound the pending completion is
-// handed to a fresh goroutine that queues for a token like any other, so nothing is dropped.
-const maxLocalRebuildRuns = 5
-
-// rebuildLocally runs one fallback rebuild of f, then one more for as long as
-// completions kept arriving while it ran.
-func rebuildLocally(database *sql.DB, f modelRefreshTarget, src modelRefreshSource) {
-	rebuildLocallyAbsorbing(database, f, src, 1)
-}
-
-func rebuildLocallyAbsorbing(database *sql.DB, f modelRefreshTarget, src modelRefreshSource, coalesced int) {
-	if !claimLocalRebuild(f.ModelID, src) {
-		log.WithFields(log.Fields{"model_id": f.ModelID, "upstream_id": src.ID}).
-			Info("upstream trigger: rebuild already running here, it will rebuild again after")
-		return
-	}
-	done := false
-	defer func() {
-		// This runs on a background goroutine, where an unrecovered panic ends the whole
-		// gateway before any deferred cleanup matters. Recovered here, one bad rebuild
-		// costs that rebuild (and whatever it had absorbed) and nothing else.
-		if p := recover(); p != nil {
-			log.WithField("model_id", f.ModelID).
-				Errorf("upstream trigger: model rebuild panicked: %v\n%s", p, debug.Stack())
-		}
-		if !done {
-			releaseLocalRebuild(f.ModelID)
-		}
-	}()
-	cur := src
-	for run := 1; ; run++ {
-		// A rerun is a new trigger and meets the policy again: under 'all', the build that
-		// just finished moved the baseline, so siblings that were fresh before it may not be.
-		if run == 1 || !waitingOnUpstreamPolicyFn(database, f, cur, coalesced) {
-			runLocalRebuildFn(database, f, cur, coalesced)
-		}
-		next, n, more := nextLocalRebuild(f.ModelID)
-		if !more {
-			done = true
-			return
-		}
-		if run >= maxLocalRebuildRuns {
-			releaseLocalRebuild(f.ModelID)
-			done = true
-			log.WithFields(log.Fields{"model_id": f.ModelID, "runs": run}).
-				Warn("upstream trigger: completions keep arriving, requeueing the next rebuild")
-			go func() {
-				eventFireSlots <- struct{}{}
-				defer func() { <-eventFireSlots }()
-				rebuildLocallyAbsorbing(database, f, next, n)
-			}()
-			return
-		}
-		cur, coalesced = next, n
-	}
-}
-
-// waitingOnUpstreamPolicyFn reports whether f must not rebuild for src yet because its
-// policy is 'all' and a sibling upstream is stale, recording the skip when so. A seam for
-// the coalescing tests, which run with no database.
-var waitingOnUpstreamPolicyFn = waitingOnUpstreamPolicy
-
-func waitingOnUpstreamPolicy(database *sql.DB, f modelRefreshTarget, src modelRefreshSource, coalesced int) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	waiting, err := unsatisfiedUpstreams(ctx, database, f.ScheduleID, src.ID)
-	if err != nil {
-		// Rebuild anyway. This path has no retry, so refusing here would drop the
-		// rebuild outright; 'any' is the behaviour every trigger had before the
-		// policy existed, and the next completion re-checks.
-		log.WithError(err).WithField("model_id", f.ModelID).
-			Warn("upstream trigger: could not check the fan-in policy, rebuilding")
-		return false
-	}
-	if len(waiting) == 0 {
-		return false
-	}
-	recordModelRunSkip(ctx, database, f.ModelID, f.ScheduleID, f.RunAsUserID,
-		skipWaitingOnUpstreams, waitingOnMessage(waiting), provenanceFor(src, coalesced))
-	return true
-}
-
-// runLocalRebuildFn is a seam so the coalescing can be tested without a warehouse. Set
-// in init because runLocalRebuild reaches rebuildLocally again down the chain, which a
-// package-level initializer would reject as a cycle.
-var runLocalRebuildFn func(*sql.DB, modelRefreshTarget, modelRefreshSource, int)
-
-func init() { runLocalRebuildFn = runLocalRebuild }
-
-// runLocalRebuild is one in-process rebuild of f woken by src, recorded with its
-// provenance, continuing the chain below it when it succeeds.
-func runLocalRebuild(database *sql.DB, f modelRefreshTarget, src modelRefreshSource, coalesced int) {
-	// Per run, not per batch: one model that runs to the full timeout must not eat the
-	// budget of the models queued behind it.
-	runCtx, cancel := context.WithTimeout(context.Background(), modelRunTimeout+time.Minute)
-	defer cancel()
-	startedAt := time.Now()
-	res, err := runSavedQueryModel(runCtx, database, f.ModelID, f.RunAsUserID)
-	if err != nil {
-		// Transient by construction (runSavedQueryModel returns errors only for conditions
-		// that recover on their own). No retry: the next completion of the upstream is the
-		// retry, and it carries fresher data than a replay of this one would.
-		log.WithError(err).WithFields(log.Fields{"model_id": f.ModelID, "upstream_id": src.ID}).
-			Error("upstream trigger: model rebuild could not be attempted")
-		return
-	}
-	// Coalesced is 1 for a rebuild of one completion, and the number absorbed for a
-	// rebuild that ran because completions landed while an earlier one was in flight.
-	runID := recordModelRunOutcome(runCtx, database, f.ModelID, res, modelRunAudit{
-		Trigger:    triggerTriggered,
-		ScheduleID: f.ScheduleID,
-		ActorID:    f.RunAsUserID,
-		StartedAt:  startedAt,
-		Provenance: provenanceFor(src, coalesced),
+	// getTemporalClient may dial, and not blocking the projector's consume loop is this
+	// function's whole contract, so the client is resolved on the goroutine too.
+	go deliverFanOut(database, fanOutTemporalBreaker, newUpstreamFanOutDispatch, upstreamFanOut{
+		Occurrence: fanOutOccurrence(src),
+		Source:     src,
+		Targets:    toFire,
 	})
-	if res.AutoPauseReason != "" {
-		// Empty temporalID: an event trigger has nothing registered to pause, so the status
-		// write is the whole pause. The lookup re-reads status on every completion, which is
-		// what makes that sufficient.
-		autoPauseModelSchedule(runCtx, database, f.ScheduleID, "", res.AutoPauseReason)
-	}
-	// This model is now itself an upstream. The chain gets its own context, not runCtx.
-	fireDownstreamModelsAfterRun(res, f.ModelID, runID, src.ExecutionID, src.Depth)
 }
 
 // autoPauseModelSchedule records a machine pause. It writes auto_paused_* rather than
@@ -2480,13 +2677,19 @@ func runLocalRebuild(database *sql.DB, f modelRefreshTarget, src modelRefreshSou
 // reaches it from a projector callback that has no request behind it. An empty
 // temporalID means an event trigger, which has nothing registered to pause: the row
 // written here IS the pause, and FireModelsAfterPipeline re-reads status per event.
-func autoPauseModelSchedule(ctx context.Context, database *sql.DB, scheduleID, temporalID, reason string) {
-	if _, err := database.ExecContext(ctx, `
+//
+// The owner is told (notifyModelSchedulePaused) once the row says paused: nothing else
+// would bring them back to a schedule that has stopped running.
+func autoPauseModelSchedule(ctx context.Context, database *sql.DB, modelID, scheduleID, temporalID, reason string) {
+	res, err := database.ExecContext(ctx, `
 		UPDATE saved_query_schedules
 		SET status = 'paused', auto_paused_at = NOW(), auto_paused_reason = $2
 		WHERE schedule_id = $1
-	`, scheduleID, reason); err != nil {
+	`, scheduleID, reason)
+	if err != nil {
 		log.WithError(err).WithField("schedule_id", scheduleID).Error("failed to record model schedule auto-pause")
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		notifyModelSchedulePaused(modelID, scheduleID)
 	}
 	if temporalClient == nil || temporalID == "" {
 		return
@@ -3067,7 +3270,8 @@ func loadSavedQuerySchedule(c *gin.Context, database *sql.DB, savedQueryID strin
 
 // createTemporalModelSchedule registers the schedule with Temporal. Same policies as
 // the pipeline version: SKIP overlap so a slow rebuild is never stacked on itself, and
-// a 1-minute catchup window so a brief worker outage does not replay a backlog.
+// scheduleCatchupWindow, so a fire missed while the host slept or Temporal was down
+// still runs once when it is back (SKIP drops the rest of the backlog).
 func createTemporalModelSchedule(ctx context.Context, scheduleID, savedQueryID, scheduleType string, spec ScheduleSpec) error {
 	scheduleSpec := client.ScheduleSpec{}
 	switch scheduleType {
@@ -3113,7 +3317,7 @@ func createTemporalModelSchedule(ctx context.Context, scheduleID, savedQueryID, 
 			WorkflowRunTimeout: modelRunTimeout + 15*time.Minute,
 		},
 		Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
-		CatchupWindow: 1 * time.Minute,
+		CatchupWindow: scheduleCatchupWindow,
 		Paused:        false,
 	})
 	return err

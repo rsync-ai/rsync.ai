@@ -25,6 +25,10 @@ vi.mock("next/navigation", () => ({
 vi.mock("next-themes", () => ({
   useTheme: () => ({ resolvedTheme: "light", setTheme: vi.fn() }),
 }))
+// The layer list is its own request (useWorkspaceLayers); these tests are not about layers.
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: null, canManage: false, error: null, reload: async () => {} }),
+}))
 vi.mock("@/contexts/WorkspaceContext", () => ({
   useWorkspaceRole: () => ({
     role: "admin",
@@ -293,6 +297,21 @@ describe("Explorer header for a document connection", () => {
     expect(alert).toHaveTextContent("smallmart.example.net")
     expect(alert).toHaveTextContent("The database did not answer")
     expect(document.body.textContent).not.toMatch(/LLM service|AI service/)
+  })
+
+  // Most readers are on rsync.ai Cloud, where no one runs Docker: the host saved on
+  // the connection comes first, and the server step is for whoever hosts rsync.ai.
+  it("points at the saved host, not Docker, when the host name does not resolve", async () => {
+    serve(() =>
+      res(500, { error: "Failed to build schema index: could not list collections: lookup cluster0.example.net on 127.0.0.53:53: no such host" }),
+    )
+    render(<ExplorerPage />)
+
+    const alert = await screen.findByTestId("doc-collections-error")
+    expect(alert).toHaveTextContent("The database hostname could not be resolved")
+    expect(alert).toHaveTextContent("Check the host saved on this connection")
+    expect(alert).toHaveTextContent("If you host rsync.ai yourself")
+    expect(alert).not.toHaveTextContent(/docker|compose/i)
   })
 })
 

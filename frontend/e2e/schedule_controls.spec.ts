@@ -3,21 +3,21 @@
  * Covers: create schedule in UI, verify it appears, trigger now, verify scheduled execution exists, delete schedule.
  */
 
-import { test, expect, type Dialog, type Page, type Response } from '@playwright/test'
+import { test, expect, type Dialog, type Page } from '@playwright/test'
 
 const API_URL = process.env.API_URL || 'http://localhost:5001'
 const DEV_USER_ID = process.env.E2E_USER_ID || '00000000-0000-0000-0000-000000000000'
 const API_HEADERS = { 'X-User-ID': DEV_USER_ID }
 
 async function ensureLoggedIn(page: Page) {
-  await page.goto('/dashboard')
+  await page.goto('/')
   const onLogin = await page.locator('text=Welcome to rsync.ai').isVisible().catch(() => false)
   if (onLogin) {
     const useBtn = page.locator('button:has-text("Use")')
     if (await useBtn.isVisible().catch(() => false)) await useBtn.click()
     await page.locator('button:has-text("Sign in")').click()
   }
-  await expect(page.locator('a:has-text("Agentic Data Pipeline")')).toBeVisible({ timeout: 30000 })
+  await expect(page.getByRole('navigation').getByRole('link', { name: 'Pipelines', exact: true })).toBeVisible({ timeout: 30000 })
 }
 
 type Execution = { id?: string; trigger_source?: string; schedule_id?: string } & Record<string, unknown>
@@ -90,7 +90,7 @@ test.describe('rsync.ai - Scheduler UI', () => {
     await page.goto(`/pipelines/${pipelineId}`)
 
     // CDC pipelines should not render the schedules panel at all.
-    await expect(page.locator('text=Pipeline Schedules')).toHaveCount(0)
+    await expect(page.locator('#schedules')).toHaveCount(0)
     await expect(page.locator('button:has-text("Create Schedule")')).toHaveCount(0)
 
     // API must also reject schedules for CDC pipelines (server-side enforcement).
@@ -185,11 +185,10 @@ test.describe('rsync.ai - Scheduler UI', () => {
     // Verify schedule created via API (authoritative), then assert matching schedule card renders in UI.
     const createdSchedule = await waitForSchedule(page, pipelineId, 30000)
     expect(createdSchedule?.schedule_id).toBeTruthy()
-    const createdTimezone = createdSchedule?.schedule_spec?.timezone || 'UTC'
     const createdScheduleId = createdSchedule?.schedule_id
     if (!createdScheduleId) throw new Error('Expected created schedule to have a schedule_id')
 
-    await expect(page.locator('text=Pipeline Schedules')).toBeVisible()
+    await expect(page.locator('#schedules')).toBeVisible()
     await expect(page.locator(`[data-schedule-id="${createdScheduleId}"]`)).toBeVisible({ timeout: 30000 })
     await expect(page.locator(`[data-schedule-id="${createdScheduleId}"]`)).toContainText('Timezone:', { timeout: 30000 })
 
@@ -201,50 +200,31 @@ test.describe('rsync.ai - Scheduler UI', () => {
     const scheduledExecId = await waitForScheduledExecution(page, pipelineId, createdScheduleId, 120000)
     expect(scheduledExecId).toBeTruthy()
 
-    // Go to Executions page; verify Scheduled badge title contains timezone, then click to deep-link back to schedule
-    await page.goto('/executions')
-    const shortId = (scheduledExecId as string).slice(0, 8)
-    const search = page.locator('input[placeholder*="Search by pipeline name or execution ID"]')
-    await expect(search).toBeVisible({ timeout: 30000 })
-    await search.fill(shortId)
-    await expect(page.locator(`text=#${shortId}`).first()).toBeVisible({ timeout: 30000 })
-
-    const scheduledBadgeLink = page.locator('a:has-text("Scheduled")').first()
+    // On Runs, the scheduled run's trigger links back to the schedule that started it.
+    await page.goto('/runs?kind=pipeline')
+    const runRow = page.locator('tr', { has: page.locator(`a[href="/executions/${scheduledExecId}"]`) })
+    await expect(runRow).toBeVisible({ timeout: 30000 })
+    const scheduledBadgeLink = runRow.getByRole('link', { name: 'Schedule' })
     await expect(scheduledBadgeLink).toBeVisible({ timeout: 30000 })
 
-    // Sanity: the scheduled badge deep-link should point at the created schedule id
+    // Sanity: the trigger link should point at the created schedule id
     const href = await scheduledBadgeLink.getAttribute('href')
     expect(href).toContain(`scheduleId=${createdScheduleId}`)
 
-    // Hover to trigger lazy schedule fetch; assert the network call succeeds and then title includes timezone.
-    const schedulesPath = `/api/v1/pipelines/${pipelineId}/schedules`
-    const respPromise = page.waitForResponse(
-      (r: Response) => r.request().method() === 'GET' && r.url().includes(schedulesPath),
-      { timeout: 30000 }
-    )
-    await scheduledBadgeLink.hover()
-    const resp = await respPromise
-    expect(resp.status()).toBe(200)
-
-    // Wait for title to eventually include timezone (async state update)
-    await expect.poll(async () => (await scheduledBadgeLink.getAttribute('title')) || '', {
-      timeout: 30000,
-    }).toContain(`Timezone: ${createdTimezone}`)
-
-    // Click the Scheduled badge (it should deep-link)
+    // Click the trigger link (it should deep-link)
     await scheduledBadgeLink.click()
 
     // Assert we landed on pipeline page schedules section
     await expect(page).toHaveURL(/\/pipelines\//)
     await expect(page).toHaveURL(/scheduleId=/)
-    await expect(page.locator('text=Pipeline Schedules')).toBeVisible({ timeout: 30000 })
+    await expect(page.locator('#schedules')).toBeVisible({ timeout: 30000 })
 
     // Delete schedule from UI (trash icon button)
     page.once('dialog', (d: Dialog) => d.accept())
     await page.locator('button[title="Delete"]').first().click()
 
     // Verify schedule removed
-    await expect(page.locator('text=No schedules configured')).toBeVisible({ timeout: 30000 })
+    await expect(page.locator('text=Runs only when started')).toBeVisible({ timeout: 30000 })
   })
 })
 

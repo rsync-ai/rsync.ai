@@ -103,7 +103,7 @@ func TestIssueDerivedDiagnosisNeverReachesTheAutoBand(t *testing.T) {
 // shipped green in #723.
 //
 // component_id is VARCHAR(255), and filtering on component_type does NOT
-// guarantee it holds a UUID: cdc_wal_watchdog.go:305-307 writes
+// guarantee it holds a UUID: cdc_wal_watchdog.go:572-576 writes
 // component_type='cdc_pipeline' with the replication SLOT NAME as the
 // component_id when the slot has no pipeline attached. A join written
 // `p.id = c.component_id::uuid` therefore raises `invalid input syntax for type

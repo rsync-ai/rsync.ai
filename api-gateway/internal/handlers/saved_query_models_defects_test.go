@@ -145,11 +145,13 @@ func TestModelSQLGate_AcceptsLegitimateReads(t *testing.T) {
 	}
 }
 
-// modelDialects is every value modelDialect can return for a supported engine.
+// modelDriverDialects is every value modelDialect can return for an engine the gateway
+// holds a database/sql driver for — the ones executeModelPlan runs. The warehouses run
+// through runEngineModel instead (modelEngineDialects, saved_query_models_engines_test.go).
 // Redshift is absent on purpose: it arrives as "postgres" (see TestModelDialect), so a
 // table driven by literal "redshift" would be exercising a string that never reaches
 // these functions.
-var modelDialects = []string{"postgres", "mysql", "sqlserver"}
+var modelDriverDialects = []string{"postgres", "mysql", "sqlserver"}
 
 // ---------------------------------------------------------------------------
 // The swap: an interrupted rebuild must never leave the target missing
@@ -163,7 +165,7 @@ var modelDialects = []string{"postgres", "mysql", "sqlserver"}
 func TestModelSwap_IsAtomicOnEveryDialect(t *testing.T) {
 	// Every value modelDialect can return. Redshift is absent because it arrives here
 	// as "postgres" — see TestModelDialect.
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		swap := modelSwapSQL(dialect, "analytics", "orders", true)
 
 		if dialect == "mysql" {
@@ -191,7 +193,7 @@ func TestModelSwap_IsAtomicOnEveryDialect(t *testing.T) {
 // A first run has not proven ownership, so it must not retire anything — the rename
 // onto an occupied name is what refuses to take over somebody else's table.
 func TestModelSwap_UnownedNeverRetires(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		for _, stmt := range modelSwapSQL(dialect, "", "orders", false) {
 			if strings.Contains(stmt, modelRetiredSuffix) {
 				t.Fatalf("[%s] an unowned swap must not name the retired table: %q", dialect, stmt)
@@ -204,7 +206,7 @@ func TestModelSwap_UnownedNeverRetires(t *testing.T) {
 // the plan must not clear the retired name until the replacement has been built.
 // Ordering the DROP before the CREATE is what made a crashed run unrecoverable.
 func TestBuildMaterializationPlan_DropsRetiredOnlyAfterTheBuild(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		plan := buildMaterializationPlan(dialect, "", "orders", "SELECT 1", true)
 
 		buildIdx, firstRetiredDrop := -1, -1
@@ -483,7 +485,7 @@ func planRetires(plan []string) bool {
 // helped, because nothing about the run changed the state it was tripping over. The
 // only exit was a hand-written UPDATE to a column no operator knows exists.
 func TestModelPlan_DoesNotRetireATargetThatIsNoLongerThere(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		plan := planFor(t, dialect, true, 0)
 
 		if planRetires(plan) {
@@ -500,7 +502,7 @@ func TestModelPlan_DoesNotRetireATargetThatIsNoLongerThere(t *testing.T) {
 // The other half of the same decision: when the table IS there, it still has to be
 // moved aside rather than dropped, or the swap loses its only backup.
 func TestModelPlan_RetiresTheLiveTableWhenItIsStillThere(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		if plan := planFor(t, dialect, true, 1); !planRetires(plan) {
 			t.Fatalf("[%s] an owned run over a live table must retire it, not overwrite it: %v", dialect, plan)
 		}
@@ -510,7 +512,7 @@ func TestModelPlan_RetiresTheLiveTableWhenItIsStillThere(t *testing.T) {
 // An unowned run has nothing to retire by definition, and must not spend a round trip
 // asking. sqlmock fails the test if the builder queries at all.
 func TestModelPlan_UnownedNeverAsksTheCatalog(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		if plan := planFor(t, dialect, false, 0); planRetires(plan) {
 			t.Fatalf("[%s] an unowned run must not name the retired table: %v", dialect, plan)
 		}
@@ -545,7 +547,7 @@ func TestModelPlan_ACatalogFailureIsNotAnAbsentTable(t *testing.T) {
 // only base tables. A view standing at the target name is not something rsync.ai left
 // behind, and ALTER TABLE … RENAME would happily move a user's view aside.
 func TestModelTargetExists_IsSchemaAwareAndTableOnly(t *testing.T) {
-	for _, dialect := range modelDialects {
+	for _, dialect := range modelDriverDialects {
 		database, mock, err := sqlmock.New()
 		if err != nil {
 			t.Fatalf("sqlmock: %v", err)

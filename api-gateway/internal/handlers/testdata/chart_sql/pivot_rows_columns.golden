@@ -1,0 +1,119 @@
+# settings: {"version":2,"type":"pivot","roles":{"rows":[{"column":"region"},{"column":"day","grain":"month"}],"columns":[{"column":"channel"}],"measure":[{"aggregate":"sum","column":"amount"},{"aggregate":"avg","column":"amount"},{"aggregate":"count"}]}}
+
+-- postgres
+SELECT p."region", p."day", p."channel", p."amount", p."amount_2", p."count", p."rsync_total_r1", p."rsync_total_r2", p."rsync_total_c1"
+FROM (
+SELECT src."region" AS "region", DATE_TRUNC('month', src."day") AS "day", src."channel" AS "channel", SUM(src."amount") AS "amount", AVG(src."amount") AS "amount_2", COUNT(*) AS "count", GROUPING(src."region") AS "rsync_total_r1", GROUPING(DATE_TRUNC('month', src."day")) AS "rsync_total_r2", GROUPING(src."channel") AS "rsync_total_c1"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY GROUPING SETS ((src."region", DATE_TRUNC('month', src."day"), src."channel"), (src."region", DATE_TRUNC('month', src."day")), (src."region", src."channel"), (src."region"), (src."channel"), ())
+) p
+ORDER BY p."rsync_total_r1" + p."rsync_total_r2" + p."rsync_total_c1" DESC, p."rsync_total_r1" DESC, p."rsync_total_r2" DESC, p."rsync_total_c1" DESC, p."region" ASC, p."day" ASC, p."channel" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT p.`region`, p.`day`, p.`channel`, p.`amount`, p.`amount_2`, p.`count`, p.`rsync_total_r1`, p.`rsync_total_r2`, p.`rsync_total_c1`
+FROM (
+SELECT src.`region` AS `region`, MAKEDATE(YEAR(src.`day`), 1) + INTERVAL (MONTH(src.`day`) - 1) MONTH AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 0 AS `rsync_total_r1`, 0 AS `rsync_total_r2`, 0 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`, MAKEDATE(YEAR(src.`day`), 1) + INTERVAL (MONTH(src.`day`) - 1) MONTH, src.`channel`
+UNION ALL
+SELECT src.`region` AS `region`, MAKEDATE(YEAR(src.`day`), 1) + INTERVAL (MONTH(src.`day`) - 1) MONTH AS `day`, NULL AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 0 AS `rsync_total_r1`, 0 AS `rsync_total_r2`, 1 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`, MAKEDATE(YEAR(src.`day`), 1) + INTERVAL (MONTH(src.`day`) - 1) MONTH
+UNION ALL
+SELECT src.`region` AS `region`, NULL AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 0 AS `rsync_total_r1`, 1 AS `rsync_total_r2`, 0 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`, src.`channel`
+UNION ALL
+SELECT src.`region` AS `region`, NULL AS `day`, NULL AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 0 AS `rsync_total_r1`, 1 AS `rsync_total_r2`, 1 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`region`
+UNION ALL
+SELECT NULL AS `region`, NULL AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 1 AS `rsync_total_r1`, 1 AS `rsync_total_r2`, 0 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY src.`channel`
+UNION ALL
+SELECT NULL AS `region`, NULL AS `day`, NULL AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, 1 AS `rsync_total_r1`, 1 AS `rsync_total_r2`, 1 AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+) p
+ORDER BY p.`rsync_total_r1` + p.`rsync_total_r2` + p.`rsync_total_c1` DESC, p.`rsync_total_r1` DESC, p.`rsync_total_r2` DESC, p.`rsync_total_c1` DESC, p.`region` ASC, p.`day` ASC, p.`channel` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --" "2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) p.[region], p.[day], p.[channel], p.[amount], p.[amount_2], p.[count], p.[rsync_total_r1], p.[rsync_total_r2], p.[rsync_total_c1]
+FROM (
+SELECT src.[region] AS [region], DATEFROMPARTS(YEAR(src.[day]), MONTH(src.[day]), 1) AS [day], src.[channel] AS [channel], SUM(src.[amount]) AS [amount], AVG(src.[amount]) AS [amount_2], COUNT_BIG(*) AS [count], GROUPING(src.[region]) AS [rsync_total_r1], GROUPING(DATEFROMPARTS(YEAR(src.[day]), MONTH(src.[day]), 1)) AS [rsync_total_r2], GROUPING(src.[channel]) AS [rsync_total_c1]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY GROUPING SETS ((src.[region], DATEFROMPARTS(YEAR(src.[day]), MONTH(src.[day]), 1), src.[channel]), (src.[region], DATEFROMPARTS(YEAR(src.[day]), MONTH(src.[day]), 1)), (src.[region], src.[channel]), (src.[region]), (src.[channel]), ())
+) p
+ORDER BY p.[rsync_total_r1] + p.[rsync_total_r2] + p.[rsync_total_c1] DESC, p.[rsync_total_r1] DESC, p.[rsync_total_r2] DESC, p.[rsync_total_c1] DESC, p.[region] ASC, p.[day] ASC, p.[channel] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT p.`region`, p.`day`, p.`channel`, p.`amount`, p.`amount_2`, p.`count`, p.`rsync_total_r1`, p.`rsync_total_r2`, p.`rsync_total_c1`
+FROM (
+SELECT src.`region` AS `region`, DATE_TRUNC(DATE(src.`day`), MONTH) AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, GROUPING(src.`region`) AS `rsync_total_r1`, GROUPING(DATE_TRUNC(DATE(src.`day`), MONTH)) AS `rsync_total_r2`, GROUPING(src.`channel`) AS `rsync_total_c1`
+FROM `gold`.`orders` src
+GROUP BY GROUPING SETS ((src.`region`, DATE_TRUNC(DATE(src.`day`), MONTH), src.`channel`), (src.`region`, DATE_TRUNC(DATE(src.`day`), MONTH)), (src.`region`, src.`channel`), (src.`region`), (src.`channel`), ())
+) p
+ORDER BY p.`rsync_total_r1` + p.`rsync_total_r2` + p.`rsync_total_c1` DESC, p.`rsync_total_r1` DESC, p.`rsync_total_r2` DESC, p.`rsync_total_c1` DESC, p.`region` ASC, p.`day` ASC, p.`channel` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT p."REGION", p."DAY", p."CHANNEL", p."AMOUNT", p."AMOUNT_2", p."COUNT", p."RSYNC_TOTAL_R1", p."RSYNC_TOTAL_R2", p."RSYNC_TOTAL_C1"
+FROM (
+SELECT src."REGION" AS "REGION", DATE_TRUNC('MONTH', src."DAY") AS "DAY", src."CHANNEL" AS "CHANNEL", SUM(src."AMOUNT") AS "AMOUNT", AVG(src."AMOUNT") AS "AMOUNT_2", COUNT(*) AS "COUNT", GROUPING(src."REGION") AS "RSYNC_TOTAL_R1", GROUPING(DATE_TRUNC('MONTH', src."DAY")) AS "RSYNC_TOTAL_R2", GROUPING(src."CHANNEL") AS "RSYNC_TOTAL_C1"
+FROM "GOLD"."ORDERS" src
+GROUP BY GROUPING SETS ((src."REGION", DATE_TRUNC('MONTH', src."DAY"), src."CHANNEL"), (src."REGION", DATE_TRUNC('MONTH', src."DAY")), (src."REGION", src."CHANNEL"), (src."REGION"), (src."CHANNEL"), ())
+) p
+ORDER BY p."RSYNC_TOTAL_R1" + p."RSYNC_TOTAL_R2" + p."RSYNC_TOTAL_C1" DESC, p."RSYNC_TOTAL_R1" DESC, p."RSYNC_TOTAL_R2" DESC, p."RSYNC_TOTAL_C1" DESC, p."REGION" ASC, p."DAY" ASC, p."CHANNEL" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT p.`region`, p.`day`, p.`channel`, p.`amount`, p.`amount_2`, p.`count`, p.`rsync_total_r1`, p.`rsync_total_r2`, p.`rsync_total_c1`
+FROM (
+SELECT src.`region` AS `region`, DATE_TRUNC('MONTH', src.`day`) AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, GROUPING(src.`region`) AS `rsync_total_r1`, GROUPING(DATE_TRUNC('MONTH', src.`day`)) AS `rsync_total_r2`, GROUPING(src.`channel`) AS `rsync_total_c1`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY GROUPING SETS ((src.`region`, DATE_TRUNC('MONTH', src.`day`), src.`channel`), (src.`region`, DATE_TRUNC('MONTH', src.`day`)), (src.`region`, src.`channel`), (src.`region`), (src.`channel`), ())
+) p
+ORDER BY p.`rsync_total_r1` + p.`rsync_total_r2` + p.`rsync_total_c1` DESC, p.`rsync_total_r1` DESC, p.`rsync_total_r2` DESC, p.`rsync_total_c1` DESC, p.`region` ASC, p.`day` ASC, p.`channel` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT p.`region`, p.`day`, p.`channel`, p.`amount`, p.`amount_2`, p.`count`, p.`rsync_total_r1`, p.`rsync_total_r2`, p.`rsync_total_c1`
+FROM (
+SELECT src.`region` AS `region`, toStartOfMonth(src.`day`) AS `day`, src.`channel` AS `channel`, SUM(src.`amount`) AS `amount`, AVG(src.`amount`) AS `amount_2`, COUNT(*) AS `count`, GROUPING(src.`region`) AS `rsync_total_r1`, GROUPING(toStartOfMonth(src.`day`)) AS `rsync_total_r2`, GROUPING(src.`channel`) AS `rsync_total_c1`
+FROM `gold`.`orders` src
+GROUP BY GROUPING SETS ((src.`region`, toStartOfMonth(src.`day`), src.`channel`), (src.`region`, toStartOfMonth(src.`day`)), (src.`region`, src.`channel`), (src.`region`), (src.`channel`), ())
+) p
+ORDER BY p.`rsync_total_r1` + p.`rsync_total_r2` + p.`rsync_total_c1` DESC, p.`rsync_total_r1` DESC, p.`rsync_total_r2` DESC, p.`rsync_total_c1` DESC, p.`region` ASC, p.`day` ASC, p.`channel` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT p."REGION", p."DAY", p."CHANNEL", p."AMOUNT", p."AMOUNT_2", p."COUNT", p."RSYNC_TOTAL_R1", p."RSYNC_TOTAL_R2", p."RSYNC_TOTAL_C1"
+FROM (
+SELECT src."REGION" AS "REGION", TRUNC(src."DAY", 'MM') AS "DAY", src."CHANNEL" AS "CHANNEL", SUM(src."AMOUNT") AS "AMOUNT", AVG(src."AMOUNT") AS "AMOUNT_2", COUNT(*) AS "COUNT", GROUPING(src."REGION") AS "RSYNC_TOTAL_R1", GROUPING(TRUNC(src."DAY", 'MM')) AS "RSYNC_TOTAL_R2", GROUPING(src."CHANNEL") AS "RSYNC_TOTAL_C1"
+FROM "GOLD"."ORDERS" src
+GROUP BY GROUPING SETS ((src."REGION", TRUNC(src."DAY", 'MM'), src."CHANNEL"), (src."REGION", TRUNC(src."DAY", 'MM')), (src."REGION", src."CHANNEL"), (src."REGION"), (src."CHANNEL"), ())
+) p
+ORDER BY p."RSYNC_TOTAL_R1" + p."RSYNC_TOTAL_R2" + p."RSYNC_TOTAL_C1" DESC, p."RSYNC_TOTAL_R1" DESC, p."RSYNC_TOTAL_R2" DESC, p."RSYNC_TOTAL_C1" DESC, p."REGION" ASC, p."DAY" ASC, p."CHANNEL" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

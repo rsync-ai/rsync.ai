@@ -221,9 +221,8 @@ batch:  <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…>dt=<YYYY-MM-DD>/p
 > table name, and exposed the Kafka partition number. Nothing outside the sink reads the CDC
 > key shape (no Glue/Athena registration, no manifest on the CDC path). **Batch/full-load**
 > keys still carry the `<dataset>` segment + `dt=` folder + `part-<offset:06d>` (DMS's LOAD-
-> counter equivalent); aligning the batch folder to the CDC shape also touches the
-> orchestrator `keybuilder.go` reload-delete + the `_MANIFEST.json`/`_SUCCESS` markers, so it
-> is tracked separately.
+> counter equivalent); aligning the batch folder to the CDC shape also touches the sink's
+> `_MANIFEST.json`/`_SUCCESS` markers, so it is tracked separately.
 
 #### Layout v2 (GCS, S3, Azure Blob): no pipeline id in the path
 
@@ -278,8 +277,8 @@ now **dropped with a one-time warning** rather than silently bucketing every row
 | `partition_by` | string | — | `""` | D | **Sink** | ✅ CDC (4c) + batch (4d) | comma-sep columns → Hive keys `col=val/`; honored by `cdcObjectKey` (CDC) and `partKey` via `splitRowsForObjectPartition` (batch). Columns absent from the row schema are dropped + warned (no silent `__HIVE_DEFAULT_PARTITION__`) |
 | `partition_time_granularity` | string | select | `none` | D | **Sink** | ✅ CDC (4c) | `none,hour,day,month` → time-bucketed prefix (`dt=…[/hour=…]`); honored by `cdcObjectKey` from each event's `source_ts_ms`. **CDC only — batch stays day-level by design** (batch messages carry no per-row event ts, and the `_MANIFEST.json`/`_SUCCESS` markers anchor at the day root; finer buckets would fabricate a landing-time hour) |
 | `max_file_rows` | integer | — | `0` (off) | D | **Sink** | ✅ CDC + batch (4e) | roll a new part-file every N rows (0 = off); CDC → `maxEvents`, batch → row chunker |
-| `max_file_mb` | integer | — | `0` (off) | D | **Sink** | ✅ CDC + batch (4e) | roll a new part-file at ~N MB pre-compression (0 = off); CDC → `maxBytes`, batch → byte chunker |
-| `max_file_interval_seconds` | integer | — | unset (30 s) | D | **Sink** | 🔬 CDC (unit-tested only) | longest time CDC changes wait in the sink before they are written as a file; CDC → `flushInterval` (`objectFlushIntervalOverride`). Whole seconds from 1 to 240 (why 240: see the CDC path notes below). Any other value is refused, never clamped: `start_sink` returns `status: invalid_config` with the reason, and the worker refuses it again at startup. The value is checked for every destination, so a bad value stops a relational sink too, but only object storage uses it. Batch writes are not affected. Set it on the storage connection form (advanced settings): all three connectors declare it in `metadata.json` with no default, so a blank box saves no key and the 30 s default applies. The orchestrator copies every connection key into the sink's `destination_config`, so the value applies to every CDC pipeline writing to that connection. Guard: `test_kafka_sink_flush_interval.py` (declared in both schema blocks, no default, description states the enforced bounds) |
+| `max_file_mb` | integer | — | `0` (CDC: 32 MB; batch: off) | D | **Sink** | ✅ CDC + batch (4e) | roll a new part-file at ~N MB pre-compression; CDC → `maxBytes` (0 keeps the 32 MB default, `defaultObjectFileMaxBytes`), batch → byte chunker (0 = off) |
+| `max_file_interval_seconds` | integer | — | unset (240 s) | D | **Sink** | 🔬 CDC (unit-tested only) | longest time CDC changes wait in the sink before they are written as a file; CDC → `flushInterval` (`objectFlushIntervalOverride`). Whole seconds from 1 to 240 (why 240: see the CDC path notes below). Any other value is refused, never clamped: `start_sink` returns `status: invalid_config` with the reason, and the worker refuses it again at startup. The value is checked for every destination, so a bad value stops a relational sink too, but only object storage uses it. Batch writes are not affected. Set it on the storage connection form (advanced settings): all three connectors declare it in `metadata.json` with no default, so a blank box saves no key and the 240 s default (`defaultObjectFlushInterval`) applies. The orchestrator copies every connection key into the sink's `destination_config`, so the value applies to every CDC pipeline writing to that connection. Guard: `test_kafka_sink_flush_interval.py` (declared in both schema blocks, no default, description states the enforced bounds) |
 
 #### File rolling (`max_file_rows` / `max_file_mb`) — Phase 4e (implemented)
 
@@ -300,9 +299,16 @@ well-sized files (too small → many-files overhead; too large → poor read par
 is the warehouse sweet spot.
 
 **Maps to our two write paths (as built in 4e):**
-- **CDC path.** `cdcObjectBatcher` rolls a new object on `maxEvents` (2000) **or**
-  `maxBytes` (24 MB) **or** `flushInterval` (30 s) — rows+bytes+time, whichever first
-  (defaults in `resolveCDCBatchingParams`). `newCDCObjectBatcher` lets the **destination
+- **CDC path.** `cdcObjectBatcher` rolls a new object on `maxEvents` **or** `maxBytes`
+  **or** `flushInterval` — rows+bytes+time, whichever first. Object storage has its own
+  defaults, set in `newCDCObjectBatcher`: no row cap, 32 MB (`defaultObjectFileMaxBytes`, the
+  size AWS DMS's S3 target waits for) and 240 s (`defaultObjectFlushInterval`, the ceiling
+  below). The shared `resolveCDCBatchingParams` defaults (2000 rows / 24 MB / 30 s) are sized
+  for a database transaction and made files of about 1 MB on narrow tables. Many tables
+  each holding an open 32 MB file would outgrow the sink container, so the worker also has
+  one memory budget for every change it holds (`RSYNC_SINK_BUFFER_BUDGET_MB`, default
+  128 MiB of estimated heap, 0 = off; `cdc_buffer_budget.go`): past it, the largest open
+  batches are written early and the worker fetches nothing more until they are. `newCDCObjectBatcher` lets the **destination
   config** override all three: `max_file_rows`/`max_file_mb` → `maxEvents`/`maxBytes` (via
   `objectFileRollLimits`) and `max_file_interval_seconds` → `flushInterval` (via
   `objectFlushIntervalOverride`, 1–240 s). The destination keys win over
@@ -317,8 +323,8 @@ is the warehouse sweet spot.
   - The consumer stall watchdog (`RSYNC_SINK_STALL_WATCHDOG_SECONDS`, default 60 s) counts
     buffered, uncommitted changes as records still waiting. Its window is therefore raised to
     at least interval + 30 s (`stallWindowCoveringFlush`), so a quiet topic holding a partly
-    filled file is not restarted as stalled. With the 30 s default this is the same 60 s; at
-    the 240 s ceiling it is 270 s.
+    filled file is not restarted as stalled. With the 240 s default it is 270 s; a 30 s
+    interval keeps the 60 s default.
   - Why the ceiling is 240 s: for object storage the pipeline's "last applied" time moves
     only when a file is written. The pipeline page shows a pipeline as idle once that time is
     more than 300 s old while changes are waiting (`cdcLivenessPhase`), and the CDC sentinel
@@ -352,9 +358,10 @@ so the sink estimates pre-compression bytes (running `json.Marshal` length per r
 like DMS's pre-compression target. Recommended over a connector-side post-encode roll (which
 would touch all three connectors).
 
-**Defaults:** both `0` = off (current single-file behavior, back-compat). When surfaced in the
-UI, suggest `max_file_mb=128` as a starting point; `max_file_rows=0` unless row-count files are
-explicitly wanted.
+**Defaults:** both `0`. For batch output that means off (one file per message, back-compat).
+For CDC, `max_file_rows=0` means no row cap and `max_file_mb=0` keeps the 32 MB default above.
+Suggest `max_file_mb=128` as a starting point for warehouse reads; `max_file_rows=0` unless
+row-count files are explicitly wanted.
 
 ### Group D — Destination CDC layout (Sink-enforced) — wired (4e)
 
@@ -401,11 +408,21 @@ JSON_VALUE(document, '$.started_at."$date"')         -- a date: reach inside $da
 JSON_QUERY(document, '$.address')                    -- a nested object, kept as JSON
 ```
 
-Implementation: `shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go:7482-7489`
-(the `{_id, document}` packing) and `:7505-7570` (Extended JSON passthrough).
+Implementation: `decodeMongoDocument` in
+`shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go`
+builds the `{_id, document}` row and keeps Extended JSON as is; `normalizeMongoID`
+in the same file turns the key into the `_id` string.
 
-> The same packing is why a column mask cannot match a MongoDB CDC field
-> (`KI-MONGO-CDC-MASK-SILENT-NOOP`).
+> A mask on a MongoDB CDC pipeline names the field as it sits inside the document.
+> `column: email` masks every `email` key at any depth of the document, arrays
+> included and in any letter case; `path: document.contact.phone` masks one exact
+> field. The `_id` and the `document` wrapper are never masked, so the table keeps
+> its two columns (`maskPackedMongoRows` in `mongo_packed_rules.go`, next to `main.go`).
+> A `type_convert` runs on the document's fields too. Any other consumer rule
+> (filter, select, exclude, rename, …) names a top-level column the row does not
+> have, so it is refused when you save or enable it, and the sink sends such an
+> event to the DLQ rather than land it unfiltered. Every mask runs under a check
+> that fails the event if a masked value is still in the row.
 
 #### CDC output has no completeness marker — and should not grow one inside the partition
 

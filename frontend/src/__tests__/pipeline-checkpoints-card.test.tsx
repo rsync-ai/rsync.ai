@@ -17,8 +17,8 @@
  *    full replay that is not actually going to happen.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest"
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
 import {
@@ -27,6 +27,7 @@ import {
   latestRunTotals,
   summarizeCheckpoint,
 } from "@/components/pipeline/PipelineCheckpointsCard"
+import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 
 const mockFetch = vi.fn()
 vi.stubGlobal("fetch", mockFetch)
@@ -154,8 +155,12 @@ describe("PipelineCheckpointsCard", () => {
 
     render(<PipelineCheckpointsCard pipelineId="p-42" />)
 
-    await waitFor(() => expect(mockFetch).toHaveBeenCalled())
-    expect(String(mockFetch.mock.calls[0][0])).toContain("/api/v1/pipelines/p-42/checkpoints")
+    // The card also reads /state (to know whether to poll), so find the call by URL.
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        expect.stringContaining("/api/v1/pipelines/p-42/checkpoints")
+      )
+    )
   })
 })
 
@@ -383,5 +388,94 @@ describe("PipelineCheckpointsCard with many tables", () => {
     await screen.findByText("public.t00")
     const names = screen.getAllByText(/^public\.t\d\d$/).map((el) => el.textContent)
     expect(names).toEqual(["public.t01", "public.t02", "public.t00", "public.t03"])
+  })
+})
+
+// A batch run commits a checkpoint per batch, but the card read once on mount and
+// then only on a Refresh click, so the list sat at its first answer for the whole
+// run. Bug class: a live panel that never re-reads while the pipeline is running.
+describe("PipelineCheckpointsCard follows a running pipeline", () => {
+  let stateStatus = "running"
+  const checkpointCalls = () =>
+    mockFetch.mock.calls.filter((c) => String(c[0]).includes("/checkpoints")).length
+
+  async function tick(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms)
+    })
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" })
+    stateStatus = "running"
+    mockFetch.mockImplementation(async (url: string) =>
+      String(url).includes("/state")
+        ? res(200, { status: stateStatus })
+        : res(200, { checkpoints: [checkpoint()] })
+    )
+  })
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+  })
+
+  it("re-reads every 10 s while running, once more when the run finishes, then stops", async () => {
+    render(<PipelineCheckpointsCard pipelineId="p-live" />)
+    await tick(0)
+    expect(screen.getByText("public.orders")).toBeInTheDocument()
+    expect(checkpointCalls()).toBe(1)
+
+    await tick(10_000)
+    expect(checkpointCalls()).toBe(2)
+    // A poll is a background read: the list stays on screen, no "Loading…".
+    expect(screen.queryByText("Loading…")).not.toBeInTheDocument()
+
+    stateStatus = "completed"
+    // The /state poll (4 s while running) sees the finished run.
+    await tick(4_000)
+    const atFinish = checkpointCalls()
+    expect(atFinish).toBeGreaterThan(2)
+
+    await tick(60_000)
+    expect(checkpointCalls()).toBe(atFinish)
+  })
+
+  it("a hidden tab skips its ticks", async () => {
+    render(<PipelineCheckpointsCard pipelineId="p-live" />)
+    await tick(0)
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" })
+    await tick(30_000)
+    expect(checkpointCalls()).toBe(1)
+  })
+
+  it("control: a finished pipeline is read once, not polled", async () => {
+    stateStatus = "completed"
+    render(<PipelineCheckpointsCard pipelineId="p-live" />)
+    await tick(0)
+    await tick(60_000)
+    expect(checkpointCalls()).toBe(1)
+  })
+
+  it("re-reads when the page announces a change on the refresh bus", async () => {
+    stateStatus = "completed"
+    render(<PipelineCheckpointsCard pipelineId="p-live" />)
+    await tick(0)
+    act(() => emitPipelineRefresh("p-live"))
+    await tick(0)
+    expect(checkpointCalls()).toBe(2)
+    act(() => emitPipelineRefresh("someone-else"))
+    await tick(0)
+    expect(checkpointCalls()).toBe(2)
+  })
+
+  it("an expanded position value wraps between words, like the resume cell", async () => {
+    stateStatus = "completed"
+    render(<PipelineCheckpointsCard pipelineId="p-live" />)
+    await tick(0)
+    fireEvent.click(screen.getByRole("button", { name: /show the full position for public\.orders/i }))
+    const value = screen.getByText("0/1A2B3C4", { selector: "dd" })
+    expect(value).toHaveClass("wrap-anywhere")
+    expect(value).not.toHaveClass("break-all")
   })
 })

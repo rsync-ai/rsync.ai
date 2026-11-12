@@ -24,7 +24,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Search, Filter, GitBranch, Sparkles, Loader2 } from "lucide-react"
+import { Search, Filter, GitBranch, SearchX, Sparkles } from "lucide-react"
+import { EmptyState } from "@/components/kit/EmptyState"
+import { RowsSkeleton } from "@/components/kit/PageSkeleton"
+import {
+  ANY_TIME,
+  CreatedRangeFilter,
+  createdRangeParams,
+  isAnyTime,
+  type CreatedRange,
+} from "@/components/pipeline/CreatedRangeFilter"
 import { PipelinesTable } from "@/components/pipeline/PipelinesTable"
 import type { PipelineListItem } from "@/components/pipeline/PipelinesTable"
 import { API_ENDPOINTS } from "@/lib/config/api"
@@ -109,8 +118,7 @@ export function PipelinesPageClient() {
   const [searchQuery, setSearchQuery] = useState("")
   const [statusFilter, setStatusFilter] = useState("all")
   const [typeFilter, setTypeFilter] = useState("all")
-  const [createdFrom, setCreatedFrom] = useState("")
-  const [createdTo, setCreatedTo] = useState("")
+  const [createdRange, setCreatedRange] = useState<CreatedRange>(ANY_TIME)
   const [currentPage, setCurrentPage] = useState(1)
 
   // Panel state removed - redirecting to /chat instead
@@ -131,8 +139,10 @@ export function PipelinesPageClient() {
       if (searchQuery.trim()) params.set("q", searchQuery.trim())
       if (statusFilter !== "all") params.set("status", statusFilter)
       if (typeFilter !== "all") params.set("type", typeFilter)
-      if (createdFrom) params.set("created_from", createdFrom)
-      if (createdTo) params.set("created_to", createdTo)
+      // A preset is relative to now, so each poll re-reads it.
+      const created = createdRangeParams(createdRange)
+      if (created.from) params.set("created_from", created.from)
+      if (created.to) params.set("created_to", created.to)
 
       const res = await authFetch(`${API_ENDPOINTS.PIPELINES.LIST}?${params}`, {
         cache: "no-store",
@@ -167,56 +177,17 @@ export function PipelinesPageClient() {
         error: classifyError(err, "pipeline.load"),
       }))
     }
-  }, [currentPage, searchQuery, statusFilter, typeFilter, createdFrom, createdTo])
+  }, [currentPage, searchQuery, statusFilter, typeFilter, createdRange])
 
   // Initial fetch and polling for running pipelines
   useEffect(() => {
     fetchPipelines()
   }, [fetchPipelines])
 
-  // Aggregate stats from /api/v1/pipelines/stats. Backend already had
-  // this endpoint live; the page was computing counts from the loaded
-  // list which is wrong when pagination is active. Single GET on mount
-  // gives accurate totals (the endpoint already returns global counts, so
-  // it does not need to re-fetch when the loaded list length changes).
-  type PipelineStats = {
-    total?: number
-    active?: number
-    executions?: {
-      running?: number
-      completed?: number
-      failed?: number
-      total?: number
-    }
-  }
-  const [pipelineStats, setPipelineStats] = useState<PipelineStats | null>(null)
-  const fetchStats = useCallback(async () => {
-    const isStale = captureWorkspace()
-    try {
-      const res = await authFetch(API_ENDPOINTS.PIPELINES.STATS, { cache: "no-store" })
-      if (!res.ok) return
-      const data = await res.json()
-      if (isStale()) return
-      setPipelineStats({
-        total: typeof data?.pipelines?.total === "number" ? data.pipelines.total : undefined,
-        active: typeof data?.pipelines?.active === "number" ? data.pipelines.active : undefined,
-        executions: data?.executions || undefined,
-      })
-    } catch {
-      /* best-effort */
-    }
-  }, [])
-  // Fetch on mount; the stats endpoint's counts are independent of the
-  // currently-loaded page, so it does not re-fetch on list change (ISSUE-007).
-  useEffect(() => {
-    void fetchStats()
-  }, [fetchStats])
-
-  // Poll the list AND the stats cards. Fast while any pipeline is running or
-  // parked on user input (a HITL prompt answered elsewhere resumes the run);
-  // slow otherwise, because a row's status also changes with nothing running
-  // here — a Failed CDC stream the healer, a Reload or another tab brings back
-  // stayed "Failed" (and the cards kept their mount-time counts) until a manual
+  // Poll the list. Fast while any pipeline is running or parked on user input
+  // (a HITL prompt answered elsewhere resumes the run); slow otherwise, because a
+  // row's status also changes with nothing running here — a Failed CDC stream the
+  // healer, a Reload or another tab brings back stayed "Failed" until a manual
   // reload (prod retest 2026-09-18).
   const pollMs = pipelinesPollInterval(state.pipelines)
   useEffect(() => {
@@ -225,15 +196,14 @@ export function PipelinesPageClient() {
     const interval = setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return
       void fetchPipelines()
-      void fetchStats()
     }, pollMs)
 
     return () => {
       clearInterval(interval)
     }
-  }, [pollMs, fetchPipelines, fetchStats, isAnyMenuOpen])
+  }, [pollMs, fetchPipelines, isAnyMenuOpen])
 
-  // Re-fetch list + stats when the active workspace changes (header switcher or
+  // Re-fetch the list when the active workspace changes (header switcher or
   // another tab). router.refresh() only re-runs server components; this is a
   // client page, so without this the list keeps showing the previous
   // workspace's pipelines until a manual reload. (R4)
@@ -241,9 +211,8 @@ export function PipelinesPageClient() {
     () =>
       onActiveWorkspaceChange(() => {
         void fetchPipelines()
-        void fetchStats()
       }),
-    [fetchPipelines, fetchStats],
+    [fetchPipelines],
   )
 
   const handleCreateNew = () => {
@@ -332,12 +301,6 @@ export function PipelinesPageClient() {
     }
   }
 
-  const handleEditPipeline = (id: string) => {
-    // Edit opens the pipeline's own page rather than the draft panel. The panel
-    // builds a draft from scratch, and nothing seeds one from an existing pipeline.
-    router.push(`/pipelines/${id}`)
-  }
-
   const deleteTarget = deleteTargetId ? state.pipelines.find((p) => p.id === deleteTargetId) : undefined
   const deleteTargetRunning =
     deleteTarget?.derived_status === "running" || deleteTarget?.derived_status === "waiting_for_user"
@@ -387,60 +350,29 @@ export function PipelinesPageClient() {
     setSearchQuery("")
     setStatusFilter("all")
     setTypeFilter("all")
-    setCreatedFrom("")
-    setCreatedTo("")
+    setCreatedRange(ANY_TIME)
     setCurrentPage(1)
   }
 
   const hasActiveFilters =
-    searchQuery || statusFilter !== "all" || typeFilter !== "all" || createdFrom || createdTo
+    searchQuery || statusFilter !== "all" || typeFilter !== "all" || !isAnyTime(createdRange)
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader
         heading="Pipelines"
         description="Create and manage your data pipelines with AI assistance"
       />
 
-      {/* Aggregate stats from /api/v1/pipelines/stats. Backend ships the
-          endpoint already; UI was computing counts from the current page
-          which under-reports with pagination. */}
-      {pipelineStats && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Pipelines</div>
-            <div className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {pipelineStats.total ?? 0}
-            </div>
-          </div>
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Running</div>
-            <div className="text-xl font-semibold text-blue-700 dark:text-blue-300">
-              {pipelineStats.executions?.running ?? 0}
-            </div>
-          </div>
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Successful runs</div>
-            <div className="text-xl font-semibold text-emerald-700 dark:text-emerald-300">
-              {pipelineStats.executions?.completed ?? 0}
-            </div>
-          </div>
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Failed runs</div>
-            <div className="text-xl font-semibold text-red-700 dark:text-red-300">
-              {pipelineStats.executions?.failed ?? 0}
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* No count cards: Home has them. These counted runs, Home's count
+          pipelines, and the same word read differently on the two pages. */}
       {/* Filters & Actions Bar */}
       <Card>
         <CardContent className="p-4">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex flex-col gap-3 md:flex-row md:flex-wrap md:items-center">
+          <div className="flex flex-col gap-4 @3xl:flex-row @3xl:items-center @3xl:justify-between">
+            <div className="flex flex-col gap-3 @xl:flex-row @xl:flex-wrap @xl:items-center">
               {/* Search */}
-              <div className="relative w-full md:w-64">
+              <div className="relative w-full @xl:w-64">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
                 <Input
                   placeholder="Search pipelines..."
@@ -450,15 +382,17 @@ export function PipelinesPageClient() {
                 />
               </div>
 
-              {/* Status + Type filters side by side on mobile */}
+              {/* Status + Type filters side by side on mobile. Each trigger
+                  shows only the chosen value, so it names its filter itself
+                  (axe button-name, critical). */}
               <div className="flex gap-2">
                 <Select value={statusFilter} onValueChange={setStatusFilter}>
-                  <SelectTrigger className="w-full sm:w-[160px]">
+                  <SelectTrigger className="w-full @md:w-[160px]" aria-label="Status">
                     <SelectValue placeholder="All Statuses" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">All Statuses</SelectItem>
-                    <SelectItem value="passed">Completed</SelectItem>
+                    <SelectItem value="passed">Succeeded</SelectItem>
                     <SelectItem value="failed">Failed</SelectItem>
                     <SelectItem value="running">Running</SelectItem>
                     <SelectItem value="paused">Paused</SelectItem>
@@ -469,7 +403,7 @@ export function PipelinesPageClient() {
                 </Select>
 
                 <Select value={typeFilter} onValueChange={setTypeFilter}>
-                  <SelectTrigger className="w-full sm:w-[120px]">
+                  <SelectTrigger className="w-full @md:w-[120px]" aria-label="Type">
                     <SelectValue placeholder="All Types" />
                   </SelectTrigger>
                   <SelectContent>
@@ -480,24 +414,14 @@ export function PipelinesPageClient() {
                 </Select>
               </div>
 
-              {/* Date Range */}
-              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
-                <input
-                  type="date"
-                  value={createdFrom}
-                  onChange={(e) => setCreatedFrom(e.target.value)}
-                  className="w-full sm:w-auto px-3 py-2 border border-zinc-200 dark:border-zinc-800 rounded-md text-sm bg-transparent"
-                  placeholder="From"
-                />
-                <span className="hidden sm:block text-zinc-400 text-sm">to</span>
-                <input
-                  type="date"
-                  value={createdTo}
-                  onChange={(e) => setCreatedTo(e.target.value)}
-                  className="w-full sm:w-auto px-3 py-2 border border-zinc-200 dark:border-zinc-800 rounded-md text-sm bg-transparent"
-                  placeholder="To"
-                />
-              </div>
+              {/* When the pipeline was created: one button, presets and a custom range. */}
+              <CreatedRangeFilter
+                value={createdRange}
+                onChange={(next) => {
+                  setCreatedRange(next)
+                  setCurrentPage(1)
+                }}
+              />
 
               {hasActiveFilters && (
                 <Button variant="outline" size="sm" onClick={clearFilters}>
@@ -510,10 +434,7 @@ export function PipelinesPageClient() {
             {/* Primary action */}
             {canCreate && (
               <div className="flex justify-end">
-                <Button
-                  onClick={handleCreateNew}
-                  className="gap-2 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700"
-                >
+                <Button onClick={handleCreateNew} className="gap-2">
                   <Sparkles className="h-4 w-4" />
                   Create New
                 </Button>
@@ -527,44 +448,38 @@ export function PipelinesPageClient() {
       <Card>
         <CardContent className="p-0">
           {state.loading ? (
-            <div className="flex items-center justify-center py-16">
-              <Loader2 className="h-8 w-8 animate-spin text-violet-600" />
-            </div>
+            <RowsSkeleton rows={6} label="Loading pipelines…" className="p-4" />
           ) : state.error ? (
             <ErrorPage error={state.error} onRetry={fetchPipelines} />
           ) : state.pipelines.length === 0 && !hasActiveFilters ? (
-            // Empty state: no pipelines at all
-            <div className="flex flex-col items-center justify-center py-16">
-              <div className="rounded-full p-4 bg-zinc-100 dark:bg-zinc-800 mb-4">
-                <GitBranch className="h-8 w-8 text-zinc-400" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">No pipelines yet</h3>
-              <p className="text-sm text-zinc-500 dark:text-zinc-400 text-center max-w-sm mb-6">
-                Create your first data pipeline to start syncing data between your sources and
-                destinations.
-              </p>
-              {canCreate ? (
-                <Button
-                  onClick={handleCreateNew}
-                  className="gap-2 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700"
-                >
-                  <Sparkles className="h-4 w-4" />
-                  Create with AI
-                </Button>
-              ) : (
-                <p className="text-sm text-zinc-500 dark:text-zinc-400">
-                  You have view-only access to this workspace.
-                </p>
-              )}
-            </div>
+            <EmptyState
+              icon={GitBranch}
+              title="No pipelines yet"
+              description={
+                canCreate
+                  ? "Describe what to sync in chat, and rsync.ai builds the pipeline from your sources to your destinations."
+                  : "You have view-only access to this workspace."
+              }
+              action={
+                canCreate ? (
+                  <Button onClick={handleCreateNew} className="mt-2 gap-2">
+                    <Sparkles className="h-4 w-4" />
+                    Create with AI
+                  </Button>
+                ) : undefined
+              }
+            />
           ) : state.pipelines.length === 0 && hasActiveFilters ? (
-            // Empty state: filters returned no results
-            <div className="flex flex-col items-center justify-center py-16">
-              <div className="text-zinc-500 dark:text-zinc-400 mb-4">No pipelines match your filters</div>
-              <Button variant="outline" onClick={clearFilters}>
-                Clear Filters
-              </Button>
-            </div>
+            <EmptyState
+              icon={SearchX}
+              title="No pipelines match your filters"
+              description="Try a different search or status, or widen the date range."
+              action={
+                <Button variant="outline" size="sm" onClick={clearFilters} className="mt-2">
+                  Clear filters
+                </Button>
+              }
+            />
           ) : (
             <>
               <PipelinesTable
@@ -573,7 +488,6 @@ export function PipelinesPageClient() {
                 onRunPipeline={handleRunPipeline}
                 onPausePipeline={handlePausePipeline}
                 onResumePipeline={handleResumePipeline}
-                onEditPipeline={handleEditPipeline}
                 onDeletePipeline={handleDeletePipeline}
                 onStopPipeline={handleStopPipeline}
                 onExportConfig={exportPipelineConfig}

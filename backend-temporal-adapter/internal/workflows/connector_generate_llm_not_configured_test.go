@@ -74,8 +74,10 @@ type llmGateGenerator struct {
 	hits    int
 	paths   []string
 	secrets []seenSecretHeader
-	status  int
-	body    string
+	// workspaces is the X-Workspace-ID of each request, "" when absent.
+	workspaces []string
+	status     int
+	body       string
 	// requiredSecret, when set, makes the stub act like require_internal_secret
 	// with INTERNAL_SERVICE_SECRET set: 401 unless X-Internal-Secret matches.
 	requiredSecret string
@@ -96,6 +98,7 @@ func startLLMGateGenerator(t *testing.T, g *llmGateGenerator) *llmGateGenerator 
 		g.hits++
 		g.paths = append(g.paths, r.Method+" "+r.URL.Path)
 		g.secrets = append(g.secrets, seenSecretHeader{present: present, value: strings.Join(values, ",")})
+		g.workspaces = append(g.workspaces, r.Header.Get("X-Workspace-ID"))
 		required := g.requiredSecret
 		g.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -129,6 +132,12 @@ func (g *llmGateGenerator) secretHeaders() []seenSecretHeader {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]seenSecretHeader(nil), g.secrets...)
+}
+
+func (g *llmGateGenerator) workspaceHeaders() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.workspaces...)
 }
 
 func runGenerateConnectorActivity(t *testing.T) error {
@@ -362,6 +371,8 @@ type llmGateHarness struct {
 	// genErr, when set, replaces the real generate activity with one that fails
 	// with this error on every attempt.
 	genErr error
+	// workspaceID is the workspace the pipeline run is started for.
+	workspaceID string
 }
 
 func (h *llmGateHarness) intent(_ context.Context, _ NLPipelineWorkflowV2Input) (map[string]interface{}, error) {
@@ -458,6 +469,7 @@ func runLLMGatePipeline(t *testing.T, h *llmGateHarness, setup func(env *testsui
 		UserID:           "user-1",
 		Message:          "sync my mongodb orders to gcs",
 		ExecutorDispatch: ExecutorDispatchTemporal,
+		WorkspaceID:      h.workspaceID,
 	})
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("workflow did not complete")

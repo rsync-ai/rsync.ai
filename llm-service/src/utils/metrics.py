@@ -32,7 +32,7 @@ from typing import Optional
 
 from prometheus_client import Counter, Histogram, make_asgi_app
 
-from src.utils.llm_cost import compute_cost_cents
+from src.utils.llm_cost import billable_tokens, compute_cost_cents
 
 logger = logging.getLogger("llm-metrics")
 
@@ -88,20 +88,9 @@ def record_llm_call(
         if prompt_tokens or completion_tokens:
             cents = compute_cost_cents(provider, model, prompt_tokens, completion_tokens)
             if cents:
-                LLM_COST_CENTS_TOTAL.labels(service, provider, model).inc(cents)
+                LLM_COST_CENTS_TOTAL.labels(service, provider, model).inc(float(cents))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("record_llm_call failed (ignored): %s", e)
-
-
-def _usage_tokens(response) -> tuple[int, int]:
-    """Best-effort (prompt_tokens, completion_tokens) from an OpenAI response."""
-    usage = getattr(response, "usage", None)
-    if not usage:
-        return 0, 0
-    return (
-        int(getattr(usage, "prompt_tokens", 0) or 0),
-        int(getattr(usage, "completion_tokens", 0) or 0),
-    )
 
 
 def instrument_openai_client(client, *, service: str, provider: str):
@@ -135,7 +124,7 @@ def instrument_openai_client(client, *, service: str, provider: str):
                         result="error", duration_s=time.monotonic() - start,
                     )
                     raise
-                pt, ct = _usage_tokens(resp)
+                pt, ct = billable_tokens(getattr(resp, "usage", None), model)
                 record_llm_call(
                     service=service, provider=provider, model=model,
                     result="success", duration_s=time.monotonic() - start,

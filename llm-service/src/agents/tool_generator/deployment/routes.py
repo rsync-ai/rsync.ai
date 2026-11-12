@@ -19,9 +19,10 @@ import os
 import re
 import json
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -125,8 +126,18 @@ class DeployRequestV1(BaseModel):
     force_rebuild: bool = Field(
         False,
         description=(
-            "Regenerate path: always rebuild the image + recreate the container so the "
-            "freshly written code ships. Leaves the self-heal start-only path unchanged when false."
+            "Regenerate path: always rebuild the image, and recreate the container unless "
+            "start is false, so the freshly written code ships. Leaves the self-heal "
+            "start-only path unchanged when false."
+        ),
+    )
+    start: bool = Field(
+        True,
+        description=(
+            "Read only with force_rebuild. False starts nothing: generation sends false, "
+            "so a new connector's code runs only once a pipeline uses it (the "
+            "orchestrator's infra preflight starts it then). The image is built now, or, "
+            "under the connector-deployer, by the deployer when it first starts the connector."
         ),
     )
 
@@ -143,6 +154,9 @@ class DeployResponseV1(BaseModel):
     # minutes). The caller should poll the container's /health rather than block on /deploy.
     building: bool = False
     error_message: Optional[str] = None
+    # "build" when the connector's image failed to build: the files must change
+    # before it can run, so retrying is pointless (see _BUILD_FAILURES).
+    error_stage: Optional[str] = None
 
 
 # In-flight JIT builds, keyed by target container_name. Prevents two concurrent /deploy
@@ -150,6 +164,80 @@ class DeployResponseV1(BaseModel):
 # builds. Accessed only from async handlers on a single event loop, so a plain set with
 # synchronous check-then-add (no await between) is race-free.
 _INFLIGHT_BUILDS: set = set()
+
+# Deployer mode (DEPLOYER_URL set, as the prod compose sets it): one deployer
+# /v1/deploy call builds a missing image and starts the container, blocking for as
+# long as the build takes (up to the deployer's 900s). The orchestrator gives this
+# route 15s (server_manager.go deployCallTimeout), so it used to give up mid-build,
+# read the timeout as "still deploying", and start the same build again on every
+# retry; a build that failed was only logged, so the user was told the connector
+# "is still being set up" for good.
+#
+# Now each deployer call runs as a task, one per container name, and a request
+# waits for it at most _DEPLOY_ANSWER_WITHIN_S before answering building=true; a
+# retry joins the running task. A build failure is remembered against a
+# fingerprint of versions/<v>/ and answered at once, with the end of the build log,
+# until those files change (or a force_rebuild, or a tool-generator restart).
+_DEPLOYER_TASKS: Dict[str, asyncio.Task] = {}
+_BUILD_FAILURES: Dict[str, Tuple[str, str]] = {}
+_DEPLOY_ANSWER_WITHIN_S = 10.0
+
+BUILD_FAILED_PREFIX = "connector image failed to build"
+# The deployer's build errors (connector-deployer dockerx/backend.go buildLegacy /
+# buildRootless): "<builder> (...) failed: <last 1500 chars of build output>". A
+# timeout or a pull of the built image is not the connector's fault, so not matched.
+_BUILD_FAILED_RE = re.compile(r"(?:docker build|buildctl)\b[^:]*\bfailed:\s*(.*)\Z", re.S)
+_BUILD_LOG_TAIL_CHARS = 1000
+
+
+def _build_failure_message(start_info: str) -> Optional[str]:
+    """The user-facing message for a deployer answer that is an image build failure,
+    with the end of the build log; None for any other failure."""
+    m = _BUILD_FAILED_RE.search(start_info or "")
+    if not m:
+        return None
+    log_tail = m.group(1).strip()
+    if len(log_tail) > _BUILD_LOG_TAIL_CHARS:
+        log_tail = log_tail[-_BUILD_LOG_TAIL_CHARS:]
+        log_tail = log_tail[log_tail.find("\n") + 1:] if "\n" in log_tail else log_tail
+    return f"{BUILD_FAILED_PREFIX}. End of the build log:\n{log_tail}"
+
+
+def _version_dir_fingerprint(version_dir: Path) -> str:
+    """What an image built from versions/<v>/ is made of: every file's path and bytes.
+    Bytecode is left out; whoever imports the code writes it."""
+    h = hashlib.sha256()
+    for p in sorted(version_dir.rglob("*")):
+        if not p.is_file() or "__pycache__" in p.parts or p.suffix == ".pyc":
+            continue
+        h.update(str(p.relative_to(version_dir)).encode())
+        h.update(b"\0")
+        h.update(p.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _deployer_task(container_name: str, fingerprint: str, start) -> asyncio.Task:
+    """The running deployer call for container_name, started by start() if none is."""
+    task = _DEPLOYER_TASKS.get(container_name)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.ensure_future(start())
+
+    def _done(t: asyncio.Task) -> None:
+        if _DEPLOYER_TASKS.get(container_name) is t:
+            _DEPLOYER_TASKS.pop(container_name, None)
+        if t.cancelled() or t.exception() is not None:
+            return
+        ok, info = t.result()
+        message = None if ok else _build_failure_message(info)
+        if message:
+            _BUILD_FAILURES[container_name] = (fingerprint, message)
+            logger.error(f"❌ Image build failed for {container_name}; refusing it until its files change")
+
+    task.add_done_callback(_done)
+    _DEPLOYER_TASKS[container_name] = task
+    return task
 
 
 async def _build_and_start_in_background(
@@ -161,8 +249,10 @@ async def _build_and_start_in_background(
     container_name: str,
     net_aliases,
     recreate: bool = False,
+    start: bool = True,
 ) -> None:
-    """Build a connector image from versions/<v>/ and start its container.
+    """Build a connector image from versions/<v>/ and, unless start is false, start
+    its container.
 
     Runs as a detached task so the /deploy response can return immediately; the caller
     polls the container's /health to learn when it becomes ready. Always clears the
@@ -178,6 +268,15 @@ async def _build_and_start_in_background(
             logger.error(
                 f"❌ JIT build failed for {container_name}: "
                 f"{build_result.error_message or 'unknown error'}"
+            )
+            return
+        if not start:
+            # Under the connector-deployer, build() only defers: the deployer builds the
+            # image when it first starts the connector, so nothing was built here.
+            deferred = getattr(deploy_service.docker_builder, "use_deployer", False)
+            logger.info(
+                f"✅ {build_result.full_image_name}: "
+                f"{'build deferred to the deployer' if deferred else 'built'}; not started"
             )
             return
         start_ok, start_info = await deploy_service.docker_builder.start_container(
@@ -362,6 +461,7 @@ async def deploy_connector_v1(request: DeployRequestV1) -> Dict[str, Any]:
     # set, rebuild THIS version and recreate its container instead. Self-heal /deploy
     # callers leave force_rebuild False and keep the start-only path.
     if request.force_rebuild:
+        _BUILD_FAILURES.pop(container_name, None)
         if container_name in _INFLIGHT_BUILDS:
             logger.info(f"🔁 Build already in flight for {container_name} — returning building=true")
         else:
@@ -375,10 +475,12 @@ async def deploy_connector_v1(request: DeployRequestV1) -> Dict[str, Any]:
                     container_name=container_name,
                     net_aliases=net_aliases,
                     recreate=True,
+                    start=request.start,
                 )
             )
             logger.info(
-                f"🏗️  Force-rebuild {image_ref} in background for {container_name} (regenerate)"
+                f"🏗️  Force-rebuild {image_ref} in background for {container_name} (regenerate"
+                f"{'' if request.start else ', build only'})"
             )
         return DeployResponseV1(
             success=True,
@@ -391,21 +493,63 @@ async def deploy_connector_v1(request: DeployRequestV1) -> Dict[str, Any]:
             building=True,
         ).model_dump(exclude_none=False, exclude_defaults=False)
 
-    start_ok, start_info = await deploy_service.docker_builder.start_container(
-        image_name=image_ref,
-        container_name=container_name,
-        port=None,
-        network=deploy_service.docker_network,
-        env_vars={
-            "MCP_CONNECTOR_NAME": connector_id,
-            "MCP_CONNECTOR_VERSION": concrete_version,
-            "MCP_PORT": "8000",
-            "PORT": "8000",
-            "MCP_HTTP_MODE": "true",
-            "DOCKER_CONTAINER": "true",
-        },
-        aliases=net_aliases,
-    )
+    def _start():
+        return deploy_service.docker_builder.start_container(
+            image_name=image_ref,
+            container_name=container_name,
+            port=None,
+            network=deploy_service.docker_network,
+            env_vars={
+                "MCP_CONNECTOR_NAME": connector_id,
+                "MCP_CONNECTOR_VERSION": concrete_version,
+                "MCP_PORT": "8000",
+                "PORT": "8000",
+                "MCP_HTTP_MODE": "true",
+                "DOCKER_CONTAINER": "true",
+            },
+            aliases=net_aliases,
+        )
+
+    if getattr(deploy_service.docker_builder, "use_deployer", False) is True:
+        fingerprint = _version_dir_fingerprint(version_dir)
+        failed = _BUILD_FAILURES.get(container_name)
+        if failed is not None and failed[0] == fingerprint:
+            return DeployResponseV1(
+                success=False,
+                connector_id=connector_id,
+                version=concrete_version,
+                container_name=container_name,
+                image=image_ref,
+                error_message=failed[1],
+                error_stage="build",
+            ).model_dump(exclude_none=False, exclude_defaults=False)
+        _BUILD_FAILURES.pop(container_name, None)
+        task = _deployer_task(container_name, fingerprint, _start)
+        done, _ = await asyncio.wait({task}, timeout=_DEPLOY_ANSWER_WITHIN_S)
+        if not done:
+            logger.info(f"🏗️  Deployer still building/starting {container_name} — answering building=true")
+            return DeployResponseV1(
+                success=True,
+                connector_id=connector_id,
+                version=concrete_version,
+                container_name=container_name,
+                image=image_ref,
+                building=True,
+            ).model_dump(exclude_none=False, exclude_defaults=False)
+        start_ok, start_info = task.result()
+        build_failure = None if start_ok else _build_failure_message(start_info)
+        if build_failure:
+            return DeployResponseV1(
+                success=False,
+                connector_id=connector_id,
+                version=concrete_version,
+                container_name=container_name,
+                image=image_ref,
+                error_message=build_failure,
+                error_stage="build",
+            ).model_dump(exclude_none=False, exclude_defaults=False)
+    else:
+        start_ok, start_info = await _start()
     if start_ok:
         started = True
     else:

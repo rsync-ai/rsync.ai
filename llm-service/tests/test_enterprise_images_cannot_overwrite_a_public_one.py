@@ -1,7 +1,7 @@
 """The paid image gets its own name, and no public surface can publish or pull it.
 
-Mechanism 4 of the four in §3.3 of `docs/internal/public-vs-cloud-feature-split.md`.
-Mechanisms 1-3 keep the paid *source* out of the public repository. This one keeps the
+Mechanism 3 of those in §3.3 of `docs/internal/public-vs-cloud-feature-split.md`.
+Mechanisms 1-2 keep the paid *source* out of the public repository. This one keeps the
 paid *artifact* out of the public repository's release, which is a separate failure with
 a worse blast radius: source that leaks can be deleted, but an image published under a
 name the community pulls is on every self-hosted machine that ran `docker compose pull`.
@@ -35,12 +35,12 @@ and a guard that reads a file differently from the thing that consumes it can pa
 entries the real consumer sees. If that module is renamed, the import fails loudly here,
 which is the correct failure -- not a silent skip.
 
-WHAT THIS FILE DOES NOT ASSERT, YET
------------------------------------
-That some private-only workflow DOES publish the paid image. There is nothing to publish
-at step 1: the tree is a boundary and a README, and the service skeleton is step 2. A
-guard asserting a publish job exists would be asserting a fiction. This file reserves the
-name; the positive half arrives with the thing it names.
+WHAT THIS FILE DOES NOT ASSERT
+------------------------------
+That some workflow DOES publish the paid image. That workflow lives in the paid code's own
+repository, `rsync-ai/rsync-enterprise`, which this one cannot see; a guard here asserting
+it exists would be asserting a fiction. This file reserves the name. The positive half
+belongs in that repository, next to the thing it names.
 """
 
 import os

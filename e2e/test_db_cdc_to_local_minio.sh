@@ -199,7 +199,7 @@ run_mysql() {
   local payload
   payload="$(cat <<JSON
 {"name":"${conn}","config":{
-  "connector.class":"io.debezium.connector.mysql.MySqlConnector","tasks.max":"1",
+  "connector.class":"io.debezium.connector.mysql.MySqlConnector","tasks.max":"1","topic.creation.default.replication.factor":"-1","topic.creation.default.partitions":"-1",
   "database.hostname":"mysql-e2e","database.port":"3306","database.user":"root","database.password":"${MYSQL_ROOT_PW}",
   "database.server.id":"${sid}","topic.prefix":"${conn}","database.include.list":"${db}","table.include.list":"${db}.${tbl}",
   "snapshot.mode":"never","include.schema.changes":"false","database.allowPublicKeyRetrieval":"true","database.ssl.mode":"disabled",
@@ -249,7 +249,7 @@ run_postgres() {
   local payload
   payload="$(cat <<JSON
 {"name":"${conn}","config":{
-  "connector.class":"io.debezium.connector.postgresql.PostgresConnector","tasks.max":"1",
+  "connector.class":"io.debezium.connector.postgresql.PostgresConnector","tasks.max":"1","topic.creation.default.replication.factor":"-1","topic.creation.default.partitions":"-1",
   "database.hostname":"postgres-e2e","database.port":"5432","database.user":"${PG_USER}","database.password":"${PG_PASS}","database.dbname":"${PG_DB}",
   "topic.prefix":"${conn}","table.include.list":"public.${tbl}",
   "plugin.name":"pgoutput","slot.name":"${slot}","publication.name":"${pub}","publication.autocreate.mode":"disabled","snapshot.mode":"never",

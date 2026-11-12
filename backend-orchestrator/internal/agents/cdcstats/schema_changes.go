@@ -2,9 +2,9 @@ package cdcstats
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -33,8 +33,9 @@ import (
 // answering "is the process up?" — and the process genuinely is. The missing signal was
 // never a health probe; it was this topic.
 //
-// What is emitted here is deliberately narrow: only drops, and only drops. See
-// classifySchemaChange for why adds and type changes are excluded.
+// What is emitted here is deliberately narrow: only dropped tables. See
+// classifySchemaChange for why every other change is left to another producer or
+// excluded.
 
 // schemaChangeGroupPrefix names the DDL consumer group. Separate from the table-stats
 // group so the two can be reasoned about, lag-monitored and reset independently.
@@ -67,20 +68,10 @@ type debeziumSchemaChange struct {
 
 // unappliedChange is one source DDL that CDC has decided not to mirror.
 type unappliedChange struct {
-	changeType string // "drop_table" | "drop_column"
+	changeType string // "drop_table"
 	table      string // unquoted, qualified as far as the source reported it
-	column     string // empty for drop_table
 	ddl        string // normalized, dialect-neutral — see classifySchemaChange
 }
-
-// reDropColumn matches an explicit DROP COLUMN clause. The `COLUMN` keyword is
-// required on purpose: `ALTER TABLE t DROP FOREIGN KEY fk`, `DROP INDEX`,
-// `DROP PRIMARY KEY` and `DROP CONSTRAINT c` are all "drops" that remove no user
-// data from the destination and must not be filed as schema changes. MySQL's
-// column-only shorthand (`ALTER TABLE t DROP note`) is likewise skipped rather than
-// guessed at — a false drop_column row is worse than a missed one, because the user
-// is invited to run destructive DDL by hand.
-var reDropColumn = regexp.MustCompile(`(?i)\bDROP\s+COLUMN\s+` + "[`\"\\[]?" + `([A-Za-z0-9_$]+)`)
 
 // unquoteIdentifier strips the quoting Debezium applies to tableChanges[].id
 // (`"db"."table"`, MySQL backticks, SQL Server brackets) and keeps at most the last
@@ -104,7 +95,14 @@ func unquoteIdentifier(id string) string {
 // classifySchemaChange turns one Debezium schema-change message into the set of
 // changes worth reporting.
 //
-// Only drops are reported, and the two exclusions are the whole design:
+// Only dropped tables are reported, and the three exclusions are the whole design:
+//
+//   - DROP COLUMN is excluded because the sink reports it, with applied=true, from the
+//     row shape itself (kafka-mcp-sink reportDroppedColumns): a column previously
+//     written and now absent from a full-image row. That covers every source, including
+//     the PostgreSQL family, which has no schema-change topic at all. The destination
+//     keeps the column, so there is nothing to decide, and filing it here as well would
+//     file one drop twice, under the source's table name and the destination's.
 //
 //   - ADD COLUMN is excluded because the sink already reports it, with applied=true,
 //     from inside its own reconciler (kafka-mcp-sink reportAppliedSchemaDrift). Both
@@ -121,19 +119,19 @@ func unquoteIdentifier(id string) string {
 //     properly needs destination-dialect rendering, which lives with the executor's
 //     drift detector, not here.
 //
-// Drops are safe to report precisely because they are never executed: isDestructiveDDL
-// refuses them on auto-apply AND after approval, so the row is a record of a decision
-// and the apply is the user's to run by hand.
+// A dropped table is the one change the drift policy waits on a person for, batch and
+// CDC alike: Approve drops the destination table, Reject keeps it, and either way the
+// table leaves the pipeline. Nothing runs until then.
 //
-// The emitted DDL is normalized rather than passed through verbatim. `DROP TABLE x` and
-// `ALTER TABLE x DROP COLUMN y` are identical in every dialect we target, they are
-// stable across source-side formatting (backticks, casing, IF EXISTS), and stability
-// matters because the string is the UNIQUE (pipeline_id, ddl) key — a reformatted
-// source statement must not file the same drop a second time.
+// The emitted DDL is normalized rather than passed through verbatim. `DROP TABLE x` is
+// identical in every dialect we target, it is stable across source-side formatting
+// (backticks, casing, IF EXISTS), and stability matters because the string is the
+// UNIQUE (pipeline_id, ddl) key — a reformatted source statement must not file the
+// same drop a second time.
 //
 // It is also DESTINATION-qualified. Debezium names the object as the SOURCE knows it
-// (`inventory.orders`), but the statement we emit is one the user runs by hand against
-// the destination, where this pipeline's tables live under its own namespace. See
+// (`inventory.orders`), but the statement we emit is the one Approve runs against the
+// destination, where this pipeline's tables live under its own namespace. See
 // healer.DestinationQualifiedTable. `table` keeps the source name — that is the change's
 // identity, and what the UI shows as "which table drifted".
 func classifySchemaChange(msg *debeziumSchemaChange, destNamespace string) []unappliedChange {
@@ -151,24 +149,13 @@ func classifySchemaChange(msg *debeziumSchemaChange, destNamespace string) []una
 		if table == "" {
 			continue
 		}
-		destTable := healer.DestinationQualifiedTable(destNamespace, table)
-		switch strings.ToUpper(strings.TrimSpace(tc.Type)) {
-		case "DROP":
-			// Structured, no parsing: Debezium reports type=DROP with table=null.
+		// Structured, no parsing: Debezium reports type=DROP with table=null.
+		if strings.EqualFold(strings.TrimSpace(tc.Type), "DROP") {
 			out = append(out, unappliedChange{
 				changeType: "drop_table",
 				table:      table,
-				ddl:        fmt.Sprintf("DROP TABLE %s", destTable),
+				ddl:        fmt.Sprintf("DROP TABLE %s", healer.DestinationQualifiedTable(destNamespace, table)),
 			})
-		case "ALTER":
-			for _, m := range reDropColumn.FindAllStringSubmatch(p.DDL, -1) {
-				out = append(out, unappliedChange{
-					changeType: "drop_column",
-					table:      table,
-					column:     m[1],
-					ddl:        fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", destTable, m[1]),
-				})
-			}
 		}
 	}
 	if len(out) == 0 {
@@ -289,7 +276,7 @@ func (a *Agent) trackSelectedTableDrops(ctx context.Context, w *pipelineWorker, 
 
 	for _, reported := range life.created {
 		if name, ok := matchSelectedTable(selected, reported); ok {
-			a.clearSelectedTableDrop(ctx, w.pipelineID, name)
+			a.clearSelectedTableDrop(ctx, w.pipelineID, name, reported)
 		}
 	}
 	if life.snapshot {
@@ -328,25 +315,102 @@ func (a *Agent) recordSelectedTableDrop(ctx context.Context, pipelineID, table s
 // clearSelectedTableDrop closes an open drop. The probe returns the dependency to
 // healthy on its next 15s tick with no further action — writeHealth overwrites
 // status every tick, so there is nothing to un-stick by hand.
-func (a *Agent) clearSelectedTableDrop(ctx context.Context, pipelineID, table string) {
-	res, err := a.db.ExecContext(ctx, `
+//
+// The same CREATE disproves the pending drop_table decision the DROP filed
+// (healer storePendingApproval), so it is withdrawn in the same transaction:
+// Approve on it would unselect a table that exists and drop its destination table.
+// The decision is filed under the source's spelling (classifySchemaChange), so it
+// is matched against `reported`, not the selection's spelling in `table`. Batch
+// pipelines withdraw the same row on rediscovery (withdrawDisprovedTableDrops);
+// steady-state CDC never runs that path, so this is CDC's.
+func (a *Agent) clearSelectedTableDrop(ctx context.Context, pipelineID, table, reported string) {
+	fields := log.Fields{"pipeline_id": pipelineID, "table": table}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.WithError(err).WithFields(fields).Debug("cdc schema changes: could not clear dropped source table")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
 		UPDATE cdc_source_table_drops
 		SET restored_at = NOW()
 		WHERE pipeline_id = $1::uuid AND table_name = $2 AND restored_at IS NULL
 	`, pipelineID, table)
 	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"pipeline_id": pipelineID,
-			"table":       table,
-		}).Debug("cdc schema changes: could not clear dropped source table")
+		log.WithError(err).WithFields(fields).Debug("cdc schema changes: could not clear dropped source table")
+		return
+	}
+	withdrawn, err := withdrawRecreatedTableDrop(ctx, tx, pipelineID, reported)
+	if err != nil {
+		log.WithError(err).WithFields(fields).Warn("cdc schema changes: could not withdraw the pending drop decision for a recreated table; the drop stays open")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.WithError(err).WithFields(fields).Debug("cdc schema changes: could not clear dropped source table")
 		return
 	}
 	if n, aerr := res.RowsAffected(); aerr == nil && n > 0 {
-		log.WithFields(log.Fields{
-			"pipeline_id": pipelineID,
-			"table":       table,
-		}).Info("cdc schema changes: dropped source table exists again; CDC source stream will return to healthy")
+		log.WithFields(fields).Info("cdc schema changes: dropped source table exists again; CDC source stream will return to healthy")
 	}
+	if len(withdrawn) > 0 {
+		log.WithFields(fields).WithField("withdrawn", withdrawn).
+			Info("cdc schema changes: withdrew the pending drop decision for a table that exists again")
+	}
+}
+
+// withdrawRecreatedTableDrop withdraws the pipeline's pending drop_table decisions
+// filed for the table a CREATE just reported.
+func withdrawRecreatedTableDrop(ctx context.Context, tx *sql.Tx, pipelineID, reported string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT table_name FROM schema_change_approvals
+		WHERE pipeline_id = $1::uuid AND change_type = 'drop_table' AND status = 'pending'
+	`, pipelineID)
+	if err != nil {
+		return nil, err
+	}
+	var filed []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if sameSourceTable(name, reported) {
+			filed = append(filed, name)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return healer.WithdrawPendingTableDropsTx(ctx, tx, pipelineID, filed, healer.DroppedTableIsBackReason)
+}
+
+// sameSourceTable reports whether a decision filed under `filed` is about the table
+// a record reported as `reported`. It ignores quoting and case, and lets a bare name
+// stand for a qualified one, but two qualified names in different schemas are two
+// tables. matchSelectedTable is looser on purpose (it finds whether a table is
+// selected at all); a withdraw that loose would hide a real drop in another schema.
+func sameSourceTable(filed, reported string) bool {
+	f := strings.ToLower(strings.TrimSpace(unquoteIdentifier(filed)))
+	r := strings.ToLower(strings.TrimSpace(unquoteIdentifier(reported)))
+	if f == "" || r == "" {
+		return false
+	}
+	if f == r {
+		return true
+	}
+	fDot, rDot := strings.LastIndex(f, "."), strings.LastIndex(r, ".")
+	switch {
+	case fDot < 0 && rDot >= 0:
+		return f == r[rDot+1:]
+	case rDot < 0 && fDot >= 0:
+		return r == f[fDot+1:]
+	}
+	return false
 }
 
 // buildUnappliedChangeEvent renders one change as the healer's SchemaChangeEvent.
@@ -366,7 +430,6 @@ func buildUnappliedChangeEvent(pipelineID string, c unappliedChange, schemaName 
 			ChangeType: c.changeType,
 			Table:      c.table,
 			SchemaName: schemaName,
-			ColumnName: c.column,
 			DDL:        c.ddl,
 			RiskLevel:  "high",
 			DetectedAt: ts,

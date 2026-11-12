@@ -1,6 +1,9 @@
 package executor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestExtractExportRowsColumns pins the normalization the delegated Data Explorer
 // path (ExplorerQuery) relies on to turn a connector's MCP `export` result into
@@ -34,6 +37,23 @@ func TestExtractExportRowsColumns(t *testing.T) {
 		}
 		if len(cols) != 1 || cols[0] != "x" {
 			t.Errorf("cols=%v, want [x] backfilled from the first row", cols)
+		}
+	})
+
+	t.Run("a backfilled column list has one order, run after run", func(t *testing.T) {
+		// KI-DELEGATED-QUERY-COLUMN-ORDER: a row is a Go map, so a list read off
+		// its keys came back in a new order on every call.
+		want := []string{"alpha", "amount", "created_at", "id", "mid", "zeta"}
+		for i := 0; i < 50; i++ {
+			result := map[string]interface{}{
+				"data": []interface{}{map[string]interface{}{
+					"zeta": 1, "id": 2, "alpha": 3, "created_at": 4, "mid": 5, "amount": 6,
+				}},
+			}
+			_, cols := extractExportRowsColumns(result, 100)
+			if strings.Join(cols, ",") != strings.Join(want, ",") {
+				t.Fatalf("call %d: cols=%v, want %v (sorted, never map order)", i, cols, want)
+			}
 		}
 	})
 

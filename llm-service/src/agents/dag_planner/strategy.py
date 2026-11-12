@@ -90,16 +90,21 @@ class DAGPlanningStrategy(PlanningStrategy):
             dst_tool = ""
         if dst_tool in _SIMPLE_LOAD_DESTS:
             return False
-        # Fallback signal: planner's NL preprocessor populates detected_tools
-        # regardless of whether the chat path passed connection IDs. If any
-        # detected tool is a simple-load destination, route to heuristic too.
-        try:
-            detected = [str(t).strip().lower().replace("_", "-")
-                        for t in (getattr(context, "detected_tools", None) or [])]
-        except Exception:
-            detected = []
-        if any(t in _SIMPLE_LOAD_DESTS for t in detected):
-            return False
+        # Fallback signal, only when the destination connection is unknown: the
+        # planner's NL preprocessor populates detected_tools regardless of whether
+        # the chat path passed connection IDs. It names the SOURCE too, so read it
+        # with a known destination and the source type decides the route — a
+        # PostgreSQL source sent "sync to GCS, then notify me" to the heuristic
+        # planner while a MongoDB one got the DAG planner
+        # (KI-DAG-ROUTING-KEYED-ON-SOURCE).
+        if not dst_tool:
+            try:
+                detected = [str(t).strip().lower().replace("_", "-")
+                            for t in (getattr(context, "detected_tools", None) or [])]
+            except Exception:
+                detected = []
+            if any(t in _SIMPLE_LOAD_DESTS for t in detected):
+                return False
 
         # Explicit DAG/workflow keywords
         dag_keywords = [
@@ -192,11 +197,6 @@ class DAGPlanningStrategy(PlanningStrategy):
             "is_dag": True,
             "is_streaming": False,  # DAG workflows are typically not streaming
             "sync_mode": "dag",
-            "planning_metadata": {
-                "strategy": self.name,
-                "planning_steps": result.get("planning_steps", []),
-                "warnings": result.get("validation_warnings", []),
-            },
         }
         
         logger.info(f"✅ DAG plan created: {len(workflow_graph.get('nodes', []))} nodes")
@@ -223,41 +223,3 @@ class DAGPlanningStrategy(PlanningStrategy):
             generated_connectors=None,
             strategy_used=self.name,
         )
-
-
-def should_use_dag_strategy(context: PlanningContext) -> bool:
-    """
-    Heuristic to determine if DAG planning should be used.
-    
-    This can be called by CompositePlanningStrategy to route
-    complex requests to the DAG planner.
-    
-    Args:
-        context: PlanningContext
-        
-    Returns:
-        True if DAG planning is recommended
-    """
-    nl = (context.natural_language or "").lower()
-    
-    # Quick heuristics for DAG-worthy requests
-    
-    # 1. Explicit workflow keywords
-    if any(kw in nl for kw in ["workflow", "dag", "orchestrat", "automat"]):
-        return True
-    
-    # 2. Branching/parallel patterns
-    if any(pat in nl for pat in ["if ", "branch", "parallel", "condition"]):
-        return True
-    
-    # 3. Multiple distinct data destinations
-    dest_keywords = ["s3", "snowflake", "bigquery", "kafka", "slack", "email"]
-    dest_count = sum(1 for d in dest_keywords if d in nl)
-    if dest_count >= 2:
-        return True
-    
-    # 4. Complex multi-step patterns
-    if nl.count(" then ") >= 2 or nl.count(" and ") >= 3:
-        return True
-    
-    return False

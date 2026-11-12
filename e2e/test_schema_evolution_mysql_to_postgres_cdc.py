@@ -4,7 +4,8 @@ E2E: Schema evolution policy (MySQL -> Postgres) for CDC data plane.
 
 Policy for relational sinks:
 - ADD COLUMN: auto-applied (nullable) and pipeline continues
-- DROP/RENAME/TYPE CHANGE: pipeline halts fail-closed
+- DROP COLUMN: the destination keeps the column, rsync.ai stops writing it, and
+  the pipeline keeps running (it no longer halts fail-closed)
 """
 
 import json
@@ -158,6 +159,8 @@ INSERT INTO e2e_db.{table} VALUES (1, 1);
     cfg = {
         "connector.class": "io.debezium.connector.mysql.MySqlConnector",
         "tasks.max": "1",
+        "topic.creation.default.replication.factor": "-1",
+        "topic.creation.default.partitions": "-1",
         "topic.prefix": connector,
         "database.hostname": MYSQL_CONTAINER,
         "database.port": "3306",
@@ -181,7 +184,7 @@ INSERT INTO e2e_db.{table} VALUES (1, 1);
         raise RuntimeError(f"failed to create connector: {r.status_code} {r.text}")
     wait_kc_running(connector)
 
-    # 4) Start sink (disable auto-restart so halts are observable).
+    # 4) Start sink (no auto-restart, so a halt would show as stopped).
     pipeline_id = f"schemaevo-{uuid.uuid4()}"
     consumer_group = f"sink-schemaevo-{ts}"
     pg_cfg = {
@@ -258,7 +261,7 @@ WHERE table_schema='public' AND table_name='{table}' AND column_name='extra';
 
     wait_pg_predicate(extra_ok, timeout_s=180)
 
-    # 6) DROP COLUMN should HALT the pipeline fail-closed.
+    # 6) DROP COLUMN keeps the destination column and the pipeline running.
     sh(
         [
             "docker",
@@ -286,17 +289,22 @@ WHERE table_schema='public' AND table_name='{table}' AND column_name='extra';
         ]
     )
 
-    deadline = time.time() + 30
-    last = None
-    while time.time() < deadline:
-        st = mcp_sink_call("kafka-mcp-sink_sink_status", {"config": {"consumer_group": consumer_group}})
-        last = st
-        if st.get("status") == "stopped":
-            print("OK")
-            return
-        time.sleep(2)
+    # The row written after the drop still lands, so the worker did not halt on it.
+    wait_pg_predicate(lambda: pg_scalar(f'SELECT v FROM public."{table}" WHERE id=1;') == "3", timeout_s=180)
 
-    raise TimeoutError(f"worker did not halt within 30s; last_status={last}")
+    # The destination column survives the source drop.
+    col = pg_scalar(
+        f"""
+SELECT data_type
+FROM information_schema.columns
+WHERE table_schema='public' AND table_name='{table}' AND column_name='extra';
+""".strip()
+    )
+    assert col, "destination column extra was dropped; the destination must keep it"
+
+    st = mcp_sink_call("kafka-mcp-sink_sink_status", {"config": {"consumer_group": consumer_group}})
+    assert st.get("status") == "running" and not st.get("error"), f"sink is not running after DROP COLUMN: {st}"
+    print("OK")
 
 
 if __name__ == "__main__":

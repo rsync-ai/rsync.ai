@@ -58,7 +58,7 @@ test.describe('Demo Diagnostic - Full UI Flow', () => {
 
   test('02 - Dashboard page', async ({ page }) => {
     await loginWithRealCredentials(page)
-    await page.goto('/dashboard')
+    await page.goto('/')
     await page.waitForLoadState('networkidle')
     await page.waitForTimeout(2000)
     await page.screenshot({ path: saveScreenshot('03-dashboard'), fullPage: true })

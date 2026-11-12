@@ -11,29 +11,44 @@
  * "connector still being set up" answer is not a verdict and is not stored.
  */
 
-import { AlertTriangle, CheckCircle2, RefreshCw, XCircle } from "lucide-react"
+import { RefreshCw, XCircle } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { StatusPill, type PillTone } from "@/components/kit/StatusPill"
 import { formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
 
 export type ConnectionTestState = "connected" | "expired" | "failed" | "untested"
 
 export interface ConnectionTestFields {
   is_connected?: boolean
+  // OAuth expiry from the linked oauth_tokens row (connections.go
+  // applyTokenExpiry). is_expired is true only for a real past expiry.
   is_expired?: boolean
+  token_expires_at?: string | null
   last_tested_at?: string | null
   last_test_status?: string | null
   last_test_error?: string | null
 }
 
+/** True when the token expired after the last test ran, or the order is unknown. */
+function expiredSinceLastTest(c: ConnectionTestFields): boolean {
+  if (!c.is_expired) return false
+  const tested = c.last_tested_at ? Date.parse(c.last_tested_at) : NaN
+  const expired = c.token_expires_at ? Date.parse(c.token_expires_at) : NaN
+  if (Number.isNaN(tested) || Number.isNaN(expired)) return true
+  return expired > tested
+}
+
 /**
- * A passing test wins over an expired token (the test just proved the
- * credentials work); an expired token wins over a failed test, because
- * re-authenticating is the fix to offer first.
+ * Whichever fact is newer wins. A passing test proves the credentials worked
+ * when it ran, so it beats a token that had already expired by then; a token
+ * that expired after that test beats the stored success
+ * (KI-CONNECTION-BADGE-OUTRANKS-EXPIRED-TOKEN). An expired token wins over a
+ * failed test, because re-authenticating is the fix to offer first.
  */
 export function connectionTestState(c: ConnectionTestFields): ConnectionTestState {
+  if (expiredSinceLastTest(c)) return "expired"
   if (c.is_connected || c.last_test_status === "success") return "connected"
   if (c.is_expired) return "expired"
   if (c.last_test_status === "failed") return "failed"
@@ -44,38 +59,34 @@ function when(iso?: string | null): { relative: string; absolute: string } | nul
   if (!iso) return null
   const absolute = formatAbsoluteTime(iso)
   if (!absolute) return null
-  const relative = formatRelativeTime(iso)
-  return { relative: relative === "Just now" ? "just now" : relative, absolute }
+  return { relative: formatRelativeTime(iso), absolute }
 }
 
 const NO_MESSAGE = "The connector returned no error message."
 
+const TEST_STATE_PILL: Record<ConnectionTestState, { tone: PillTone; label: string }> = {
+  connected: { tone: "ok", label: "Connected" },
+  expired: { tone: "err", label: "Token expired" },
+  failed: { tone: "fail", label: "Test failed" },
+  untested: { tone: "skip", label: "Not tested" },
+}
+
+/** The words the badge uses for a test state, for a page that shows the state without the pill. */
+export function connectionTestLabel(state: ConnectionTestState): string {
+  return TEST_STATE_PILL[state].label
+}
+
 export function ConnectionTestBadge({ connection }: { connection: ConnectionTestFields }) {
-  switch (connectionTestState(connection)) {
-    case "connected":
-      return (
-        <Badge className="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
-          <CheckCircle2 className="h-3 w-3 mr-1" />
-          Connected
-        </Badge>
-      )
-    case "expired":
-      return (
-        <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
-          <AlertTriangle className="h-3 w-3 mr-1" />
-          Token expired
-        </Badge>
-      )
-    case "failed":
-      return (
-        <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
-          <XCircle className="h-3 w-3 mr-1" />
-          Test failed
-        </Badge>
-      )
-    default:
-      return <Badge variant="secondary">Not tested</Badge>
-  }
+  const state = connectionTestState(connection)
+  const { tone, label } = TEST_STATE_PILL[state]
+  // A success is only as good as its age, so the pill says it.
+  const t = state === "connected" ? when(connection.last_tested_at) : null
+  return (
+    <StatusPill tone={tone} title={t ? `Last tested ${t.absolute}` : undefined} data-testid="connection-test-badge">
+      {label}
+      {t ? ` · ${t.relative}` : ""}
+    </StatusPill>
+  )
 }
 
 /** One line under a connection in the list: why its last test failed. */

@@ -26,6 +26,10 @@ RUN mkdir -p /app/shared/mcp-connectors
 # Copy entire (small) version directory
 COPY . /app/
 
+# Stable batch paging, from the `shared` BuildKit named context
+# (shared/mcp-connectors/public; see docker-compose.mcp.yml additional_contexts).
+COPY --from=shared sql_paging.py /app/sql_paging.py
+
 # Resolve runtime imports to the shared base_connector (fix once, apply everywhere)
 RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \

@@ -15,8 +15,9 @@
 # INTENTIONALLY NOT baked (moat / generation-only):
 #   generators/     connector-generation tooling (method_injector.py)
 #   oauth/          curated OAuth registry (providers.json + oauth_registry.py) — cloud-only.
-#                   base_connector.py's `from oauth.token_manager import TokenManager` is a
-#                   lazy, optional import (only OAuth connectors hit it), so module load is fine.
+#                   base_connector.py imports nothing from it: a connector holds the token the
+#                   connection config hands it and never stores or refreshes one
+#                   (KI-OAUTH-TOKEN-STORE-UNREACHABLE-BY-ITS-ONLY-USERS).
 #   tests/, *.md    not needed at runtime
 FROM busybox:1.38
 
@@ -25,6 +26,10 @@ COPY public/ ./public/
 COPY internal/ ./internal/
 COPY schemas/ ./schemas/
 COPY base_connector.py ./base_connector.py
+
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 # Outside /seed so the script itself is not copied into the volume. Compose runs this CMD
 # as is -- an inline `command:` there once skipped any populated volume, which is how an

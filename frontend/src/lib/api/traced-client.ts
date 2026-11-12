@@ -13,7 +13,7 @@ import { APIRequestError } from "@/lib/errors/api-errors"
 // Single source of truth for service base URLs. These are self-correcting:
 // on a real (non-localhost) page origin a mis-baked localhost value is rebased
 // onto the current origin, so a browser request can never leak to localhost.
-import { API_GATEWAY_URL, ORCHESTRATOR_URL, LLM_SERVICE_URL } from "@/lib/config/api"
+import { API_GATEWAY_URL } from "@/lib/config/api"
 import { getActiveWorkspaceId } from "@/lib/workspace/active-workspace"
 
 function getCookie(name: string): string | null {
@@ -198,56 +198,3 @@ export async function tracedJsonFetch<T>(
   
   return response.json()
 }
-
-/**
- * Create a traced API client for a base URL
- */
-export function createTracedClient(baseUrl: string) {
-  const normalizedBaseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl
-  
-  return {
-    get: <T>(path: string, options?: RequestInit) =>
-      tracedJsonFetch<T>(`${normalizedBaseUrl}${path}`, { ...options, method: 'GET' }),
-    
-    post: <T>(path: string, data?: unknown, options?: RequestInit) =>
-      tracedJsonFetch<T>(`${normalizedBaseUrl}${path}`, {
-        ...options,
-        method: 'POST',
-        body: data ? JSON.stringify(data) : undefined,
-      }),
-    
-    put: <T>(path: string, data?: unknown, options?: RequestInit) =>
-      tracedJsonFetch<T>(`${normalizedBaseUrl}${path}`, {
-        ...options,
-        method: 'PUT',
-        body: data ? JSON.stringify(data) : undefined,
-      }),
-    
-    patch: <T>(path: string, data?: unknown, options?: RequestInit) =>
-      tracedJsonFetch<T>(`${normalizedBaseUrl}${path}`, {
-        ...options,
-        method: 'PATCH',
-        body: data ? JSON.stringify(data) : undefined,
-      }),
-    
-    delete: <T>(path: string, options?: RequestInit) =>
-      tracedJsonFetch<T>(`${normalizedBaseUrl}${path}`, { ...options, method: 'DELETE' }),
-    
-    // Get current trace ID for debugging
-    getTraceId,
-    
-    // Reset trace for new user action
-    resetTrace: resetTraceId,
-  }
-}
-
-// Export singleton clients for each service. Base URLs come from the canonical
-// self-correcting config (imported above) — this file no longer re-derives them
-// from raw env, which previously bypassed the origin guard and could ship a
-// localhost base URL to the browser on a mis-baked bundle.
-// Re-exported for back-compat with existing importers of these names.
-export { API_GATEWAY_URL, ORCHESTRATOR_URL, LLM_SERVICE_URL }
-
-export const tracedGateway = createTracedClient(API_GATEWAY_URL)
-export const tracedOrchestrator = createTracedClient(ORCHESTRATOR_URL)
-export const tracedLlm = createTracedClient(LLM_SERVICE_URL)

@@ -1,16 +1,20 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { useWorkspace } from "@/contexts/WorkspaceContext"
 import { can } from "@/lib/workspace/roles"
+import { useUsagePanelState } from "@/config/features"
+import type { WorkspaceUsage } from "@/lib/api/usage"
 import { toast } from "sonner"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { SettingRow, SettingRows } from "@/components/kit/SettingRow"
+import { CopyId } from "@/components/kit/CopyId"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -35,8 +39,9 @@ interface WorkspaceGeneralSettingsProps {
 }
 
 /**
- * General tab of the workspace settings hub: identity (name, slug, your role),
- * rename (admin+), and leave (any member, hidden on personal). Every mutation hits
+ * General tab of the workspace settings hub, one row per setting: name and
+ * rename (admin+), slug, workspace ID (copyable), plan (where plans exist), and leave (any member,
+ * hidden on personal). Every mutation hits
  * an existing api-gateway endpoint and the backend re-enforces the guard; this
  * component mirrors the rules for UX and surfaces the last-owner 409 on leave.
  */
@@ -49,6 +54,7 @@ export function WorkspaceGeneralSettings({
 }: WorkspaceGeneralSettingsProps) {
   const router = useRouter()
   const { refresh } = useWorkspace()
+  const usagePanel = useUsagePanelState()
 
   // A personal workspace is the user's identity anchor — it can't be renamed or
   // left (the backend refuses both with 409). Gate the UI upfront so the user isn't
@@ -156,70 +162,82 @@ export function WorkspaceGeneralSettings({
             <Building2 className="h-4 w-4 text-violet-500" />
             General
           </CardTitle>
-          <CardDescription>Your workspace identity and your access.</CardDescription>
+          <CardDescription>This workspace&apos;s name and your membership in it.</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-5">
-          {/* Name + rename */}
-          <div className="space-y-1.5">
-            <Label htmlFor="ws-name">Workspace name</Label>
-            <div className="flex items-center gap-2">
-              <Input
-                id="ws-name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && canSave && void handleRename()}
-                disabled={!canRename || saving}
-                className="max-w-sm"
-              />
-              {canRename && (
-                <Button onClick={() => void handleRename()} disabled={!canSave} className="gap-1.5">
-                  {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
-                  Save
-                </Button>
-              )}
-            </div>
-            {isPersonal ? (
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                This is your personal workspace — its name is fixed and can&apos;t be changed.
-              </p>
-            ) : !canRename ? (
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">Only admins and owners can rename this workspace.</p>
-            ) : null}
-          </div>
-
-          {/* Slug (read-only — derived by the backend, stable identifier) */}
-          <div className="space-y-1.5">
-            <Label>Slug</Label>
-            <code className="block w-fit rounded bg-zinc-100 px-2 py-1 font-mono text-sm text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
-              {slug || "—"}
-            </code>
-          </div>
-
-          {/* No "Your role" row: the page's banner above the tabs already shows it,
+        <CardContent>
+          {/* No "Your role" row: the role badge beside the page title shows it,
               so this tab printed it a second time (#56). */}
+          <SettingRows>
+            <SettingRow label="Workspace name" htmlFor="ws-name" hint="Shown in the workspace switcher at the top of every page.">
+              <div className="flex items-center gap-2">
+                <Input
+                  id="ws-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && canSave && void handleRename()}
+                  disabled={!canRename || saving}
+                  aria-describedby="ws-name-hint"
+                  className="max-w-sm"
+                />
+                {canRename && (
+                  // Outlined until there is a change to save: a solid button that
+                  // is greyed out before any edit read as a broken form.
+                  <Button
+                    variant={nameChanged ? "default" : "outline"}
+                    onClick={() => void handleRename()}
+                    disabled={!canSave}
+                    className="gap-1.5"
+                  >
+                    {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                    Save
+                  </Button>
+                )}
+              </div>
+              {isPersonal ? (
+                <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+                  This is your personal workspace — its name is fixed and can&apos;t be changed.
+                </p>
+              ) : !canRename ? (
+                <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+                  Only admins and owners can rename this workspace.
+                </p>
+              ) : null}
+            </SettingRow>
+
+            {/* Slug (read-only — derived by the backend, stable identifier) */}
+            <SettingRow label="Slug">
+              <code className="block w-fit rounded bg-zinc-100 px-2 py-1 font-mono text-sm text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+                {slug || "—"}
+              </code>
+            </SettingRow>
+
+            {/* Every member sees it: scripts and the API name the workspace by
+                its id (the X-Workspace-ID header), and it was shown nowhere. */}
+            <SettingRow
+              label="Workspace ID"
+              hint={<>Scripts and the API name this workspace by its ID, in the X-Workspace-ID header.</>}
+            >
+              <CopyId value={workspaceId} label="workspace ID" full className="px-2 py-1 text-sm" />
+            </SettingRow>
+
+            {/* Plans exist only where the usage panel is on; keyed so a switch
+                to another workspace reads its plan afresh. */}
+            {usagePanel === "on" && <PlanRow key={workspaceId} />}
+
+            {canLeave && (
+              <SettingRow
+                label="Leave workspace"
+                hint={<>You lose access to its pipelines and dashboards. You&apos;ll need a new invite to rejoin.</>}
+              >
+                <Button variant="outline" onClick={() => setLeaveOpen(true)} className="gap-1.5">
+                  <LogOut className="h-3.5 w-3.5" />
+                  Leave workspace
+                </Button>
+              </SettingRow>
+            )}
+          </SettingRows>
         </CardContent>
       </Card>
-
-      {canLeave && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <LogOut className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
-              Leave workspace
-            </CardTitle>
-            <CardDescription>
-              Remove yourself from {workspaceName ? `"${workspaceName}"` : "this workspace"}. You&apos;ll need a
-              new invite to rejoin.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button variant="outline" onClick={() => setLeaveOpen(true)} className="gap-1.5">
-              <LogOut className="h-3.5 w-3.5" />
-              Leave workspace
-            </Button>
-          </CardContent>
-        </Card>
-      )}
 
       <AlertDialog open={leaveOpen} onOpenChange={(open) => !open && setLeaveOpen(false)}>
         <AlertDialogContent>
@@ -247,5 +265,62 @@ export function WorkspaceGeneralSettings({
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  )
+}
+
+type PlanRead = { kind: "loading" } | { kind: "failed" } | { kind: "ready"; usage: WorkspaceUsage }
+
+// The same read the Usage page makes. authFetch sends the active workspace,
+// which is the one these settings are for.
+async function readPlan(): Promise<PlanRead> {
+  try {
+    const res = await authFetch("/api/v1/usage", { method: "GET" })
+    if (!res.ok) return { kind: "failed" }
+    return { kind: "ready", usage: (await res.json()) as WorkspaceUsage }
+  } catch {
+    return { kind: "failed" }
+  }
+}
+
+const count = (n: number) => n.toLocaleString("en-US")
+
+/** "Pro · 14 pipelines", or "Free · 1 of 2 pipelines" on a plan with a limit. */
+function planSummary({ plan, pipelines_used: used, pipeline_limit: limit }: WorkspaceUsage) {
+  const name = plan ? plan.charAt(0).toUpperCase() + plan.slice(1) : "No plan"
+  const pipelines =
+    limit == null ? `${count(used)} pipeline${used === 1 ? "" : "s"}` : `${count(used)} of ${count(limit)} pipelines`
+  return `${name} · ${pipelines}`
+}
+
+function PlanRow() {
+  const [read, setRead] = useState<PlanRead>({ kind: "loading" })
+
+  useEffect(() => {
+    let live = true
+    void readPlan().then((next) => {
+      if (live) setRead(next)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  return (
+    <SettingRow label="Plan" hint="What this workspace can use.">
+      <div className="flex flex-wrap items-center gap-3">
+        <p className="text-sm text-zinc-900 dark:text-zinc-100">
+          {read.kind === "ready" ? (
+            planSummary(read.usage)
+          ) : read.kind === "failed" ? (
+            <span className="text-zinc-500 dark:text-zinc-400">The plan did not load.</span>
+          ) : (
+            <span className="text-zinc-500 dark:text-zinc-400">Loading…</span>
+          )}
+        </p>
+        <Button asChild variant="outline" size="sm">
+          <Link href="/usage">View usage</Link>
+        </Button>
+      </div>
+    </SettingRow>
   )
 }

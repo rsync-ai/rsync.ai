@@ -10,6 +10,13 @@
  *   - POLICY GET/PUT /pipelines/:id/schema-drift-policy -> { schema_drift_policy, detector_enabled }
  * APPROVE/REJECT are owner-gated and only act on a `pending` row; a non-pending
  * row returns 404, which callers treat as a soft "already actioned" signal.
+ *
+ * Only a dropped source table waits here; every other change is handled on the
+ * spot and listed as history. Both decisions on a dropped table take it out of the
+ * pipeline — approve also drops the destination table, reject keeps it. When that
+ * removal fails (409 for the pipeline's only table or a concurrent table edit, 502
+ * when the CDC connector refuses the new list) nothing is saved and the row stays
+ * pending; the response's `message` says why.
  */
 
 import { API_ENDPOINTS } from "@/lib/config/api"
@@ -26,12 +33,19 @@ export interface SchemaChange {
   reasoning: string
   risks: string
   user_message: string
-  status: "pending" | "approved" | "rejected" | "applied" | "failed"
+  /**
+   * `withdrawn`: a dropped-table question the next run disproved — the table is
+   * back in the source, or it was only hidden because a connection setting it
+   * needs is empty. Nothing was dropped; `reasoning` says which (healer.go
+   * WithdrawPendingTableDrops).
+   */
+  status: "pending" | "approved" | "rejected" | "applied" | "failed" | "withdrawn"
   /**
    * Whether the healer will actually run the DDL after approval. False when the
    * DDL trips the healer's DROP/TRUNCATE guard (applyMigration refuses it even
    * post-approval) — approving then only records the decision and the DDL must
-   * be run manually on the destination. Optional for older gateways that
+   * be run manually on the destination. A dropped table is auto-applicable:
+   * approving it drops the destination table. Optional for older gateways that
    * predate the field.
    */
   auto_applicable?: boolean
@@ -79,21 +93,40 @@ async function postAction(url: string): Promise<Record<string, unknown> | null> 
 }
 
 /**
- * Approve a pending change. Resolves to what approval actually did: `true` when
- * the healer was asked to apply the DDL, `false` when approval only recorded the
- * decision (destructive DDL the healer refuses — run it manually). Comes from the
- * response rather than a second copy of the predicate here, so the message the
- * user reads is the one the server acted on. Older gateways omit the field; we
- * fall back to the caller's own read of `auto_applicable`.
+ * What a decision actually did, read from the response rather than predicted here,
+ * so the message the user reads is the one the server acted on.
  */
-export async function approveSchemaChange(pipelineId: string, changeId: string): Promise<boolean | null> {
-  const body = await postAction(API_ENDPOINTS.PIPELINES.SCHEMA_CHANGE_APPROVE(pipelineId, changeId))
-  return typeof body?.auto_applicable === "boolean" ? (body.auto_applicable as boolean) : null
+export interface SchemaDecision {
+  /**
+   * Approve only: `true` when the healer was asked to apply the change (for a
+   * dropped table, to drop the destination table), `false` when approval only
+   * recorded the decision. `null` when an older gateway omits the field — fall back
+   * to the row's own `auto_applicable`.
+   */
+  dispatched: boolean | null
+  /** The change was a dropped source table. */
+  dropTable: boolean
+  /** The dropped table is no longer part of the pipeline. */
+  tableRemoved: boolean
 }
 
-/** Reject a pending change. */
-export async function rejectSchemaChange(pipelineId: string, changeId: string): Promise<void> {
-  await postAction(API_ENDPOINTS.PIPELINES.SCHEMA_CHANGE_REJECT(pipelineId, changeId))
+function toDecision(body: Record<string, unknown> | null): SchemaDecision {
+  return {
+    dispatched: typeof body?.auto_applicable === "boolean" ? (body.auto_applicable as boolean) : null,
+    dropTable: body?.drop_table === true,
+    tableRemoved: body?.table_removed === true,
+  }
+}
+
+/** Approve a pending change. */
+export async function approveSchemaChange(pipelineId: string, changeId: string): Promise<SchemaDecision> {
+  return toDecision(await postAction(API_ENDPOINTS.PIPELINES.SCHEMA_CHANGE_APPROVE(pipelineId, changeId)))
+}
+
+/** Reject a pending change. Never asks the healer for anything. */
+export async function rejectSchemaChange(pipelineId: string, changeId: string): Promise<SchemaDecision> {
+  const d = toDecision(await postAction(API_ENDPOINTS.PIPELINES.SCHEMA_CHANGE_REJECT(pipelineId, changeId)))
+  return { ...d, dispatched: false }
 }
 
 /**

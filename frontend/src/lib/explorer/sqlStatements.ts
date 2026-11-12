@@ -282,17 +282,3 @@ export function resolveRunTarget(
   // "enter a SQL query", which beats a round-trip that can only come back an error.
   return { sql: "", from: 0, to: 0, source: "buffer", index: 0, total: 0, multi: false }
 }
-
-/** Replaces `[target.from, target.to)` in `doc` with `replacement`, leaving the
- *  rest of the buffer — the user's other queries — untouched.
- *
- *  No-ops unless that range still holds `target.sql`. A target is resolved against one
- *  document and may be spliced into a later one (the destructive-confirm dialog can sit
- *  open across an edit); if the buffer has moved on, the offsets describe someone else's
- *  text and writing through them would corrupt a query the user never ran. */
-export function spliceRunTarget(doc: string, target: RunTarget, replacement: string): string {
-  const src = String(doc ?? "")
-  if (target.from < 0 || target.to > src.length || target.from > target.to) return src
-  if (src.slice(target.from, target.to) !== target.sql) return src
-  return src.slice(0, target.from) + replacement + src.slice(target.to)
-}

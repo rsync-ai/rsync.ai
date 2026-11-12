@@ -161,6 +161,8 @@ print(json.dumps({
   "config": {
     "connector.class": "io.debezium.connector.mysql.MySqlConnector",
     "tasks.max": "1",
+    "topic.creation.default.replication.factor": "-1",
+    "topic.creation.default.partitions": "-1",
     "database.hostname": host,
     "database.port": "3306",
     "database.user": "root",
@@ -263,8 +265,29 @@ docker exec "${MYSQL_CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PW}" -e "
 "
 
 log "📥 Verifying topic routing by consuming 1 message from each topic…"
-DIM_MSG="$(docker exec "${STACK_PREFIX:-rsync-ai}-kafka" bash -lc "timeout 20 ${KAFKA_BIN}/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic '${UNIFIED_TOPIC}' --from-beginning --max-messages 1" 2>/dev/null || true)"
-TXN_MSG="$(docker exec "${STACK_PREFIX:-rsync-ai}-kafka" bash -lc "timeout 20 ${KAFKA_BIN}/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic '${TXN_TOPIC}' --from-beginning --max-messages 1" 2>/dev/null || true)"
+# The budget covers the console consumer's JVM start and group join, not just
+# the wait for the message. The 2026-09-30 nightly (run 36739117820) failed
+# with "Missing Kafka message for dim_products": that consumer never joined a
+# group before `timeout 20` killed it, while the next one took 11 s to start,
+# join and read. Retry `--from-beginning` (a re-read is harmless) and keep
+# stderr, so a starved consumer can't pass for a routing bug.
+consume_one() {
+  local topic="$1" out err attempt
+  err="$(mktemp)"
+  for attempt in 1 2 3; do
+    out="$(docker exec "${STACK_PREFIX:-rsync-ai}-kafka" bash -lc "timeout 45 ${KAFKA_BIN}/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic '${topic}' --from-beginning --max-messages 1" 2>"${err}" || true)"
+    if [[ -n "${out}" ]]; then
+      rm -f "${err}"
+      printf '%s' "${out}"
+      return 0
+    fi
+    echo "   consume attempt ${attempt} on ${topic} returned nothing; consumer stderr tail:" >&2
+    tail -n 5 "${err}" >&2 || true
+  done
+  rm -f "${err}"
+}
+DIM_MSG="$(consume_one "${UNIFIED_TOPIC}")"
+TXN_MSG="$(consume_one "${TXN_TOPIC}")"
 
 export DIM_MSG
 export TXN_MSG

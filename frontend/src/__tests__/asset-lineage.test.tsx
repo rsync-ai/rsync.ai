@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
@@ -8,22 +8,40 @@ import {
   ASSET_NODE_HEIGHT,
   ASSET_NODE_WIDTH,
   assetHref,
+  attentionSplit,
+  describeAsset,
+  displaysDownstream,
+  drawnGraph,
   findWarehouseTable,
-  foldUnreadTables,
+  foldLooseAssets,
+  followsItsInputs,
+  inputUpstreams,
+  inputWakes,
+  isDisplay,
   layoutAssets,
+  modelSurroundings,
   needsAttention,
   neighbourhood,
   parseAssetGraph,
+  refreshChip,
   searchAssets,
+  stageColumns,
+  tableProducers,
+  upstreamPath,
   warehouseIds,
   warehouseLabel,
   wholeGraph,
+  withoutDisplays,
   type AssetGraph,
+  type ModelRefresh,
 } from "@/components/explorer/assetLineage"
 import { revealShift } from "@/components/explorer/LineageFlowCanvas"
 import { MIN_READABLE_FIT_ZOOM } from "@/components/explorer/modelLineage"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { listConnections } from "@/lib/api/connections"
+import { getConnectorLogoUrl } from "@/lib/api/mcp-connectors"
+import { formatRelativeTime } from "@/lib/utils"
+import type { SavedModel } from "@/lib/hooks/useSavedModels"
 
 // GET /api/v1/explorer/asset-graph (asset_graph.go) had no reader. The Lineage page draws it,
 // says which models are refreshed out of step with what they read, and keeps the backend's
@@ -34,6 +52,50 @@ const media = vi.hoisted(() => ({ canvas: false }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("@/lib/api/connections", () => ({ listConnections: vi.fn() }))
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }))
+// The workspace's layer list is its own request (useWorkspaceLayers): a knob here, so
+// the fetch mocks below answer only the graph's requests, in their order.
+const mockLayers: { value: { name: string; position: number }[] | null } = { value: null }
+vi.mock("@/lib/hooks/useWorkspaceLayers", () => ({
+  useWorkspaceLayers: () => ({ layers: mockLayers.value, canManage: false, error: null, reload: async () => {} }),
+}))
+// So are the workspace's saved queries (useSavedModels), each model's last run and schedule.
+const mockSaved: { value: ReadonlyMap<string, SavedModel> } = { value: new Map() }
+const mockReloadSaved = vi.fn()
+vi.mock("@/lib/hooks/useSavedModels", () => ({
+  useSavedModels: () => ({ saved: mockSaved.value, reload: mockReloadSaved }),
+}))
+// The Schedule dialog has its own tests (SavedQueryModelDialog.test.tsx): here, only what the page opens it with.
+vi.mock("@/components/explorer/SavedQueryModelDialog", () => ({
+  SavedQueryModelDialog: (props: {
+    savedQueryId: string
+    savedQueryName: string
+    preset?: unknown
+    onOpenChange: (open: boolean) => void
+    onChanged?: () => void
+  }) => (
+    <div
+      role="dialog"
+      aria-label={`Schedule ${props.savedQueryName}`}
+      data-saved-query={props.savedQueryId}
+      data-preset={JSON.stringify(props.preset ?? null)}
+    >
+      <button type="button" onClick={() => props.onChanged?.()}>
+        Save schedule
+      </button>
+      <button type="button" onClick={() => props.onOpenChange(false)}>
+        Close schedule
+      </button>
+    </div>
+  ),
+}))
+
+// The History section asks for its runs itself (lineage-history.test.tsx tests it): here, only
+// which card the panel mounts it for, so the fetch mocks below answer the graph's requests.
+vi.mock("@/components/explorer/LineageHistorySection", () => ({
+  LineageHistorySection: (props: { node: { id: string }; reloadTick: number }) => (
+    <div data-history-node={props.node.id} data-history-reload={props.reloadTick} />
+  ),
+}))
 
 const mockFetch = authFetch as unknown as Mock
 const mockConnections = listConnections as unknown as Mock
@@ -86,6 +148,9 @@ beforeEach(() => {
   mockConnections.mockReset()
   mockConnections.mockResolvedValue({ connections: [], total: 0 })
   media.canvas = false
+  mockLayers.value = null
+  mockSaved.value = new Map()
+  mockReloadSaved.mockReset()
 })
 
 function res(status: number, body: unknown) {
@@ -234,13 +299,28 @@ describe("assetLineage helpers", () => {
     expect(warehouseLabel("0f3c9a1e-77aa-4b1d-9c1e-2f7d6e5a4b3c", new Map())).toBe("Warehouse 0f3c9a1e")
   })
 
+  it("says a table nothing drawn reads is unread only in its warehouse when the graph is narrowed to one", () => {
+    const events = graph.nodes.find((n) => n.id === T_EVENTS)!
+    expect(describeAsset(events, graph, undefined)).toBe("No model reads it")
+    // A narrowed graph lacks the models in the other warehouses, and one of them may read it.
+    expect(describeAsset(events, graph, undefined, true)).toBe("Nothing in this warehouse reads it")
+    // What a narrowed graph does draw it can still say.
+    expect(describeAsset(graph.nodes.find((n) => n.id === T_ORDERS)!, graph, undefined, true)).toBe("Read by 1 model")
+  })
+
   it("reads a Go nil slice as an empty list, and a missing body as an empty graph", () => {
     const m3 = graph.models.find((m) => m.model_id === "m-3")!
     expect(m3.upstreams).toEqual([])
     expect(m3.trigger_upstreams).toEqual([])
     const empty = parseAssetGraph(null)
     expect(empty.nodes).toEqual([])
-    expect(empty.stats.truncated).toEqual({ pipelines: false, produced_tables: false, models: false })
+    expect(empty.stats.truncated).toEqual({
+      pipelines: false,
+      produced_tables: false,
+      models: false,
+      charts: false,
+      dashboards: false,
+    })
   })
 
   it("walks everything upstream and downstream of the focus, nearest first", () => {
@@ -320,7 +400,7 @@ describe("assetLineage helpers", () => {
 
   it("links pipelines and models to their pages, and tables nowhere", () => {
     expect(assetHref(graph.nodes.find((n) => n.id === P1)!)).toBe("/pipelines/p-1")
-    expect(assetHref(graph.nodes.find((n) => n.id === M1)!)).toBe("/explorer/schedules/m-1?tab=graph")
+    expect(assetHref(graph.nodes.find((n) => n.id === M1)!)).toBe("/models/m-1?tab=graph")
     expect(assetHref(graph.nodes.find((n) => n.id === T_ORDERS)!)).toBeNull()
   })
 
@@ -339,10 +419,10 @@ describe("folding tables no model reads", () => {
   })
 
   it("folds each pipeline's unread tables into one box, and leaves read ones and a lone one drawn", () => {
-    const f = foldUnreadTables(wholeGraph(wide), wide)
-    expect([...f.groups.values()].map((g) => [g.pipeline, g.tables.length])).toEqual([
-      [PA, 9],
-      [PB, 4],
+    const f = foldLooseAssets(wholeGraph(wide), wide)
+    expect([...f.groups.values()].map((g) => [g.kind, g.from, g.members.length])).toEqual([
+      ["table", PA, 9],
+      ["table", PB, 4],
     ])
     expect(f.nodeIds).toHaveLength(25 - 13 + 2)
     // raw.d1 is read by a model; raw.d0 is its pipeline's only unread table, so a box would hide nothing.
@@ -356,16 +436,16 @@ describe("folding tables no model reads", () => {
   })
 
   it("draws a box open when asked, and never folds the tables of the focused pipeline", () => {
-    const [groupA] = [...foldUnreadTables(wholeGraph(wide), wide).groups.keys()]
-    const opened = foldUnreadTables(wholeGraph(wide), wide, new Set([groupA]))
-    expect([...opened.groups.values()].map((g) => g.pipeline)).toEqual([PB])
+    const [groupA] = [...foldLooseAssets(wholeGraph(wide), wide).groups.keys()]
+    const opened = foldLooseAssets(wholeGraph(wide), wide, new Set([groupA]))
+    expect([...opened.groups.values()].map((g) => g.from)).toEqual([PB])
     expect(opened.nodeIds).toHaveLength(25 - 4 + 1)
-    expect(foldUnreadTables(wholeGraph(wide), wide, "all").nodeIds).toHaveLength(25)
-    expect(foldUnreadTables(neighbourhood(wide, PA), wide).groups.size).toBe(0)
+    expect(foldLooseAssets(wholeGraph(wide), wide, "all").nodeIds).toHaveLength(25)
+    expect(foldLooseAssets(neighbourhood(wide, PA), wide).groups.size).toBe(0)
   })
 
   it("lays the folded workspace out so it can be read whole, with unlinked assets in rows, not a column", async () => {
-    const f = foldUnreadTables(wholeGraph(wide), wide)
+    const f = foldLooseAssets(wholeGraph(wide), wide)
     const { positions, bounds } = await layoutAssets(f.nodeIds, f.edges)
     expect(positions.size).toBe(f.nodeIds.length)
     const fit = Math.min((CANVAS.width - 48) / bounds.width, (CANVAS.height - 48) / bounds.height)
@@ -458,11 +538,18 @@ describe("AssetLineageView", () => {
     expect(mockFetch).toHaveBeenCalledWith(URL, { method: "GET" })
     const rows = [...list.querySelectorAll("[data-attention]")].map((r) => r.getAttribute("data-attention"))
     expect(rows).toEqual(["m-1", "m-2"])
-    expect(within(list).getByRole("link", { name: "daily_revenue" })).toHaveAttribute("href", "/explorer/schedules/m-1?tab=graph")
+    expect(within(list).getByRole("link", { name: "daily_revenue" })).toHaveAttribute("href", "/models/m-1?tab=graph")
     expect(within(list).getByText("Runs on a cron schedule")).toBeInTheDocument()
 
-    const tile = screen.getByText("Not refreshed by what they read").parentElement!
-    expect(tile).toHaveTextContent("2of 3 models")
+    const summary = document.querySelector<HTMLElement>("[data-lineage-summary]")!
+    expect(summary.querySelector("p")).toHaveTextContent(/^2 pipelines · 4 tables · 3 models$/)
+    expect(within(summary).getByRole("link", { name: "2 aren't refreshed by what they read" })).toHaveAttribute(
+      "href",
+      "#lineage-attention",
+    )
+    // Both read tables something here writes: no "can't trace" callout.
+    expect(within(summary).getAllByRole("link")).toHaveLength(1)
+    expect(screen.getByRole("heading", { name: /Needs attention \(2\)/ })).toBeInTheDocument()
   })
 
   it("focuses an asset from the attention list and lists what feeds it and what it feeds", async () => {
@@ -477,24 +564,32 @@ describe("AssetLineageView", () => {
     expect(screen.getByRole("heading", { name: /What feeds daily_revenue, and what it feeds/ })).toBeInTheDocument()
 
     // One hop each side to start, and the header says how much more there is.
-    expect(screen.getByText("2 of 3 upstream · 1 of 2 downstream")).toBeInTheDocument()
+    expect(screen.getByText("2 of 3 upstream · 1 downstream")).toBeInTheDocument()
     const section = (heading: RegExp) => screen.getByRole("heading", { name: heading }).closest("section")!
-    const names = (s: HTMLElement) => [...s.querySelectorAll("[data-asset-row] .font-mono")].map((n) => n.textContent)
+    const names = (s: HTMLElement) =>
+      [...s.querySelectorAll("[data-asset-row]")].map((row) => row.querySelector(".font-mono")!.textContent)
     expect(names(section(/^Upstream \(2 of 3\)/))).toEqual(["public.customers", "public.orders"])
-    expect(names(section(/^Downstream \(1 of 2\)/))).toEqual(["analytics.daily_revenue"])
+    // daily_revenue and the table it builds are one row, which says what it builds.
+    expect(section(/^Focus/).querySelector("[data-asset-row]")).toHaveTextContent("Builds analytics.daily_revenue")
+    expect(names(section(/^Downstream \(1\)/))).toEqual(["weekly_rollup"])
+    // Picked from the list, it is also the one whose details are open, with its run history.
+    expect(screen.getByRole("region", { name: "Details of daily_revenue" })).toBeInTheDocument()
+    const history = screen.getByRole("region", { name: "Details of daily_revenue" }).querySelector("[data-history-node]")
+    expect(history).toHaveAttribute("data-history-node", M1)
+    expect(history).toHaveAttribute("data-history-reload", "0")
 
     // One asset's next hop opens on its own.
     await userEvent.click(screen.getByRole("button", { name: "Show 1 more upstream of public.orders" }))
-    expect(screen.getByText("3 upstream · 1 of 2 downstream")).toBeInTheDocument()
+    expect(screen.getByText("3 upstream · 1 downstream")).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /more upstream of public\.customers/ })).toBeNull()
 
     // Every hop.
     const hops = screen.getByRole("group", { name: "Hops drawn on each side" })
     await userEvent.click(within(hops).getByRole("button", { name: "Every hop" }))
     expect(within(hops).getByRole("button", { name: "Every hop" })).toHaveAttribute("aria-pressed", "true")
-    expect(screen.getByText("3 upstream · 2 downstream")).toBeInTheDocument()
+    expect(screen.getByText("3 upstream · 1 downstream")).toBeInTheDocument()
     expect(names(section(/^Upstream \(3\)/))).toEqual(["public.customers", "public.orders", "orders_sync"])
-    expect(names(section(/^Downstream \(2\)/))).toEqual(["analytics.daily_revenue", "weekly_rollup"])
+    expect(names(section(/^Downstream \(1\)/))).toEqual(["weekly_rollup"])
     expect(within(section(/^Upstream/)).getByText("Upstream, 2 hops away")).toBeInTheDocument()
     expect(within(section(/^Upstream/)).getByRole("link", { name: "orders_sync" })).toHaveAttribute("href", "/pipelines/p-1")
 
@@ -503,6 +598,74 @@ describe("AssetLineageView", () => {
     expect(screen.getByRole("heading", { name: /What feeds weekly_rollup/ })).toBeInTheDocument()
     await userEvent.click(screen.getByRole("button", { name: "Show the whole workspace" }))
     expect(screen.getByText("Whole workspace")).toBeInTheDocument()
+  })
+
+  // A chart's lineage badge links /explorer/lineage?focus=model:<id> (chart_badges.go).
+  it("opens focused on the asset it is given, and on the whole workspace for one the graph has not", async () => {
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { unmount } = render(<AssetLineageView reloadTick={0} initialFocus={M1} />)
+    expect(await screen.findByRole("heading", { name: /What feeds daily_revenue, and what it feeds/ })).toBeInTheDocument()
+    unmount()
+
+    render(<AssetLineageView reloadTick={0} initialFocus="model:gone" />)
+    expect(await screen.findByText("Whole workspace")).toBeInTheDocument()
+  })
+
+  // A model's layer (migration 135) rides on it and on the table it builds; a table a
+  // pipeline writes is marked a pipeline table instead. A row with neither gets no
+  // badge, so a pipeline is never labelled, and the List orders each section by the
+  // workspace's own layer order, not by name.
+  it("marks pipeline tables, badges each model's layer, and orders the list by the workspace's layers", async () => {
+    mockLayers.value = [
+      { name: "Silver", position: 0 },
+      { name: "Gold", position: 1 },
+    ]
+    const layer: Record<string, string> = { [M1]: "Gold", [T_DAILY]: "Gold", [M2]: "Silver", [M3]: "Archive" }
+    const written = new Set([T_ORDERS, T_CUST])
+    mockFetch.mockResolvedValue(
+      res(200, {
+        ...BODY,
+        nodes: BODY.nodes.map((n) => ({
+          ...n,
+          ...(layer[n.id] ? { layer: layer[n.id] } : {}),
+          ...(written.has(n.id) ? { pipeline_table: true } : {}),
+        })),
+      })
+    )
+    render(<AssetLineageView reloadTick={0} />)
+
+    const rows = (heading: RegExp) =>
+      [...screen.getByRole("heading", { name: heading }).closest("section")!.querySelectorAll("[data-asset-row]")].map((row) => [
+        row.querySelector(".font-mono")!.textContent,
+        row.querySelector("[data-pipeline-table]") ? "pipeline table" : row.querySelector("[data-layer]")?.getAttribute("data-layer") ?? "",
+      ])
+    await screen.findByRole("heading", { name: /^Models \(/ })
+    // Silver before Gold because the workspace orders them so; Archive is not on its
+    // list, so it follows them; a table in no layer comes last.
+    expect(rows(/^Models \(/)).toEqual([
+      ["weekly_rollup", "Silver"],
+      ["daily_revenue", "Gold"],
+      ["scratch_report", "Archive"],
+    ])
+    expect(rows(/^Tables \(/)).toEqual([
+      ["public.customers", "pipeline table"],
+      ["public.orders", "pipeline table"],
+      ["public.events", ""],
+    ])
+    expect(rows(/^Pipelines \(/)).toEqual([
+      ["events_sync", ""],
+      ["orders_sync", ""],
+    ])
+
+    await userEvent.click(await screen.findByRole("button", { name: "Show daily_revenue in the graph" }))
+    expect(rows(/^Upstream/)).toEqual([
+      ["public.customers", "pipeline table"],
+      ["public.orders", "pipeline table"],
+    ])
+    expect(rows(/^Downstream/)).toEqual([["weekly_rollup", "Silver"]])
+    await userEvent.click(within(screen.getByRole("group", { name: "Hops drawn on each side" })).getByRole("button", { name: "Every hop" }))
+    expect(rows(/^Upstream/)).toContainEqual(["orders_sync", ""])
+    expect(rows(/^Downstream/)).toContainEqual(["weekly_rollup", "Silver"])
   })
 
   it("opens a table's columns under its row in the list, one request per warehouse", async () => {
@@ -552,40 +715,74 @@ describe("AssetLineageView", () => {
     expect(edgeLabel({ kind: "triggers", evidence: "declared" })).toBe("Wakes when it finishes · configured")
   })
 
-  it("draws edges by how the backend knows them", async () => {
+  it("draws each read by whether it refreshes its model, and each link by how the backend knows it on asking", async () => {
     media.canvas = true
     mockFetch.mockResolvedValue(res(200, BODY))
     const { container } = render(<AssetLineageView reloadTick={0} />)
 
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(9))
-    expect(container.querySelectorAll(".react-flow__edge")).toHaveLength(8)
-    const dashes = [...container.querySelectorAll<SVGPathElement>(".react-flow__edge-path")].map(
-      (p) => p.style.strokeDasharray || "solid",
-    )
-    // 3 writes seen in a run; the trigger and the materialization configured; 3 reads parsed out of SQL.
-    expect(dashes.filter((d) => d === "solid")).toHaveLength(3)
-    expect(dashes.filter((d) => d === "6 4")).toHaveLength(2)
-    expect(dashes.filter((d) => d === "2 4")).toHaveLength(3)
-    expect(screen.getByText("read from a model's SQL")).toBeInTheDocument()
+    // daily_revenue and the table it builds are one card, so its materialization is not a link.
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    expect(container.querySelectorAll(".react-flow__edge")).toHaveLength(7)
+    const dashes = () =>
+      [...container.querySelectorAll<SVGPathElement>(".react-flow__edge-path")].map((p) => p.style.strokeDasharray || "solid")
+    // Refresh: 3 writes solid; 3 reads whose writer does not wake the model dashed; the wake dotted.
+    expect(dashes().filter((d) => d === "solid")).toHaveLength(3)
+    expect(dashes().filter((d) => d === "6 4")).toHaveLength(3)
+    expect(dashes().filter((d) => d === "2 4")).toHaveLength(1)
+    expect(screen.getByText("read, but doesn't refresh it")).toBeInTheDocument()
+    expect(screen.getByText("wakes it when it finishes")).toBeInTheDocument()
 
     // Each edge names itself when the pointer rests on its middle.
     const canvas = container.querySelector(".react-flow")!.parentElement!
-    expect(within(canvas).getAllByText("Read by · read from a model's SQL")).toHaveLength(3)
+    expect(within(canvas).getAllByText("Read by · read from a model's SQL · does not refresh the model")).toHaveLength(3)
     expect(within(canvas).getByText("Wakes when it finishes · configured")).toBeInTheDocument()
 
-    // A click on a card focuses it: one hop each side stays drawn.
-    fireEvent.click(within(canvas).getByText("daily_revenue"))
+    // Each picker is captioned with what it changes, and no option shares a name with another control:
+    // the page has its own Refresh button, and each table card its own Columns button.
+    const links = within(screen.getByRole("group", { name: "Colour links by" }))
+    expect(links.getByRole("button", { name: "Freshness" })).toHaveAttribute("aria-pressed", "true")
+    expect(links.queryByRole("button", { name: "Refresh" })).toBeNull()
+    expect(screen.getByText("Colour links by:")).toBeInTheDocument()
+    expect(screen.getByText("Arrange by:")).toBeInTheDocument()
+    expect(screen.queryByRole("group", { name: "Columns" })).toBeNull()
+    expect(screen.queryByRole("group", { name: "Links" })).toBeNull()
+
+    // How we know: 3 writes seen in a run solid, the configured trigger dashed, 3 reads parsed out of SQL dotted.
+    await userEvent.click(links.getByRole("button", { name: "How we know" }))
+    await waitFor(() => expect(dashes().filter((d) => d === "2 4")).toHaveLength(3))
+    expect(dashes().filter((d) => d === "solid")).toHaveLength(3)
+    expect(dashes().filter((d) => d === "6 4")).toHaveLength(1)
+    expect(screen.getByText("read from a model's SQL")).toBeInTheDocument()
+
+    // A click on a card selects it: everything stays drawn, what is not upstream of it dimmed.
+    fireEvent.click(within(canvas).getByTitle("daily_revenue"))
+    await waitFor(() => expect(within(canvas).getByText("Selected")).toBeInTheDocument())
+    expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8)
+    const dimmed = [...container.querySelectorAll(".react-flow__node [data-dimmed]")].map(
+      (c) => c.querySelector("[title]:not([title='Show its details'])")?.getAttribute("title") ?? c.textContent,
+    )
+    expect(dimmed).toHaveLength(4)
+    for (const name of ["events_sync", "public.events", "weekly_rollup", "scratch_report"])
+      expect(within(canvas).getByTitle(name).closest("[data-dimmed]")).not.toBeNull()
+    for (const name of ["daily_revenue", "public.orders", "public.customers", "orders_sync"])
+      expect(within(canvas).getByTitle(name).closest("[data-dimmed]")).toBeNull()
+    const edgeOpacity = [...container.querySelectorAll<SVGPathElement>(".react-flow__edge-path")].map((p) => p.style.opacity)
+    expect(edgeOpacity.filter((o) => o === "")).toHaveLength(4)
+    expect(edgeOpacity.filter((o) => o !== "")).toHaveLength(3)
+    expect(screen.getByRole("region", { name: "Details of daily_revenue" })).toBeInTheDocument()
+
+    // Its neighbours only: one hop each side.
+    await userEvent.click(screen.getByRole("button", { name: "Show only its neighbours" }))
     await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(4))
     expect(container.querySelectorAll(".react-flow__edge")).toHaveLength(3)
-    expect(within(canvas).getByText("Selected")).toBeInTheDocument()
 
-    // +1 on the model's table draws the model that reads it, and nothing else.
+    // +1 on a table it reads draws the pipeline that writes it, and nothing else.
     const more = within(canvas).getAllByTitle(/^Show 1 more (upstream|downstream)$/)
-    expect(more.map((b) => b.title).sort()).toEqual(["Show 1 more downstream", "Show 1 more upstream", "Show 1 more upstream"])
-    fireEvent.click(within(canvas).getByTitle("Show 1 more downstream"))
+    expect(more.map((b) => b.title)).toEqual(["Show 1 more upstream", "Show 1 more upstream"])
+    fireEvent.click(more[0])
     await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(5))
-    expect(within(canvas).getByText("weekly_rollup")).toBeInTheDocument()
-    // Asking for a hop is not asking to focus the card it is on.
+    expect(within(canvas).getByTitle("orders_sync")).toBeInTheDocument()
+    // Asking for a hop is not asking to select the card it is on.
     expect(within(canvas).getByText("Selected").closest(".react-flow__node")).toHaveTextContent("daily_revenue")
   })
 
@@ -599,12 +796,13 @@ describe("AssetLineageView", () => {
         url.includes("/schema-index") ? res(200, { tables, foreign_keys: [] }) : res(200, BODY),
       )
       const { container, unmount } = render(<AssetLineageView reloadTick={0} />)
-      await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(9))
+      await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
       const canvas = container.querySelector(".react-flow")!.parentElement!
-      fireEvent.click(within(canvas).getByText("daily_revenue"))
+      fireEvent.click(within(canvas).getByTitle("daily_revenue"))
+      fireEvent.click(await screen.findByRole("button", { name: "Show only its neighbours" }))
       await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(4))
 
-      const card = (text: string) => within(canvas).getByText(text).closest<HTMLElement>(".react-flow__node")!
+      const card = (name: string) => within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!
       const flowAt = (text: string) => translateOf(card(text).style.transform)
       const screenAt = (text: string) => {
         const { left, top } = screenBox(container, card(text))
@@ -630,17 +828,18 @@ describe("AssetLineageView", () => {
         const ordersFrom = flowAt("public.orders")
         drag("public.orders", 240, 160)
         await waitFor(() => expect(flowAt("public.orders")).not.toEqual(ordersFrom))
-        const tableFrom = flowAt("analytics.daily_revenue")
-        drag("analytics.daily_revenue", -480, 200)
-        await waitFor(() => expect(flowAt("analytics.daily_revenue")).not.toEqual(tableFrom))
-        tableBefore = screenAt("analytics.daily_revenue")
+        const tableFrom = flowAt("daily_revenue")
+        drag("daily_revenue", -480, 200)
+        await waitFor(() => expect(flowAt("daily_revenue")).not.toEqual(tableFrom))
+        tableBefore = screenAt("daily_revenue")
       }
-      // A new layout, with the card as tall as its column list, that adds no card.
-      fireEvent.click(within(card("analytics.daily_revenue")).getByTitle("Show its columns"))
-      await waitFor(() => expect(within(card("analytics.daily_revenue")).getByText("day")).toBeInTheDocument())
-      await waitFor(() => expect(parseFloat(card("analytics.daily_revenue").style.height)).toBeGreaterThan(ASSET_NODE_HEIGHT))
+      // A new layout, with the card as tall as its column list, that adds no card. The
+      // model's card opens the columns of the table it builds.
+      fireEvent.click(within(card("daily_revenue")).getByTitle("Show the columns of analytics.daily_revenue"))
+      await waitFor(() => expect(within(card("daily_revenue")).getByText("day")).toBeInTheDocument())
+      await waitFor(() => expect(parseFloat(card("daily_revenue").style.height)).toBeGreaterThan(ASSET_NODE_HEIGHT))
       expect(container.querySelectorAll(".react-flow__node")).toHaveLength(4)
-      const after = { orders: flowAt("public.orders"), table: flowAt("analytics.daily_revenue"), tableOnScreen: screenAt("analytics.daily_revenue") }
+      const after = { orders: flowAt("public.orders"), table: flowAt("daily_revenue"), tableOnScreen: screenAt("daily_revenue") }
       unmount()
       return { ...after, tableBefore }
     }
@@ -664,7 +863,8 @@ describe("AssetLineageView", () => {
     }
   })
 
-  // A model whose table `n` models read. Focused on the model, the table's +n draws a column of n cards.
+  // A model whose table `n` models read: one card, the model with the table it builds. Focused
+  // on the table the model reads, the card's +n draws a column of n cards.
   function fanOut(n: number) {
     const [src, hub] = ["table:c-1:raw.src", "table:c-1:gold.hub"]
     return {
@@ -686,18 +886,17 @@ describe("AssetLineageView", () => {
     }
   }
 
-  /** Focuses the fan-out's model, clicks its table's +n, and returns the canvas once the n cards are drawn. */
+  /** Focuses the table the fan-out's model reads, clicks the model's +n, and returns the canvas once the n cards are drawn. */
   async function openFan(n: number) {
     media.canvas = true
     mockFetch.mockResolvedValue(res(200, fanOut(n)))
-    const { container } = render(<AssetLineageView reloadTick={0} />)
+    const { container } = render(<AssetLineageView reloadTick={0} initialFocus="table:c-1:raw.src" />)
     const canvas = await waitFor(() => {
       const el = container.querySelector(".react-flow")!.parentElement!
       expect(within(el).getByText("hub_model")).toBeInTheDocument()
       return el
     })
-    fireEvent.click(within(canvas).getByText("hub_model"))
-    const hub = () => within(canvas).getByText("gold.hub").closest<HTMLElement>(".react-flow__node")!
+    const hub = () => within(canvas).getByTitle("gold.hub").closest<HTMLElement>(".react-flow__node")!
     await waitFor(() => expect(within(hub()).getByTitle(`Show ${n} more downstream`)).toBeInTheDocument())
     const before = container.querySelectorAll(".react-flow__node").length
     fireEvent.click(within(hub()).getByTitle(`Show ${n} more downstream`))
@@ -753,26 +952,26 @@ describe("AssetLineageView", () => {
       url.includes("/schema-index") ? res(200, { tables, foreign_keys: [] }) : res(200, BODY),
     )
     const { container } = render(<AssetLineageView reloadTick={0} />)
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(9))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
     const canvas = container.querySelector(".react-flow")!.parentElement!
-    const card = () => within(canvas).getByText("public.orders").closest<HTMLElement>(".react-flow__node")!
+    const card = () => within(canvas).getByTitle("public.orders").closest<HTMLElement>(".react-flow__node")!
 
-    fireEvent.click(within(card()).getByTitle("Show its columns"))
+    fireEvent.click(within(card()).getByTitle("Show the columns of public.orders"))
     expect(mockFetch).toHaveBeenCalledWith("/api/v1/explorer/connections/c-1/schema-index")
     await waitFor(() => expect(within(card()).getByText("col_0")).toBeInTheDocument())
     expect(within(card()).getByText("key")).toBeInTheDocument()
     // Ten at a time; the pager reaches the rest.
     expect(within(card()).getByText("1–10 of 12")).toBeInTheDocument()
     expect(within(card()).queryByText("col_11")).toBeNull()
-    // The card is laid out as tall as its ten rows, search and pager, and reading it does not focus the table.
+    // The card is laid out as tall as its ten rows, search and pager, and reading it does not select the table.
     const height = (el: HTMLElement) => parseFloat(el.style.height)
     await waitFor(() => expect(height(card())).toBeGreaterThanOrEqual(ASSET_NODE_HEIGHT + 10 * 20))
     fireEvent.click(within(card()).getByText("col_0"))
     expect(within(canvas).queryByText("Selected")).toBeNull()
 
     // The next table in the same warehouse needs no second request, and one column gets a short card.
-    const customers = () => within(canvas).getByText("public.customers").closest<HTMLElement>(".react-flow__node")!
-    fireEvent.click(within(customers()).getByTitle("Show its columns"))
+    const customers = () => within(canvas).getByTitle("public.customers").closest<HTMLElement>(".react-flow__node")!
+    fireEvent.click(within(customers()).getByTitle("Show the columns of public.customers"))
     await waitFor(() => expect(within(customers()).getByText("customer_id")).toBeInTheDocument())
     expect(mockFetch.mock.calls.filter(([u]) => String(u).includes("/schema-index"))).toHaveLength(1)
     await waitFor(() => expect(height(customers())).toBeGreaterThan(ASSET_NODE_HEIGHT))
@@ -785,7 +984,8 @@ describe("AssetLineageView", () => {
     mockFetch.mockResolvedValue(res(200, WIDE))
     const { container } = render(<AssetLineageView reloadTick={0} />)
 
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(14))
+    // 13 cards: model_m-3 and the table it builds are one.
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(13))
     const inView = () => {
       const vp = container.querySelector<HTMLElement>(".react-flow__viewport")!.style.transform
       const [, tx, ty, z] = vp.match(/translate\((-?[\d.]+)px, ?(-?[\d.]+)px\) scale\(([\d.]+)\)/)!.map(Number)
@@ -802,10 +1002,10 @@ describe("AssetLineageView", () => {
     // The nine tables no model reads are one box, which opens in place.
     const canvas = container.querySelector(".react-flow")!.parentElement!
     fireEvent.click(within(canvas).getByText("9 tables no model reads"))
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(14 - 1 + 9))
-    expect(within(canvas).getByText("raw.a0")).toBeInTheDocument()
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(13 - 1 + 9))
+    expect(within(canvas).getByTitle("raw.a0")).toBeInTheDocument()
     await userEvent.click(screen.getByRole("button", { name: "Fold unread tables again" }))
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(14))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(13))
 
     // Resetting the view never lands below the readable size, as "fit everything" used to.
     await userEvent.click(screen.getByRole("button", { name: "Reset view" }))
@@ -817,8 +1017,9 @@ describe("AssetLineageView", () => {
     mockFetch.mockResolvedValue(res(200, WIDE))
     const { container } = render(<AssetLineageView reloadTick={0} />)
 
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(14))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(13))
     expect(container.querySelector(".react-flow__minimap")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Overview map" })).toBeNull()
 
     // Every table drawn is too tall to fit at a readable size. Opening them leaves the view
     // where the reader had it; a map shows where the rest is, and Reset view starts from
@@ -828,8 +1029,23 @@ describe("AssetLineageView", () => {
     await waitFor(() => expect(zoom()).not.toBe(1))
     const before = zoom()
     await userEvent.click(screen.getByRole("button", { name: "Show every table" }))
-    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(25))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(24))
     await waitFor(() => expect(container.querySelector(".react-flow__minimap")).not.toBeNull())
+    // The map colours each box by its kind from the theme, as the cards are, so it holds in dark mode.
+    const fills = [...container.querySelectorAll<SVGRectElement>(".react-flow__minimap-node")].map((r) => r.style.fill)
+    expect(fills).toHaveLength(24)
+    expect(new Set(fills)).toEqual(new Set([KIND.pipeline, KIND.table, KIND.model]))
+    // The map is framed and captioned, so it reads as a map of the drawing; the reader can put it away and back.
+    expect(within(container.querySelector<HTMLElement>("[data-overview-map]")!).getByText("Overview")).toBeInTheDocument()
+    const mapToggle = screen.getByRole("button", { name: "Overview map" })
+    expect(mapToggle).toHaveAttribute("aria-pressed", "true")
+    await userEvent.click(mapToggle)
+    expect(container.querySelector(".react-flow__minimap")).toBeNull()
+    expect(container.querySelector("[data-overview-map]")).toBeNull()
+    expect(mapToggle).toHaveAttribute("aria-pressed", "false")
+    await userEvent.click(mapToggle)
+    await waitFor(() => expect(container.querySelector(".react-flow__minimap")).not.toBeNull())
+    expect(mapToggle).toHaveAttribute("aria-pressed", "true")
     expect(zoom()).toBe(before)
     expect(screen.queryByRole("button", { name: "Show every table" })).toBeNull()
     await userEvent.click(screen.getByRole("button", { name: "Reset view" }))
@@ -838,7 +1054,7 @@ describe("AssetLineageView", () => {
     const opener = screen.getByRole("button", { name: "Full screen" })
     await userEvent.click(opener)
     const dialog = screen.getByRole("dialog", { name: "Whole workspace" })
-    await waitFor(() => expect(dialog.querySelectorAll(".react-flow__node")).toHaveLength(25))
+    await waitFor(() => expect(dialog.querySelectorAll(".react-flow__node")).toHaveLength(24))
     expect(within(dialog).queryByRole("button", { name: "Full screen" })).toBeNull()
     await userEvent.keyboard("{Escape}")
     expect(screen.queryByRole("dialog")).toBeNull()
@@ -856,10 +1072,11 @@ describe("AssetLineageView", () => {
     mockFetch.mockResolvedValue(res(200, many))
     render(<AssetLineageView reloadTick={0} />)
 
-    expect(await screen.findByText(/has 89 assets, too many to draw at once/)).toBeInTheDocument()
+    // 89 assets, 88 cards: daily_revenue and the table it builds are one.
+    expect(await screen.findByText(/has 88 assets, too many to draw at once/)).toBeInTheDocument()
     expect(document.querySelectorAll("[data-asset-row]")).toHaveLength(0)
 
-    const search = screen.getByRole("combobox", { name: "Find a pipeline, table or model" })
+    const search = screen.getByRole("combobox", { name: "Find a pipeline, table, model, chart or dashboard" })
     await userEvent.type(search, "weekly")
     const matches = screen.getByRole("listbox", { name: "Matches" })
     expect(within(matches).getAllByRole("option")).toHaveLength(1)
@@ -878,8 +1095,9 @@ describe("AssetLineageView", () => {
     expect(options[1]).toHaveAttribute("aria-selected", "true")
     await userEvent.keyboard("{ArrowDown}")
     expect(search).toHaveAttribute("aria-activedescendant", options[0].id)
+    // The table is found by its own name, and drawn as the model that builds it.
     await userEvent.keyboard("{ArrowUp}{Enter}")
-    expect(screen.getByRole("heading", { name: /What feeds analytics\.daily_revenue/ })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: /What feeds daily_revenue, and what it feeds/ })).toBeInTheDocument()
 
     // Leaving the box closes the list; a click on a match still picks it.
     await userEvent.type(search, "orders")
@@ -890,6 +1108,40 @@ describe("AssetLineageView", () => {
     await userEvent.click(search)
     await userEvent.click(within(screen.getByRole("listbox", { name: "Matches" })).getByText("orders_sync"))
     expect(screen.getByRole("heading", { name: /What feeds orders_sync/ })).toBeInTheDocument()
+
+    // A search that finds nothing says so without listing kinds, so it holds for charts and dashboards too.
+    await userEvent.type(search, "zzz")
+    expect(screen.getByText("Nothing matches.")).toBeInTheDocument()
+    expect(screen.queryByRole("listbox")).toBeNull()
+  })
+
+  it("keeps a wide box, like the search, inside the card on a phone", async () => {
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await screen.findByRole("combobox", { name: "Find a pipeline, table, model, chart or dashboard" })
+
+    // jsdom lays nothing out, so this reads the classes that decide it. A box 16rem or wider
+    // fits a 375px phone only if it is capped, and a cap of max-w-full only bites if every
+    // flex item between it and the card can shrink: a flex item in a row is held at least as
+    // wide as its widest child unless it is min-w-0 (or is itself capped).
+    const classes = (e: Element) => (e.getAttribute("class") ?? "").split(/\s+/)
+    const wide = /^w-(6[4-9]|[7-9]\d|\d{3})$|^w-\[(1[6-9]|[2-9]\d)(\.\d+)?rem\]$/
+    const boxes = [...container.querySelectorAll("*")].filter(
+      (e) => classes(e).some((c) => wide.test(c)) && !classes(e).some((c) => c === "absolute" || c === "fixed"),
+    )
+    expect(boxes.length).toBeGreaterThan(0)
+    const held: string[] = []
+    for (const box of boxes) {
+      if (!classes(box).some((c) => c.startsWith("max-w-"))) held.push(`uncapped: ${box.getAttribute("class")}`)
+      for (let e: Element | null = box; e && e !== container; e = e.parentElement) {
+        const row = e.parentElement && classes(e.parentElement).some((c) => c === "flex" || c === "inline-flex")
+        const column = e.parentElement && classes(e.parentElement).includes("flex-col")
+        if (row && !column && !classes(e).some((c) => c === "min-w-0" || c === "max-w-full")) {
+          held.push(`held open: ${e.getAttribute("class")}`)
+        }
+      }
+    }
+    expect(held).toEqual([])
   })
 
 
@@ -918,6 +1170,7 @@ describe("AssetLineageView", () => {
     const row = (name: string) => screen.getByText(name, { selector: ".font-mono" }).closest("[data-asset-row]") as HTMLElement
     expect(within(row("public.events")).getByText("events_wh")).toBeInTheDocument()
     expect(within(row("public.orders")).getByText("analytics_wh")).toBeInTheDocument()
+    expect(within(row("public.events")).getByText("No model reads it")).toBeInTheDocument()
 
     // The backend filters: pipelines by where they write, models by where they run.
     await userEvent.selectOptions(filter, "events_wh")
@@ -926,6 +1179,9 @@ describe("AssetLineageView", () => {
     await waitFor(() => expect(screen.getByText("Pipelines (1)")).toBeInTheDocument())
     // One warehouse drawn: labelling every card with it says nothing.
     expect(within(row("public.events")).queryByText("events_wh")).toBeNull()
+    // The models in the other warehouses are not drawn, so all it can say is that none here reads it.
+    expect(within(row("public.events")).getByText("Nothing in this warehouse reads it")).toBeInTheDocument()
+    expect(screen.queryByText("No model reads it")).toBeNull()
     // The other warehouses stay on offer.
     expect(within(filter).getAllByRole("option")).toHaveLength(3)
 
@@ -934,13 +1190,68 @@ describe("AssetLineageView", () => {
     expect(await screen.findByText("Whole workspace")).toBeInTheDocument()
   })
 
+  it("says what nothing in a graph narrowed to one warehouse reads is unread there, not unread by every model", async () => {
+    media.canvas = true
+    // A second warehouse puts the filter on offer; narrowed, the graph hit the pipeline cap.
+    const TWO = {
+      ...WIDE,
+      nodes: [...WIDE.nodes, { id: "table:wh-2:other.t", kind: "table", name: "other.t", connection_id: "wh-2" }],
+    }
+    const NARROWED = { ...WIDE, stats: { ...WIDE.stats, truncated: { pipelines: true, produced_tables: false, models: false } } }
+    mockFetch.mockImplementation(async (url: string) => res(200, url.includes("connection_id=") ? NARROWED : TWO))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    const canvas = () => container.querySelector(".react-flow")!.parentElement!
+
+    // The whole workspace: what no model reads, no model anywhere reads.
+    await waitFor(() => expect(within(canvas()).getByText("9 tables no model reads")).toBeInTheDocument())
+    expect(screen.getByText(/^13 tables no model reads are folded into one box per pipeline\./)).toBeInTheDocument()
+    expect(within(canvas()).getAllByText("No model reads it").length).toBeGreaterThan(0)
+
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Warehouse" }), "wh-1")
+    expect(mockFetch).toHaveBeenLastCalledWith(`${URL}?connection_id=wh-1`, { method: "GET" })
+    await waitFor(() => expect(within(canvas()).getByText("9 tables unread here")).toBeInTheDocument())
+    expect(screen.getByText(/^13 tables unread in this warehouse are folded into one box per pipeline\./)).toBeInTheDocument()
+    // raw.c0 and raw.d0: their own cards, as a pipeline's one or two unread tables are not folded.
+    expect(within(canvas()).getAllByText("Nothing in this warehouse reads it")).toHaveLength(2)
+    expect(within(canvas()).queryByText("No model reads it")).toBeNull()
+    expect(within(canvas()).queryByText(/tables no model reads/)).toBeNull()
+    // So do a card's details.
+    fireEvent.click(within(canvas()).getByTitle("raw.c0"))
+    expect(
+      within(await screen.findByRole("region", { name: "Details of raw.c0" })).getByText("Nothing in this warehouse reads it"),
+    ).toBeInTheDocument()
+    // The cap was hit in this warehouse's graph, not the workspace's.
+    expect(screen.getByText(/^This warehouse has more than 500 pipelines\./)).toBeInTheDocument()
+    expect(screen.queryByText(/This workspace has more than/)).toBeNull()
+  })
+
+  it("says a lone asset has nothing feeding or reading it in the workspace, or in the warehouse it is narrowed to", async () => {
+    const LONE = {
+      ...BODY,
+      nodes: [{ id: "table:c-2:public.lone", kind: "table", name: "public.lone", connection_id: "c-2" }],
+      edges: [],
+      models: [],
+    }
+    mockFetch.mockResolvedValue(res(200, LONE))
+    const { unmount } = render(<AssetLineageView reloadTick={0} />)
+    expect(await screen.findByText("Nothing in this workspace feeds it or reads from it.")).toBeInTheDocument()
+    unmount()
+
+    mockFetch.mockImplementation(async (url: string) => res(200, url.includes("connection_id=") ? LONE : BODY))
+    render(<AssetLineageView reloadTick={0} />)
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Warehouse" }), "c-2")
+    expect(await screen.findByText("Nothing in this warehouse feeds it or reads from it.")).toBeInTheDocument()
+    expect(screen.queryByText(/Nothing in this workspace/)).toBeNull()
+  })
+
   it("keeps the warehouse filter out of a one-warehouse workspace, and names a warehouse it cannot look up by id", async () => {
     const ONE = { ...BODY, nodes: BODY.nodes.filter((n) => n.id !== T_EVENTS), edges: BODY.edges.filter((e) => e.to !== T_EVENTS) }
     mockFetch.mockResolvedValue(res(200, ONE))
     const { unmount } = render(<AssetLineageView reloadTick={0} />)
     await screen.findByText("Whole workspace")
     expect(screen.queryByRole("combobox", { name: "Warehouse" })).toBeNull()
-    expect(mockConnections).not.toHaveBeenCalled()
+    // The connection list is still read, for each card's logo.
+    expect(mockConnections).toHaveBeenCalled()
     unmount()
 
     // The connection list did not load: the filter still works, by a short id.
@@ -979,5 +1290,1040 @@ describe("AssetLineageView", () => {
     rerender(<AssetLineageView reloadTick={1} />)
     expect(await screen.findByRole("alert")).toHaveTextContent("Showing the graph from the last load.")
     expect(screen.getByText("Whole workspace")).toBeInTheDocument()
+  })
+})
+
+// The launch review (PR4): the summary is the app's stat cards, each with its kind's icon,
+// and "Not refreshed" links to the list that names them. A card says its kind with an
+// icon, a table's schema apart from its name, its warehouse's logo, and a chip when a
+// model needs attention. One colour per kind, from the theme, on the card, the legend's
+// square swatch (bug 14: a 4px sliver, the table's invisible) and the overview map.
+const KIND = {
+  pipeline: "hsl(var(--chart-series-6))",
+  table: "hsl(var(--chart-other))",
+  model: "hsl(var(--chart-series-3))",
+}
+
+describe("the Lineage page's launch review", () => {
+  it("says the workspace in one line, each callout linking to the models it counts", async () => {
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { unmount } = render(<AssetLineageView reloadTick={0} />)
+    await screen.findByText("Whole workspace")
+
+    const summary = () => document.querySelector<HTMLElement>("[data-lineage-summary]")!
+    expect(summary().querySelector("p")).toHaveTextContent(/^2 pipelines · 4 tables · 3 models$/)
+    const behind = within(summary()).getByRole("link", { name: "2 aren't refreshed by what they read" })
+    expect(behind).toHaveAttribute("href", "#lineage-attention")
+    // The link lands on the list of them.
+    expect(document.getElementById("lineage-attention")).toContainElement(
+      screen.getByRole("list", { name: "Models that need attention" }),
+    )
+    unmount()
+
+    // A model refreshed by what it reads, whose SQL names a table nothing writes: the other callout.
+    const traced = BODY.models.map((m) => ({ ...m, uncovered_upstreams: [], trigger_paused: false, ambiguous: false }))
+    mockFetch.mockResolvedValue(res(200, { ...BODY, models: traced }))
+    const second = render(<AssetLineageView reloadTick={0} />)
+    await screen.findByText("Whole workspace")
+    expect(within(summary()).getAllByRole("link").map((a) => a.textContent)).toEqual(["1 reads a table we can't trace"])
+    second.unmount()
+
+    // Nothing out of step: no callout, and the panel says so.
+    const clean = traced.map((m) => ({ ...m, unresolved: [] }))
+    mockFetch.mockResolvedValue(res(200, { ...BODY, models: clean }))
+    render(<AssetLineageView reloadTick={0} />)
+    await screen.findByText("Whole workspace")
+    expect(within(summary()).queryByRole("link")).toBeNull()
+    expect(screen.getByText("Nothing needs attention")).toBeInTheDocument()
+    expect(screen.queryByRole("list", { name: "Models that need attention" })).toBeNull()
+  })
+
+  it("gives each card its kind's icon and colour, a table's schema apart from its name, its warehouse's logo, and a chip when it needs attention", async () => {
+    media.canvas = true
+    mockConnections.mockResolvedValue({
+      connections: [{ id: "c-1", name: "analytics_wh", connector_type: "bigquery" }],
+      total: 1,
+    })
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const card = (name: string) => within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!
+    const face = (name: string) => card(name).firstElementChild as HTMLElement
+
+    // A table: the schema small, the name bold, the logo of the warehouse it is in.
+    const orders = within(canvas).getByTitle("public.orders")
+    expect([...orders.children].map((c) => c.textContent)).toEqual(["public.", "orders"])
+    expect(orders.children[1].className).toMatch(/font-semibold/)
+    expect(orders.className).not.toMatch(/font-mono/)
+    // (The canvas is hidden from screen readers, so its images are found by their alt text.)
+    const logo = await waitFor(() => within(card("public.orders")).getByAltText("bigquery logo"))
+    expect(logo).toHaveAttribute("src", getConnectorLogoUrl("bigquery"))
+    expect(card("public.orders").querySelector("[data-kind-icon=table] svg")).not.toBeNull()
+    expect(face("public.orders").style.borderLeftColor).toBe(KIND.table)
+    // A warehouse the connection list does not have: no logo, nothing guessed.
+    expect(card("public.events").querySelector("img")).toBeNull()
+
+    // A model that needs attention says so in words; one that does not, does not. A card that
+    // also carries the table it builds has no room for the words, so its chip names itself.
+    expect(card("daily_revenue").querySelector("[data-kind-icon=model]")).not.toBeNull()
+    expect(face("daily_revenue").style.borderLeftColor).toBe(KIND.model)
+    expect(within(card("daily_revenue")).getByTitle("Needs attention")).toBeInTheDocument()
+    expect(within(card("weekly_rollup")).getByText("Needs attention")).toBeInTheDocument()
+    expect(within(card("scratch_report")).queryByTitle("Needs attention")).toBeNull()
+    // A model's name is not split at a dot it does not have.
+    expect(within(canvas).getByTitle("daily_revenue").textContent).toBe("daily_revenue")
+
+    // A pipeline: its icon, in its colour, and no uppercase kind label any more.
+    expect(card("orders_sync").querySelector("[data-kind-icon=pipeline]")).not.toBeNull()
+    expect(face("orders_sync").style.borderLeftColor).toBe(KIND.pipeline)
+    expect(card("orders_sync").querySelector(".uppercase")).toBeNull()
+
+    // The legend's swatches are squares of the same colours.
+    const swatches = [...container.querySelectorAll<HTMLElement>("[data-swatch]")]
+    expect(swatches.map((s) => [s.dataset.swatch, s.style.backgroundColor])).toEqual([
+      ["pipeline", KIND.pipeline],
+      ["table", KIND.table],
+      ["model", KIND.model],
+    ])
+    for (const s of swatches) expect(s.className.split(/\s+/)).toEqual(expect.arrayContaining(["h-2.5", "w-2.5"]))
+  })
+})
+
+// The Lineage page as a map of the workspace: a model and the table it builds are one card,
+// the columns are the workspace's own layers, each read says whether it refreshes the model,
+// and a model's schedule opens from its card.
+describe("the Lineage page's layers and refresh", () => {
+  const modelOf = (g: AssetGraph, id: string) => g.models.find((m) => m.model_id === id)!
+  const byIdOf = (g: AssetGraph) => new Map(g.nodes.map((n) => [n.id, n]))
+  const withEdges = (edges: object[]) => parseAssetGraph({ ...BODY, edges: [...BODY.edges, ...edges] })
+  const withModel = (id: string, patch: object) =>
+    parseAssetGraph({ ...BODY, models: BODY.models.map((m) => (m.model_id === id ? { ...m, ...patch } : m)) })
+
+  // Silver before Gold, as the workspace orders them; scratch_report is in none. The tables
+  // orders_sync and events_sync write are pipeline tables.
+  const LAYERS = [
+    { name: "Silver", position: 0 },
+    { name: "Gold", position: 1 },
+  ]
+  const LAYERED = {
+    ...BODY,
+    nodes: BODY.nodes.map((n) => ({
+      ...n,
+      ...({ [M1]: { layer: "Gold" }, [T_DAILY]: { layer: "Gold" }, [M2]: { layer: "Silver" } } as Record<string, object>)[n.id],
+      ...([T_ORDERS, T_CUST, T_EVENTS].includes(n.id) ? { pipeline_table: true } : {}),
+    })),
+  }
+
+  it("draws a model and the one table it builds as one card, each read marked by whether it refreshes the model", () => {
+    const drawn = drawnGraph(graph)
+    expect([...drawn.builds]).toEqual([[M1, T_DAILY]])
+    expect([...drawn.builtBy]).toEqual([[T_DAILY, M1]])
+    expect(drawn.graph.nodes.map((n) => n.id)).not.toContain(T_DAILY)
+    expect(drawn.graph.nodes).toHaveLength(8)
+    // The build is not a link any more; what read the table reads the model.
+    expect(drawn.graph.edges.map((e) => [e.from, e.to, e.kind, e.refresh ?? ""])).toEqual([
+      [P1, T_ORDERS, "writes", ""],
+      [P1, T_CUST, "writes", ""],
+      [P1, M2, "triggers", "wakes"],
+      [T_ORDERS, M1, "reads", "stale"],
+      [T_CUST, M1, "reads", "stale"],
+      [M1, M2, "reads", "stale"],
+      [P2, T_EVENTS, "writes", ""],
+    ])
+    // The asset graph it came from is left alone.
+    expect(graph.nodes).toHaveLength(9)
+
+    // Not one thing: a table something else writes too, a build only inferred, a model that builds two.
+    expect(drawnGraph(withEdges([{ from: P2, to: T_DAILY, kind: "writes", evidence: "observed" }])).builds.size).toBe(0)
+    const inferred = parseAssetGraph({
+      ...BODY,
+      edges: BODY.edges.map((e) => (e.kind === "materializes" ? { ...e, evidence: "inferred" } : e)),
+    })
+    expect(drawnGraph(inferred).builds.size).toBe(0)
+    const twice = parseAssetGraph({
+      ...BODY,
+      nodes: [...BODY.nodes, { id: "table:c-1:analytics.daily_copy", kind: "table", name: "analytics.daily_copy", connection_id: "c-1" }],
+      edges: [...BODY.edges, { from: M1, to: "table:c-1:analytics.daily_copy", kind: "materializes", evidence: "declared" }],
+    })
+    expect(drawnGraph(twice).builds.size).toBe(0)
+  })
+
+  it("leaves out a trigger from what the model reads, and marks a read that wakes it and a paused one", () => {
+    // weekly_rollup also follows daily_revenue, which it reads: the read says so, the trigger adds nothing.
+    const follows = parseAssetGraph({
+      ...BODY,
+      edges: [...BODY.edges, { from: M1, to: M2, kind: "triggers", evidence: "declared" }],
+      models: BODY.models.map((m) => (m.model_id === "m-2" ? { ...m, trigger_upstreams: [P1, M1], uncovered_upstreams: [] } : m)),
+    })
+    const edges = drawnGraph(follows).graph.edges
+    expect(edges.filter((e) => e.from === M1 && e.to === M2).map((e) => [e.kind, e.refresh])).toEqual([["reads", "wakes"]])
+    expect(edges.find((e) => e.from === P1 && e.to === M2)!.refresh).toBe("wakes")
+
+    // Paused: no read keeps it fresh, and no trigger wakes it.
+    const paused = drawnGraph(withModel("m-2", { trigger_paused: true, uncovered_upstreams: [] })).graph.edges
+    expect(paused.find((e) => e.from === M1 && e.to === M2)!.refresh).toBe("stale")
+    expect(paused.find((e) => e.from === P1 && e.to === M2)!.refresh).toBeUndefined()
+  })
+
+  it("walks everything upstream of a card", () => {
+    const { edges } = drawnGraph(graph).graph
+    expect(upstreamPath(edges, M2)).toEqual(new Set([M2, P1, M1, T_ORDERS, T_CUST]))
+    expect(upstreamPath(edges, M1)).toEqual(new Set([M1, T_ORDERS, T_CUST, P1]))
+    expect(upstreamPath(edges, P2)).toEqual(new Set([P2]))
+  })
+
+  it("puts each card in its stage: pipelines, their tables, each layer in the workspace's order, then no layer", () => {
+    const cardsOf = (g: AssetGraph) => drawnGraph(g).graph.nodes.map((node) => ({ id: node.id, node }))
+    const layered = parseAssetGraph(LAYERED)
+    const { bands, columns } = stageColumns(cardsOf(layered), LAYERS)
+    expect(columns).toEqual([
+      { band: 0, label: "Pipelines", count: 2 },
+      { band: 1, label: "Pipeline tables", count: 3 },
+      { band: 2, label: "Silver", count: 1 },
+      { band: 3, label: "Gold", count: 1 },
+      { band: 4, label: "No layer", count: 1 },
+    ])
+    expect([M2, M1, M3].map((id) => bands.get(id))).toEqual([2, 3, 4])
+
+    // A layer the workspace no longer lists follows the ones it does; a folded box counts its tables;
+    // a table nothing marks a pipeline table makes the column plain "Tables".
+    const moved = cardsOf(parseAssetGraph({ ...LAYERED, nodes: LAYERED.nodes.map((n) => (n.id === M3 ? { ...n, layer: "Archive" } : n)) }))
+    const box = { id: "fold:p-9", node: undefined, count: 9 }
+    expect(stageColumns([...moved, box], LAYERS).columns.map((c) => [c.label, c.count])).toEqual([
+      ["Pipelines", 2],
+      ["Pipeline tables", 12],
+      ["Silver", 1],
+      ["Gold", 1],
+      ["Archive", 1],
+    ])
+    expect(stageColumns(cardsOf(graph), null).columns.map((c) => [c.label, c.count])).toEqual([
+      ["Pipelines", 2],
+      ["Tables", 3],
+      ["Models", 3],
+    ])
+
+    // A built table that keeps its own card sits with its model.
+    const unmerged = parseAssetGraph({
+      ...LAYERED,
+      edges: LAYERED.edges.map((e) => (e.kind === "materializes" ? { ...e, evidence: "inferred" } : e)),
+    })
+    const own = stageColumns(cardsOf(unmerged), LAYERS)
+    expect(own.bands.get(T_DAILY)).toBe(own.bands.get(M1))
+    expect(own.columns.find((c) => c.label === "Gold")!.count).toBe(2)
+  })
+
+  it("says in a couple of words what refreshes a model, and what to schedule it after", () => {
+    expect(refreshChip(modelOf(graph, "m-1"))).toEqual({ label: "On a cron", tone: "warn" })
+    expect(refreshChip(modelOf(graph, "m-2"))).toEqual({ label: "After 0 of 1 inputs", tone: "warn" })
+    expect(refreshChip(modelOf(graph, "m-3"))).toEqual({ label: "By hand", tone: "plain" })
+    const m2 = modelOf(graph, "m-2")
+    expect(refreshChip({ ...m2, uncovered_upstreams: [] })).toEqual({ label: "After its inputs", tone: "ok" })
+    expect(refreshChip({ ...m2, upstreams: [], uncovered_upstreams: [] })).toEqual({ label: "After its upstreams", tone: "plain" })
+    expect(refreshChip({ ...m2, trigger_paused: true })).toEqual({ label: "Paused", tone: "warn" })
+    expect(refreshChip({ ...modelOf(graph, "m-3"), trigger: "interval" })).toEqual({ label: "On an interval", tone: "plain" })
+
+    const byId = byIdOf(graph)
+    expect(inputUpstreams(modelOf(graph, "m-2"), byId)).toEqual([{ kind: "model", id: "m-1", name: "daily_revenue" }])
+    expect(inputUpstreams(modelOf(graph, "m-1"), byId)).toEqual([{ kind: "pipeline", id: "p-1", name: "orders_sync" }])
+    expect(inputUpstreams(modelOf(graph, "m-3"), byId)).toEqual([])
+    // An upstream the graph does not draw keeps its id; a table is not something to wait for.
+    expect(inputUpstreams({ ...m2, upstreams: ["model:gone", T_ORDERS] }, byId)).toEqual([{ kind: "model", id: "gone" }])
+
+    expect(followsItsInputs(m2)).toBe(false)
+    expect(followsItsInputs({ ...m2, uncovered_upstreams: [] })).toBe(true)
+    expect(followsItsInputs({ ...m2, uncovered_upstreams: [], trigger_paused: true })).toBe(false)
+    expect(followsItsInputs({ ...m2, uncovered_upstreams: [], upstreams: [] })).toBe(false)
+    expect(followsItsInputs({ ...modelOf(graph, "m-1"), uncovered_upstreams: [] })).toBe(false)
+  })
+
+  it("splits the attention list the way the summary counts it", () => {
+    const ids = (items: { model: ModelRefresh }[]) => items.map((i) => i.model.model_id)
+    const split = attentionSplit(needsAttention(graph))
+    expect([ids(split.notRefreshed), ids(split.untraced)]).toEqual([["m-1", "m-2"], []])
+    // daily_revenue followed by what it reads still names a table nothing writes; scratch_report is paused while following a pipeline.
+    const g = parseAssetGraph({
+      ...BODY,
+      models: BODY.models.map((m) =>
+        m.model_id === "m-1"
+          ? { ...m, uncovered_upstreams: [] }
+          : m.model_id === "m-3"
+            ? { ...m, trigger: "after_upstream", trigger_upstreams: [P2], trigger_paused: true }
+            : m,
+      ),
+    })
+    const both = attentionSplit(needsAttention(g))
+    expect([ids(both.notRefreshed).sort(), ids(both.untraced)]).toEqual([["m-2", "m-3"], ["m-1"]])
+  })
+
+  it("lays the canvas out in the workspace's layers, and says where a read goes back a layer", async () => {
+    media.canvas = true
+    mockLayers.value = LAYERS
+    mockFetch.mockResolvedValue(res(200, LAYERED))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const x = (name: string) => translateOf(within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!.style.transform)[0]
+    const headers = () =>
+      [...container.querySelectorAll<HTMLElement>("[data-column-header]")].map((h) => ({
+        text: [...h.children].map((c) => c.textContent),
+        x: translateOf(h.style.transform)[0],
+      }))
+    const columns = within(screen.getByRole("group", { name: "Arrange by" }))
+
+    // A workspace with layers starts in them.
+    expect(columns.getByRole("button", { name: "Layers" })).toHaveAttribute("aria-pressed", "true")
+    await waitFor(() => expect(headers()).toHaveLength(5))
+    expect(headers().map((h) => h.text)).toEqual([
+      ["Pipelines", "2"],
+      ["Pipeline tables", "3"],
+      ["Silver", "1"],
+      ["Gold", "1"],
+      ["No layer", "1"],
+    ])
+    const xs = headers().map((h) => h.x)
+    expect(xs).toEqual([...xs].sort((a, b) => a - b))
+    expect(new Set(xs).size).toBe(5)
+    // Each card under its column: weekly_rollup in Silver, left of daily_revenue in Gold, though it reads it.
+    expect(x("orders_sync")).toBe(xs[0])
+    expect(x("public.orders")).toBe(xs[1])
+    expect(x("weekly_rollup")).toBe(xs[2])
+    expect(x("daily_revenue")).toBe(xs[3])
+    expect(x("scratch_report")).toBe(xs[4])
+    // The read that goes back a layer says so on the link, and the legend explains it.
+    expect([...container.querySelectorAll("[data-edge-note]")].map((n) => n.textContent)).toEqual(["Reads a later layer"])
+
+    // Run order: what runs first on the left, no headers, nothing goes back.
+    await userEvent.click(columns.getByRole("button", { name: "Run order" }))
+    await waitFor(() => expect(container.querySelectorAll("[data-column-header]")).toHaveLength(0))
+    await waitFor(() => expect(x("daily_revenue")).toBeLessThan(x("weekly_rollup")))
+    expect(container.querySelectorAll("[data-edge-note]")).toHaveLength(0)
+    expect(columns.getByRole("button", { name: "Run order" })).toHaveAttribute("aria-pressed", "true")
+  })
+
+  it("starts in run order when the workspace has no layers", async () => {
+    media.canvas = true
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    expect(within(screen.getByRole("group", { name: "Arrange by" })).getByRole("button", { name: "Run order" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    )
+    expect(container.querySelectorAll("[data-column-header]")).toHaveLength(0)
+  })
+
+  it("shows on each model's card what refreshes it and when it last ran", async () => {
+    media.canvas = true
+    const ranAt = new Date(Date.now() - 2 * 3600_000).toISOString()
+    const failedAt = new Date(Date.now() - 5 * 60_000).toISOString()
+    mockSaved.value = new Map([
+      ["m-1", { id: "m-1", name: "daily_revenue", materialization: "table", last_run_at: ranAt, last_run_status: "success" }],
+      ["m-2", { id: "m-2", name: "weekly_rollup", materialization: "table", last_run_at: failedAt, last_run_status: "failed" }],
+    ])
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const card = (name: string) => within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!
+    const chip = (name: string) => {
+      const c = card(name).querySelector<HTMLElement>("[data-refresh-chip]")
+      return c && [c.textContent, c.dataset.refreshChip]
+    }
+
+    expect(chip("daily_revenue")).toEqual(["On a cron", "warn"])
+    expect(chip("weekly_rollup")).toEqual(["After 0 of 1 inputs", "warn"])
+    expect(chip("scratch_report")).toEqual(["By hand", "plain"])
+    expect(chip("public.orders")).toBeNull()
+    expect(chip("orders_sync")).toBeNull()
+    expect(card("daily_revenue")).toHaveTextContent(`ran ${formatRelativeTime(ranAt)}`)
+    expect(card("weekly_rollup")).toHaveTextContent(`failed ${formatRelativeTime(failedAt)}`)
+    // Not run, or not in the list: no run to show.
+    expect(card("scratch_report")).not.toHaveTextContent(/ran |failed /)
+  })
+
+  it("opens a model's details from its card, and its schedule with what it reads picked", async () => {
+    media.canvas = true
+    mockSaved.value = new Map([
+      ["m-1", { id: "m-1", name: "daily_revenue", materialization: "table" }],
+      [
+        "m-2",
+        {
+          id: "m-2",
+          name: "weekly_rollup",
+          materialization: "table",
+          last_run_at: new Date(Date.now() - 60_000).toISOString(),
+          last_run_status: "failed",
+          last_run_error: 'relation "analytics.daily_revenue" does not exist',
+        },
+      ],
+    ])
+    mockFetch.mockResolvedValue(res(200, BODY))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+
+    fireEvent.click(within(canvas).getByTitle("weekly_rollup"))
+    const details = await screen.findByRole("region", { name: "Details of weekly_rollup" })
+    expect(within(details).getByText("After 0 of 1 inputs")).toBeInTheDocument()
+    expect(within(details).getByText(/^Last run failed /)).toBeInTheDocument()
+    expect(within(details).getByText('relation "analytics.daily_revenue" does not exist')).toBeInTheDocument()
+    expect(within(details).getByRole("list", { name: "Why it needs attention" })).toBeInTheDocument()
+    // What feeds it: the model it reads, which does not refresh it, and the pipeline that wakes it.
+    const feeds = within(details).getByRole("list", { name: "What feeds it" })
+    // (Each starts with its kind icon's hidden word.)
+    expect([...feeds.querySelectorAll("li")].map((li) => li.textContent)).toEqual([
+      "Pipelineorders_sync wakes it when it finishes",
+      "Modeldaily_revenue it reads this · doesn't refresh it",
+    ])
+    expect(within(details).getByText("Nothing drawn.")).toBeInTheDocument()
+
+    // Rebuild after its inputs: the Schedule dialog, with daily_revenue picked.
+    await userEvent.click(within(details).getByRole("button", { name: "Rebuild after its inputs" }))
+    let dialog = screen.getByRole("dialog", { name: "Schedule weekly_rollup" })
+    expect(dialog).toHaveAttribute("data-saved-query", "m-2")
+    expect(JSON.parse(dialog.getAttribute("data-preset")!)).toEqual({
+      upstreams: [{ kind: "model", id: "m-1", name: "daily_revenue" }],
+    })
+    await userEvent.click(within(dialog).getByRole("button", { name: "Close schedule" }))
+    expect(screen.queryByRole("dialog")).toBeNull()
+
+    // Edit schedule: the dialog as it is, nothing picked. Saving refetches the graph and the runs.
+    await userEvent.click(within(details).getByRole("button", { name: "Edit schedule" }))
+    dialog = screen.getByRole("dialog", { name: "Schedule weekly_rollup" })
+    expect(JSON.parse(dialog.getAttribute("data-preset")!)).toBeNull()
+    const fetches = mockFetch.mock.calls.length
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save schedule" }))
+    expect(mockReloadSaved).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(mockFetch.mock.calls.length).toBeGreaterThan(fetches))
+    await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close schedule" }))
+
+    // Its upstream, from the panel: the merged card, with the table it builds and the pipeline it waits for.
+    await userEvent.click(within(details).getByRole("button", { name: "Select daily_revenue" }))
+    const upstream = await screen.findByRole("region", { name: "Details of daily_revenue" })
+    expect(upstream).toHaveTextContent("Builds analytics.daily_revenue")
+    await userEvent.click(within(upstream).getByRole("button", { name: "Rebuild after its inputs" }))
+    expect(JSON.parse(screen.getByRole("dialog", { name: "Schedule daily_revenue" }).getAttribute("data-preset")!)).toEqual({
+      upstreams: [{ kind: "pipeline", id: "p-1", name: "orders_sync" }],
+    })
+    await userEvent.click(screen.getByRole("button", { name: "Close schedule" }))
+
+    // No saved query listed for it: nothing to schedule from here.
+    fireEvent.click(within(canvas).getByTitle("scratch_report"))
+    const scratch = await screen.findByRole("region", { name: "Details of scratch_report" })
+    expect(within(scratch).queryByRole("button", { name: "Edit schedule" })).toBeNull()
+    expect(within(scratch).queryByRole("button", { name: "Rebuild after its inputs" })).toBeNull()
+
+    // A click on the empty canvas puts the attention list back.
+    fireEvent.click(container.querySelector(".react-flow__pane")!)
+    await waitFor(() => expect(screen.queryByRole("region", { name: /^Details of / })).toBeNull())
+    expect(screen.getByRole("heading", { name: /Needs attention \(2\)/ })).toBeInTheDocument()
+  })
+
+  it("says a model already rebuilds after its inputs instead of offering to", async () => {
+    mockSaved.value = new Map([["m-2", { id: "m-2", name: "weekly_rollup", materialization: "table" }]])
+    mockFetch.mockResolvedValue(
+      res(200, {
+        ...BODY,
+        models: BODY.models.map((m) => (m.model_id === "m-2" ? { ...m, trigger_upstreams: [P1, M1], uncovered_upstreams: [] } : m)),
+      }),
+    )
+    render(<AssetLineageView reloadTick={0} />)
+    await userEvent.click(await screen.findByRole("button", { name: "Show the details of weekly_rollup" }))
+    const details = screen.getByRole("region", { name: "Details of weekly_rollup" })
+    expect(within(details).getByText("Already rebuilds after its inputs")).toBeInTheDocument()
+    expect(within(details).queryByRole("button", { name: "Rebuild after its inputs" })).toBeNull()
+    expect(within(details).getByRole("button", { name: "Edit schedule" })).toBeInTheDocument()
+    await userEvent.click(within(details).getByRole("button", { name: "Close details" }))
+    expect(screen.queryByRole("region", { name: /^Details of / })).toBeNull()
+  })
+})
+
+// A lake pipeline writes Parquet files to a bucket; a BigQuery external table reads them;
+// a Silver model reads the external table. The backend links the folder's table to the
+// external table (an "external" link, asset_graph.go) and gives the model the pipeline as
+// its upstream, so the page has to see the pipeline behind the external table too: what
+// refreshes the read, what the Schedule dialog lists as the input's producer.
+describe("a lake pipeline linked to the external table a warehouse reads its files through", () => {
+  const P_LAKE = "pipeline:p-lake"
+  const T_FOLDER = "table:gcs-1\u0000lake\u0000fintech/public/transactions"
+  const T_EXT = "table:bq-1:fintech_bronze.transactions"
+  const M_SILVER = "model:m-silver"
+  const silver = {
+    model_id: "m-silver",
+    node_id: M_SILVER,
+    name: "silver_transactions",
+    trigger: "after_upstream",
+    trigger_upstreams: [P_LAKE],
+    trigger_paused: false,
+    upstreams: [P_LAKE],
+    uncovered_upstreams: [],
+    unresolved: [],
+    ambiguous: false,
+  }
+  const LAKE = {
+    nodes: [
+      { id: P_LAKE, kind: "pipeline", name: "card_transactions", ref_id: "p-lake", connection_id: "gcs-1" },
+      { id: T_FOLDER, kind: "table", name: "public.transactions", connection_id: "gcs-1", pipeline_table: true },
+      { id: T_EXT, kind: "table", name: "fintech_bronze.transactions", connection_id: "bq-1", pipeline_table: true },
+      { id: M_SILVER, kind: "model", name: "silver_transactions", ref_id: "m-silver", connection_id: "bq-1", layer: "Silver" },
+    ],
+    edges: [
+      { from: P_LAKE, to: T_FOLDER, kind: "writes", evidence: "observed" },
+      { from: T_FOLDER, to: T_EXT, kind: "external", evidence: "observed" },
+      { from: T_EXT, to: M_SILVER, kind: "reads", evidence: "inferred" },
+    ],
+    models: [silver],
+    stats: {
+      pipelines: 1,
+      tables: 2,
+      models: 1,
+      edges: { writes: 1, external: 1, reads: 1 },
+      models_with_uncovered_upstreams: 0,
+      models_with_unresolved_references: 0,
+      models_with_multiple_upstreams: 0,
+      truncated: { pipelines: false, produced_tables: false, models: false },
+    },
+  }
+  const lake = parseAssetGraph(LAKE)
+  const withSilver = (patch: object) => parseAssetGraph({ ...LAKE, models: [{ ...silver, ...patch }] })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("finds the pipeline behind an external table, and marks the model's read by whether it follows it", () => {
+    const producers = tableProducers(lake.edges)
+    expect(producers.get(T_FOLDER)).toEqual([P_LAKE])
+    expect(producers.get(T_EXT)).toEqual([P_LAKE])
+    expect(producers.has(M_SILVER)).toBe(false)
+
+    const readOf = (g: AssetGraph) => drawnGraph(g).graph.edges.find((e) => e.from === T_EXT && e.to === M_SILVER)!
+    expect(readOf(lake).refresh).toBe("wakes")
+    expect(readOf(withSilver({ trigger: "cron", trigger_upstreams: [], uncovered_upstreams: [P_LAKE] })).refresh).toBe("stale")
+    expect(readOf(withSilver({ trigger_paused: true })).refresh).toBe("stale")
+    // The link itself is kept as it is: nothing merges a folder into the table that reads it.
+    expect(drawnGraph(lake).graph.edges.map((e) => [e.from, e.to, e.kind])).toEqual([
+      [P_LAKE, T_FOLDER, "writes"],
+      [T_FOLDER, T_EXT, "external"],
+      [T_EXT, M_SILVER, "reads"],
+    ])
+    expect(upstreamPath(drawnGraph(lake).graph.edges, M_SILVER)).toEqual(new Set([M_SILVER, T_EXT, T_FOLDER, P_LAKE]))
+  })
+
+  it("gives the Schedule dialog the pipeline as the producer of what the model reads", () => {
+    const around = modelSurroundings(lake, M_SILVER)!
+    expect(around.inputs.map((i) => [i.table.id, i.producers.map((p) => p.id)])).toEqual([[T_EXT, [P_LAKE]]])
+    expect(inputWakes(around.inputs[0], new Set([P_LAKE]))).toBe(true)
+    expect(inputWakes(around.inputs[0], new Set())).toBe(false)
+    expect(inputUpstreams(lake.models[0], new Map(lake.nodes.map((n) => [n.id, n])))).toEqual([
+      { kind: "pipeline", id: "p-lake", name: "card_transactions" },
+    ])
+  })
+
+  it("says a folder is read as an external table, and names the link", () => {
+    const folder = lake.nodes.find((n) => n.id === T_FOLDER)!
+    expect(describeAsset(folder, lake, undefined)).toBe("A warehouse reads it as 1 external table")
+    const both = parseAssetGraph({ ...LAKE, edges: [...LAKE.edges, { from: T_FOLDER, to: M_SILVER, kind: "reads", evidence: "inferred" }] })
+    expect(describeAsset(folder, both, undefined)).toBe("Read by 1 model and 1 external table")
+    expect(describeAsset(lake.nodes.find((n) => n.id === T_EXT)!, lake, undefined)).toBe("Read by 1 model")
+    expect(edgeLabel({ kind: "external", evidence: "observed" })).toBe("Read as an external table · seen in a run")
+    // A folder the warehouse reads is not folded away with the tables nothing reads.
+    expect(foldLooseAssets(wholeGraph(lake), lake).groups.size).toBe(0)
+  })
+
+  it("reads whether a warehouse's external tables are still being read", () => {
+    expect(lake.external_tables_pending).toBe(false)
+    expect(parseAssetGraph({ ...LAKE, external_tables_pending: true }).external_tables_pending).toBe(true)
+    expect(parseAssetGraph(null).external_tables_pending).toBe(false)
+  })
+
+  it("lays the folder and its external table out in the pipeline tables' column, in that order, before Silver", async () => {
+    media.canvas = true
+    mockLayers.value = [{ name: "Silver", position: 0 }]
+    mockFetch.mockResolvedValue(res(200, LAKE))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(4))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const x = (name: string) => translateOf(within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!.style.transform)[0]
+    await waitFor(() => expect(container.querySelectorAll("[data-column-header]")).toHaveLength(3))
+    const headers = [...container.querySelectorAll<HTMLElement>("[data-column-header]")].map((h) => ({
+      text: [...h.children].map((c) => c.textContent),
+      x: translateOf(h.style.transform)[0],
+    }))
+    expect(headers.map((h) => h.text)).toEqual([
+      ["Pipelines", "1"],
+      ["Pipeline tables", "2"],
+      ["Silver", "1"],
+    ])
+    expect(x("card_transactions")).toBe(headers[0].x)
+    expect(x("public.transactions")).toBe(headers[1].x)
+    expect(x("fintech_bronze.transactions")).toBeGreaterThan(x("public.transactions"))
+    expect(x("silver_transactions")).toBeGreaterThan(x("fintech_bronze.transactions"))
+    expect(x("silver_transactions")).toBe(headers[2].x)
+    // Nothing reads back a layer.
+    expect(container.querySelectorAll("[data-edge-note]")).toHaveLength(0)
+  })
+
+  it("asks again, quietly, while a warehouse's external tables are first being read, and draws the link once they are", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // Before the read: the model names a table the graph cannot place yet.
+    const before = {
+      ...LAKE,
+      nodes: LAKE.nodes.filter((n) => n.id !== T_EXT),
+      edges: LAKE.edges.slice(0, 1),
+      models: [{ ...silver, trigger: "manual", trigger_upstreams: [], upstreams: [], unresolved: ["fintech_bronze.transactions"] }],
+      external_tables_pending: true,
+    }
+    mockFetch
+      .mockResolvedValueOnce(res(200, before))
+      .mockResolvedValueOnce(res(500, { error: "boom" }))
+      .mockResolvedValueOnce(res(200, before))
+      .mockResolvedValueOnce(res(200, LAKE))
+    render(<AssetLineageView reloadTick={0} />)
+    const tableRows = () =>
+      [...screen.getByRole("heading", { name: /^Tables \(/ }).closest("section")!.querySelectorAll("[data-asset-row]")].map(
+        (row) => row.querySelector(".font-mono")!.textContent,
+      )
+
+    expect(await screen.findByText(/Reading the external tables of a warehouse for the first time/)).toBeInTheDocument()
+    expect(tableRows()).toEqual(["public.transactions"])
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+
+    // A failed ask says nothing; one still reading leaves the graph as it is.
+    await vi.advanceTimersByTimeAsync(15_000)
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole("alert")).toBeNull()
+    await vi.advanceTimersByTimeAsync(15_000)
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(3))
+    expect(tableRows()).toEqual(["public.transactions"])
+
+    // Read: the link is drawn, the notice goes, and nothing more is asked.
+    await vi.advanceTimersByTimeAsync(15_000)
+    await waitFor(() => expect(tableRows()).toEqual(["fintech_bronze.transactions", "public.transactions"]))
+    expect(screen.queryByText(/Reading the external tables of a warehouse/)).toBeNull()
+    expect(screen.getByText("A warehouse reads it as 1 external table")).toBeInTheDocument()
+    expect(mockFetch.mock.calls.every(([url]) => url === URL)).toBe(true)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(mockFetch).toHaveBeenCalledTimes(4)
+  })
+
+  it("stops asking after as long as the backend gives the read", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    mockFetch.mockResolvedValue(res(200, { ...LAKE, external_tables_pending: true }))
+    render(<AssetLineageView reloadTick={0} />)
+    await screen.findByText(/Reading the external tables of a warehouse for the first time/)
+    // Twelve asks, 15 seconds apart: the three minutes the backend gives the read. Far
+    // longer on the clock than that asks no more.
+    for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(15_000)
+    expect(mockFetch).toHaveBeenCalledTimes(13)
+  })
+})
+
+// The charts drawn from a model, and the dashboards that show them, after the last model
+// layer. daily_revenue draws four charts, one on a dashboard; weekly_rollup draws one,
+// on the same dashboard. So three of daily_revenue's charts are on no dashboard.
+describe("charts and dashboards on Lineage", () => {
+  const C_ON = "chart:c-1"
+  const C_LOOSE = ["chart:c-2", "chart:c-3", "chart:c-4"]
+  const C_WEEKLY = "chart:c-5"
+  const D = "dashboard:d-1"
+  const CHARTS = {
+    ...BODY,
+    nodes: [
+      ...BODY.nodes,
+      { id: C_ON, kind: "chart", name: "revenue_by_day", ref_id: "c-1", chart_type: "bar" },
+      { id: C_LOOSE[0], kind: "chart", name: "revenue_trend", ref_id: "c-2", chart_type: "line" },
+      { id: C_LOOSE[1], kind: "chart", name: "revenue_split", ref_id: "c-3", chart_type: "pie" },
+      { id: C_LOOSE[2], kind: "chart", name: "top_customers", ref_id: "c-4", chart_type: "a-type-from-later" },
+      { id: C_WEEKLY, kind: "chart", name: "weekly_total", ref_id: "c-5", chart_type: "scorecard" },
+      { id: D, kind: "dashboard", name: "Revenue overview", ref_id: "d-1", charts: 2 },
+    ],
+    edges: [
+      ...BODY.edges,
+      ...[C_ON, ...C_LOOSE].map((to) => ({ from: M1, to, kind: "draws", evidence: "declared" })),
+      { from: M2, to: C_WEEKLY, kind: "draws", evidence: "declared" },
+      { from: C_ON, to: D, kind: "shows", evidence: "declared" },
+      { from: C_WEEKLY, to: D, kind: "shows", evidence: "declared" },
+    ],
+    stats: {
+      ...BODY.stats,
+      charts: 5,
+      dashboards: 1,
+      edges: { ...BODY.stats.edges, draws: 5, shows: 2 },
+      truncated: { ...BODY.stats.truncated, charts: true },
+    },
+  }
+  const charted = parseAssetGraph(CHARTS)
+  const node = (id: string) => charted.nodes.find((n) => n.id === id)!
+
+  it("reads charts and dashboards, says what each is, and links each to its own page", () => {
+    expect(charted.stats).toMatchObject({ charts: 5, dashboards: 1 })
+    expect(charted.stats.truncated).toMatchObject({ charts: true, dashboards: false })
+    expect(node(C_ON).chart_type).toBe("bar")
+    expect(node(D).charts).toBe(2)
+    expect(charted.nodes.filter((n) => isDisplay(n.kind)).map((n) => n.id)).toEqual([C_ON, ...C_LOOSE, C_WEEKLY, D])
+
+    expect(describeAsset(node(C_ON), charted, undefined)).toBe("Bar · on 1 dashboard")
+    expect(describeAsset(node(C_LOOSE[0]), charted, undefined)).toBe("Line · on no dashboard")
+    // A type this page does not know yet is still a chart.
+    expect(describeAsset(node(C_LOOSE[2]), charted, undefined)).toBe("Chart · on no dashboard")
+    expect(describeAsset(node(D), charted, undefined)).toBe("Shows 2 charts")
+
+    expect(assetHref(node(C_ON))).toBe("/charts/c-1")
+    expect(assetHref(node(D))).toBe("/dashboards/d-1")
+    expect(edgeLabel({ kind: "draws", evidence: "declared" })).toBe("Drawn as a chart · configured")
+    expect(edgeLabel({ kind: "shows", evidence: "declared" })).toBe("Shown on a dashboard · configured")
+
+    // Named alike, a model comes before a chart and a chart before a dashboard.
+    expect(searchAssets(charted, "revenue").map((n) => n.name)).toEqual([
+      "revenue_by_day",
+      "revenue_split",
+      "revenue_trend",
+      "Revenue overview",
+      "daily_revenue",
+      "analytics.daily_revenue",
+    ])
+  })
+
+  it("lists what a model changes, however far downstream: its charts, then the dashboards, by name", () => {
+    expect(displaysDownstream(charted, M1).map((n) => n.name)).toEqual([
+      "revenue_by_day",
+      "revenue_split",
+      "revenue_trend",
+      "top_customers",
+      // Through the table daily_revenue builds, which weekly_rollup reads.
+      "weekly_total",
+      "Revenue overview",
+    ])
+    expect(displaysDownstream(charted, M2).map((n) => n.name)).toEqual(["weekly_total", "Revenue overview"])
+    expect(displaysDownstream(charted, M3)).toEqual([])
+  })
+
+  it("leaves charts and dashboards out when asked, but keeps the workspace's counts", () => {
+    const plain = withoutDisplays(charted)
+    expect(plain.nodes).toHaveLength(BODY.nodes.length)
+    expect(plain.edges.map((e) => e.kind)).toEqual(BODY.edges.map((e) => e.kind))
+    expect(plain.stats).toBe(charted.stats)
+    // Nothing to leave out: the graph itself, so nothing redraws.
+    expect(withoutDisplays(graph)).toBe(graph)
+  })
+
+  it("folds a model's charts on no dashboard into one box, and keeps a chart a dashboard shows", () => {
+    const f = foldLooseAssets(wholeGraph(charted), charted)
+    expect([...f.groups.values()].map((g) => [g.id, g.kind, g.from, g.members])).toEqual([
+      ["fold:model:m-1", "chart", M1, C_LOOSE],
+    ])
+    expect(f.kinds).toEqual(new Set(["chart"]))
+    expect(f.nodeIds).toEqual(expect.arrayContaining([C_ON, C_WEEKLY, D, "fold:model:m-1"]))
+    expect(f.nodeIds.some((id) => C_LOOSE.includes(id))).toBe(false)
+    expect(f.edges.filter((e) => e.to === "fold:model:m-1")).toEqual([
+      { from: M1, to: "fold:model:m-1", kind: "draws", evidence: "declared" },
+    ])
+
+    // Two hops from public.orders reach the charts but not the dashboard: the chart it
+    // shows still keeps its own card.
+    const near = neighbourhood(charted, T_ORDERS, { depth: 2 })
+    expect(near.nodeIds).not.toContain(D)
+    expect([...foldLooseAssets(near, charted).groups.values()].map((g) => g.members)).toEqual([C_LOOSE])
+    // The focused model's charts are what was asked to see.
+    expect(foldLooseAssets(neighbourhood(charted, M1), charted).groups.size).toBe(0)
+    // Opened, the box is still counted as one that would fold.
+    const opened = foldLooseAssets(wholeGraph(charted), charted, "all")
+    expect(opened.groups.size).toBe(0)
+    expect(opened.opened).toBe(1)
+    expect(opened.kinds).toEqual(new Set(["chart"]))
+  })
+
+  it("puts charts after every model layer, and dashboards last", () => {
+    const g = parseAssetGraph({
+      ...CHARTS,
+      nodes: CHARTS.nodes.map((n) => (n.id === M1 ? { ...n, layer: "Gold" } : n)),
+    })
+    const byId = new Map(g.nodes.map((n) => [n.id, n]))
+    const cards = [P1, T_ORDERS, M1, M3, C_ON, D].map((id) => ({ id, node: byId.get(id) }))
+    const box = { id: "fold:model:m-1", node: undefined, count: 3, kind: "chart" as const }
+    const { bands, columns } = stageColumns([...cards, box], [{ name: "Gold" }])
+    expect(columns.map((c) => [c.label, c.count])).toEqual([
+      ["Pipelines", 1],
+      ["Tables", 1],
+      ["Gold", 1],
+      ["No layer", 1],
+      ["Charts", 4],
+      ["Dashboards", 1],
+    ])
+    expect(bands.get("fold:model:m-1")).toBe(bands.get(C_ON))
+    // A box of tables, which has no kind, stays with the tables.
+    expect(stageColumns([{ id: "fold:pipeline:p-1", node: undefined, count: 3 }], null).columns[0].label).toBe("Pipeline tables")
+  })
+
+  it("counts them in the summary, lists them, and a switch leaves them out", async () => {
+    mockFetch.mockResolvedValue(res(200, CHARTS))
+    render(<AssetLineageView reloadTick={0} />)
+
+    expect(await screen.findByText("Charts (5)")).toBeInTheDocument()
+    const summary = () => document.querySelector<HTMLElement>("[data-lineage-summary]")!.querySelector("p")
+    expect(summary()).toHaveTextContent(/^2 pipelines · 4 tables · 3 models · 5 charts · 1 dashboard$/)
+    expect(screen.getByText("Dashboards (1)")).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "revenue_by_day" })).toHaveAttribute("href", "/charts/c-1")
+    expect(screen.getByRole("link", { name: "Revenue overview" })).toHaveAttribute("href", "/dashboards/d-1")
+    expect(screen.getByText("Bar · on 1 dashboard")).toBeInTheDocument()
+
+    const toggle = screen.getByRole("switch", { name: "Charts & dashboards" })
+    expect(toggle).toBeChecked()
+    await userEvent.click(toggle)
+    expect(toggle).not.toBeChecked()
+    expect(screen.queryByText("Charts (5)")).toBeNull()
+    expect(screen.queryByText("Dashboards (1)")).toBeNull()
+    expect(screen.queryByRole("link", { name: "revenue_by_day" })).toBeNull()
+    // The workspace still has them.
+    expect(summary()).toHaveTextContent(/· 5 charts · 1 dashboard$/)
+    await userEvent.click(toggle)
+    expect(screen.getByText("Charts (5)")).toBeInTheDocument()
+  })
+
+  it("names in a model's details the charts and dashboards it changes, even with them left out of the drawing", async () => {
+    mockFetch.mockResolvedValue(res(200, CHARTS))
+    render(<AssetLineageView reloadTick={0} />)
+    await userEvent.click(await screen.findByRole("button", { name: "Show the details of weekly_rollup" }))
+    const details = () => screen.getByRole("region", { name: "Details of weekly_rollup" })
+    const impact = () => within(details()).getByRole("list", { name: "Charts and dashboards it changes" })
+    expect(within(details()).getByText("Charts and dashboards it changes (2)")).toBeInTheDocument()
+    const links = () => within(impact()).getAllByRole("link")
+    expect(links().map((a) => [a.closest("li")!.getAttribute("data-impact"), a.getAttribute("href")])).toEqual([
+      ["chart", "/charts/c-5"],
+      ["dashboard", "/dashboards/d-1"],
+    ])
+    // Each says what it is, then its name, as two words.
+    expect(links().map((a) => a.textContent)).toEqual(["Chart weekly_total", "Dashboard Revenue overview"])
+    expect(links()[1]).toHaveAccessibleName("Dashboard Revenue overview")
+
+    await userEvent.click(screen.getByRole("switch", { name: "Charts & dashboards" }))
+    expect(links()).toHaveLength(2)
+
+    // A model nothing is drawn from has no such list, and nor has a chart.
+    await userEvent.click(screen.getByRole("button", { name: "Show the details of scratch_report" }))
+    expect(within(screen.getByRole("region", { name: "Details of scratch_report" })).queryByRole("list", {
+      name: "Charts and dashboards it changes",
+    })).toBeNull()
+  })
+
+  it("draws charts and dashboards as the last two columns, a model's loose charts as one box that opens", async () => {
+    media.canvas = true
+    // A workspace with layers is drawn in columns, one per layer.
+    mockLayers.value = [{ name: "Gold", position: 0 }]
+    mockFetch.mockResolvedValue(res(200, CHARTS))
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+
+    // 15 assets: daily_revenue and the table it builds are one card, its three loose charts one box.
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(15 - 1 - 2))
+    await waitFor(() => expect(container.querySelectorAll("[data-column-header]").length).toBeGreaterThan(0))
+    const headers = () =>
+      [...container.querySelectorAll<HTMLElement>("[data-column-header]")].map((h) => [...h.children].map((c) => c.textContent))
+    expect(headers().slice(-2)).toEqual([
+      ["Charts", "5"],
+      ["Dashboards", "1"],
+    ])
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const x = (name: string) => translateOf(within(canvas).getByTitle(name).closest<HTMLElement>(".react-flow__node")!.style.transform)[0]
+    expect(x("revenue_by_day")).toBeGreaterThan(x("weekly_rollup"))
+    expect(x("Revenue overview")).toBeGreaterThan(x("revenue_by_day"))
+    expect(within(canvas).getByTitle("Show these charts")).toHaveTextContent("3 charts on no dashboard")
+    expect(screen.getByText(/3 charts on no dashboard are folded into one box per model/)).toBeInTheDocument()
+    // The legend has a swatch for each kind drawn.
+    expect([...container.querySelectorAll<HTMLElement>("[data-swatch]")].map((s) => s.dataset.swatch)).toEqual([
+      "pipeline",
+      "table",
+      "model",
+      "chart",
+      "dashboard",
+    ])
+
+    fireEvent.click(within(canvas).getByText("3 charts on no dashboard"))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(15 - 1))
+    expect(within(canvas).getByTitle("top_customers")).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Fold loose charts again" }))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(15 - 1 - 2))
+
+    // Left out, the drawing is the workspace's pipelines, tables and models again.
+    await userEvent.click(screen.getByRole("switch", { name: "Charts & dashboards" }))
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(9 - 1))
+    expect(headers().map((h) => h[0])).not.toContain("Charts")
+    expect([...container.querySelectorAll<HTMLElement>("[data-swatch]")].map((s) => s.dataset.swatch)).toEqual([
+      "pipeline",
+      "table",
+      "model",
+    ])
+  })
+})
+
+// Column lineage (design § 3.5): each model's output columns and what each is computed from,
+// read out of its SQL by sqlglot. daily_revenue's revenue sums orders.amount and a refunds
+// table the graph does not have, and its rows are filtered and joined; weekly_rollup's
+// revenue sums daily_revenue's, in the warehouse's case. scratch_report's SQL did not parse.
+describe("column lineage on Lineage", () => {
+  const direct = (from: string, from_table: string, from_column: string, to: string, to_column: string, subtype: string) => ({
+    from,
+    from_table,
+    from_column,
+    to,
+    to_column,
+    type: "DIRECT",
+    subtype,
+  })
+  const COLUMNS = {
+    pending: false,
+    truncated: false,
+    models: [
+      { node_id: M1, status: "partial", columns: ["day", "revenue", "customer_count"], reason: "public.refunds is not in the warehouse's schema" },
+      { node_id: M2, status: "ok", columns: ["week", "revenue"] },
+      { node_id: M3, status: "failed", columns: [], reason: "the SQL did not parse" },
+    ],
+    edges: [
+      direct(T_ORDERS, "public.orders", "created_at", M1, "day", "TRANSFORMATION"),
+      direct(T_ORDERS, "public.orders", "amount", M1, "revenue", "AGGREGATION"),
+      direct("", "public.refunds", "refund_amount", M1, "revenue", "TRANSFORMATION"),
+      direct(T_CUST, "public.customers", "customer_id", M1, "customer_count", "AGGREGATION"),
+      { from: T_ORDERS, from_table: "public.orders", from_column: "status", to: M1, to_column: "", type: "INDIRECT", subtype: "FILTER" },
+      { from: T_CUST, from_table: "public.customers", from_column: "customer_id", to: M1, to_column: "", type: "INDIRECT", subtype: "JOIN" },
+      direct(T_DAILY, "analytics.daily_revenue", "day", M2, "week", "TRANSFORMATION"),
+      direct(T_DAILY, "analytics.daily_revenue", "REVENUE", M2, "revenue", "AGGREGATION"),
+    ],
+  }
+  const WITH_COLUMNS = { ...BODY, column_lineage: COLUMNS }
+  const items = (list: HTMLElement) => [...list.querySelectorAll("li")].map((li) => li.textContent)
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("lists a model's columns in its details, and says where the chosen one comes from and what reads it", async () => {
+    mockFetch.mockResolvedValue(res(200, WITH_COLUMNS))
+    render(<AssetLineageView reloadTick={0} />)
+    await userEvent.click(await screen.findByRole("button", { name: "Show the details of daily_revenue" }))
+    const details = (name: string) => screen.getByRole("region", { name: `Details of ${name}` })
+    const lineage = (name: string) => within(details(name)).getByRole("group", { name: "Column lineage" })
+    const column = (name: string, c: string) => within(lineage(name)).getByRole("button", { name: c })
+
+    expect(within(lineage("daily_revenue")).getByText("Some of its columns could not be traced: public.refunds is not in the warehouse's schema")).toBeInTheDocument()
+    const chips = within(lineage("daily_revenue")).getByRole("list", { name: "Columns of daily_revenue" })
+    expect(within(chips).getAllByRole("button").map((b) => b.textContent)).toEqual(["day", "revenue", "customer_count"])
+    // What filters or joins its rows is listed apart from where any one column comes from.
+    expect(items(within(lineage("daily_revenue")).getByRole("list", { name: "Its rows are filtered, joined or grouped by" }))).toEqual([
+      "Tablepublic.customers.customer_id in a join",
+      "Tablepublic.orders.status in a filter",
+    ])
+    expect(within(lineage("daily_revenue")).queryByRole("list", { name: "Comes from" })).toBeNull()
+
+    await userEvent.click(column("daily_revenue", "revenue"))
+    expect(column("daily_revenue", "revenue")).toHaveAttribute("aria-pressed", "true")
+    expect(column("daily_revenue", "day")).toHaveAttribute("aria-pressed", "false")
+    expect(items(within(lineage("daily_revenue")).getByRole("list", { name: "Comes from" }))).toEqual([
+      "Tablepublic.orders.amount aggregated",
+      "public.refunds.refund_amount transformed · not on this graph",
+    ])
+    expect(items(within(lineage("daily_revenue")).getByRole("list", { name: "Read by" }))).toEqual([
+      "Modelweekly_rollup.revenue aggregated",
+    ])
+
+    // Following a link chooses that column on its asset.
+    await userEvent.click(within(lineage("daily_revenue")).getByRole("button", { name: "Trace weekly_rollup.revenue" }))
+    expect(column("weekly_rollup", "revenue")).toHaveAttribute("aria-pressed", "true")
+    expect(items(within(lineage("weekly_rollup")).getByRole("list", { name: "Comes from" }))).toEqual([
+      "Tableanalytics.daily_revenue.REVENUE aggregated",
+    ])
+    expect(within(lineage("weekly_rollup")).getByText("No model on this graph reads it.")).toBeInTheDocument()
+
+    // The table daily_revenue builds is its card: back there, with the same column chosen.
+    await userEvent.click(within(lineage("weekly_rollup")).getByRole("button", { name: "Trace analytics.daily_revenue.REVENUE" }))
+    expect(column("daily_revenue", "revenue")).toHaveAttribute("aria-pressed", "true")
+
+    // A source table: the columns models read from it, filled in by the pipeline that writes it.
+    await userEvent.click(within(lineage("daily_revenue")).getByRole("button", { name: "Trace public.orders.amount" }))
+    expect(within(within(lineage("public.orders")).getByRole("list", { name: "Columns of public.orders" })).getAllByRole("button").map((b) => b.textContent)).toEqual(
+      ["created_at", "amount", "status"],
+    )
+    expect(column("public.orders", "amount")).toHaveAttribute("aria-pressed", "true")
+    expect(within(lineage("public.orders")).getByText("Copied in by orders_sync.")).toBeInTheDocument()
+    expect(items(within(lineage("public.orders")).getByRole("list", { name: "Read by" }))).toEqual(["Modeldaily_revenue.revenue aggregated"])
+
+    // Choosing it again stops tracing it.
+    await userEvent.click(column("public.orders", "amount"))
+    expect(column("public.orders", "amount")).toHaveAttribute("aria-pressed", "false")
+    expect(within(lineage("public.orders")).queryByRole("list", { name: "Read by" })).toBeNull()
+
+    // A model whose SQL could not be read says why, and offers nothing to choose.
+    await userEvent.click(screen.getByRole("button", { name: "Show the details of scratch_report" }))
+    expect(within(lineage("scratch_report")).getByText("Its columns could not be read: the SQL did not parse")).toBeInTheDocument()
+    expect(within(lineage("scratch_report")).queryByRole("list")).toBeNull()
+  })
+
+  it("has no column section without column lineage, and says when its links were cut short", async () => {
+    mockFetch.mockResolvedValueOnce(res(200, BODY))
+    const { unmount } = render(<AssetLineageView reloadTick={0} />)
+    await userEvent.click(await screen.findByRole("button", { name: "Show the details of daily_revenue" }))
+    expect(within(screen.getByRole("region", { name: "Details of daily_revenue" })).queryByRole("group", { name: "Column lineage" })).toBeNull()
+    expect(screen.queryByText(/column links/)).toBeNull()
+    unmount()
+
+    mockFetch.mockResolvedValueOnce(res(200, { ...WITH_COLUMNS, column_lineage: { ...COLUMNS, truncated: true } }))
+    render(<AssetLineageView reloadTick={0} />)
+    expect(await screen.findByText(/more than 20,000 column links\. Column lineage stops there/)).toBeInTheDocument()
+  })
+
+  it("lights a chosen column's path on the canvas, and the card's own path again once it is put down", async () => {
+    media.canvas = true
+    const columns = ["created_at", "amount", "status"].map((name) => ({ name, type: "text", is_primary_key: false }))
+    mockFetch.mockImplementation(async (url: string) =>
+      url.includes("/schema-index")
+        ? res(200, { tables: [{ name: "orders", schema: "public", columns }], foreign_keys: [] })
+        : res(200, WITH_COLUMNS),
+    )
+    const { container } = render(<AssetLineageView reloadTick={0} />)
+    await waitFor(() => expect(container.querySelectorAll(".react-flow__node")).toHaveLength(8))
+    const canvas = container.querySelector(".react-flow")!.parentElement!
+    const card = () => within(canvas).getByTitle("public.orders").closest<HTMLElement>(".react-flow__node")!
+    const dimmed = (name: string) => within(canvas).getByTitle(name).closest("[data-dimmed]") !== null
+    const names = ["orders_sync", "public.orders", "public.customers", "daily_revenue", "weekly_rollup", "events_sync", "public.events", "scratch_report"]
+
+    // (React Flow's cards are not in jsdom's accessibility tree: found by their text.)
+    const amount = () => within(card()).getByText("amount").closest("button")!
+    fireEvent.click(within(card()).getByTitle("Show the columns of public.orders"))
+    await waitFor(() => expect(within(card()).getByText("amount")).toBeInTheDocument())
+    expect(amount()).toHaveAttribute("title", "Trace where amount comes from and what reads it")
+    fireEvent.click(amount())
+
+    // The table is selected, and its amount column's path lit: the model that sums it, the
+    // table that model builds (its card), the model that reads that, and the pipeline.
+    await waitFor(() => expect(within(card()).getByText("Selected")).toBeInTheDocument())
+    expect(amount()).toHaveAttribute("aria-pressed", "true")
+    expect(amount()).toHaveAttribute("title", "Stop tracing amount")
+    expect(names.filter(dimmed)).toEqual(["public.customers", "events_sync", "public.events", "scratch_report"])
+    expect(
+      within(screen.getByRole("region", { name: "Details of public.orders" })).getByRole("button", { name: "amount" }),
+    ).toHaveAttribute("aria-pressed", "true")
+
+    // Put down, the selected table lights only what is upstream of it.
+    fireEvent.click(amount())
+    await waitFor(() => expect(amount()).toHaveAttribute("aria-pressed", "false"))
+    expect(names.filter(dimmed)).toEqual(["public.customers", "daily_revenue", "weekly_rollup", "events_sync", "public.events", "scratch_report"])
+  })
+
+  it("says while a model's columns are being read, and asks again until they are", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const reading = { ...WITH_COLUMNS, column_lineage: { ...COLUMNS, pending: true, models: COLUMNS.models.slice(1), edges: [] } }
+    mockFetch.mockResolvedValueOnce(res(200, reading)).mockResolvedValueOnce(res(200, WITH_COLUMNS))
+    render(<AssetLineageView reloadTick={0} />)
+    await userEvent.click(await screen.findByRole("button", { name: "Show the details of daily_revenue" }))
+    const lineage = () =>
+      within(screen.getByRole("region", { name: "Details of daily_revenue" })).getByRole("group", { name: "Column lineage" })
+    expect(within(lineage()).getByText("Reading the model's columns…")).toBeInTheDocument()
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(15_000)
+    await waitFor(() => expect(within(lineage()).getByRole("button", { name: "revenue" })).toBeInTheDocument())
+    expect(within(lineage()).queryByText("Reading the model's columns…")).toBeNull()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(mockFetch).toHaveBeenCalledTimes(2)
   })
 })

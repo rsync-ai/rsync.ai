@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { render, screen, fireEvent, waitFor } from "@testing-library/react"
 import type { Mock } from "vitest"
 
-import { PlanBanner } from "@/components/layout/PlanBanner"
+import { PlanBanner, bannerFromPlan } from "@/components/layout/PlanBanner"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { notifyPipelinesChanged } from "@/lib/plan/plan-events"
 
@@ -37,10 +37,10 @@ function mockPlan(plan: Record<string, unknown>) {
 
 describe("PlanBanner — Upgrade to Pro", () => {
   it("shows the free-plan banner and opens the contact dialog on click", async () => {
-    mockPlan({ plan: "free", pipelines_limit: 2, pipelines_used: 0 })
+    mockPlan({ plan: "free", pipelines_limit: 2, pipelines_used: 1 })
     render(<PlanBanner />)
 
-    expect(await screen.findByText(/Free plan — 0\/2 pipelines used/)).toBeInTheDocument()
+    expect(await screen.findByText(/Free plan — 1\/2 pipelines used/)).toBeInTheDocument()
 
     // The CTA is a real button (not a bare mailto anchor).
     fireEvent.click(screen.getByRole("button", { name: /upgrade to pro/i }))
@@ -80,8 +80,10 @@ describe("PlanBanner — pipeline meter stays current", () => {
       }
       return { ok: true, status: 200, json: async () => ({}) }
     })
-    render(<PlanBanner />)
-    expect(await screen.findByText(/Free plan — 0\/2 pipelines used/)).toBeInTheDocument()
+    const { container } = render(<PlanBanner />)
+    // Two left: the Usage page has the meter, the banner stays out of the way.
+    await waitFor(() => expect(authFetch).toHaveBeenCalled())
+    expect(container).toBeEmptyDOMElement()
 
     used = 1
     notifyPipelinesChanged()
@@ -90,6 +92,22 @@ describe("PlanBanner — pipeline meter stays current", () => {
     used = 2
     window.dispatchEvent(new Event("focus"))
     expect(await screen.findByText(/Free plan — 2\/2 pipelines used/)).toBeInTheDocument()
+  })
+
+  // Coming back to a tab fires both "visibilitychange" and "focus"; each used to
+  // start its own read of the same meter.
+  it("reads once when the tab comes back, not once per event", async () => {
+    mockPlan({ plan: "free", pipelines_limit: 2, pipelines_used: 1 })
+    render(<PlanBanner />)
+    await screen.findByText(/Free plan — 1\/2 pipelines used/)
+    const reads = () => (authFetch as Mock).mock.calls.filter((c) => String(c[0]).endsWith("/usage/plan")).length
+    const before = reads()
+
+    document.dispatchEvent(new Event("visibilitychange"))
+    window.dispatchEvent(new Event("focus"))
+    await waitFor(() => expect(reads()).toBe(before + 1))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(reads()).toBe(before + 1)
   })
 
   it("falls back to /auth/me when the gateway has no /usage/plan route", async () => {
@@ -102,5 +120,29 @@ describe("PlanBanner — pipeline meter stays current", () => {
     })
     render(<PlanBanner />)
     expect(await screen.findByText(/Free plan — 2\/2 pipelines used/)).toBeInTheDocument()
+  })
+})
+
+// The Usage page owns the "x/y pipelines used" meter; the banner on every page
+// repeated it even with room to spare. It now shows only near the cap.
+describe("PlanBanner — the meter shows only near the cap", () => {
+  it.each([
+    ["free", 0, 2, false],
+    ["free", 1, 2, true],
+    ["free", 2, 2, true],
+    ["free", 3, 5, false],
+    ["free", 4, 5, true],
+    ["starter", 4, 5, false],
+    ["starter", 5, 5, true],
+  ])("%s plan, %i of %i used → banner %s", (plan, used, limit, shown) => {
+    const banner = bannerFromPlan({ plan, pipelines_used: used, pipelines_limit: limit })
+    expect(banner !== null).toBe(shown)
+    if (shown) expect(banner).toMatchObject({ variant: "plan_limit", used, limit })
+  })
+
+  it("control: a trial still shows its days left, and an unlimited plan shows nothing", () => {
+    const ends = new Date(Date.now() + 3 * 86_400_000).toISOString()
+    expect(bannerFromPlan({ plan: "trial", trial_ends_at: ends })).toMatchObject({ variant: "trial", daysLeft: 3 })
+    expect(bannerFromPlan({ plan: "free", pipelines_used: 9, pipelines_limit: null })).toBeNull()
   })
 })

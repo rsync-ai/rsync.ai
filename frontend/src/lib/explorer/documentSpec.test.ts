@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest"
 import {
+  buildAggregateBody,
+  buildDocumentQueryText,
   buildFindBody,
   cellKind,
   clampLimit,
@@ -9,6 +11,7 @@ import {
   mergeColumns,
   nextPageParams,
   normalizeResult,
+  parseDocumentQueryText,
 } from "./documentSpec"
 
 const base = { connectionId: "conn-1", collection: "orders" }
@@ -51,6 +54,99 @@ describe("buildFindBody", () => {
   it("escapes the collection name", () => {
     const b = buildFindBody({ ...base, collection: `we"ird` })
     expect(b.ok && JSON.parse(b.body).collection).toBe(`we"ird`)
+  })
+})
+
+// A pipeline is spliced into the body as typed. Parsing and re-printing it would round a
+// 64-bit integer to the nearest double and could reorder a $sort's keys — both silent
+// changes to what the pipeline means.
+describe("buildAggregateBody", () => {
+  const pipe = `[{"$match":{"n":{"$gte":9007199254740993}}},{"$sort":{"b":1,"a":-1}}]`
+
+  it("forwards the pipeline verbatim with the collection and the default limit", () => {
+    const b = buildAggregateBody({ ...base, pipeline: `  ${pipe}\n` })
+    expect(b).toEqual({
+      ok: true,
+      body: `{"connection_id":"conn-1","collection":"orders","pipeline":${pipe},"limit":50}`,
+    })
+    expect(() => JSON.parse(b.ok ? b.body : "")).not.toThrow()
+  })
+
+  it("names the database only when one is picked, and clamps the limit", () => {
+    const withDb = buildAggregateBody({ ...base, database: " shop ", pipeline: "[]", limit: 10_000 })
+    expect(withDb.ok && withDb.body).toBe(
+      `{"connection_id":"conn-1","collection":"orders","database":"shop","pipeline":[],"limit":${DOCUMENT_FIND_MAX_LIMIT}}`,
+    )
+    const noDb = buildAggregateBody({ ...base, database: "  ", pipeline: "[]" })
+    expect(noDb.ok && noDb.body).not.toContain(`"database"`)
+  })
+
+  it.each([
+    ["", "Write a pipeline: a JSON array of stages"],
+    ["   ", "Write a pipeline: a JSON array of stages"],
+    [`{"$match":{}}`, "A pipeline must be a JSON array of stages"],
+    [`[{"$match":{}}, 3]`, `Stage 1 must be a JSON object such as {"$match": {…}}`],
+    [`[[]]`, `Stage 0 must be a JSON object such as {"$match": {…}}`],
+    [`[null]`, `Stage 0 must be a JSON object such as {"$match": {…}}`],
+  ])("refuses %j on the pipeline field", (pipeline, error) => {
+    expect(buildAggregateBody({ ...base, pipeline })).toEqual({ ok: false, field: "pipeline", error })
+  })
+
+  it("reports invalid JSON on the pipeline field", () => {
+    const b = buildAggregateBody({ ...base, pipeline: `[{"$match":` })
+    expect(b.ok).toBe(false)
+    expect(!b.ok && b.field).toBe("pipeline")
+    expect(!b.ok && b.error).toMatch(/^Pipeline is not valid JSON/)
+  })
+
+  it("asks for a collection before looking at the pipeline", () => {
+    expect(buildAggregateBody({ ...base, collection: " ", pipeline: "" })).toEqual({
+      ok: false,
+      field: "collection",
+      error: "Pick a collection",
+    })
+  })
+})
+
+// A saved pipeline is stored as `{database?, collection, pipeline}` — the shape the
+// gateway's parseDocumentModelQuery reads — and must come back exactly as it was typed.
+describe("buildDocumentQueryText / parseDocumentQueryText", () => {
+  const pipe = `[\n  {"$match": {"n": {"$gte": 9007199254740993}}},\n  {"$sort": {"b": 1, "a": -1}}\n]`
+
+  it("round-trips the pipeline text byte for byte", () => {
+    const text = buildDocumentQueryText({ database: "shop", collection: "orders", pipeline: pipe })
+    expect(text).toBe(`{"database":"shop","collection":"orders","pipeline":${pipe}}`)
+    expect(parseDocumentQueryText(text)).toEqual({ database: "shop", collection: "orders", pipeline: pipe })
+  })
+
+  it("leaves the database out when none is picked", () => {
+    const text = buildDocumentQueryText({ database: "", collection: "orders", pipeline: "[]" })
+    expect(text).toBe(`{"collection":"orders","pipeline":[]}`)
+    expect(parseDocumentQueryText(text)).toEqual({ collection: "orders", pipeline: "[]" })
+  })
+
+  it("has nothing to save without a collection or a valid pipeline", () => {
+    expect(buildDocumentQueryText({ collection: "", pipeline: "[]" })).toBe("")
+    expect(buildDocumentQueryText({ collection: "orders", pipeline: "" })).toBe("")
+    expect(buildDocumentQueryText({ collection: "orders", pipeline: `{"$match":{}}` })).toBe("")
+    expect(buildDocumentQueryText({ collection: "orders", pipeline: "[1]" })).toBe("")
+  })
+
+  it("cuts the pipeline out past strings holding quotes and brackets, in any key order", () => {
+    const inner = `[{"$match":{"note":"a \\"]}[\\" b","x":[1,{"y":"}"}]}}]`
+    const text = ` { "pipeline" : ${inner} , "collection":"o\\"rders", "database": "s" } `
+    expect(parseDocumentQueryText(text)).toEqual({ database: "s", collection: `o"rders`, pipeline: inner })
+  })
+
+  it.each([
+    ["not JSON", "SELECT 1"],
+    ["an array", "[]"],
+    ["a missing collection", `{"pipeline":[]}`],
+    ["a non-string collection", `{"collection":1,"pipeline":[]}`],
+    ["a non-array pipeline", `{"collection":"o","pipeline":{"$match":{}}}`],
+    ["a non-string database", `{"database":1,"collection":"o","pipeline":[]}`],
+  ])("refuses %s", (_, text) => {
+    expect(parseDocumentQueryText(text)).toBeNull()
   })
 })
 

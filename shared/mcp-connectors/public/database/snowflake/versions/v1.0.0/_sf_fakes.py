@@ -17,17 +17,45 @@ from typing import Any, Dict, List, Optional
 
 
 class FakeCursor:
-    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None):
-        self._rows = rows if rows is not None else []
-        # call log: list of {"sql": ..., "params": ...}
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, answers=None,
+                 rowcount: Optional[int] = None):
+        self._default = rows if rows is not None else []
+        self._rows = self._default
+        # (SQL substring, rows or an Exception to raise): a catalog or snapshot
+        # query gets its own answer, every other statement gets ``rows``.
+        self._answers = list(answers or [])
+        # call log: list of {"sql": ..., "params": ..., "timeout": ...}
         self.executed: List[Dict[str, Any]] = []
+        # DB-API rowcount after execute (the driver reports DML affected rows).
+        self._rowcount = rowcount
+        self.rowcount: Optional[int] = None
+        self.description = None
 
-    def execute(self, sql, params=None):
-        self.executed.append({"sql": sql, "params": params})
+    def execute(self, sql, params=None, timeout=None):
+        # ``timeout`` mirrors snowflake-connector's execute(timeout=) — the
+        # server-side abort deadline; recorded so tests can assert it reached
+        # the driver.
+        self.executed.append({"sql": sql, "params": params, "timeout": timeout})
+        self._rows = self._default
+        for needle, answer in self._answers:
+            if needle in sql:
+                if isinstance(answer, Exception):
+                    raise answer
+                self._rows = answer
+                break
+        self.rowcount = self._rowcount
+        # Column metadata as the driver exposes it: 7-tuples keyed by name.
+        self.description = (
+            [(k, None, None, None, None, None, None) for k in self._rows[0].keys()]
+            if self._rows and isinstance(self._rows[0], dict) else None
+        )
         return None
 
     def fetchall(self):
         return list(self._rows)
+
+    def fetchmany(self, size=1):
+        return list(self._rows)[:size]
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -45,8 +73,12 @@ class FakeCursor:
 class FakeConn:
     """Records cursors so a test can read back every statement executed."""
 
-    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None):
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, answers=None,
+                 rowcount: Optional[int] = None, commit_raises: Optional[Exception] = None):
         self._rows = rows if rows is not None else []
+        self._answers = list(answers or [])
+        self._rowcount = rowcount
+        self._commit_raises = commit_raises
         self.cursors: List[FakeCursor] = []
         self.committed = 0
         self.rolled_back = 0
@@ -55,11 +87,13 @@ class FakeConn:
     def cursor(self, *args, **kwargs):
         # SnowflakeMCPServer._dict_cursor calls conn.cursor(DictCursor); the arg
         # is ignored here since the fake already yields dict rows.
-        c = FakeCursor(rows=self._rows)
+        c = FakeCursor(rows=self._rows, answers=self._answers, rowcount=self._rowcount)
         self.cursors.append(c)
         return c
 
     def commit(self):
+        if self._commit_raises is not None:
+            raise self._commit_raises
         self.committed += 1
 
     def rollback(self):
@@ -88,9 +122,11 @@ class FakeConn:
         return out
 
 
-def make_connector(connector_module, *, rows=None):
+def make_connector(connector_module, *, rows=None, answers=None, rowcount=None,
+                   commit_raises=None):
     """Build a SnowflakeMCPServer wired to a FakeConn (the _connect seam)."""
     server = connector_module.SnowflakeMCPServer()
-    conn = FakeConn(rows=rows)
+    conn = FakeConn(rows=rows, answers=answers, rowcount=rowcount,
+                    commit_raises=commit_raises)
     server._connect = lambda config: conn  # type: ignore[assignment]
     return server, conn

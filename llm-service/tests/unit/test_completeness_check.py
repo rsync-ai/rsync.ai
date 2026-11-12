@@ -199,16 +199,19 @@ def test_api_saas_connector_does_not_need_warehouse_adapters(tmp_path: Path):
     assert all("warehouse_adapters" not in m for m in report.missing_protocol_required)
 
 
-def test_oauth_metadata_without_oauth_dir_only_warns(tmp_path: Path):
-    """OAuth connectors get a note when oauth/ is absent but still pass."""
+def test_oauth_connector_needs_no_oauth_dir(tmp_path: Path):
+    """An OAuth connector is complete without an oauth/ copy, and is not told
+    to want one: tokens arrive in the connection config, refresh is the
+    orchestrator's, and no connector may carry the token store
+    (KI-OAUTH-TOKEN-STORE-UNREACHABLE-BY-ITS-ONLY-USERS)."""
     conn = tmp_path / "salesforce"
     _make_complete_connector(
         conn,
         auth_methods=[{"method": "oauth2"}],
     )
     report = check(conn)
-    assert report.passed  # still passes
-    assert any("oauth" in n.lower() for n in report.notes)
+    assert report.passed
+    assert not any("oauth" in n.lower() for n in report.notes), report.notes
 
 
 def test_recommended_files_missing_does_not_fail(tmp_path: Path):

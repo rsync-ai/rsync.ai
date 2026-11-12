@@ -21,12 +21,12 @@ absent, so its door is simply shut. Managed mode's door opens onto a drop: the
 build is dispatched detached (deployment/routes.py:146), so /v1/deploy answers
 200 with building:true before docker.from_env() has been tried; the orchestrator
 extends its poll on that flag and waits out the whole pre-flight timeout while
-the build has already failed with a WARNING (docker_builder.py:158). What the
+the build has already failed with a WARNING (docker_builder.py:148). What the
 operator sees is a slow "not reachable -- check `docker compose logs`" on a
 cluster that has no compose in it.
 */}}
 {{- if .Values.generation.toolGenerator.managedConnectors }}
-{{- fail "generation.toolGenerator.managedConnectors=true is not supported on Kubernetes.\n\nManaged mode lets tool-generator build a connector image and start its container\nitself. With DEPLOYER_URL unset -- which this chart guarantees -- DockerBuilder\ntakes the in-process path and calls docker.from_env()\n(llm-service/src/agents/tool_generator/deployment/docker_builder.py:154), so it\nneeds the host Docker socket in the tool-generator pod. Mounting one hands that\npod the node, which is the privilege connectorDeployer is absent to avoid.\n\nIt does not fail cleanly if you force it: the build runs as a detached task, so\n/v1/deploy returns success and the orchestrator waits out its full pre-flight\ntimeout before reporting the connector unreachable.\n\nLeave it false and declare the connectors your pipelines use under\n`connectors.fleet`. Generated connectors are a Docker-host feature; on\nKubernetes, build the connector image and add it to the fleet." }}
+{{- fail "generation.toolGenerator.managedConnectors=true is not supported on Kubernetes.\n\nManaged mode lets tool-generator build a connector image and start its container\nitself. With DEPLOYER_URL unset -- which this chart guarantees -- DockerBuilder\ntakes the in-process path and calls docker.from_env()\n(llm-service/src/agents/tool_generator/deployment/docker_builder.py:144), so it\nneeds the host Docker socket in the tool-generator pod. Mounting one hands that\npod the node, which is the privilege connectorDeployer is absent to avoid.\n\nIt does not fail cleanly if you force it: the build runs as a detached task, so\n/v1/deploy returns success and the orchestrator waits out its full pre-flight\ntimeout before reporting the connector unreachable.\n\nLeave it false and declare the connectors your pipelines use under\n`connectors.fleet`. Generated connectors are a Docker-host feature; on\nKubernetes, build the connector image and add it to the fleet." }}
 {{- end }}
 
 {{/*
@@ -176,6 +176,11 @@ and the message live in one place, rsync-ai.assertDeliverableSecret
 {{- if and (eq .Values.objectStorage.mode "minio") (not .Values.secrets.minioSecretKey) }}
 {{- fail "secrets.minioSecretKey is required when objectStorage.mode=minio (or set secrets.existingSecret). Generate with: openssl rand -base64 32" }}
 {{- end }}
+{{- with .Values.secrets.minioKmsSecretKey }}
+{{- if or (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]*:[A-Za-z0-9+/]{43}=$" .)) (ne (len (b64dec (last (splitList ":" .)))) 32) }}
+{{- fail "secrets.minioKmsSecretKey must be <name>:<base64 of exactly 32 bytes> -- MinIO exits at start on anything else (\"kms: invalid secret key format\"). Generate with: echo \"rsync-ai-kms:$(openssl rand -base64 32)\"\n\nSet it once: changing it later makes every object MinIO encrypted under the old key unreadable." }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -292,7 +297,7 @@ came up healthy.
 
 {{/*
 Half a keypair. Both the Go client (shared/go/kafkaclient) and the Python one
-(kafka_security.py:158) fail closed on one half, so this is caught either way --
+(kafka_security.py:156) fail closed on one half, so this is caught either way --
 but caught at pod startup, one service at a time, with a message about an
 environment variable. Here it names the value.
 */}}

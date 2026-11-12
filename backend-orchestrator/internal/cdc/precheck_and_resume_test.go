@@ -144,23 +144,3 @@ func TestGetCheckpointForTable_NoRowsIsStillNotAnError(t *testing.T) {
 		t.Fatalf("a table with no checkpoint must read as (nil, nil), got %+v / %v", cp, err)
 	}
 }
-
-func TestGetCheckpoints_CorruptPositionFailsTheWholeRead(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	mock.ExpectQuery("SELECT id, pipeline_id").
-		WithArgs("p-1").
-		WillReturnRows(checkpointRows(`not json at all`))
-
-	cps, err := GetCheckpoints(context.Background(), db, "p-1")
-	if err == nil {
-		t.Fatalf("a corrupt position was returned as %d usable checkpoints", len(cps))
-	}
-	if !errors.Is(err, ErrCheckpointPositionUnreadable) {
-		t.Errorf("caller cannot classify the failure: %v", err)
-	}
-}

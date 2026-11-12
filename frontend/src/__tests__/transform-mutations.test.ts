@@ -32,9 +32,9 @@ describe("idsOf", () => {
 })
 
 describe("isDeIdentifying", () => {
-  it("matches exactly the aliases the pre-run gate folds", () => {
-    // nl_transforms_gate.go isMaskTransformConfig —
-    // `case "mask", "mask_pii", "hash":`. Nothing else.
+  it("matches exactly the aliases the engine folds to mask_pii", () => {
+    // shared/go/transforms/validate.go normalizeType — `mask_pii`, plus
+    // `case "mask":` and `case "hash":`. Nothing else.
     expect(isDeIdentifying("mask")).toBe(true)
     expect(isDeIdentifying("mask_pii")).toBe(true)
     expect(isDeIdentifying("  MASK_PII ")).toBe(true)

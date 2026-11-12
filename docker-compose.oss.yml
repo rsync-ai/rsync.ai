@@ -98,6 +98,9 @@ services:
     build:
       context: ./shared/mcp-connectors
       dockerfile: Dockerfile.seed
+      additional_contexts:
+        # THIRD_PARTY_NOTICES.md for `COPY --from=legal` (a repo-root file this context cannot reach)
+        legal: .
     image: rsync-ai/connector-seed:local
     container_name: rsync-ai-connector-seed
     restart: "no"
@@ -115,6 +118,9 @@ services:
   connector-deployer:
     build:
       context: ./connector-deployer
+      additional_contexts:
+        # THIRD_PARTY_NOTICES.md for `COPY --from=legal` (a repo-root file this context cannot reach)
+        legal: .
     container_name: rsync-ai-connector-deployer
     restart: unless-stopped
     environment:
@@ -145,6 +151,9 @@ services:
     build:
       context: ./llm-service
       dockerfile: Dockerfile.oss
+      additional_contexts:
+        # THIRD_PARTY_NOTICES.md for `COPY --from=legal` (a repo-root file this context cannot reach)
+        legal: .
     image: rsync-ai/connector-lifecycle:local
     container_name: rsync-ai-connector-lifecycle
     restart: unless-stopped

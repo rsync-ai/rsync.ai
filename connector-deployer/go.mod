@@ -1,15 +1,17 @@
 module github.com/rsync-ai/connector-deployer
 
-go 1.25.7
+go 1.26.0
 
 // Pin the patched toolchain so CI/local builds + govulncheck analyze against the
-// fixed stdlib. go1.25.13 clears the five reachable stdlib CVEs go1.25.12
-// carries here -- GO-2026-6218 (net/url), GO-2026-6090 (crypto/tls),
-// GO-2026-6089 + GO-2026-5026 (net/http), GO-2026-5972 (encoding/asn1) -- on
-// top of the crypto/tls, net/url, os CVEs go1.25.7 carried. Matches the other
-// Go modules in this repo; the golang:1.25 Docker base already floats to this
-// patch. Docker-daemon CVEs stay in .govulncheck-allow.txt (fix is N/A there).
-toolchain go1.25.13
+// fixed stdlib. go1.26.9 (2026-10-08) clears GO-2026-6603, 6605, 6610-6613,
+// 6617 (net/http), 6607 (crypto/tls) and 6608 (mime/multipart) reachable here,
+// and no Go 1.25 release carries those fixes, so this module moved to Go 1.26
+// with the services (BACKLOG F-GO-1.26-TOOLCHAIN-MOVE). The `go 1.26.0` line
+// makes a 1.25 builder refuse the module; the golang:1.26 Docker base floats to
+// this patch. Docker-daemon CVEs stay in .govulncheck-allow.txt (fix is N/A there).
+// go1.26.10 (2026-10-22) clears GO-2026-6809 (crypto/x509).
+// go1.26.11 (2026-11-10) clears GO-2026-6859 (net/http).
+toolchain go1.26.11
 
 require (
 	github.com/docker/docker v28.5.2+incompatible

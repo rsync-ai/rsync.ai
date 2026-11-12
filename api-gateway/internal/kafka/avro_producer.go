@@ -10,7 +10,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,27 +47,6 @@ type AvroConfig struct {
 	Brokers             []string
 	SchemaRegistryURL   string
 	AutoRegisterSchemas bool
-}
-
-// DefaultAvroConfig returns default Avro configuration
-func DefaultAvroConfig() *AvroConfig {
-	schemaRegistry := os.Getenv("SCHEMA_REGISTRY_URL")
-	if schemaRegistry == "" {
-		schemaRegistry = "http://schema-registry:8080"
-	}
-
-	brokers := os.Getenv("KAFKA_BROKERS")
-	if brokers == "" {
-		brokers = "kafka:29092"
-	}
-
-	return &AvroConfig{
-		// Split, not wrapped: []string{brokers} turned a customer's
-		// "b1:9093,b2:9093" into one unresolvable hostname.
-		Brokers:             splitComma(brokers),
-		SchemaRegistryURL:   schemaRegistry,
-		AutoRegisterSchemas: true,
-	}
 }
 
 // NewAvroProducer creates a new Avro-enabled Kafka producer

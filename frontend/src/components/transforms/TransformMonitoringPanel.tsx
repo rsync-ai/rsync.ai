@@ -7,7 +7,9 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 import { Badge } from "@/components/ui/badge"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, History, Activity } from "lucide-react"
-import { formatAbsoluteTime, formatAge, formatCount, formatDuration } from "@/lib/transform-format"
+import { formatCount } from "@/lib/transform-format"
+import { formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
+import { formatDuration } from "@/lib/duration"
 
 // Read-only consumers of the two new pipeline-scoped endpoints:
 //   GET /transforms/pipeline/:id/rollup          → per-run net in→out + honest drop + freshness
@@ -174,7 +176,7 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
                     <td className="px-3 py-2 text-right text-zinc-500 dark:text-zinc-400">
                       {r.latest_activity_at ? (
                         <div className="flex flex-col items-end leading-tight">
-                          <time dateTime={r.latest_activity_at}>{formatAge(r.latest_activity_at)}</time>
+                          <time dateTime={r.latest_activity_at}>{formatRelativeTime(r.latest_activity_at)}</time>
                           <span className="text-[10px] text-zinc-400">{formatAbsoluteTime(r.latest_activity_at)}</span>
                         </div>
                       ) : (
@@ -281,7 +283,7 @@ function ConfigSlotCard({ slot }: { slot: ConfigSlot }) {
                     </Link>
                     {isCurrent && <Badge variant="success" className="text-[10px]">current</Badge>}
                     <time dateTime={rev.first_seen_at} className="text-xs text-zinc-500 dark:text-zinc-400">
-                      {formatAbsoluteTime(rev.first_seen_at) || formatAge(rev.first_seen_at)}
+                      {formatAbsoluteTime(rev.first_seen_at) || formatRelativeTime(rev.first_seen_at)}
                     </time>
                     {changed.length > 0 ? (
                       changed.map((k) => (

@@ -225,6 +225,9 @@ jobs:
         #     exactly that -- a reachable x/text infinite-loop on the SCRAM
         #     password-normalization path that all four service modules reported
         #     clean.
+        #   * shared/go/sqlexec -- the engines that run a customer's statements
+        #     (the MySQL and SQL Server drivers among them). Same reason as
+        #     pgdriver: its own graph can hold a version the services' hide.
         run: |
           PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
           "$PY" scripts/security/ci-scan.py go-modules \
@@ -233,7 +236,8 @@ jobs:
             backend-temporal-adapter \
             connector-deployer \
             shared/mcp-connectors/internal/kafka-mcp-sink/worker-src \
-            shared/go/pgdriver
+            shared/go/pgdriver \
+            shared/go/sqlexec
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         if: ${{ steps.scope.outputs.modules != '' }}
         with:
@@ -241,15 +245,15 @@ jobs:
           cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       # Reachability-based: only fails when the vulnerable symbol is actually
       # called. Each module is analyzed with GOTOOLCHAIN=<its toolchain>+auto,
-      # the toolchain its go.mod pins (go1.26.8 for the three services, go1.25.13
-      # for the other modules), so the stdlib analyzed is the PATCHED one the
-      # Docker base ships. A NEW stdlib CVE surfaces here until the pin is bumped.
+      # the toolchain its go.mod pins (go1.26.11 for all seven modules), so the
+      # stdlib analyzed is the PATCHED one the Docker base ships. A NEW stdlib
+      # CVE surfaces here until the pin is bumped.
       # A module with no `toolchain` line runs on setup-go's toolchain (`local`,
-      # the go1.26.8 api-gateway pins), as ci.yml's Go job does. Its `go` line
+      # the go1.26.11 api-gateway pins), as ci.yml's Go job does. Its `go` line
       # is NOT a toolchain name: `go 1.23` gives `go1.23`, which go refuses
       # ("go1.23 is a language version but not a toolchain version"), and this
       # step used to build exactly that name. No module on the list has hit it,
-      # since all six pin a toolchain; shared/go/{correlation,crypto,naming,
+      # since all seven pin a toolchain; shared/go/{correlation,crypto,naming,
       # transforms} (go 1.23/1.24, no pin) would the day they are added.
       # A module MAY carry a `.govulncheck-allow.txt` listing GO-XXXX-XXXX IDs it
       # consciously accepts (with justification in that file). The gate still fails
@@ -262,11 +266,11 @@ jobs:
       # `|| true` let a govulncheck that never analyzed anything pass as clean.
       # That had already happened (2026-09-18): golang.org/x/vuln v1.8.0 needs go
       # >= 1.26, and the old per-module job ran with GOTOOLCHAIN=local, so for
-      # connector-deployer, worker-src and pgdriver (go1.25.13) `go run` printed
+      # connector-deployer, worker-src and pgdriver (then go1.25.13) `go run` printed
       # "requires go >= 1.26.0 ... GOTOOLCHAIN=local" and the job said "govulncheck
       # OK" (run 35242937434). The `+auto` here lets go fetch 1.26 to BUILD the
       # tool; the analysis still uses the module's pin (govulncheck -format json
-      # reports "go_version": "go1.25.13" for them).
+      # reported "go_version": "go1.25.13" for them while they were on 1.25).
       # `set -o pipefail` is what lets that check see the exit code at all: the
       # step runs under `bash -e`, so `( go run ... ) | tee` exits with TEE's
       # status, rc stayed 0 and the check never fired. Until 2026-09-18 a
@@ -329,13 +333,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # connector-deployer is the SEC-H-02 trusted socket-holder -- SAST-scan
         # the code that speaks the Docker API on behalf of untrusted callers.
+        # shared/go/sqlexec runs a customer's statements; it left api-gateway
+        # (query-service Q0), and gosec scans a module's own packages only, so
+        # without it that code would have lost the SAST it had.
         run: |
           PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
           "$PY" scripts/security/ci-scan.py go-modules \
             api-gateway \
             backend-orchestrator \
             backend-temporal-adapter \
-            connector-deployer
+            connector-deployer \
+            shared/go/sqlexec
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         if: ${{ steps.scope.outputs.modules != '' }}
         with:
@@ -377,7 +385,7 @@ jobs:
         # every module: a PR's scoped SARIF would mark the skipped modules fixed.
         if: ${{ vars.CODE_SCANNING_ENABLED == 'true' && steps.scope.outputs.mode == 'full' }}
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: gosec.sarif
           category: gosec
@@ -404,7 +412,7 @@ jobs:
         # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
         # or unparseable SARIF.
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: gosec-sarif
           path: gosec.sarif
@@ -468,7 +476,7 @@ jobs:
       # interpreter because setup-python cannot write the hosted tool cache on
       # the self-hosted Macs; the flip-day split moved it to ubuntu-latest,
       # where the action works as designed.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.11'
       - name: Set up Semgrep venv
@@ -511,7 +519,7 @@ jobs:
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
         if: ${{ vars.CODE_SCANNING_ENABLED == 'true' && steps.scope.outputs.mode == 'full' }}   # see gosec's step of the same name
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
@@ -533,7 +541,7 @@ jobs:
         # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
         # or unparseable SARIF.
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: semgrep-sarif
           path: semgrep.sarif
@@ -559,47 +567,69 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Trivy
-        # Official script auto-detects the runner's OS/arch. Install to
+        # Pinned release tarball for this runner's OS/arch. Install to
         # RUNNER_TEMP: writing /usr/local/bin needs sudo.
         run: |
-          # Supply-chain hardening: pin the Trivy installer to a tagged release and
-          # verify its sha256 before executing — never `curl | sh` from a mutable
-          # branch. Also pin the installed binary to the same version.
-          TRIVY_VERSION=v0.72.0
-          TRIVY_INSTALL_SHA256=e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
-          # Two of the three steps below cross the network, and on 2026-09-24 the
-          # second one -- install.sh fetching the release tarball -- exited 1 on a
-          # docs-only commit after printing nothing past "found version". It turned
+          # Supply-chain hardening: pin Trivy to a tagged release and verify every
+          # download against a pinned sha256 before unpacking it — never
+          # `curl | sh` from a mutable branch.
+          #
+          # This step used to run the release's own contrib/install.sh. On
+          # 2026-11-04 that stopped working on every branch at once: the script
+          # fetches its tarball from get.trivy.dev, which no longer resolves
+          # (NXDOMAIN on public resolvers), so a BLOCKING gate went red for a
+          # reason no diff contained. The tarball and the checksum list are both
+          # GitHub release assets, so take them from there and leave the
+          # installer, and its extra host, out of the path.
+          TRIVY_VERSION=0.72.0
+          # sha256 of trivy_${TRIVY_VERSION}_checksums.txt. Pinning the list rather
+          # than one tarball keeps every OS/arch verifiable, so the step does not
+          # change when the job changes runner pool.
+          TRIVY_CHECKSUMS_SHA256=ebe9d19a774b950e240b1017a038e9b5a002ea068e02023369ff6d241c10c580
+          case "$(uname -s)" in
+            Darwin) os=macOS ;;
+            Linux) os=Linux ;;
+            *) echo "::error::no Trivy release asset for OS $(uname -s)"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) arch=ARM64 ;;
+            x86_64|amd64) arch=64bit ;;
+            *) echo "::error::no Trivy release asset for arch $(uname -m)"; exit 1 ;;
+          esac
+          checksums="trivy_${TRIVY_VERSION}_checksums.txt"
+          tarball="trivy_${TRIVY_VERSION}_${os}-${arch}.tar.gz"
+          # Both downloads cross the network, and on 2026-09-24 a release-tarball
+          # fetch exited 1 on a docs-only commit after printing nothing. It turned
           # a BLOCKING gate red for a reason no diff contained, and the same commit
           # had passed eleven minutes earlier. A single transient fetch must not be
-          # able to do that, so both fetches retry and announce each retry.
+          # able to do that, so each fetch retries and announces each retry.
           #
-          # The checksum between them is deliberately NOT retried: a mismatch is a
-          # moved tag or a tampered installer, and retrying a supply-chain red flag
-          # only buries it. It is the one failure here that should be believed the
-          # first time.
-          for attempt in 1 2 3; do
-            if curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"; then break; fi
-            echo "::warning::fetching the pinned Trivy installer failed (attempt ${attempt}/3)"
-            [ "$attempt" -eq 3 ] || sleep $(( attempt * 10 ))
-          done
-          # Assert the fetch rather than letting the checksum below infer it. A
-          # failed `curl -o` can leave a zero-length file behind, and leaning on a
-          # LATER command to notice an EARLIER one failed is how a step ends up
-          # reporting the wrong cause -- or, if the file is somehow present from
-          # anywhere else, no cause at all.
-          [ -s "$RUNNER_TEMP/trivy-install.sh" ] || { echo "::error::could not fetch the pinned Trivy installer after 3 attempts"; exit 1; }
-          echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
-          for attempt in 1 2 3; do
-            rm -rf "$RUNNER_TEMP/bin"
-            if sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"; then break; fi
-            echo "::warning::installing Trivy ${TRIVY_VERSION} failed (attempt ${attempt}/3)"
-            [ "$attempt" -eq 3 ] || sleep $(( attempt * 10 ))
-          done
-          # Neither loop can fail this step on its own -- each ends in a `sleep` or a
-          # `[`, both of which succeed -- so assert the artifact they were supposed
-          # to produce, and RUN it: a truncated download unpacks into a file that
-          # exists, is executable, and dies on the first scan instead of here.
+          # A failed `curl -o` can leave a zero-length file behind, so the fetch
+          # reports its own failure rather than leaving a LATER command to notice
+          # it -- which is how a step ends up reporting the wrong cause.
+          fetch() {
+            for attempt in 1 2 3; do
+              if curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/$1" -o "$RUNNER_TEMP/$1"; then return 0; fi
+              echo "::warning::fetching $1 failed (attempt ${attempt}/3)"
+              [ "$attempt" -eq 3 ] || sleep $(( attempt * 10 ))
+            done
+            echo "::error::could not fetch $1 after 3 attempts"
+            exit 1
+          }
+          fetch "$checksums"
+          fetch "$tarball"
+          # The checksums are deliberately NOT retried: a mismatch is a moved tag
+          # or a tampered asset, and retrying a supply-chain red flag only buries
+          # it. It is the one failure here that should be believed the first time.
+          echo "${TRIVY_CHECKSUMS_SHA256}  $RUNNER_TEMP/$checksums" | shasum -a 256 -c -
+          line=$(grep "  ${tarball}\$" "$RUNNER_TEMP/$checksums") || { echo "::error::${tarball} is not in the pinned checksum list"; exit 1; }
+          (cd "$RUNNER_TEMP" && echo "$line" | shasum -a 256 -c -)
+          rm -rf "$RUNNER_TEMP/bin" "$RUNNER_TEMP/trivy-unpacked"
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/trivy-unpacked"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/trivy-unpacked"
+          install -m 0755 "$RUNNER_TEMP/trivy-unpacked/trivy" "$RUNNER_TEMP/bin/trivy"
+          # Assert the artifact, and RUN it: a binary that unpacked but cannot
+          # start should fail here, not on the first scan.
           "$RUNNER_TEMP/bin/trivy" --version
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Pull Trivy's databases anonymously
@@ -640,7 +670,7 @@ jobs:
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
         if: ${{ vars.CODE_SCANNING_ENABLED == 'true' }}   # see the header; Trivy always scans the whole tree, so there is no scope to check
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: trivy.sarif
           category: trivy
@@ -662,7 +692,7 @@ jobs:
         # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
         # or unparseable SARIF.
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: trivy-sarif
           path: trivy.sarif

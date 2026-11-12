@@ -6,6 +6,10 @@ import {
   wordCompletions,
   foreignKeyJoinHints,
   tablesInSchema,
+  sqlSlotAt,
+  statementBounds,
+  scopedColumnCompletions,
+  joinCompletions,
   type CompletionTable,
 } from "../sqlCompletions"
 
@@ -47,6 +51,25 @@ describe("parseTableAliases", () => {
     expect(a.has("where")).toBe(false)
     expect(a.size).toBe(0)
   })
+
+  // A comma is a table list only inside FROM: in ORDER BY it separates columns, and
+  // `total ASC` is not a table with an alias.
+  it("reads no table out of a comma that is not in a FROM list", () => {
+    expect(parseTableAliases("SELECT * FROM orders ORDER BY id DESC, total ASC").size).toBe(0)
+    expect(parseTableAliases("SELECT id, users u FROM orders").size).toBe(0)
+  })
+
+  it("reads no table out of a comment or a string", () => {
+    expect(parseTableAliases("SELECT 1 -- from users u\nFROM orders o")).toEqual(new Map([["o", "orders"]]))
+    expect(parseTableAliases("SELECT 'from users u' FROM orders o")).toEqual(new Map([["o", "orders"]]))
+  })
+
+  it("reads the tables of MERGE … USING and DELETE … USING", () => {
+    const a = parseTableAliases("MERGE INTO orders t USING staged_orders s ON t.id = s.id")
+    expect(a.get("t")).toBe("orders")
+    expect(a.get("s")).toBe("staged_orders")
+    expect(parseTableAliases("DELETE FROM orders o USING users u WHERE o.uid = u.id").get("u")).toBe("users")
+  })
 })
 
 describe("columnCompletionsFor", () => {
@@ -80,12 +103,13 @@ describe("columnCompletionsFor", () => {
 })
 
 describe("wordCompletions", () => {
-  it("offers qualified tables (boosted) plus de-duplicated columns", () => {
+  it("offers tables by bare name (inserting the qualified one) plus de-duplicated columns", () => {
     const opts = wordCompletions(buildSchemaLookup(TABLES))
-    expect(opts.filter((o) => o.type === "class").map((o) => o.label)).toEqual([
-      "sales.orders",
-      "sales.users",
-    ])
+    const tables = opts.filter((o) => o.type === "class")
+    // A bare label scores as a prefix match; `sales.orders` ranked below keywords.
+    expect(tables.map((o) => o.label)).toEqual(["orders", "users"])
+    expect(tables.map((o) => o.apply)).toEqual(["sales.orders", "sales.users"])
+    expect(tables.map((o) => o.detail)).toEqual(["sales · table", "sales · table"])
     expect(opts.filter((o) => o.label === "id").length).toBe(1) // deduped across tables
   })
 })
@@ -173,5 +197,107 @@ describe("wordCompletions — cross-table column collisions", () => {
     const opts = wordCompletions(buildSchemaLookup(tables))
     expect(opts.filter((o) => o.label === "status")).toHaveLength(1) // still deduped
     expect(opts.find((o) => o.label === "status")?.detail).toBe("column") // neutral, not int/varchar
+  })
+})
+
+describe("sqlSlotAt", () => {
+  it.each([
+    ["", "statement"],
+    ["SELECT * FROM ", "table"],
+    ["SELECT * FROM a JOIN ", "table"],
+    ["SELECT * FROM a, ", "table"],
+    ["INSERT INTO ", "table"],
+    ["UPDATE ", "table"],
+    ["SELECT * FROM a ", "afterTable"],
+    ["SELECT * FROM sales.orders o ", "afterTable"],
+    ["UPDATE orders ", "afterTable"],
+    ["SELECT ", "column"],
+    ["SELECT a, ", "column"],
+    ["SELECT * FROM a WHERE ", "column"],
+    ["SELECT * FROM a WHERE x = 1 AND ", "column"],
+    ["SELECT * FROM a JOIN b ON ", "column"],
+    ["SELECT * FROM a GROUP BY ", "column"],
+    ["UPDATE a SET ", "column"],
+    ["SELECT * FROM a LIMIT ", "any"],
+    // A subquery or CTE body starts a statement of its own.
+    ["WITH x AS (", "statement"],
+    ["WITH x AS (SELECT 1) ", "statement"],
+    ["WITH x AS (SELECT 1), y AS (", "statement"],
+    ["SELECT * FROM (", "statement"],
+    ["SELECT * FROM a WHERE id IN (", "column"],
+    // A closed group is skipped as one item: the clause that holds it decides.
+    ["SELECT a, (SELECT max(b) FROM t) ", "column"],
+    ["SELECT * FROM a WHERE x IN (SELECT y FROM b) AND ", "column"],
+    ["SELECT * FROM (SELECT * FROM a) x ", "afterTable"],
+    ["INSERT INTO orders (id, total) ", "afterTable"],
+    // FROM as an operand, not a clause.
+    ["SELECT EXTRACT(YEAR FROM ", "column"],
+    ["SELECT TRIM(BOTH FROM ", "column"],
+    ["SELECT * FROM a WHERE x IS DISTINCT FROM ", "column"],
+    // USING names a table in MERGE and DELETE, and a column list in JOIN.
+    ["MERGE INTO orders t USING ", "table"],
+    ["DELETE FROM a USING ", "table"],
+    ["SELECT * FROM a JOIN b USING (", "column"],
+    // UPDATE names a table only where it starts a statement.
+    ["WITH x AS (SELECT 1) UPDATE ", "table"],
+    ["INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE ", "afterTable"],
+  ])("%j → %s", (before, slot) => {
+    expect(sqlSlotAt(before)).toBe(slot)
+  })
+
+  it("ignores keywords inside strings and comments", () => {
+    expect(sqlSlotAt("SELECT * FROM a WHERE x = 'from ")).toBe("column")
+    expect(sqlSlotAt("-- from\n")).toBe("statement")
+  })
+})
+
+describe("statementBounds", () => {
+  it("finds the statement around the caret, ignoring a ; inside a string", () => {
+    const doc = "SELECT 1; SELECT ';' FROM t; SELECT 3"
+    const pos = doc.indexOf("FROM")
+    const { from, to } = statementBounds(doc, pos)
+    expect(doc.slice(from, to)).toBe(" SELECT ';' FROM t")
+  })
+})
+
+describe("scopedColumnCompletions", () => {
+  it("names the owning table when several are in scope", () => {
+    const opts = scopedColumnCompletions(
+      buildSchemaLookup(TABLES),
+      "SELECT  FROM sales.orders o JOIN sales.users u ON u.id = o.user_id",
+    )!
+    expect(opts.find((o) => o.label === "email")?.detail).toBe("varchar · users")
+    expect(opts.find((o) => o.label === "id")?.detail).toBe("column · orders, users")
+    expect(opts.filter((o) => o.type === "variable").map((o) => o.label)).toEqual(["o", "u"])
+  })
+
+  it("returns null when the statement names no known table", () => {
+    expect(scopedColumnCompletions(buildSchemaLookup(TABLES), "SELECT  FROM nowhere")).toBeNull()
+  })
+})
+
+describe("joinCompletions", () => {
+  const fk = {
+    from_schema: "sales",
+    from_table: "orders",
+    from_column: "user_id",
+    to_schema: "sales",
+    to_table: "users",
+    to_column: "id",
+  }
+
+  it("writes the join from either side of the key, using the in-scope table's alias", () => {
+    const lookup = buildSchemaLookup(TABLES)
+    expect(joinCompletions(lookup, [fk], "SELECT * FROM sales.orders o JOIN ").map((o) => o.label)).toEqual([
+      "users ON users.id = o.user_id",
+    ])
+    expect(joinCompletions(lookup, [fk], "SELECT * FROM sales.users JOIN ").map((o) => o.apply)).toEqual([
+      "sales.orders ON orders.user_id = users.id",
+    ])
+  })
+
+  it("skips a self-referencing key", () => {
+    const self = { ...fk, to_table: "orders", to_column: "id" }
+    expect(joinCompletions(buildSchemaLookup(TABLES), [self], "SELECT * FROM sales.orders JOIN ")).toEqual([])
   })
 })

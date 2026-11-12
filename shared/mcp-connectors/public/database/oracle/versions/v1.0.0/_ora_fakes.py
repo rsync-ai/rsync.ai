@@ -40,7 +40,11 @@ class FakeCursor:
         self.rowcount = -1
 
     def execute(self, sql, params=None):
-        self.executed.append({"sql": sql, "params": params})
+        entry = {"sql": sql, "params": params}
+        if self._conn is not None and self._conn.call_timeout:
+            # oracledb's per-round-trip deadline (ms) in force for this call.
+            entry["call_timeout"] = self._conn.call_timeout
+        self.executed.append(entry)
         verb = sql.lstrip()[:6].upper()
         if self._router is not None:
             routed = self._router(sql, params)
@@ -54,6 +58,8 @@ class FakeCursor:
             )
         if verb.startswith("DELETE"):
             self.rowcount = 1  # one row matched per key tuple
+        if self._conn is not None and self._conn.dml_rowcount is not None:
+            self.rowcount = self._conn.dml_rowcount  # opt-in: a DML's affected rows
         return None
 
     def executemany(self, sql, seq):
@@ -69,6 +75,9 @@ class FakeCursor:
 
     def fetchall(self):
         return list(self._result)
+
+    def fetchmany(self, size=1):
+        return list(self._result)[:size]
 
     def fetchone(self):
         return self._result[0] if self._result else None
@@ -86,11 +95,16 @@ class FakeCursor:
 class FakeConn:
     """Records every cursor so a test can read back all executed statements."""
 
-    def __init__(self, columns=None, rows=None, router=None, fail_executemany_once=False):
+    def __init__(self, columns=None, rows=None, router=None, fail_executemany_once=False,
+                 dml_rowcount=None):
         self._columns = columns
         self._rows = rows
         self._router = router
         self.fail_executemany_once = fail_executemany_once
+        # When set, every execute() reports this rowcount (a DML's affected rows).
+        self.dml_rowcount = dml_rowcount
+        # oracledb Connection.call_timeout: ms per round-trip, 0 = no deadline.
+        self.call_timeout = 0
         self.cursors: List[FakeCursor] = []
         self.committed = 0
         self.rolled_back = 0
@@ -131,11 +145,12 @@ class FakeConn:
 
 
 def make_connector(connector_module, *, columns=None, rows=None, router=None,
-                   fail_executemany_once=False):
+                   fail_executemany_once=False, dml_rowcount=None):
     """Build an OracleMCPServer wired to a FakeConn (the _get_connection seam)."""
     server = connector_module.OracleMCPServer()
     conn = FakeConn(columns=columns, rows=rows, router=router,
-                    fail_executemany_once=fail_executemany_once)
+                    fail_executemany_once=fail_executemany_once,
+                    dml_rowcount=dml_rowcount)
     server._get_connection = lambda config: conn  # type: ignore[assignment]
     return server, conn
 

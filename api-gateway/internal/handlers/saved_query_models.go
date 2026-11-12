@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rsync-ai/shared/crypto"
+	"github.com/rsync-ai/shared/sqlexec"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -129,6 +130,20 @@ type modelRunResult struct {
 	// caller pauses on this rather than failing in a loop forever. A plain SQL failure
 	// leaves it empty — that is worth retrying.
 	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
+
+	// CDCWatermarks is what the run was built from: the watermark of each CDC table its
+	// SQL reads, read as the run started (model_run_cdc_watermarks.go). Recorded with
+	// the run, never part of a response.
+	CDCWatermarks json.RawMessage `json:"-"`
+
+	// CheckBlocked marks a failed run whose new table a blocking data check held back:
+	// the old table is still live, and what runs after this model is skipped with
+	// upstream_check_failed rather than upstream_failed.
+	CheckBlocked bool `json:"-"`
+	// CheckResults is what each data check saw on this run, recorded with it
+	// (saved_query_check_results). Never part of a response: it carries counts, and a
+	// run result reaches the agent tools.
+	CheckResults []modelCheckResult `json:"-"`
 }
 
 // validateModelTarget splits and validates a "table" or "schema.table" identifier.
@@ -156,25 +171,36 @@ func validateModelTarget(raw string) (schemaName, tableName string, err error) {
 // quoteModelIdent renders validated parts for one engine. Every part has already
 // passed modelIdentPart, so no escaping is required — the quotes are here so a target
 // that collides with a reserved word still works.
+//
+// Snowflake and Oracle fold an unquoted name to upper case, so a name is upper-cased
+// inside its quotes: `orders` then names the same ORDERS every other tool on that
+// warehouse sees, rather than a second, lower-case table only a quoted name can reach.
 func quoteModelIdent(dialect, schemaName, tableName string) string {
 	var open, close string
+	fold := func(s string) string { return s }
 	switch dialect {
-	case "mysql":
+	case "mysql", "bigquery", "databricks", "clickhouse":
 		open, close = "`", "`"
 	case "sqlserver":
 		open, close = "[", "]"
+	case "snowflake", "oracle":
+		open, close = `"`, `"`
+		fold = strings.ToUpper
 	default: // postgres, redshift
 		open, close = `"`, `"`
 	}
-	q := func(s string) string { return open + s + close }
+	q := func(s string) string { return open + fold(s) + close }
 	if schemaName != "" {
 		return q(schemaName) + "." + q(tableName)
 	}
 	return q(tableName)
 }
 
-// modelDialect maps a connector type to the direct-driver dialect used for quoting,
-// DDL syntax and driver selection. Returns "" for connectors models do not support.
+// modelDialect maps a connector type to the dialect used for quoting, DDL syntax and
+// how a run reaches the engine: a database/sql driver for postgres, mysql and
+// sqlserver (modelDialectRunsOnDriver), the orchestrator or the Databricks API for
+// the warehouses (saved_query_models_engines.go). Returns "" for connectors models do
+// not support — document stores, whose models are an aggregation rather than SQL.
 func modelDialect(connectorType string) string {
 	ct := strings.ToLower(connectorType)
 	switch {
@@ -184,6 +210,16 @@ func modelDialect(connectorType string) string {
 		return "mysql"
 	case strings.Contains(ct, "sqlserver"), strings.Contains(ct, "mssql"):
 		return "sqlserver"
+	case strings.Contains(ct, "bigquery"):
+		return "bigquery"
+	case strings.Contains(ct, "snowflake"):
+		return "snowflake"
+	case strings.Contains(ct, "databricks"):
+		return "databricks"
+	case strings.Contains(ct, "clickhouse"):
+		return "clickhouse"
+	case strings.Contains(ct, "oracle"):
+		return "oracle"
 	default:
 		return ""
 	}
@@ -434,7 +470,7 @@ const modelRunMinRole = security.WSAdmin
 // A returned error means authorization could not be DECIDED. That is not a refusal and
 // must never reach auto_paused_reason — the caller retries instead.
 func authorizeModelRun(ctx context.Context, database *sql.DB, m *savedQueryModel, actorUserID string) (validators.StatementClass, string, error) {
-	class := validators.ClassifyStatementSQL(m.SQLText)
+	class := modelStatementClass(m)
 
 	role, roleErr := resolveWorkspaceRoleForUser(ctx, database, m.WorkspaceID, actorUserID)
 	if roleErr != nil {
@@ -445,6 +481,13 @@ func authorizeModelRun(ctx context.Context, database *sql.DB, m *savedQueryModel
 	}
 	if !role.Meets(modelRunMinRole) {
 		return class, fmt.Sprintf("the run-as user's role (%s) does not meet the %s role required to run a model", role, modelRunMinRole), nil
+	}
+
+	// A MongoDB model's text is a pipeline, not SQL: ValidateExplorerStatement would
+	// refuse it as an unrecognized statement. Its gate is the pipeline validator,
+	// re-run on the CURRENT text here for the same reason the SQL gate is.
+	if isDocumentConnector(m.ConnectorType) {
+		return class, authorizeDocumentModel(m), nil
 	}
 
 	// The statement gate runs for EVERY class, ahead of any question about what this
@@ -501,11 +544,11 @@ func authorizeModelRun(ctx context.Context, database *sql.DB, m *savedQueryModel
 func modelDSN(dialect string, config map[string]interface{}) (string, error) {
 	switch dialect {
 	case "postgres":
-		return postgresExplorerDSN(config), nil
+		return sqlexec.PostgresDSN(config), nil
 	case "mysql":
-		return mysqlExplorerDSN(config), nil
+		return sqlexec.MySQLDSN(config), nil
 	case "sqlserver":
-		return sqlServerExplorerDSN(config), nil
+		return sqlexec.SQLServerDSN(config), nil
 	default:
 		return "", fmt.Errorf("unsupported dialect %q", dialect)
 	}
@@ -575,9 +618,11 @@ func modelTargetExists(ctx context.Context, q modelQueryer, dialect, schemaName,
 // Postgres, Redshift and SQL Server all commit DDL transactionally. MySQL commits
 // implicitly on every DDL statement, so wrapping its plan in a transaction would buy
 // nothing and imply a rollback that will not happen; its swap is made atomic by the
-// single-statement RENAME form instead (see modelSwapSQL).
+// single-statement RENAME form instead (see modelSwapSQL). None of the warehouses can
+// roll a rebuild back either, which is why this is an allowlist: a dialect added
+// later is assumed to need the sweep until someone shows it does not.
 func modelDialectSupportsTransactionalDDL(dialect string) bool {
-	return dialect != "mysql"
+	return dialect == "postgres" || dialect == "sqlserver"
 }
 
 // execModelStatements runs the plan in order, stopping at the first failure.
@@ -588,7 +633,7 @@ func execModelStatements(ctx context.Context, ex modelExecer, stmts []string) (*
 		if err != nil {
 			return nil, fmt.Errorf("statement failed: %w", err)
 		}
-		if res == nil || !reportsRowsAffected(validators.ClassifyStatementSQL(stmt)) {
+		if res == nil || !sqlexec.ReportsRowsAffected(validators.ClassifyStatementSQL(stmt)) {
 			continue
 		}
 		if n, rErr := res.RowsAffected(); rErr == nil {
@@ -621,7 +666,7 @@ func execModelStatements(ctx context.Context, ex modelExecer, stmts []string) (*
 // different connection is about to change. Called once the connection is up and, where
 // the engine has one, inside the transaction, so on those engines the question and the
 // swap it decides are the same atomic unit.
-func executeModelPlan(ctx context.Context, dialect, dsn string, buildPlan func(context.Context, modelQueryer) ([]string, error), sweepOnFailure string) (*int64, error) {
+func executeModelPlan(ctx context.Context, dialect, dsn string, buildPlan func(context.Context, modelQueryer) ([]string, error), sweepOnFailure string, checks *modelPlanChecks) (*int64, error) {
 	conn, err := sql.Open(dialect, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
@@ -638,23 +683,50 @@ func executeModelPlan(ctx context.Context, dialect, dsn string, buildPlan func(c
 	if err := conn.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("connection ping failed: %w", err)
 	}
+	return runModelPlan(ctx, conn, dialect, buildPlan, sweepOnFailure, checks)
+}
 
+// modelPlanChecks is where a rebuild's data checks look (saved_query_checks.go): the
+// blocking ones at the staging table once the plan's first auditAfter statements have
+// built it, before anything touches the live table; the warning ones at the live table
+// once the swap is done.
+type modelPlanChecks struct {
+	run        *modelCheckRun
+	auditAfter int
+	auditTable string // the quoted staging table
+	liveTable  string // the quoted target
+}
+
+// modelCheckNoAuditPoint is a blocking check's message on a plan with no point between
+// its build and its publish.
+const modelCheckNoAuditPoint = "not run: this rebuild has no point to check the new table before publishing it"
+
+// driverPlanAuditAfter is where a driver rebuild has built its staging table and not
+// yet touched the live one: buildMaterializationPlan's DROP staging, CREATE staging.
+const driverPlanAuditAfter = 2
+
+// runModelPlan is executeModelPlan once the connection is up.
+func runModelPlan(ctx context.Context, conn *sql.DB, dialect string, buildPlan func(context.Context, modelQueryer) ([]string, error), sweepOnFailure string, checks *modelPlanChecks) (*int64, error) {
 	if !modelDialectSupportsTransactionalDDL(dialect) {
 		stmts, planErr := buildPlan(ctx, conn)
 		if planErr != nil {
 			return nil, planErr
 		}
-		rows, execErr := execModelStatements(ctx, conn, stmts)
+		rows, execErr := execAuditedPlan(ctx, conn, stmts, checks, driverCheckReader{q: conn, dialect: dialect})
 		if execErr != nil && sweepOnFailure != "" {
 			// No transaction to unwind, so the staging table has to be swept by hand or
 			// it sits in the user's schema until the next run reclaims it. Best effort on
 			// a fresh deadline — ctx may already be cancelled, and the failure worth
-			// reporting is the original one, not this.
+			// reporting is the original one, not this. A blocked run lands here too: its
+			// staging table is the one the checks refused.
 			sweepCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if _, dErr := conn.ExecContext(sweepCtx, sweepOnFailure); dErr != nil {
 				log.WithError(dErr).Warn("model run: could not sweep the staging table after a failed rebuild")
 			}
+		}
+		if execErr == nil {
+			checks.report(ctx, conn, dialect)
 		}
 		return rows, execErr
 	}
@@ -664,7 +736,7 @@ func executeModelPlan(ctx context.Context, dialect, dsn string, buildPlan func(c
 		return nil, fmt.Errorf("failed to open transaction: %w", err)
 	}
 	// The rollback IS the cleanup. A failed rebuild leaves no scratch tables behind and,
-	// far more importantly, leaves the live table exactly as it was.
+	// far more importantly, leaves the live table exactly as it was. A blocked one too.
 	defer func() { _ = tx.Rollback() }()
 
 	stmts, err := buildPlan(ctx, tx)
@@ -672,14 +744,71 @@ func executeModelPlan(ctx context.Context, dialect, dsn string, buildPlan func(c
 		return nil, err
 	}
 
-	rows, err := execModelStatements(ctx, tx, stmts)
+	rows, err := execAuditedPlan(ctx, tx, stmts, checks, driverCheckReader{q: tx, dialect: dialect, inTx: true})
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit the rebuild: %w", err)
 	}
+	// After the commit: a warning reads what was published, and its error cannot reach
+	// the transaction.
+	checks.report(ctx, conn, dialect)
 	return rows, nil
+}
+
+// execAuditedPlan runs the plan, stopping after checks.auditAfter statements to run the
+// blocking checks on the staging table. If one fails, or cannot run, nothing after that
+// point runs and it returns errModelCheckBlocked; the caller's cleanup — the rollback, or
+// the sweep — removes the staging table. Without blocking checks it is
+// execModelStatements.
+func execAuditedPlan(ctx context.Context, ex modelExecer, stmts []string, checks *modelPlanChecks, rd checkReader) (*int64, error) {
+	if checks == nil || !checks.run.hasBlock() {
+		return execModelStatements(ctx, ex, stmts)
+	}
+	if checks.auditAfter <= 0 || checks.auditAfter >= len(stmts) {
+		// A plan with no point between its build and its publish. Fail closed: a
+		// blocking check that cannot look cannot vouch for the table.
+		checks.run.auditUnreachable(modelCheckNoAuditPoint)
+		return nil, errModelCheckBlocked
+	}
+	built, err := execModelStatements(ctx, ex, stmts[:checks.auditAfter])
+	if err != nil {
+		return nil, err
+	}
+	if checks.run.audit(ctx, rd, checks.auditTable) {
+		return nil, errModelCheckBlocked
+	}
+	published, err := execModelStatements(ctx, ex, stmts[checks.auditAfter:])
+	if err != nil {
+		return nil, err
+	}
+	// As execModelStatements: the last statement that reports a count is the count.
+	if published != nil {
+		return published, nil
+	}
+	return built, nil
+}
+
+// report runs the warning checks on the published table, each in its own read-only
+// transaction on the run's connection (read_only_reads.go): the plan is done, so a
+// check's SQL is a read and runs as one. It is the last thing the run sends; on MySQL
+// the session stays read-only after it. Safe on nil.
+func (c *modelPlanChecks) report(ctx context.Context, conn *sql.DB, dialect string) {
+	if c == nil || !c.run.hasWarn() {
+		return
+	}
+	dbc, err := conn.Conn(ctx)
+	if err != nil {
+		c.run.report(ctx, unreadableCheckReader{err: err}, c.liveTable)
+		return
+	}
+	defer func() { _ = dbc.Close() }()
+	timeout := modelRunTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		timeout = time.Until(dl)
+	}
+	c.run.report(ctx, readOnlyCheckReader{conn: dbc, dialect: dialect, timeout: timeout}, c.liveTable)
 }
 
 // modelRunLockNamespace separates this feature's advisory locks from every other
@@ -809,6 +938,11 @@ func recordTargetOwnership(database *sql.DB, modelID string) {
 			"(UPDATE saved_queries SET target_owned = TRUE) or the target table is removed")
 }
 
+// modelRunInProgressError is a run skipped because another run of the model held its
+// lock. A workflow's refresh_model step asks again when it reads it (§ 3.1: busy waits,
+// then starts its own).
+const modelRunInProgressError = "a run of this model is already in progress"
+
 // runSavedQueryModel executes one model run end to end. It is the single entry point
 // for both the manual and the scheduled path.
 //
@@ -833,7 +967,7 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 		// momentary overlap into an outage that needs a human to clear.
 		return &modelRunResult{
 			Status: "skipped",
-			Error:  "a run of this model is already in progress",
+			Error:  modelRunInProgressError,
 		}, nil
 	}
 	defer release()
@@ -863,7 +997,7 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 		// burn warehouse time to produce nothing.
 		return &modelRunResult{
 			Status:          "skipped",
-			StatementClass:  string(validators.ClassifyStatementSQL(m.SQLText)),
+			StatementClass:  string(modelStatementClass(m)),
 			Error:           "this saved query has no materialization target; set one before running it as a model",
 			AutoPauseReason: "the saved query is no longer materialized",
 		}, nil
@@ -887,10 +1021,10 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 	}
 
 	dialect := modelDialect(m.ConnectorType)
-	if dialect == "" {
-		// BigQuery and the other delegated engines route through the orchestrator's MCP
-		// tools, which have no execute-DDL path today. Say so rather than silently doing
-		// nothing.
+	document := isDocumentConnector(m.ConnectorType)
+	if dialect == "" && !document {
+		// A connector with no SQL engine and no pipeline behind it. Say so rather than
+		// silently doing nothing.
 		return &modelRunResult{
 			Status:          "skipped",
 			StatementClass:  string(class),
@@ -937,16 +1071,96 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 		return unusableConnectionResult(class, m.TargetTable, "could not be parsed"), nil
 	}
 
-	dsn, err := modelDSN(dialect, config)
-	if err != nil {
-		log.WithError(err).WithField("connection_id", m.ConnectionID).
-			Error("model run: could not build a DSN for this connection")
-		return unusableConnectionResult(class, m.TargetTable, "could not be turned into a connection string"), nil
+	onDriver := !document && modelDialectRunsOnDriver(dialect)
+	var dsn string
+	if onDriver {
+		dsn, err = modelDSN(dialect, config)
+		if err != nil {
+			log.WithError(err).WithField("connection_id", m.ConnectionID).
+				Error("model run: could not build a DSN for this connection")
+			return unusableConnectionResult(class, m.TargetTable, "could not be turned into a connection string"), nil
+		}
 	}
+
+	// A check looks at the model's own table, so a statement model, which has none, and
+	// a document model run none; saving one on either is refused.
+	var checks *modelCheckRun
+	if !document && !isStatementModel(m.Materialization) {
+		checks, err = loadModelCheckRun(ctx, database, modelID, dialect, m.TargetOwned)
+		if err != nil {
+			// Not knowing a model's checks is not knowing it has none: running anyway
+			// would publish a table a blocking check might refuse. Retryable, like a
+			// load fault above.
+			return nil, fmt.Errorf("failed to load the model's data checks: %w", err)
+		}
+	}
+
+	// Before the rebuild, so the recorded watermarks are a lower bound on what it read.
+	cdcWatermarks := modelRunCDCWatermarks(ctx, database, m)
 
 	runCtx, cancel := context.WithTimeout(ctx, modelRunTimeout)
 	defer cancel()
 
+	var rowsAffected *int64
+	var execErr error
+	switch {
+	case document:
+		// schemaName/tableName are the target's database and collection.
+		rowsAffected, execErr = runDocumentModel(runCtx, m, config, schemaName, tableName)
+	case onDriver:
+		rowsAffected, execErr = runDriverModel(runCtx, dialect, dsn, schemaName, tableName, m, checks)
+	default:
+		rowsAffected, execErr = runEngineModel(runCtx, newModelEngineRunner(dialect, m.ConnectorType, config), dialect, schemaName, tableName, m, checks)
+	}
+	if errors.Is(execErr, errModelCheckBlocked) {
+		// The SQL ran; a blocking check refused what it built. The old table is still
+		// the live one. No ownership either: a first run's table was removed with the
+		// refusal, so there is nothing at the target name this model made.
+		return &modelRunResult{
+			Status:         "failed",
+			StatementClass: string(class),
+			TargetTable:    m.TargetTable,
+			Error:          modelCheckBlockedError,
+			CDCWatermarks:  cdcWatermarks,
+			CheckBlocked:   true,
+			CheckResults:   checks.resultsOrNil(),
+		}, nil
+	}
+	if execErr != nil {
+		// The raw driver error goes to the log; the stored one drops the source host.
+		log.WithError(execErr).WithField("model_id", modelID).Warn("model run failed")
+		return &modelRunResult{
+			Status:         "failed",
+			StatementClass: string(class),
+			TargetTable:    m.TargetTable,
+			Error:          modelRunErrorMessage(execErr.Error()),
+			CDCWatermarks:  cdcWatermarks,
+			// Blocking checks that passed before a later statement failed.
+			CheckResults: checks.resultsOrNil(),
+		}, nil
+	}
+
+	// The swap succeeded, so this model provably owns the table and later runs may
+	// retire it. A statement model owns nothing — it never created the tables its SQL
+	// writes to, and claiming otherwise would hand a later table-mode run of the same
+	// saved query a licence to DROP a table rsync.ai did not create.
+	if !m.TargetOwned && !isStatementModel(m.Materialization) {
+		recordTargetOwnership(database, modelID)
+	}
+
+	return &modelRunResult{
+		Status:         "succeeded",
+		RowsAffected:   rowsAffected,
+		StatementClass: string(class),
+		TargetTable:    m.TargetTable,
+		CDCWatermarks:  cdcWatermarks,
+		CheckResults:   checks.resultsOrNil(),
+	}, nil
+}
+
+// runDriverModel runs one model on an engine the gateway holds a database/sql driver
+// for (modelDialectRunsOnDriver).
+func runDriverModel(runCtx context.Context, dialect, dsn, schemaName, tableName string, m *savedQueryModel, checks *modelCheckRun) (*int64, error) {
 	// Both modes run through executeModelPlan, and that is deliberate rather than
 	// incidental: everything it does — the dedicated single connection, the 30-minute
 	// lifetime, the transaction where the engine has one — is as necessary for a bulk
@@ -972,32 +1186,16 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 		sweepOnFailure = "DROP TABLE IF EXISTS " + quoteModelIdent(dialect, schemaName, tableName+modelStagingSuffix)
 	}
 
-	rowsAffected, execErr := executeModelPlan(runCtx, dialect, dsn, plan, sweepOnFailure)
-	if execErr != nil {
-		// The raw driver error goes to the log; the stored one drops the source host.
-		log.WithError(execErr).WithField("model_id", modelID).Warn("model run failed")
-		return &modelRunResult{
-			Status:         "failed",
-			StatementClass: string(class),
-			TargetTable:    m.TargetTable,
-			Error:          modelRunErrorMessage(execErr.Error()),
-		}, nil
+	var planChecks *modelPlanChecks
+	if checks != nil && !isStatementModel(m.Materialization) {
+		planChecks = &modelPlanChecks{
+			run:        checks,
+			auditAfter: driverPlanAuditAfter,
+			auditTable: quoteModelIdent(dialect, schemaName, tableName+modelStagingSuffix),
+			liveTable:  quoteModelIdent(dialect, schemaName, tableName),
+		}
 	}
-
-	// The swap succeeded, so this model provably owns the table and later runs may
-	// retire it. A statement model owns nothing — it never created the tables its SQL
-	// writes to, and claiming otherwise would hand a later table-mode run of the same
-	// saved query a licence to DROP a table rsync.ai did not create.
-	if !m.TargetOwned && !isStatementModel(m.Materialization) {
-		recordTargetOwnership(database, modelID)
-	}
-
-	return &modelRunResult{
-		Status:         "succeeded",
-		RowsAffected:   rowsAffected,
-		StatementClass: string(class),
-		TargetTable:    m.TargetTable,
-	}, nil
+	return executeModelPlan(runCtx, dialect, dsn, plan, sweepOnFailure, planChecks)
 }
 
 // unusableConnectionResult is the shared shape for "the stored connection config cannot
@@ -1051,7 +1249,7 @@ type modelRunAudit struct {
 // could not tell which of its upstreams had caused that, or whether it was the chain's
 // first hop or its eighth.
 type runProvenance struct {
-	UpstreamKind string // upstreamKindPipeline or upstreamKindModel
+	UpstreamKind string // upstreamKindPipeline, upstreamKindModel or upstreamKindWorkflow
 	UpstreamID   string
 	// UpstreamRunID is the upstream model's own saved_query_runs row. Empty for a
 	// pipeline upstream, which has no row there.
@@ -1072,7 +1270,7 @@ type runProvenance struct {
 // extra hop the counter did not count.
 func provenanceFor(src modelRefreshSource, coalesced int) runProvenance {
 	hops := src.Depth
-	if src.Kind == upstreamKindPipeline {
+	if src.Kind == upstreamKindPipeline || src.Kind == upstreamKindWorkflow {
 		hops = 1
 	} else if src.ExecutionID != "" {
 		hops++
@@ -1091,7 +1289,9 @@ func provenanceFor(src modelRefreshSource, coalesced int) runProvenance {
 // payload, and one malformed id must cost the provenance, never the run's history row —
 // the INSERT is one statement and a bad cast would take every column down with it.
 func (p runProvenance) sanitized() runProvenance {
-	if p.UpstreamKind != upstreamKindPipeline && p.UpstreamKind != upstreamKindModel {
+	switch p.UpstreamKind {
+	case upstreamKindPipeline, upstreamKindModel, upstreamKindWorkflow:
+	default:
 		return runProvenance{}
 	}
 	if _, err := uuid.Parse(p.UpstreamID); err != nil {
@@ -1141,7 +1341,18 @@ func stampLastRunOutcome(ctx context.Context, ex modelExecer, modelID string, re
 	return err
 }
 
-// recordModelRunOutcome stamps the result onto the saved query for the list UI and
+// recordModelRunOutcome records a run (writeModelRunOutcome), then raises its data
+// check alert, if it has one, and its failure notice, if nobody started it by hand
+// (model_run_alert.go). Both go out even when the record could not be written: losing
+// the bookkeeping must not also lose the one message that says a table was held back.
+func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string, res *modelRunResult, audit modelRunAudit) string {
+	runID := writeModelRunOutcome(ctx, database, modelID, res, audit)
+	notifyModelCheckOutcome(modelID, runID, res)
+	notifyModelRunFailed(modelID, runID, res, audit)
+	return runID
+}
+
+// writeModelRunOutcome stamps the result onto the saved query for the list UI and
 // appends the attempt to saved_query_runs (migration 086), returning the new row's id so
 // the models this run wakes can point back at it. "" when no row was written.
 //
@@ -1150,7 +1361,7 @@ func stampLastRunOutcome(ctx context.Context, ex modelExecer, modelID string, re
 // because they describe the same event: a badge saying "succeeded" with no matching
 // history row is worse than no record at all, since the history panel is what an
 // operator consults precisely when the badge looks wrong.
-func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string, res *modelRunResult, audit modelRunAudit) string {
+func writeModelRunOutcome(ctx context.Context, database *sql.DB, modelID string, res *modelRunResult, audit modelRunAudit) string {
 	if database == nil || res == nil {
 		return ""
 	}
@@ -1204,22 +1415,36 @@ func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string
 	args := append([]interface{}{modelID, audit.ScheduleID, string(audit.Trigger), res.Status,
 		res.StatementClass, res.TargetTable, res.RowsAffected, res.Error,
 		res.AutoPauseReason, audit.ActorID, elapsedMicros}, prov.args()...)
+	// cdc_watermarks is named only when there is a map to write. A map can only have been
+	// read once migration 137, one transaction, created the column alongside its table;
+	// so a gateway whose 137 is still blocked keeps every run's history row.
+	watermarkColumn, watermarkValue := "", ""
+	if len(res.CDCWatermarks) > 0 {
+		args = append(args, string(res.CDCWatermarks))
+		watermarkColumn, watermarkValue = ", cdc_watermarks", fmt.Sprintf(", $%d::jsonb", len(args))
+	}
 	var runID string
 	if err := tx.QueryRowContext(ctx, `
 		INSERT INTO saved_query_runs (
 			saved_query_id, schedule_id, trigger_source, status,
 			statement_class, target_table, rows_affected, error,
 			auto_pause_reason, ran_as_user_id, started_at, finished_at,
-			`+runProvenanceColumns+`
+			`+runProvenanceColumns+watermarkColumn+`
 		) VALUES (
 			$1, NULLIF($2, '')::uuid, $3, $4,
 			$5, $6, $7, NULLIF($8, ''),
 			NULLIF($9, ''), NULLIF($10, '')::uuid, NOW() - ($11::bigint * interval '1 microsecond'), NOW(),
-			`+runProvenanceValues(12)+`
+			`+runProvenanceValues(12)+watermarkValue+`
 		)
 		RETURNING run_id::text
 	`, args...).Scan(&runID); err != nil {
 		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to append run history")
+		return ""
+	}
+	// The check results share the run's transaction for the same reason the badge does:
+	// a blocked run whose row says nothing about its checks reads as "no checks ran".
+	if err := insertModelCheckResults(ctx, tx, runID, res.CheckResults); err != nil {
+		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to record the run's data check results")
 		return ""
 	}
 
@@ -1230,12 +1455,20 @@ func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string
 	return runID
 }
 
-// Skip reasons a model that was deliberately NOT rebuilt records (migration 104).
+// Skip reasons a model that was deliberately NOT rebuilt records (migration 104;
+// trigger_lost 136; upstream_check_failed 138). The newest migration's CHECK must accept
+// every one of them (TestSkipReasons_EveryOneTheCodeWritesIsOneTheDatabaseAccepts).
 const (
 	skipUpstreamFailed     = "upstream_failed"
 	skipUpstreamSkipped    = "upstream_skipped"
 	skipChainDepthExceeded = "chain_depth_exceeded"
 	skipWaitingOnUpstreams = "waiting_on_upstreams"
+	// skipTriggerLost: the upstream completed, but its fan-out could not be handed to
+	// Temporal within fanOutRetryBudget (deliverFanOut).
+	skipTriggerLost = "trigger_lost"
+	// skipUpstreamCheckFailed: the upstream's run was blocked by one of its data checks,
+	// so its table was not published (saved_query_checks.go).
+	skipUpstreamCheckFailed = "upstream_check_failed"
 )
 
 // recordModelRunSkip appends a 'skipped' history row for a triggered model that did not

@@ -18,7 +18,8 @@ boundary (that is a separate future axis); it is
 **single-company, multi-user**.
 
 - Every user has exactly **one personal workspace** (`is_personal = true`), provisioned at
-  signup and again by the clean-slate activation migration. It is the user's identity
+  signup and again by the clean-slate activation migration — except a user who signed up in
+  single-workspace mode (§1.1), who has none. It is the user's identity
   anchor: it cannot be renamed, deleted, or left, and its owner is always exactly that user.
 - Users create additional **shared workspaces** and invite others into them. A shared
   workspace can have many members across the four roles.
@@ -29,6 +30,68 @@ boundary (that is a separate future axis); it is
 Delivered across two PRs: backend multi-user + membership/invites/delete
 (#344); operator-facing management UI +
 `is_personal` DTO (#346).
+
+### 1.1 Single-workspace mode (self-host)
+
+`RSYNC_SINGLE_WORKSPACE=true` gives an install **one team workspace that every new user
+joins**, instead of a personal workspace each. It is set only by the self-host compose
+(`docker-compose.quickstart.yml:1535`) and Helm (`apiGateway.singleWorkspace`, `values.yaml:609`;
+a removed value still renders `true`). Cloud leaves it unset and everything above holds
+unchanged. It is a flag defaulting to the cloud behaviour, not an edition gate:
+`config.SingleWorkspace()` ([`features.go:231`](../../api-gateway/internal/config/features.go))
+reads it like `BillingEnforced()`, and unset or unparseable means multi. `/api/v1/features`
+reports it as `single_workspace`.
+
+**The install workspace.** Its id is stored in `instance_settings` under `install_workspace_id`,
+a key the admin settings PATCH cannot write. `ensureInstallWorkspaceLocked`
+([`install_workspace.go:47`](../../api-gateway/internal/handlers/install_workspace.go)) returns
+the first of:
+
+1. the workspace the stored key names, if it still exists;
+2. the earliest platform admin's oldest team workspace (an install upgraded from multi mode);
+3. a new **team** workspace (`is_personal = false` — a personal one refuses invites) owned by
+   the earliest admin.
+
+It runs under a transaction-scoped advisory lock (`lockInstallWorkspace`, `:30`) that Register
+takes before it reads the user count, so two racing first sign-ups never produce two admins or
+two install workspaces. Only `sql.ErrNoRows` moves to the next step; any other read error fails
+the sign-up rather than create a second workspace on a database blip.
+
+**Sign-up** (`registerIntoInstallWorkspace`,
+[`auth.go:657`](../../api-gateway/internal/handlers/auth.go)) skips the personal workspace.
+Under the lock it re-reads the registration gate, inserts the user, resolves the install
+workspace, joins the user to it, and claims any invites — one transaction, so a refusal at any
+step leaves no account. The workspace role (`installWorkspaceRole`, `install_workspace.go:124`):
+
+| Sign-up | Workspace it joins | Role |
+|---|---|---|
+| First user (also platform admin) | install | `owner` |
+| Workspace invite | the one the invite names | the invite's role |
+| Instance invite | install | `admin` → `admin`; `power_user`/`user` → `member`; `viewer` → `viewer` |
+| Open registration, no invite | install | `viewer` |
+
+**Invite-only by default.** With no saved `registration_mode`, `defaultRegistrationMode`
+(`install_workspace.go:141`) answers `invite_only` once a user exists; admin settings report the
+same value (`admin_settings.go:55`). A workspace invite passes that gate only in this mode
+(`holdsSignupInvite`, `:177`): here joining a workspace is joining the install, while on cloud a
+workspace invite adds a team to an account that must get in some other way.
+
+**Active-workspace fallback** (§4 item 2): personal first, as before; a caller with none gets
+their install-workspace membership, else their oldest membership (`installWorkspaceMembership`,
+[`workspace_context.go:182`](../../api-gateway/internal/handlers/workspace_context.go)). Users
+upgraded from multi mode keep their personal workspaces and every team workspace they hold.
+
+**Guards** (server-side; the header only mirrors them):
+
+| Call | Answer | Where |
+|---|---|---|
+| `POST /workspaces` | **403** `single_workspace_mode` | [`workspaces.go:168`](../../api-gateway/internal/handlers/workspaces.go) |
+| Delete the install workspace | **409** `install_workspace` | `workspaces.go:681-692` |
+| Admin-delete the install workspace's owner | **409** `install_workspace_owner` — `workspaces.owner_id` is `ON DELETE CASCADE` | [`admin_users.go:491`](../../api-gateway/internal/handlers/admin_users.go) |
+
+The header shows a single workspace as a label, with no switcher and no "New workspace"; a user
+who already holds several keeps the switcher without "New workspace" (`Header.tsx`, flag
+`singleWorkspace` in `config/features.ts`).
 
 ---
 
@@ -87,7 +150,7 @@ indexes) and makes `logAudit()` stamp the caller's active workspace.
 ## 4. Request lifecycle — resolving the active workspace
 
 Every authenticated request passes through **`WorkspaceContextMiddleware`**
-([`workspace_context.go:49-114`](../../api-gateway/internal/handlers/workspace_context.go)).
+([`workspace_context.go:52-135`](../../api-gateway/internal/handlers/workspace_context.go)).
 It pins two values into the gin context: `workspace_id` (`ctxWorkspaceID`) and the caller's
 role in it (`ctxWorkspaceRole`) — **after re-verifying membership against the DB on every
 request**. The client's selection is an *untrusted hint*, honored only when membership checks
@@ -95,16 +158,18 @@ out.
 
 **Resolution order:**
 
-1. **`X-Workspace-ID` header** ([`:16`](../../api-gateway/internal/handlers/workspace_context.go)),
-   or its **`rsync_active_workspace_id` cookie** mirror ([`:17`](../../api-gateway/internal/handlers/workspace_context.go))
+1. **`X-Workspace-ID` header** ([`:17`](../../api-gateway/internal/handlers/workspace_context.go)),
+   or its **`rsync_active_workspace_id` cookie** mirror ([`:18`](../../api-gateway/internal/handlers/workspace_context.go))
    when the header is absent. (The client source of truth is `localStorage`; the cookie is
    the SSR mirror so server-rendered pages agree with the client.)
 2. Fallback: the caller's **personal workspace** (`personalWorkspace()`,
-   [`:145`](../../api-gateway/internal/handlers/workspace_context.go)) — every user has exactly one post-069.
+   [`:166`](../../api-gateway/internal/handlers/workspace_context.go)) — every user has exactly one post-069,
+   except in single-workspace mode, where a caller without one falls back to the install
+   workspace (§1.1).
 
 Membership is resolved by `lookupWorkspaceMembership()` —
 `SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2`
-([`:136-141`](../../api-gateway/internal/handlers/workspace_context.go)).
+([`:157-164`](../../api-gateway/internal/handlers/workspace_context.go)).
 
 **Failure semantics (deliberate — these prevent both lockout and leakage):**
 
@@ -114,7 +179,7 @@ Membership is resolved by `lookupWorkspaceMembership()` —
 | DB unavailable | **503** |
 | Explicit **header** names a workspace the caller can't access, on a non-optional route | **404** — never confirm existence, never proceed under it |
 | Stale **cookie** naming an inaccessible workspace | never hard-fails → falls through to personal |
-| **Optional** routes (`/admin/*`, `GET /workspaces`, `/features`) | never abort on a bad selection; resolve best-effort so the user can always recover ([`workspaceContextOptional`, :119-134](../../api-gateway/internal/handlers/workspace_context.go)) |
+| **Optional** routes (`/admin/*`, `GET /workspaces`, `/features`) | never abort on a bad selection; resolve best-effort so the user can always recover ([`workspaceContextOptional`, :140-155](../../api-gateway/internal/handlers/workspace_context.go)) |
 
 The header-vs-cookie asymmetry is intentional: an explicit header is a deliberate act (hard
 404 on miss), while a stale cookie must never lock a user out of the routes they need to
@@ -131,15 +196,15 @@ write or request-body bind). All live in
 
 | Gate | Gates on | Use for | On failure |
 |---|---|---|---|
-| **`requireWorkspaceRole`** ([:179](../../api-gateway/internal/handlers/workspace_context.go)) | role in the **active** workspace | active-workspace-scoped actions where the target *is* the active ws | 403 |
-| **`requireWorkspaceParamRole`** ([:201](../../api-gateway/internal/handlers/workspace_context.go)) | role in the workspace named by the **URL `:id`** | workspace **administration** (invites, members, delete) where the target ws is in the path | 401 / 404 / 503 / 403 |
-| **`requireResourceRole`** ([:244](../../api-gateway/internal/handlers/workspace_context.go)) | resource ∈ active ws **AND** caller is a member — in one JOIN | mutating a **specific resource** (`connections`, `pipelines`) | 401 / 500 / 404 / 503 / 403 |
+| **`requireWorkspaceRole`** ([:183](../../api-gateway/internal/handlers/workspace_context.go)) | role in the **active** workspace | active-workspace-scoped actions where the target *is* the active ws | 403 |
+| **`requireWorkspaceParamRole`** ([:276](../../api-gateway/internal/handlers/workspace_context.go)) | role in the workspace named by the **URL `:id`** | workspace **administration** (invites, members, delete) where the target ws is in the path | 401 / 404 / 503 / 403 |
+| **`requireResourceRole`** ([:319](../../api-gateway/internal/handlers/workspace_context.go)) | resource ∈ active ws **AND** caller is a member — in one JOIN | mutating a **specific resource** (`connections`, `pipelines`) | 401 / 500 / 404 / 503 / 403 |
 | **`requirePipelineWorkspaceRole`** ([`pipeline_ownership.go:21-22`](../../api-gateway/internal/handlers/pipeline_ownership.go)) | wraps `requireResourceRole` for `pipelines` | **every** `/pipelines/:id/*` handler — reads at `security.WSViewer` as well as mutations | delegates |
-| **`requireNonPersonalWorkspace`** | active ws is not personal | actions forbidden on the personal identity anchor | 409 |
+| **`requireNonPersonalWorkspace`** ([`workspaces.go:251`](../../api-gateway/internal/handlers/workspaces.go)) | active ws is not personal | actions forbidden on the personal identity anchor | 409 |
 
 Dozens of call sites across the handlers wire these gates. Two representative examples:
 - Connection delete/update — `requireResourceRole(c, "connections", id, security.WSMember)`
-  ([`connections.go:1140`](../../api-gateway/internal/handlers/connections.go), [`:1415`](../../api-gateway/internal/handlers/connections.go)).
+  ([`connections.go:1143`](../../api-gateway/internal/handlers/connections.go), [`:1415`](../../api-gateway/internal/handlers/connections.go)).
 - Pipeline mutations — `requirePipelineWorkspaceRole(c, id, security.WSMember)`
   ([`pipelines.go:2052`](../../api-gateway/internal/handlers/pipelines.go) and 7 more sites, e.g. `:1300` at viewer level).
 
@@ -148,7 +213,7 @@ Dozens of call sites across the handlers wire these gates. Two representative ex
 The classic IDOR attack: workspace-A admin sends `X-Workspace-ID: A` but a resource ID that
 belongs to workspace B. A naïve "is the caller an admin of their active ws?" check would pass.
 `requireResourceRole` closes this by proving three things **in a single query** —
-([`:267-275`](../../api-gateway/internal/handlers/workspace_context.go)):
+([`:342-347`](../../api-gateway/internal/handlers/workspace_context.go)):
 
 ```sql
 SELECT wm.role
@@ -164,7 +229,7 @@ fallback** — clean-slate ownership is by membership only.
 Two hardening details:
 - **Table-name allowlist.** `table` is interpolated into SQL (identifiers can't be bound as
   params), so it must come from the `resourceTables` allowlist
-  (`{pipelines, connections}`, [`:25-28`](../../api-gateway/internal/handlers/workspace_context.go)) and
+  (`{pipelines, connections, saved_queries}`, [`:26-30`](../../api-gateway/internal/handlers/workspace_context.go)) and
   **never** from request input. A non-allowlisted table is a 500 (programming error), not a query.
 - **404, not 403, on a foreign or missing resource.** The gate never reveals whether a
   resource it can't authorize actually exists — a cross-tenant probe and a genuine 404 are
@@ -232,7 +297,7 @@ failure mode above.
 workspace** (`WHERE workspace_id = $active`) *and* pass a membership gate. This is a P0 rule
 with no exceptions — no "internal" endpoint may skip it. Examples of the scope predicate in
 list/read paths: `ListConnections` (`WHERE workspace_id = $1`,
-[`connections.go:504`](../../api-gateway/internal/handlers/connections.go)),
+[`connections.go:507`](../../api-gateway/internal/handlers/connections.go)),
 `ListExecutions` / `GetExecution` / `CancelExecution`
 (`WHERE p.workspace_id = $1`, [`pipelines.go:3230`](../../api-gateway/internal/handlers/pipelines.go) and siblings).
 
@@ -256,8 +321,11 @@ server-side (the UI only mirrors them):
   left. `DeleteWorkspace` is **owner-only**, returns **409** on a personal workspace, and
   **409** on a non-empty workspace. Administration endpoints gate the *path* workspace via
   `requireWorkspaceParamRole` (IDOR-safe), and the role gate fires **before** the request body
-  is bound (e.g. `ChangeMemberRole` — gate at [`workspaces.go:391`](../../api-gateway/internal/handlers/workspaces.go),
+  is bound (e.g. `ChangeMemberRole` — gate at [`workspaces.go:449`](../../api-gateway/internal/handlers/workspaces.go),
   bind after).
+- **Install-workspace permanence** (single-workspace mode only, §1.1). The install workspace
+  cannot be deleted (**409** `install_workspace`), nor can its owner be admin-deleted (**409**
+  `install_workspace_owner`).
 
 ---
 
@@ -301,7 +369,7 @@ data never leaves the browser or the request never happens. Each has one owner:
 3. **Reads AND mutations on a specific id:** gate with
    `requireResourceRole(c, "<table>", id, <minRole>)` — and add `"<table>"` to the
    `resourceTables` allowlist
-   ([`workspace_context.go:25`](../../api-gateway/internal/handlers/workspace_context.go)), or the
+   ([`workspace_context.go:26`](../../api-gateway/internal/handlers/workspace_context.go)), or the
    gate 500s by design. Put the gate **before** binding the request body. GET differs only in
    the minimum role (`WSViewer`), never in whether the gate runs — see §5.2.
 4. **Foreign/missing → 404**, insufficient role → 403, personal-ws-forbidden → 409. Never

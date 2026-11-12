@@ -1,0 +1,7 @@
+{
+  "_comment": "Which workflow_graph node kinds the pipeline runtime can run. runnable: the temporal adapter's DAG scheduler resolves source, transform, wait, merge and split itself, and dispatches destination to the executor as the one data_transfer. not_runnable: declared kinds with no runtime; the adapter refuses a graph containing one before any node starts, and the planner must not emit one. executed_by_executor: the only node task the executor accepts; any other node_execution task is refused, so it can never fall through to a full source-to-destination transfer. Readers: backend-temporal-adapter internal/workflows/node_kind_runtime_test.go (census and graph preflight), backend-orchestrator internal/agents/executor/node_execution_guard_test.go (the executor's refusal), llm-service tests/test_dag_planner_runnable_kinds.py (planner validation, prompt and tool schema), api-gateway internal/handlers/chat_not_done_test.go (the chat Confirm card names each not_runnable kind a request asks for).",
+  "runnable": ["destination", "merge", "source", "split", "transform", "wait"],
+  "not_runnable": ["api_call", "condition", "llm", "notification"],
+  "executed_by_executor": {"node_kind": "destination", "operation": "data_transfer"},
+  "wait": {"config_key": "wait_seconds", "max_seconds": 86400}
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "ignoreExportsUsedInFile": true,
+  "project": [
+    "**/*.{js,mjs,cjs,ts,tsx,mts}!",
+    "!e2e/**!",
+    "!**/__tests__/**!",
+    "!**/*.test.{ts,tsx}!",
+    "!vitest.setup.ts!",
+    "!playwright*.config.ts!"
+  ]
+}

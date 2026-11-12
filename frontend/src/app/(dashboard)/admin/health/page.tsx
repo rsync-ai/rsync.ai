@@ -6,13 +6,11 @@ import { AdminNav } from "@/components/admin/AdminNav"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 import { BrowserConnectivityCard } from "@/components/admin/BrowserConnectivityCard"
 import { ComponentHealthTable } from "@/components/admin/ComponentHealthTable"
-import { toast } from "sonner"
 import { RefreshCw, Database, Server, Radio, Clock, Timer, Workflow, Cable, ArrowDownToLine } from "lucide-react"
-import type { ServiceHealth } from "@/lib/api/admin"
+import { adminGetHealth, type AdminReadFailure, type ServiceHealth } from "@/lib/api/admin"
 import { formatAbsoluteTime } from "@/lib/utils"
 
 const serviceIcons: Record<string, React.ElementType> = {
@@ -150,8 +148,7 @@ function HealthDetail({ detail }: { detail: Record<string, unknown> }) {
 export default function AdminHealthPage() {
   const [services, setServices] = useState<ServiceHealth[]>([])
   const [loading, setLoading] = useState(true)
-  const [pageStatus, setPageStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
   const [lastChecked, setLastChecked] = useState<Date | null>(null)
   // Bumped by Refresh and the 30 s tick so the worker table re-reads with the cards; it
   // reads once on its own when it mounts.
@@ -159,21 +156,15 @@ export default function AdminHealthPage() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const load = useCallback(async () => {
-    try {
-      const res = await authFetch("/api/v1/admin/health", { method: "GET" })
-      if (res.status === 401) { window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`; return }
-      if (res.status === 403) { setPageStatus(403); setLoading(false); return }
-      if (res.status === 429) {
-        setPageStatus(429)
-        setRetryAfter(parseInt(res.headers.get("Retry-After") || "", 10))
-        setLoading(false)
-        return
-      }
-      const json = await res.json()
-      setServices(json.services || [])
+    // A failed check replaces the cards rather than leaving the last good ones
+    // up: "up" from a read that did not come back is not a status.
+    const r = await adminGetHealth()
+    if (r.ok) {
+      setFailure(null)
+      setServices(r.data.services || [])
       setLastChecked(new Date())
-    } catch {
-      toast.error("Failed to check health")
+    } else {
+      setFailure(r)
     }
     setLoading(false)
   }, [])
@@ -192,16 +183,14 @@ export default function AdminHealthPage() {
   }, [load, refresh])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="System health" />
       <AdminNav />
 
       {loading && services.length === 0 ? (
         <LoadingState />
-      ) : pageStatus === 403 ? (
-        <AccessDeniedState />
-      ) : pageStatus === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : (
         <>
           <div className="flex items-center justify-between">
@@ -215,7 +204,7 @@ export default function AdminHealthPage() {
             </Button>
           </div>
 
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-4 @xl:grid-cols-2 @3xl:grid-cols-4">
             {services.map((svc) => {
               const Icon = serviceIcons[svc.service] || Server
               return (

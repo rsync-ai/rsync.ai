@@ -553,6 +553,7 @@ func TestEveryExplorerQueryNameIsRegisteredOnTheWorkflowThatOwnsIt(t *testing.T)
 		"ModelRefreshStateQuery":   "ModelRefreshWorkflow",
 		"FreshnessSweepStateQuery": "ModelFreshnessWorkflow",
 		"FanOutStateQuery":         "UpstreamFanOutWorkflow",
+		"HITLWaitQuery":            "NLPipelineWorkflowV2",
 	} {
 		got, ok := registeredIn[constName]
 		if !ok {

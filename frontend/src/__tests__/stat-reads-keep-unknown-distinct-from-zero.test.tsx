@@ -18,6 +18,10 @@
  *    failure mode these components exist to defend against, a count silently
  *    reading zero, was the failure mode they produced.
  *
+ * The stat cards have since been replaced by Home's overview (HomeOverview),
+ * which loads in the browser only; it is held to the same rule below: a count
+ * it could not read shows "—", never 0.
+ *
  * The consequence users saw is in the onboarding case below: a workspace that
  * had completed every step got its counts zeroed on mount and was shown the
  * "Get your first sync running" checklist again — the exact outcome
@@ -42,9 +46,8 @@ vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 
 import { authFetch } from "@/lib/api/auth-fetch"
 import { readStatOrUnknown } from "@/lib/api/read-stat"
-import { DashboardStatsRefresher } from "@/components/dashboard/DashboardStatsRefresher"
+import { HomeOverview } from "@/components/home/HomeOverview"
 import { FirstRunOnboarding } from "@/components/onboarding/FirstRunOnboarding"
-import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 
 const mockFetch = authFetch as unknown as Mock
 
@@ -95,45 +98,39 @@ describe("readStatOrUnknown", () => {
   })
 })
 
-describe("DashboardStatsRefresher", () => {
-  const cards = [
-    { title: "Pipelines", value: 5, iconName: "GitBranch", color: "", bgColor: "", subtitle: "1 running" },
-    { title: "Executions", value: 12, iconName: "History", color: "", bgColor: "", subtitle: "12 successful" },
-    { title: "Sources", value: 3, iconName: "Database", color: "", bgColor: "" },
-    { title: "Destinations", value: 2, iconName: "ArrowRightLeft", color: "", bgColor: "" },
-  ]
+describe("HomeOverview", () => {
+  /** The big number on an overview card, as shown. */
+  const total = (title: string) => screen.getByRole("region", { name: title }).querySelector("p")?.textContent
 
-  it("leaves the rendered counts alone when the refresh cannot be read", async () => {
+  it("shows a count it cannot read as unknown, not as zero", async () => {
     allReadsNotFound()
-    render(<DashboardStatsRefresher initialCards={cards} looksEmpty={false} />)
+    render(<HomeOverview />)
 
-    await act(async () => {
-      emitPipelineRefresh("p1")
-    })
-    await waitFor(() => expect(mockFetch).toHaveBeenCalled())
-
-    for (const value of ["5", "12", "3", "2"]) {
-      expect(screen.getByText(value)).toBeInTheDocument()
-    }
-    expect(screen.queryByText("0")).not.toBeInTheDocument()
+    await waitFor(() => expect(total("Pipelines")).toBe("—"))
+    expect(total("Scheduled models")).toBe("—")
+    expect(total("Workflows")).toBe("—")
+    expect(screen.getByText(/could not be loaded/)).toBeInTheDocument()
+    // "Nothing needs you" would be a claim about lists it never saw.
+    expect(screen.queryByText("Nothing needs you right now.")).not.toBeInTheDocument()
   })
 
-  // The control: the same event with readable responses must move the numbers.
-  // Without it, a component that had simply stopped refreshing would pass the
-  // case above while being broken in a different direction.
-  it("does update the counts when the refresh can be read", async () => {
+  // The control: an empty workspace that answered must read 0, not "—".
+  // Without it, a card that showed "—" unconditionally would pass the case above.
+  it("shows a genuine zero as 0", async () => {
     mockFetch.mockImplementation(async (path: string) => {
-      if (path.startsWith("/api/v1/pipelines")) return res(200, { total: 9, pipelines: [] })
-      if (path.startsWith("/api/v1/executions")) return res(200, { total: 20, executions: [] })
-      return res(200, { total: 7, connections: [] })
+      if (path.startsWith("/api/v1/pipelines")) return res(200, { total: 0, pipelines: [] })
+      if (path.startsWith("/api/v1/explorer/schedules")) return res(200, { schedules: [] })
+      if (path.startsWith("/api/v1/explorer/freshness")) return res(200, { breaches: [] })
+      if (path.startsWith("/api/v1/workflows")) return res(200, { workflows: [], can_manage: true })
+      return res(404, {})
     })
-    render(<DashboardStatsRefresher initialCards={cards} looksEmpty={false} />)
+    render(<HomeOverview />)
 
-    await act(async () => {
-      emitPipelineRefresh("p1")
-    })
-    await waitFor(() => expect(screen.getByText("9")).toBeInTheDocument())
-    expect(screen.getByText("20")).toBeInTheDocument()
+    await waitFor(() => expect(total("Pipelines")).toBe("0"))
+    expect(total("Scheduled models")).toBe("0")
+    expect(total("Workflows")).toBe("0")
+    expect(screen.getByText("Nothing needs you right now.")).toBeInTheDocument()
+    expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument()
   })
 })
 
@@ -234,7 +231,7 @@ describe("no client module addresses the api-gateway by a relative path", () => 
   it("scans a real corpus", () => {
     expect(files.length).toBeGreaterThan(100)
     for (const known of [
-      "components/dashboard/DashboardStatsRefresher.tsx",
+      "components/home/HomeOverview.tsx",
       "components/onboarding/FirstRunOnboarding.tsx",
       "app/oauth/callback/page.tsx",
       "app/(dashboard)/explorer/page.tsx",

@@ -3,11 +3,15 @@
 import { useState, useEffect } from "react"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { GenericConnectorForm } from "@/components/connectors/GenericConnectorForm"
+import { ConnectorGeneratedByNote } from "@/components/connectors/ConnectorGeneratedByNote"
 import { fetchMCPConnector } from "@/lib/api/mcp-connectors"
 import { Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 import { saveConnection } from "@/lib/api/mcp-connectors"
+import { extractErrorMessage } from "@/lib/utils/error-handling"
+import { APIRequestError } from "@/lib/errors/api-errors"
+import { notifyTableCheck } from "@/components/connectors/ConnectionTablesCheck"
 
 interface ConnectorConfigModalProps {
   open: boolean
@@ -15,7 +19,6 @@ interface ConnectorConfigModalProps {
   connectorType: string
   direction: "source" | "destination"
   onSave: (connectionId: string, config: Record<string, unknown>) => void
-  pipelineId?: string
 }
 
 /**
@@ -42,12 +45,10 @@ export function ConnectorConfigModal({
   connectorType,
   direction,
   onSave,
-  pipelineId,
 }: ConnectorConfigModalProps) {
   const [loading, setLoading] = useState(false)
   const [connector, setConnector] = useState<any>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
   
   // Load connector metadata when modal opens
   useEffect(() => {
@@ -74,7 +75,6 @@ export function ConnectorConfigModal({
   // GenericConnectorForm emits a CreateConnectionRequest-like payload when creating
   // { name, connection_type, connector_type, sync_mode?, cdc_mode?, config, description?, trace_id? }
   const handleSave = async (payload: Record<string, unknown>) => {
-    setSaving(true)
     try {
       // Ensure connection_type aligns with modal direction (defensive)
       if (!payload.connection_type) {
@@ -89,22 +89,28 @@ export function ConnectorConfigModal({
       const connectionId = requireConnectionId(result)
 
       toast.success(`${direction === "source" ? "Source" : "Destination"} connection configured successfully`)
+      notifyTableCheck(result)
       onSave(connectionId, (payload.config as Record<string, unknown>) || {})
       onClose()
     } catch (error) {
       console.error("Failed to save connection:", error)
       // The server says WHY (duplicate name, unreachable host, bad credentials).
       // A flat "Failed to save connection" threw all of that away and left the
-      // user to guess which field to change.
-      const detail = error instanceof Error ? error.message.trim() : ""
-      toast.error(detail ? `Failed to save connection: ${detail}` : "Failed to save connection")
-    } finally {
-      setSaving(false)
+      // user to guess which field to change. The label alone ("Invalid
+      // oauth_token_id") is not the why either; extractErrorMessage adds `details`.
+      const detail = error instanceof Error ? extractErrorMessage(error) : ""
+      // The connector's own words, when the save was refused by its test (a failed
+      // image build carries the end of its build log here).
+      const cause = error instanceof APIRequestError ? error.cause : undefined
+      toast.error(
+        detail ? `Failed to save connection: ${detail}` : "Failed to save connection",
+        cause ? { description: cause } : undefined,
+      )
     }
   }
   
   return (
-    <Dialog open={open} onOpenChange={onClose}>
+    <Dialog open={open} onOpenChange={onClose} closeOnOutsideClick={false}>
       <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
@@ -113,6 +119,7 @@ export function ConnectorConfigModal({
           <DialogDescription>
             The pipeline needs a {connectorType} connection. Please provide the configuration details.
           </DialogDescription>
+          {connector && <ConnectorGeneratedByNote connector={connector} />}
         </DialogHeader>
         
         {loading ? (

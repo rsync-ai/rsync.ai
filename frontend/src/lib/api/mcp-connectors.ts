@@ -17,6 +17,7 @@ import { getAuthHeaders } from "@/lib/auth"
 import { extractErrorMessage } from "@/lib/utils/error-handling"
 import { APIRequestError } from "@/lib/errors/api-errors"
 import { isConnectorDeployingResponse } from "@/lib/errors/connector-deploying"
+import type { TableCheckAnswer } from "@/components/connectors/ConnectionTablesCheck"
 
 /**
  * Fetch all MCP connectors
@@ -176,7 +177,7 @@ export async function testMCPConnection(
  */
 export async function saveConnection(
   connectionData: Record<string, unknown>
-): Promise<{ id: string; success: boolean; message?: string }> {
+): Promise<{ id: string; success: boolean; message?: string } & TableCheckAnswer> {
   const traceId = (connectionData.trace_id as string) || `trace-${Date.now()}`
   
   const payload = {
@@ -189,7 +190,8 @@ export async function saveConnection(
   }
   
   try {
-    return await tracedJsonFetch<{ id: string; success: boolean; message?: string }>(
+    // An API connection's answer also carries its table check (notifyTableCheck).
+    return await tracedJsonFetch<{ id: string; success: boolean; message?: string } & TableCheckAnswer>(
       API_ENDPOINTS.CONNECTIONS.CREATE,
       {
         method: "POST",

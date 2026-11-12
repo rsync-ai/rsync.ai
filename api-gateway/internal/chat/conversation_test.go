@@ -431,3 +431,20 @@ func TestConversationFlow_FullFlow(t *testing.T) {
 		t.Errorf("expected 'idle' after reset, got '%s'", conv.State)
 	}
 }
+
+// TestConversationKeyIsPerWorkspace locks the workspace in the conversation key.
+// The key was user+session only, so a pending confirmation built in workspace A
+// could be answered "yes" after the user switched to workspace B and create the
+// pipeline there, against a pair the user confirmed for A.
+func TestConversationKeyIsPerWorkspace(t *testing.T) {
+	c := &ConversationCache{}
+	if a, b := c.buildKey("u1", "ws-a", "s1"), c.buildKey("u1", "ws-b", "s1"); a == b {
+		t.Fatalf("buildKey ignores the workspace: both %q", a)
+	}
+	// Set derives the key from the snapshot, so the workspace must survive it.
+	conv := NewConversationContext("u1", "s1")
+	conv.WorkspaceID = "ws-a"
+	if got := conv.Snapshot().WorkspaceID; got != "ws-a" {
+		t.Fatalf("Snapshot().WorkspaceID = %q, want ws-a", got)
+	}
+}

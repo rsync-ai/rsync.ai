@@ -27,7 +27,7 @@ export function ErrorBanner({ error, onRetry, retryLabel = "Retry", className, v
       <ErrorIcon />
       <div className="flex-1 min-w-0 space-y-1">
         <p className="font-semibold text-sm text-red-700 dark:text-red-400">{error.title}</p>
-        <p className="text-sm text-red-600 dark:text-red-300 font-mono break-words">{error.message}</p>
+        <p className="text-sm text-red-700 dark:text-red-300 font-mono break-words">{error.message}</p>
         {error.hint && (
           <div className="flex items-start gap-1.5 mt-2 text-xs text-zinc-600 dark:text-zinc-400 bg-white/60 dark:bg-zinc-900/60 rounded px-2 py-1.5">
             <span className="shrink-0 mt-px">💡</span>

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"github.com/rsync-ai/shared/kafkaclient"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -97,6 +98,8 @@ var logSafeFields = map[string]bool{
 	"key_fields": true, "pk_fingerprint": true,
 	"rows_deleted": true, "rows_flushed": true,
 	"flush_reason": true, "lsn": true, "tx_id": true,
+	// Batched apply (cdc_batch_apply.go): counts of deleted keys sent and of calls.
+	"deletes_sent": true, "calls": true,
 }
 
 // scrubLogValue masks a structured field value unless its key is a known
@@ -375,7 +378,7 @@ type Metrics struct {
 	// cdcSnapshotRowsByTable is each table's snapshot reads (op r, value: int64),
 	// counted apart from its inserts (op c): a re-snapshot re-reads every row, and
 	// adding those to inserts reported the table as having grown by its own size.
-	// Seeded from the ack ledger like the insert/update/delete maps.
+	// Seeded from cdc_counter_totals like the insert/update/delete maps.
 	cdcSnapshotRowsByTable sync.Map
 
 	// Observability: last known Kafka position + lag (best-effort from kafka-go reader stats).
@@ -452,11 +455,13 @@ type SinkMessage struct {
 	Ignore      bool
 
 	// SourceTable is the SOURCE-qualified table name (e.g. "datingapp.matches"),
-	// for LABELLING stats only; the write paths keep using Table. The batch
-	// executor sends it because Table is the DESTINATION identifier and carries
-	// the destination namespace ("demo.matches"), which TABLE_STATS reported as
-	// the table's qualified_name. Empty from producers that don't send it (CDC,
-	// older executors); tableIdentityForStats then falls back to Table.
+	// for LABELLING stats and for scoping an API destination's key map
+	// (apiScopeFor, so a Reload of one source table never deletes the records
+	// another wrote); the write paths keep using Table. The batch executor sends
+	// it because Table is the DESTINATION identifier and carries the destination
+	// namespace ("demo.matches"), which TABLE_STATS reported as the table's
+	// qualified_name. Empty from producers that don't send it (CDC, older
+	// executors); tableIdentityForStats and apiScopeFor then fall back to Table.
 	SourceTable string
 	Dataset     string
 	DBOrSchema  string
@@ -548,6 +553,21 @@ type SinkMessage struct {
 	// bucket) the destination connector uses to fetch ClaimCheckURL. Forwarded from
 	// the executor (which staged the bytes) so the sink holds no creds of its own.
 	StagingConfig map[string]interface{}
+
+	// consumerTransformsApplied is set once applyCDCTransformChain has rewritten
+	// this message. The single-event writer retries the same message in place, and
+	// a second run would mask an already-masked value.
+	consumerTransformsApplied bool
+
+	// mongoPacked is set by decodeMongoDocument: the row is {_id, document} with
+	// the whole source document nested under "document", and the destination
+	// table has that fixed two-column shape.
+	mongoPacked bool
+
+	// cdcReplay is set when the message was consumed at or below its offset floor
+	// (markCDCReplay): an earlier process already counted it, so landing it again
+	// must not add to the per-table CDC counters.
+	cdcReplay bool
 }
 
 type consumerTransformsCacheEntry struct {
@@ -631,10 +651,11 @@ func loadConsumerTransformsRaw(ctx context.Context, pgDB *sql.DB, pipelineID str
 
 // ensureExecutionRowForCDCAudit pre-creates the synthetic executions row that the
 // CDC convention execution_id == pipeline_id (parseCDCMessage below) requires before
-// any child row can reference it. TWO hard FKs depend on it:
-// transform_execution_logs.execution_id (migration 045) and
-// pipeline_batch_acks.fk_batch_acks_execution (migration 043). Best-effort by design:
-// it only logs on failure, because both callers are audit-only paths.
+// any child row can reference it: transform_execution_logs.execution_id (migration
+// 045) has a hard FK to it, and so do the run events and metrics keyed by the same
+// execution. CDC no longer writes pipeline_batch_acks rows (cdc_counter_ledger.go),
+// but those references remain. Best-effort by design: it only logs on failure,
+// because both callers are audit-only paths.
 func ensureExecutionRowForCDCAudit(ctx context.Context, pgDB *sql.DB, pipelineID, executionID string) bool {
 	if pgDB == nil {
 		return false
@@ -647,8 +668,8 @@ func ensureExecutionRowForCDCAudit(ctx context.Context, pgDB *sql.DB, pipelineID
 	if !looksLikeUUID(pipelineID) || !looksLikeUUID(executionID) {
 		return false
 	}
-	// Best-effort: ensures the transform_execution_logs AND pipeline_batch_acks FKs to
-	// executions don't fail for CDC (execution_id == pipeline_id).
+	// Best-effort: ensures the FKs to executions (transform_execution_logs and the
+	// run events) don't fail for CDC (execution_id == pipeline_id).
 	if _, err := pgDB.ExecContext(ctx, `
 		INSERT INTO executions (id, pipeline_id, status, start_time, trigger_source)
 		VALUES ($1, $2, 'running', NOW(), 'cdc')
@@ -800,8 +821,8 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 		return nil
 	}
 
-	ensureExecutionRowForCDCAudit(ctx, pgDB, sm.PipelineID, sm.ExecutionID)
-
+	// The executions row the audit rows hang off is written with them, once per window
+	// (cdc_transform_audit.go), not here once per row.
 	canonical, _, err := transforms.NormalizeAndValidate(raw, sm.Table, transforms.NormalizeModeCDC)
 	if err != nil {
 		// A transform-validation failure here fail-closes the whole batch to the DLQ —
@@ -811,6 +832,8 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 		// once, and re-validate before giving up: a transient empty read must not silently
 		// drop a table. We deliberately do NOT skip the offending transform — it may be a
 		// real mask_pii step, and skipping it would emit unmasked PII to the destination.
+		// This must stay rare: while the validator edited the cached chain in place, every
+		// message after the first took this path, a transform_definitions read per row.
 		consumerTransformsCache.Delete(strings.TrimSpace(sm.PipelineID))
 		if raw2, rErr := loadConsumerTransformsRaw(ctx, pgDB, sm.PipelineID); rErr == nil && len(raw2) > 0 {
 			if c2, _, e2 := transforms.NormalizeAndValidate(raw2, sm.Table, transforms.NormalizeModeCDC); e2 == nil {
@@ -844,6 +867,29 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	if len(canonical) == 0 {
 		return nil
 	}
+	return applyCDCTransformChain(ctx, pgDB, sm, canonical)
+}
+
+// applyCDCTransformChain runs a validated consumer chain over one CDC message
+// and keeps its envelope (Before/After, key metadata, column types) in step with
+// the transformed row. Split from applyConsumerTransforms so the chain can be
+// exercised without the control-plane DB that loads it; a nil pgDB only skips
+// the transform_execution_logs audit rows.
+func applyCDCTransformChain(ctx context.Context, pgDB *sql.DB, sm *SinkMessage, canonical []transforms.CanonicalTransform) error {
+	if sm.consumerTransformsApplied {
+		// A retry of a message this chain already rewrote: running it again would
+		// write sha256(sha256(x)) for every masked column.
+		return nil
+	}
+	if sm.mongoPacked {
+		// Checked against the whole chain, for every operation, so a pipeline
+		// holding such a rule fails on its first event (mongo_packed_rules.go).
+		if err := refusePackedMongoChain(canonical); err != nil {
+			return err
+		}
+	}
+	op := strings.ToLower(strings.TrimSpace(sm.CDCOp))
+	isDelete := op == "d"
 
 	// A delete has to be reshaped but must never be DROPPED. If a filter removed
 	// it, an upsert destination would keep the deleted row forever and an append
@@ -862,7 +908,18 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	// transform, but its key metadata still has to follow the chain's renames.
 	if len(rows) == 0 {
 		applyRenamesToCDCKeys(sm, applicable)
+		sm.consumerTransformsApplied = true
 		return nil
+	}
+
+	// The update's new row as the source sent it, kept before the chain can
+	// rewrite it: if a filter rejects it, the delete it turns into is built from it.
+	var updateAfter map[string]interface{}
+	if op == "u" {
+		updateAfter = make(map[string]interface{}, len(sm.Data[0]))
+		for k, v := range sm.Data[0] {
+			updateAfter[k] = v
+		}
 	}
 
 	tier1 := transforms.NewSimpleTransformEngine()
@@ -876,19 +933,46 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 		// batch, but it still does nothing at all, so say so rather than running
 		// silent. Checked against the rows ENTERING this step, so a column an
 		// earlier rename/select/exclude removed is caught.
-		for _, w := range transforms.MissingColumnWarnings(t.EngineTransform(), out) {
-			logf("warning", "transform %s (order %d) on %s: %s", t.Type, t.Order, sm.Table, w)
+		// A packed MongoDB row's columns are its document's fields.
+		warnRows := out
+		if sm.mongoPacked {
+			warnRows, _ = packedDocuments(out)
+		}
+		for _, w := range transforms.MissingColumnWarnings(t.EngineTransform(), warnRows) {
+			warnMissingColumnOnce(sm.PipelineID, sm.Table, t, w)
 		}
 
 		start := time.Now()
-		stepOut, stepErr := coordinator.Apply(ctx, out, []transforms.Transform{t.EngineTransform()})
+		var stepOut []transforms.Row
+		var stepErr error
+		var maskStats transforms.MaskStats
+		switch {
+		case t.Type == "mask_pii" && sm.mongoPacked:
+			stepOut, maskStats, stepErr = maskPackedMongoRows(ctx, tier1, out, t)
+		case t.Type == "mask_pii":
+			stepOut, maskStats, stepErr = guardedMask(ctx, tier1, out, t, t.Config)
+		case sm.mongoPacked:
+			// type_convert: refusePackedMongoChain let nothing else through.
+			stepOut, stepErr = applyInsidePackedDocuments(out, func(docs []transforms.Row) ([]transforms.Row, error) {
+				return coordinator.Apply(ctx, docs, []transforms.Transform{t.EngineTransform()})
+			})
+		default:
+			stepOut, stepErr = coordinator.Apply(ctx, out, []transforms.Transform{t.EngineTransform()})
+		}
 		dur := time.Since(start)
+		if stepErr == nil && t.Type == "mask_pii" {
+			warnUnmatchedMasks(sm.PipelineID, sm.Table, t.Order, maskStats)
+		}
 
 		outRows := 0
 		if stepOut != nil {
 			outRows = len(stepOut)
 		}
-		upsertTransformExecutionLogPG(ctx, pgDB, sm.PipelineID, sm.ExecutionID, sm.Table, t, inRows, outRows, dur, stepErr)
+		if pgDB != nil {
+			// Summed and written once per window, not upserted per row: see
+			// cdc_transform_audit.go.
+			cdcTransformAudit.record(sm.PipelineID, sm.ExecutionID, sm.Table, t, inRows, outRows, dur, stepErr)
+		}
 		if stepErr != nil {
 			return stepErr
 		}
@@ -901,13 +985,36 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	}
 	sm.RowCount = int64(len(sm.Data))
 
+	// A filter decides which rows the destination holds. An insert it rejects
+	// never got there, but an update it rejects can be a row LEAVING the set, and
+	// dropping that update left the row's last matching version at the destination
+	// for good (KI-CDC-FILTER-KEEPS-ROW-THAT-LEFT-IT). Send it as a delete: the
+	// keyed delete removes it from an upsert destination and append mode records
+	// the tombstone. The delete is reshaped by the rules a delete runs (no
+	// row-reducing ones) without a second audit row per step.
+	if op == "u" && len(sm.Data) == 0 && cdcUpdateWasInTheFilteredSet(ctx, sm, canonical) {
+		logEvent("info", "cdc update left the transform filter; sending it as a delete",
+			"pipeline_id", strings.TrimSpace(sm.PipelineID),
+			"table", sm.Table)
+		sm.CDCOp = "d"
+		sm.After = nil
+		sm.Before = updateAfter
+		sm.Data = []map[string]interface{}{updateAfter}
+		sm.RowCount = 1
+		return applyCDCTransformChain(ctx, nil, sm, canonical)
+	}
+
 	// Reconcile destination column types for value-mutating transforms. ensure_table
 	// derives each column's DDL type from the PRE-transform source schema (sm.ColumnTypes),
 	// but mask_pii rewrites a value to a string hash and type_convert changes the type.
 	// Without this, masking a non-string column (boolean verifiedEmail, numeric salary)
 	// makes ensure_table CREATE a BOOLEAN/NUMERIC column the string value cannot be
 	// inserted into — a deterministic dest-write failure and silent table drop.
-	reconcileTransformedColumnTypes(sm, applicable)
+	// A packed MongoDB table is always _id + document: a masked field stays inside
+	// the document, so naming it here would add an empty column of its own.
+	if !sm.mongoPacked {
+		reconcileTransformedColumnTypes(sm, applicable)
+	}
 
 	// Keep CDC envelope convenience fields in sync. For batch messages op is empty,
 	// so this is skipped (batch has no After/Before envelope).
@@ -931,7 +1038,42 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	}
 
 	applyRenamesToCDCKeys(sm, applicable)
+	sm.consumerTransformsApplied = true
 	return nil
+}
+
+// cdcUpdateWasInTheFilteredSet reports whether an update the chain filtered out
+// may have a copy at the destination: its before image passed the same chain.
+// An update to a row that was already outside the filter has nothing there to
+// remove, and turning it into a delete would cost a single-event write per such
+// update and, in append mode, a tombstone for a row never written. With no
+// before image (REPLICA IDENTITY not FULL, MongoDB without pre-images) the answer
+// is unknown, so it is yes: deleting an absent row is a no-op, keeping one that
+// should be gone is the bug.
+func cdcUpdateWasInTheFilteredSet(ctx context.Context, sm *SinkMessage, chain []transforms.CanonicalTransform) bool {
+	if sm.Before == nil {
+		return true
+	}
+	before := make(transforms.Row, len(sm.Before))
+	for k, v := range sm.Before {
+		before[k] = v
+	}
+	coordinator := transforms.NewTransformCoordinator(
+		transforms.NewSimpleTransformEngine(), transforms.NewDuckDBTransformEngine())
+	out := []transforms.Row{before}
+	for _, t := range chain {
+		next, err := coordinator.Apply(ctx, out, []transforms.Transform{t.EngineTransform()})
+		if err != nil {
+			logf("warning", "transform %s (order %d) on %s failed on an update's before image; sending the update as a delete: %v",
+				t.Type, t.Order, sm.Table, err)
+			return true
+		}
+		if len(next) == 0 {
+			return false
+		}
+		out = next
+	}
+	return true
 }
 
 // cdcApplicableTransforms returns the rules that may run against a CDC event of
@@ -1099,7 +1241,7 @@ func isFatal(err error) bool {
 // can never succeed (e.g. a keyless CDC delete routed to an upsert destination that
 // needs a PK, or a change event with no row payload at all). It is deliberately
 // NOT a fatalError: a fatalError halts the worker (os.Exit) for a genuinely
-// unrecoverable condition (DLQ down, destructive schema change), but a poison
+// unrecoverable condition (DLQ down), but a poison
 // message must instead be dead-lettered + committed so the worker advances and keeps
 // delivering every OTHER table. Treating poison as fatal is a crash-loop trap: the
 // offset never commits, the supervisor respawns into the same message forever, and
@@ -1229,6 +1371,10 @@ type cdcObjectBatch struct {
 	sms          []*SinkMessage
 	createdAt    time.Time
 	lastAppendAt time.Time
+
+	// heapBytes is what this batch has charged the worker's buffer budget
+	// (bufferedChangeBytes per change), refunded when it lands.
+	heapBytes int64
 }
 
 // highWaterTracker holds the durable per-(topic,partition) Kafka offsets that
@@ -1363,10 +1509,12 @@ func getCDCOffsetsArgs(cfg *WorkerConfig, destType string) map[string]interface{
 
 // cdcObjectMetadata is the provenance stamped onto each CDC object at import_data
 // (#16). The key leaf carries only the FIRST offset and no topic, so the durable
-// high-water mark (the LAST offset per topic/partition) must travel as object
-// metadata for get_cdc_offsets to read back. Values are strings (GCS/S3/Azure
+// high-water mark must travel as object metadata for get_cdc_offsets to read back.
+// durableOffset is the partition's safe floor once the object lands (commitGate),
+// not the object's own last offset: it can sit below it, or be -1, while another
+// open batch still holds an earlier change. Values are strings (GCS/S3/Azure
 // metadata are string maps).
-func cdcObjectMetadata(pipelineID, topic string, partition int, firstOffset, lastOffset int64) map[string]interface{} {
+func cdcObjectMetadata(pipelineID, topic string, partition int, firstOffset, durableOffset int64) map[string]interface{} {
 	if strings.TrimSpace(pipelineID) == "" || strings.TrimSpace(topic) == "" {
 		return nil
 	}
@@ -1375,7 +1523,7 @@ func cdcObjectMetadata(pipelineID, topic string, partition int, firstOffset, las
 		"rsync_topic":        topic,
 		"rsync_partition":    strconv.Itoa(partition),
 		"rsync_first_offset": strconv.FormatInt(firstOffset, 10),
-		"rsync_last_offset":  strconv.FormatInt(lastOffset, 10),
+		"rsync_last_offset":  strconv.FormatInt(durableOffset, 10),
 	}
 }
 
@@ -1386,8 +1534,9 @@ type cdcObjectBatcher struct {
 	params   cdcBatchingParams
 	ackTTL   time.Duration
 
-	reader       *kafka.Reader
-	hw           *highWaterTracker
+	// gate commits Kafka offsets and raises the high-water mark, never past a
+	// change another open batch still holds (cdc_commit_gate.go).
+	gate         *commitGate
 	pgDB         *sql.DB
 	httpClient   *http.Client
 	eventsWriter *kafka.Writer
@@ -1401,6 +1550,10 @@ type cdcObjectBatcher struct {
 
 	batches map[string]*cdcObjectBatch
 
+	// budget caps the heap all open batches hold together (cdc_buffer_budget.go).
+	// nil = no budget.
+	budget *bufferBudget
+
 	// Layout v2 (objectLayoutV2CDCEnabled): parquet only, LOAD files for snapshot
 	// reads, CDC files for changes, and a per-table folder clean before the first write.
 	v2        bool
@@ -1408,9 +1561,9 @@ type cdcObjectBatcher struct {
 	v2Cleaned objectLayoutV2Cleaned
 }
 
-// cdcDBBatch accumulates CDC upsert rows for a single (topic, partition, table) key.
-// On flush, all buffered rows are written in a single MCP upsert_data call instead
-// of one call per row, giving ~1000x throughput improvement for snapshot loads.
+// cdcDBBatch accumulates the CDC changes of one (topic, partition, table) key. On
+// flush they are netted per key and written in a few calls (planFlush,
+// cdc_batch_apply.go) instead of one call per change.
 type cdcDBBatch struct {
 	table       string
 	targetTable string // normalized destination table name
@@ -1428,16 +1581,27 @@ type cdcDBBatch struct {
 	keyFields   []string          // PK/key columns for upsert ON CONFLICT
 	columnTypes map[string]string // Debezium column type hints for DDL
 
+	// kinds[i] says whether rows[i] is an upsert or a delete key (kindOf).
+	kinds []cdcBatchEventKind
+	// upserts / unkeyedUpserts count the buffered upserts and those the netting
+	// cannot key; add seals the batch before a delete that could not net against them.
+	upserts        int
+	unkeyedUpserts int
+
 	firstOffset  int64
 	lastOffset   int64
 	createdAt    time.Time
 	lastAppendAt time.Time
+
+	// heapBytes is what this batch has charged the worker's buffer budget, refunded
+	// when its lane finishes the write.
+	heapBytes int64
 }
 
-// cdcDBBatcher buffers CDC insert/update events and flushes them to relational
-// database destinations in bulk (N rows per MCP call instead of 1 per call).
-// Deletes are passed through immediately to preserve ordering.
-// Only used for non-object-storage, non-warehouse destinations (PostgreSQL, MySQL, etc.).
+// cdcDBBatcher buffers CDC changes and flushes them to relational, document and
+// warehouse destinations in bulk (cdc_batch_apply.go). A change it cannot represent
+// exactly (admit) takes the single-event path after the table's batch is flushed, so
+// changes to a table are applied in order. Object storage uses cdcObjectBatcher.
 type cdcDBBatcher struct {
 	cfg      *WorkerConfig
 	destType string
@@ -1445,8 +1609,16 @@ type cdcDBBatcher struct {
 	params   cdcBatchingParams
 	ackTTL   time.Duration
 
-	reader       *kafka.Reader
-	hw           *highWaterTracker
+	// warehouse: one MERGE per table per flush (planWarehouse). whMu serializes a
+	// warehouse's flushes across lanes: two partitions of one table flush on
+	// different lanes, and the connectors stage through a table named after the
+	// target, which two concurrent merges would share.
+	warehouse bool
+	whMu      sync.Mutex
+
+	// gate commits Kafka offsets and raises the high-water mark, never past a
+	// change another open batch still holds (cdc_commit_gate.go).
+	gate         *commitGate
 	pgDB         *sql.DB
 	httpClient   *http.Client
 	ddl          *DDLSupport
@@ -1467,13 +1639,18 @@ type cdcDBBatcher struct {
 	// batches itself stays single-owner and needs no lock: submitFlush removes a
 	// batch from the map BEFORE handing it to a lane, so a lane never touches it.
 	lanes *flushLanes
+
+	// budget caps the heap open AND in-flight batches hold together
+	// (cdc_buffer_budget.go): a batch is refunded when its lane finishes, not when
+	// it is submitted. nil = no budget.
+	budget *bufferBudget
 }
 
-func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reader, hw *highWaterTracker, pgDB *sql.DB, httpClient *http.Client,
+func newCDCObjectBatcher(cfg *WorkerConfig, destType string, gate *commitGate, pgDB *sql.DB, httpClient *http.Client,
 	eventsWriter *kafka.Writer, dlqWriter *kafka.Writer, metrics *Metrics, ackTTL time.Duration,
 	cdcInserts, cdcUpdates, cdcDeletes, cdcBytes *sync.Map) *cdcObjectBatcher {
 
-	if cfg == nil || reader == nil || httpClient == nil || metrics == nil {
+	if cfg == nil || gate == nil || httpClient == nil || metrics == nil {
 		return nil
 	}
 	if !isObjectStorageConnector(destType) {
@@ -1482,6 +1659,26 @@ func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reade
 	p := resolveCDCBatchingParams(cfg)
 	if !p.enabled {
 		return nil
+	}
+	// Object-storage file defaults: roll a file at defaultObjectFileMaxBytes or
+	// defaultObjectFlushInterval, whichever comes first, with no row cap. The shared
+	// defaults (2000 rows / 24 MB / 30 s) are sized for a database write, where a batch
+	// is a transaction; a bronze file is a unit of storage and of every later read, so a
+	// 2000-row cap only made files small — about 1 MB of narrow rows, one every few
+	// seconds on a busy table. An explicit cdc_batching value still wins, and the
+	// destination's max_file_* keys below win over both.
+	var bc *CDCBatchingConfig
+	if cfg.KafkaSinkWorker != nil {
+		bc = cfg.KafkaSinkWorker.CDCBatching
+	}
+	if bc == nil || bc.MaxEvents <= 0 {
+		p.maxEvents = 0 // no row cap: bytes and time decide
+	}
+	if bc == nil || bc.MaxBytes <= 0 {
+		p.maxBytes = defaultObjectFileMaxBytes
+	}
+	if bc == nil || bc.FlushIntervalSeconds <= 0 {
+		p.flushInterval = defaultObjectFlushInterval
 	}
 	// Group C file rolling: let the destination's max_file_rows / max_file_mb cap each
 	// bronze object's size, overriding the global CDC batching defaults. The object
@@ -1495,8 +1692,8 @@ func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reade
 			p.maxBytes = maxBytes
 		}
 	}
-	// The destination's max_file_interval_seconds wins over cdc_batching and the 30s
-	// default. loadConfig has already refused an invalid value, so an error here only
+	// The destination's max_file_interval_seconds wins over cdc_batching and the
+	// defaultObjectFlushInterval default. loadConfig has already refused an invalid value, so an error here only
 	// means the batcher was built without it; keep the default rather than guess.
 	if d, ok, err := objectFlushIntervalOverride(cfg.DestinationConfig); err != nil {
 		logf("warning", "ignoring invalid %s, keeping %s: %v", objectFlushIntervalKey, p.flushInterval, err)
@@ -1509,8 +1706,7 @@ func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reade
 		destCfg:      cfg.DestinationConfig,
 		params:       p,
 		ackTTL:       ackTTL,
-		reader:       reader,
-		hw:           hw,
+		gate:         gate,
 		pgDB:         pgDB,
 		httpClient:   httpClient,
 		eventsWriter: eventsWriter,
@@ -1521,44 +1717,62 @@ func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reade
 		cdcDeletes:   cdcDeletes,
 		cdcBytes:     cdcBytes,
 		batches:      map[string]*cdcObjectBatch{},
+		budget:       newBufferBudget(resolveBufferBudgetBytes()),
 		v2:           objectLayoutV2CDCEnabled(cfg),
 		store:        newObjectLoadStore(pgDB),
 		v2Cleaned:    objectLayoutV2Cleaned{},
 	}
 }
 
-// newCDCDBBatcher creates a batcher for relational DB CDC sinks (PostgreSQL, MySQL, …).
-// Returns nil if batching is disabled, or if the destination is object storage / warehouse
-// (those have their own batching paths).
-func newCDCDBBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reader, hw *highWaterTracker, pgDB *sql.DB,
+// newCDCDBBatcher creates the batcher for relational, document and warehouse CDC sinks.
+// Returns nil if batching is disabled, or for object storage (cdcObjectBatcher).
+func newCDCDBBatcher(cfg *WorkerConfig, destType string, gate *commitGate, pgDB *sql.DB,
 	httpClient *http.Client, ddl *DDLSupport, eventsWriter *kafka.Writer, dlqWriter *kafka.Writer,
 	metrics *Metrics, ackTTL time.Duration, cdcInserts, cdcUpdates, cdcDeletes, cdcBytes *sync.Map) *cdcDBBatcher {
 
-	if cfg == nil || reader == nil || httpClient == nil || metrics == nil {
+	if cfg == nil || gate == nil || httpClient == nil || metrics == nil {
 		return nil
 	}
-	// Object storage uses cdcObjectBatcher; warehouses use the merge path in processCDCEvent.
-	if isObjectStorageConnector(destType) || isDataWarehouseConnector(destType) {
+	// Object storage uses cdcObjectBatcher.
+	if isObjectStorageConnector(destType) {
 		return nil
 	}
 	p := resolveCDCBatchingParams(cfg)
 	if !p.enabled {
 		return nil
 	}
-	// Use a shorter default flush interval for relational sinks (5 s instead of 30 s)
-	// so streaming-mode deltas land quickly while snapshot-mode still batches to 1000 rows.
-	if cfg.KafkaSinkWorker == nil || cfg.KafkaSinkWorker.CDCBatching == nil ||
-		cfg.KafkaSinkWorker.CDCBatching.FlushIntervalSeconds == 0 {
+	var bc *CDCBatchingConfig
+	if cfg.KafkaSinkWorker != nil {
+		bc = cfg.KafkaSinkWorker.CDCBatching
+	}
+	warehouse := isDataWarehouseConnector(destType)
+	switch {
+	case warehouse:
+		// One MERGE per table per interval (defaultWarehouseFlushInterval).
+		if bc == nil || bc.FlushIntervalSeconds <= 0 {
+			p.flushInterval = defaultWarehouseFlushInterval
+		}
+		if bc == nil || bc.MaxEvents <= 0 {
+			p.maxEvents = defaultWarehouseMaxEvents
+		}
+		if bc == nil || bc.MaxBytes <= 0 {
+			p.maxBytes = defaultWarehouseMaxBytes
+		}
+	case bc == nil || bc.FlushIntervalSeconds == 0:
+		// Use a shorter default flush interval for relational sinks (5 s instead of 30 s)
+		// so streaming-mode deltas land quickly while snapshot-mode still batches up to 2000 rows (resolveCDCBatchingParams).
 		p.flushInterval = 5 * time.Second
 	}
+	// The destination's batch_* settings win over both.
+	applyDestBatchSettings(&p, cfg.DestinationConfig)
 	return &cdcDBBatcher{
 		cfg:          cfg,
 		destType:     canonicalConnectorType(destType),
 		destCfg:      cfg.DestinationConfig,
 		params:       p,
 		ackTTL:       ackTTL,
-		reader:       reader,
-		hw:           hw,
+		warehouse:    warehouse,
+		gate:         gate,
 		pgDB:         pgDB,
 		httpClient:   httpClient,
 		ddl:          ddl,
@@ -1571,6 +1785,7 @@ func newCDCDBBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reader, h
 		cdcBytes:     cdcBytes,
 		batches:      map[string]*cdcDBBatch{},
 		lanes:        newFlushLanes(resolveFlushLaneCount()),
+		budget:       newBufferBudget(resolveBufferBudgetBytes()),
 	}
 }
 
@@ -1578,64 +1793,33 @@ func (b *cdcDBBatcher) batchKey(msg kafka.Message, sm *SinkMessage) string {
 	return fmt.Sprintf("%s|%d|%s", msg.Topic, msg.Partition, sm.Table)
 }
 
-// add buffers one CDC upsert event (op=c/r/u). Deletes are NOT added here; call
-// processCDCEvent directly for deletes (after flushing pending upserts for the table).
-func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessage) {
+// add buffers one CDC change and reports whether the batcher took it. false means
+// the batch cannot represent it exactly (admit): nothing was buffered or
+// acknowledged, and the caller flushes the table and writes it single-event.
+func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessage) bool {
 	if b == nil || sm == nil {
-		return
+		return false
 	}
 
 	// Dedup hot-path: if this offset is at/below the durable high-water mark for
 	// its (topic,partition), it was already written to the destination — skip + commit.
-	if b.hw.seen(msg.Topic, msg.Partition, msg.Offset) {
+	if b.gate.seen(msg.Topic, msg.Partition, msg.Offset) {
 		atomic.AddUint64(&b.metrics.skipped, 1)
 		logMsgEvent("debug", sm, msg, "cdc dedup: offset at/below high-water, skipping")
-		_ = b.reader.CommitMessages(ctx, msg)
-		return
+		b.gate.handled(ctx, msg)
+		return true
 	}
 
-	// Extract the row to write.  For upserts use sm.Data[0] / sm.After; fall back to PK.
-	var row map[string]interface{}
-	if len(sm.Data) > 0 {
-		row = sm.Data[0]
-	} else if sm.After != nil {
-		row = sm.After
+	adm := b.admit(msg, sm)
+	if adm.decline {
+		return false
 	}
-	if row == nil {
+	if adm.skip {
 		// Nothing to write; ack and move on.
 		atomic.AddUint64(&b.metrics.skipped, 1)
 		logMsgEvent("debug", sm, msg, "cdc event has no writable row (no Data/After), skipping")
-		_ = b.reader.CommitMessages(ctx, msg)
-		return
-	}
-
-	// Determine key fields for ON CONFLICT (upsert).
-	keyFields := []string{}
-	for _, k := range []string{"key_fields", "primary_keys", "primary_key_fields"} {
-		if b.destCfg != nil {
-			if v, ok := b.destCfg[k]; ok {
-				if kf := toStringSlice(v); len(kf) > 0 {
-					keyFields = kf
-					break
-				}
-			}
-		}
-	}
-	if len(keyFields) == 0 && sm != nil && len(sm.KeyFields) > 0 {
-		keyFields = append([]string{}, sm.KeyFields...)
-	}
-	// No third source: a key is what the source (its message key) or the destination
-	// config declares, never a column that looks like one (`id`, a lone `*_id`) —
-	// naming a column does not make it unique, and upserting on a non-unique one
-	// collapses rows (KI-CDC-SINK-GUESSED-KEY-COLLAPSES-ROWS). A keyless row takes the
-	// synthetic row hash (relational, flushBatch) or its Kafka-record _id (below).
-	//
-	// A keyless row bound for a document destination is keyed on its Kafka record
-	// (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES): a deterministic _id, upserted, so
-	// a redelivery replaces its own document instead of inserting a second one.
-	if len(keyFields) == 0 && isDocumentDBConnector(b.destType) {
-		row = withKeylessDocumentID(row, b.cfg.PipelineID, msg, 0)
-		keyFields = append([]string{}, keylessDocumentKey...)
+		b.gate.handled(ctx, msg)
+		return true
 	}
 
 	targetTable := normalizeTargetTable(b.destType, b.destCfg, sm.Table)
@@ -1648,6 +1832,30 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 	}
 	key := b.batchKey(msg, sm)
 	now := time.Now().UTC()
+	held := bufferedChangeBytes(msg, sm, nil)
+
+	// Seal the open batch first when this change cannot join it:
+	//   - its key differs from the batch's (the netting compares rows on one key);
+	//   - it is a delete keyed from the message key while the batch holds upserts,
+	//     or the batch holds upserts the netting cannot key: either could be the
+	//     same row, and only the order of the two calls would then decide it;
+	//   - it would take the batch over its byte or row cap.
+	if batch := b.batches[key]; batch != nil && len(batch.rows) > 0 {
+		reason := ""
+		switch {
+		case !sameFields(batch.keyFields, adm.keyFields):
+			reason = "key_change_flush"
+		case adm.kind == cdcBatchDelete && ((adm.pkDerived && batch.upserts > 0) || batch.unkeyedUpserts > 0):
+			reason = "delete_order_flush"
+		case b.params.maxBytes > 0 && batch.heapBytes+held > int64(b.params.maxBytes):
+			reason = "byte_threshold_flush"
+		case len(batch.rows)+1 > b.params.maxEvents:
+			reason = "threshold_flush"
+		}
+		if reason != "" {
+			b.submitFlush(ctx, key, batch, reason)
+		}
+	}
 
 	batch := b.batches[key]
 	if batch == nil {
@@ -1657,7 +1865,7 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 			topic:        msg.Topic,
 			partition:    msg.Partition,
 			namespace:    strings.TrimSpace(sm.DBOrSchema),
-			keyFields:    keyFields,
+			keyFields:    adm.keyFields,
 			columnTypes:  sm.ColumnTypes,
 			firstOffset:  msg.Offset,
 			lastOffset:   msg.Offset,
@@ -1665,48 +1873,69 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 			lastAppendAt: now,
 		}
 		b.batches[key] = batch
+		b.gate.hold(msg.Topic, msg.Partition, msg.Offset)
 	}
 
-	// Flush on threshold BEFORE appending (same pattern as cdcObjectBatcher).
-	if len(batch.rows) > 0 && len(batch.rows)+1 > b.params.maxEvents {
-		b.submitFlush(ctx, key, batch, "threshold_flush")
-		// Recreate after flush.
-		batch = nil
-		if b2 := b.batches[key]; b2 != nil {
-			batch = b2
-		}
-		if batch == nil {
-			batch = &cdcDBBatch{
-				table:        sm.Table,
-				targetTable:  targetTable,
-				topic:        msg.Topic,
-				partition:    msg.Partition,
-				namespace:    strings.TrimSpace(sm.DBOrSchema),
-				keyFields:    keyFields,
-				columnTypes:  sm.ColumnTypes,
-				firstOffset:  msg.Offset,
-				lastOffset:   msg.Offset,
-				createdAt:    now,
-				lastAppendAt: now,
-			}
-			b.batches[key] = batch
-		}
-	}
-
-	batch.rows = append(batch.rows, row)
+	batch.rows = append(batch.rows, adm.row)
 	batch.messages = append(batch.messages, msg)
 	batch.sms = append(batch.sms, sm)
+	batch.kinds = append(batch.kinds, adm.kind)
+	if adm.kind == cdcBatchUpsert {
+		batch.upserts++
+		if adm.unkeyed {
+			batch.unkeyedUpserts++
+		}
+	}
 	batch.lastOffset = msg.Offset
 	batch.lastAppendAt = now
-	// Merge key fields if later messages carry richer info.
-	if len(batch.keyFields) == 0 && len(keyFields) > 0 {
-		batch.keyFields = keyFields
+	batch.heapBytes += held
+	b.budget.charge(held)
+	if len(batch.columnTypes) == 0 && len(sm.ColumnTypes) > 0 {
+		batch.columnTypes = sm.ColumnTypes
 	}
 
 	// Flush immediately when threshold exactly reached.
 	if len(batch.rows) >= b.params.maxEvents {
 		b.submitFlush(ctx, key, batch, "threshold_reached_flush")
 	}
+	b.enforceBudget(ctx)
+	return true
+}
+
+// enforceBudget brings the worker back under its buffer budget: it submits the largest
+// open batch, then waits for the lanes, whose finished writes refund what they held,
+// and repeats while still over. It runs on the consume goroutine, so nothing more is
+// fetched until it returns — the wait IS the fetch pause (see flushLanes.submit).
+func (b *cdcDBBatcher) enforceBudget(ctx context.Context) {
+	for b.budget.over() {
+		key, batch := b.largestOpenBatch()
+		if batch != nil {
+			held := batch.heapBytes
+			b.submitFlush(ctx, key, batch, "memory_budget_flush")
+			b.budget.noteEarlyFlush(batch.table, held)
+			if !b.budget.over() {
+				return
+			}
+		}
+		b.lanes.waitAll()
+		if batch == nil {
+			// Nothing open and nothing left in flight: whatever is still charged
+			// cannot be written any sooner by waiting here.
+			return
+		}
+	}
+}
+
+// largestOpenBatch is the open batch holding the most heap, or nil when none is open.
+func (b *cdcDBBatcher) largestOpenBatch() (string, *cdcDBBatch) {
+	var bestKey string
+	var best *cdcDBBatch
+	for key, batch := range b.batches {
+		if batch != nil && len(batch.rows) > 0 && (best == nil || batch.heapBytes > best.heapBytes) {
+			bestKey, best = key, batch
+		}
+	}
+	return bestKey, best
 }
 
 // submitFlush seals a batch and runs its destination write on the lane that owns
@@ -1723,7 +1952,13 @@ func (b *cdcDBBatcher) submitFlush(ctx context.Context, key string, batch *cdcDB
 		return
 	}
 	delete(b.batches, key)
-	b.lanes.submit(key, func() { b.flushBatch(ctx, key, batch, reason) })
+	// Refunded when the write finishes, not now: until then the lane still holds every
+	// row, and a budget that forgot them would let the next batches pile up behind it.
+	held := batch.heapBytes
+	b.lanes.submit(key, func() {
+		defer b.budget.refund(held)
+		b.flushBatch(ctx, key, batch, reason)
+	})
 }
 
 // flushDue flushes all batches that have exceeded the flush interval.
@@ -1785,19 +2020,16 @@ func (b *cdcDBBatcher) flushAll(ctx context.Context) {
 	b.lanes.waitAll()
 }
 
-// flushBatch writes all buffered rows for one (topic|partition|table) key to the
-// destination in a single upsert_data call, then persists per-message acks and
-// commits the Kafka offsets. Fail-closed: exits on unrecoverable errors.
-// commitFlushedBatch is everything a landed CDC batch owes: the audit ledger,
-// the per-table counters, the Kafka offset commit + high-water advance, and the
+// commitFlushedBatch is everything a landed CDC batch owes: the stored counter
+// totals and offset floors, the per-table counters, the Kafka offset commit + high-water advance, and the
 // TABLE_STATS emit. Split out of flushBatch so the extended infrastructure-fault
 // retry can reuse it when a destination comes back mid-hold, rather than keeping
 // a second copy of the commit sequence in step with this one
 // (KI-CDC-SINK-INFRA-FAULT-DLQ-COMMITS).
 func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch *cdcDBBatch, dlqd map[int]bool) {
 	// dlqd holds the batch positions the destination skipped and landFlushedBatch
-	// parked in the DLQ. They did not land, so they stay out of the ledger and the
-	// landed-row counters; their offsets are still committed below with the rest.
+	// parked in the DLQ. They did not land, so they stay out of the stored totals and
+	// the landed-row counters; their offsets are still committed below with the rest.
 	sms, messages := batch.sms, batch.messages
 	if len(dlqd) > 0 {
 		sms = make([]*SinkMessage, 0, len(batch.sms))
@@ -1811,49 +2043,24 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 	}
 
 	// Per-message bookkeeping. The durable offset already landed in
-	// _rsync_cdc_offsets within the upsert transaction above; the Postgres ledger
-	// write here is a best-effort audit trail only (non-fatal on error).
-	// Best-effort audit ledger for the ENTIRE batch in one (chunked) INSERT
-	// instead of one remote round-trip per message — the high-volume CDC
-	// throughput fix. Non-fatal: exactly-once is enforced by _rsync_cdc_offsets
-	// committed in the upsert transaction above, not by this ledger.
-	counted, ackErr := persistCDCAcksBatch(ctx, b.pgDB, sms, messages, batch.targetTable)
+	// _rsync_cdc_offsets within the upsert transaction above; the counter write
+	// here only keeps the per-table totals restart-safe (non-fatal on error), in
+	// one statement for the whole batch.
+	counted, ackErr := persistCDCCounts(ctx, b.pgDB, sms, messages)
 	if ackErr != nil {
-		logf("warning", "cdc ack-ledger batch write failed (non-fatal, audit only): %v", ackErr)
+		logf("warning", "cdc counter write failed (non-fatal, totals restart from the last stored value): %v", ackErr)
 	}
 
-	// Update per-table CDC counters (in-memory). A message the ledger already held
-	// was counted before — by this process or the one before a restart — so only the
-	// process-wide metrics see it again.
-	for i, sm := range sms {
-		switch strings.ToLower(strings.TrimSpace(sm.CDCOp)) {
-		case "c":
-			if counted[i] {
-				incrementCounter(b.cdcInserts, sm.Table, 1)
-			}
-			atomic.AddUint64(&b.metrics.cdcInserts, 1)
-		case "r":
-			if counted[i] {
-				incrementCounter(&b.metrics.cdcSnapshotRowsByTable, sm.Table, 1)
-			}
-			atomic.AddUint64(&b.metrics.cdcReads, 1)
-		case "u":
-			if counted[i] {
-				incrementCounter(b.cdcUpdates, sm.Table, 1)
-			}
-			atomic.AddUint64(&b.metrics.cdcUpdates, 1)
-		}
-		if counted[i] {
-			incrementCounter(b.cdcBytes, sm.Table, cdcRowBytes(sm))
-		}
-	}
+	// Update per-table CDC counters (in-memory), once per flush. A replay — consumed
+	// at or below its offset floor — was counted before, by this process or the one
+	// before a restart, so only the process-wide metrics see it again.
+	tallyLandedCDC(sms, counted).apply(b.metrics, b.cdcInserts, b.cdcUpdates, b.cdcDeletes, b.cdcBytes)
 
-	// Commit Kafka offsets for the entire batch in one call, then advance the
-	// in-memory high-water mark so any redelivery of these offsets is skipped.
-	_ = b.reader.CommitMessages(ctx, batch.messages...)
-	last := batch.messages[len(batch.messages)-1]
-	b.hw.advance(batch.topic, batch.partition, last.Offset)
-	atomic.StoreInt64(&b.metrics.lastCommittedOffset, last.Offset)
+	// Commit the Kafka offset and advance the in-memory high-water mark so a
+	// redelivery is skipped — up to the partition's safe floor, never past a change
+	// another table's batch still holds.
+	floor := b.gate.landed(ctx, batch.topic, batch.partition, batch.firstOffset, batch.lastOffset)
+	atomic.StoreInt64(&b.metrics.lastCommittedOffset, floor)
 	atomic.StoreInt64(&b.metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 	atomic.StoreInt64(&b.metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 
@@ -1885,7 +2092,7 @@ func (b *cdcDBBatcher) landFlushedBatch(ctx context.Context, key string, batch *
 		// A skip the destination could not pin to rows. Re-apply row by row: a
 		// single-row write lands or fails on its own, and a failed one is DLQ'd.
 		b.flushBatchPerRow(ctx, key, batch, reason,
-			fmt.Errorf("dest %s reported skipped rows without identifying them (table=%s)", b.destType, batch.targetTable))
+			fmt.Errorf("dest %s reported skipped rows without identifying them (table=%s)", b.destType, batch.targetTable), nil)
 		return
 	}
 	if len(skipped) == 0 {
@@ -1913,36 +2120,42 @@ func (b *cdcDBBatcher) landFlushedBatch(ctx context.Context, key string, batch *
 	b.commitFlushedBatch(ctx, key, batch, dlqd)
 }
 
+// flushBatch writes one (topic|partition|table) batch to the destination as the calls
+// planFlush plans (cdc_batch_apply.go) — for a relational table one delete_data and
+// one upsert_data, for a warehouse one MERGE per row shape — then lands it: the
+// counter totals, the Kafka offset commit and TABLE_STATS. Fail-closed: exits on
+// unrecoverable errors.
 func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBBatch, reason string) {
 	if b == nil || batch == nil || len(batch.rows) == 0 {
 		return
 	}
+	if b.warehouse {
+		b.whMu.Lock()
+		defer b.whMu.Unlock()
+	}
+	plan := b.planFlush(batch)
 
 	// Schema evolution is handled by ensureDestinationTable's additive reconciliation
 	// (CREATE TABLE IF NOT EXISTS + ADD COLUMN IF NOT EXISTS) — the destination's live
 	// schema IS the source of truth, so no separate Redis-cached gate is needed.
-	// Net-additive changes apply automatically; incompatible changes surface as a write
-	// error and escalate via the fail-closed os.Exit path below.
-	// cdcDBBatcher is the CDC apply path exclusively, so batch.columnTypes are
-	// always resolved destination DDL types → pass through verbatim (types_are_ddl).
-	// cdcDBBatcher buffers insert/update (full-image) events only — deletes bypass it —
-	// so enabling the fail-closed drop gate here is safe (no PK-only delete images).
-	// Skip the gate in append-only history mode, where tombstone rows are intentional.
+	// Net-additive changes apply automatically; a column dropped in the source is
+	// kept in the destination and reported, and the stream keeps flowing. An
+	// incompatible change surfaces as a write error and escalates via the fail-closed
+	// write path below.
+	// cdcDBBatcher is the CDC apply path exclusively, so the column types are always
+	// resolved destination DDL types → pass through verbatim (types_are_ddl). Dropped
+	// columns are detected only from full-image upserts (plan.detectDropped): a delete
+	// key is not a row image, and append-only tombstones are intentional.
 	//
 	// Document-DB destinations (MongoDB) have no DDL and no ensure_table tool —
-	// collections auto-create on first write — so skip the relational reconcile entirely.
-	if !isDocumentDBConnector(b.destType) {
+	// collections auto-create on first write — and a warehouse self-provisions inside
+	// merge(), so planFlush leaves plan.ensure false for both.
+	if plan.ensure && len(plan.ensureRows) > 0 {
 		if err := ensureDestinationTable(ctx, b.httpClient, b.cfg, b.ddl, b.destType, batch.targetTable,
-			batch.namespace, batch.rows, batch.keyFields, batch.columnTypes, b.cfg.PipelineID, true, !cdcAppendMode(b.cfg), true); err != nil {
-			if isFatal(err) {
-				// Destructive source schema change: halt fail-closed so the offset is
-				// not advanced past a row the destination can no longer faithfully hold.
-				logf("error", "fatal: destructive schema change in CDC batch for %s: %v", batch.targetTable, err)
-				os.Exit(1)
-			}
-			// Non-fatal: log and proceed; destination write may still succeed.
+			batch.namespace, plan.ensureRows, plan.ensureKeys, plan.ensureTypes, b.cfg.PipelineID, true, plan.detectDropped && !cdcAppendMode(b.cfg), true); err != nil {
+			// Log and proceed; destination write may still succeed.
 			// Surface it on the metrics endpoint too. Proceeding is correct — the
-			// upsert below is itself fail-closed (retry → setErr → per-row
+			// write below is itself fail-closed (retry → setErr → per-row
 			// isolation → DLQ → os.Exit) — but a log line alone is invisible to
 			// the health scrape, so a destination whose reconcile fails on every
 			// flush while writes keep succeeding looks perfectly healthy. This is
@@ -1952,125 +2165,73 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 			b.metrics.setErr(fmt.Errorf("ensureDestinationTable %s: %w", batch.targetTable, err))
 		}
 	}
+	if len(plan.calls) == 0 {
+		b.commitFlushedBatch(ctx, key, batch, nil)
+		return
+	}
 
-	// Build the upsert_data MCP call with ALL buffered rows.
 	// kafka_offset is written into the destination's _rsync_cdc_offsets table in the
 	// SAME transaction as the data (Tier-A relational sinks) → exactly-once: the durable
-	// offset advances iff the data commits. batch.lastOffset is the highest offset in
-	// this batch for (topic,partition).
+	// offset advances iff the data commits. Only the plan's final call stamps the
+	// batch's landing floor (applyCall), so a restart after a partial flush
+	// redelivers the whole batch, and every call is idempotent on redelivery except
+	// an append-only insert (at-least-once, as the single-event path).
 	//
 	// A document destination applies the batch unordered, so it gets each key once,
-	// by its last event (#22, lastEventPerKey). sent maps what it was sent back to
-	// batch positions; batch.messages/sms stay whole, and every message is still
+	// by its last event (#22, lastEventPerKey). plan.sent maps what it was sent back
+	// to batch positions; batch.messages/sms stay whole, and every message is still
 	// acked, counted and committed — a superseded event was applied by its successor.
-	data, sent := batch.rows, []int(nil)
-	if isDocumentDBConnector(b.destType) {
-		if sent = lastEventPerKey(batch.rows, batch.keyFields); sent != nil {
-			data = make([]map[string]interface{}, len(sent))
-			for j, i := range sent {
-				data[j] = batch.rows[i]
-			}
+	next := 0
+	var lastResult map[string]interface{}
+	var rowsSent, deletesSent int
+	var rowsWritten, rowsDeleted int64
+	landedCall := func(call cdcApplyCall, result map[string]interface{}, n int64) {
+		lastResult = result
+		if call.deletes {
+			deletesSent += call.sent
+			rowsDeleted += n
+		} else {
+			rowsSent += call.sent
+			rowsWritten += n
 		}
-	}
-	args := map[string]interface{}{
-		"config":    b.destCfg,
-		"table":     batch.targetTable,
-		"data":      data,
-		"operation": "upsert",
-		"kafka_offset": map[string]interface{}{
-			"pipeline_id": b.cfg.PipelineID,
-			"topic":       batch.topic,
-			"partition":   batch.partition,
-			"offset":      batch.lastOffset,
-		},
-	}
-	// Forward the destination namespace on the write (batch.targetTable is bare);
-	// no-op when unset. Mirrors the batch path's writeToDestination.
-	addNamespaceParam(args, batch.namespace)
-	if len(batch.keyFields) > 0 {
-		args["key_fields"] = batch.keyFields
-		args["primary_key_fields"] = batch.keyFields
-	}
-	// Forward the Debezium-derived destination column types on the WRITE call too,
-	// not just the ensure_table pre-call. If ensureDestinationTable is skipped (its
-	// in-memory "already ensured" cache) or loses the race, the connector's upsert
-	// auto-creates the table — and without these it would default every column to
-	// TEXT. With them, the on-the-fly create is correctly typed. See
-	// CAPABILITIES.md KI-CDC-TYPE-RACE.
-	if len(batch.columnTypes) > 0 {
-		args["column_types"] = batch.columnTypes
-	}
-
-	// Keyless table + not append-mode → synthetic-PK path. ensureDestinationTable
-	// created _rsync_row_hash (NOT NULL) + a unique index for exactly this case; the
-	// WRITE call must compute the hash via upsert_data(synthetic_pk=true), or the
-	// connector plain-inserts a NULL hash and the NOT NULL constraint rejects every
-	// row — a silent drop of a keyless/GIPK table. Append-mode keeps plain INSERT.
-	//
-	// A document DB never synthesizes a PK and never reaches here keyless: add() keys
-	// a keyless row on a deterministic _id from its Kafka record (withKeylessDocumentID),
-	// so it is an idempotent upsert_data. Excluded anyway so a doc DB never gets a hash.
-	useSyntheticPK := len(batch.keyFields) == 0 && !cdcAppendMode(b.cfg) && !isDocumentDBConnector(b.destType)
-	if useSyntheticPK {
-		args["synthetic_pk"] = true
-	}
-	toolName := fmt.Sprintf("%s_upsert_data", b.destType)
-	if len(batch.keyFields) == 0 && !useSyntheticPK {
-		toolName = fmt.Sprintf("%s_import_data", b.destType)
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= b.params.maxRetries; attempt++ {
-		result, err := callDestinationTool(ctx, b.httpClient, b.cfg, b.destType, strings.TrimPrefix(toolName, b.destType+"_"), args)
+	for next < len(plan.calls) {
+		call := plan.calls[next]
+		result, n, err := b.applyWithRetry(ctx, batch, call, next == len(plan.calls)-1)
 		if err != nil {
 			lastErr = err
-			if attempt < b.params.maxRetries {
-				sleep := b.params.backoff * time.Duration(1<<attempt)
-				sleep += time.Duration(rand.Intn(250)) * time.Millisecond
-				time.Sleep(sleep)
-			}
-			continue
+			break
 		}
+		landedCall(call, result, n)
+		next++
+	}
 
-		// Require the destination to report an actual write-count. A success
-		// response WITHOUT a count field is the silent-data-loss signature: the
-		// connector returned ok but may not have persisted. Do NOT fabricate
-		// len(batch.rows) (the old behavior) — that committed Kafka offsets for
-		// rows that never landed. Treat a missing count as a retryable failure;
-		// after maxRetries flushBatch fails closed (no offset commit) below. A
-		// legitimate zero (count field present and == 0) is trusted as-is.
-		writtenRows, ok := extractDestRowCount(result)
-		if !ok {
-			lastErr = fmt.Errorf("dest %s returned success without a write-count field (possible non-landing write); table=%s rows=%d",
-				toolName, batch.targetTable, len(batch.rows))
-			if attempt < b.params.maxRetries {
-				sleep := b.params.backoff * time.Duration(1<<attempt)
-				sleep += time.Duration(rand.Intn(250)) * time.Millisecond
-				time.Sleep(sleep)
+	if next == len(plan.calls) {
+		tools := make([]string, 0, len(plan.calls))
+		for _, c := range plan.calls {
+			if t := b.destType + "_" + c.tool; len(tools) == 0 || tools[len(tools)-1] != t {
+				tools = append(tools, t)
 			}
-			continue
 		}
-
-		// KI-CDC-DELETE-PATH-UNLOGGED: this is what finally emits `pre_delete_flush`.
-		// The reason string was threaded all the way down here and then discarded —
-		// it reached a logger only on the FAILURE branches below, so on the happy
-		// path nothing ever recorded WHY a batch flushed. writtenRows was discarded
-		// too, under a comment claiming it was "consumed for logging purposes" while
-		// nothing logged it.
-		//
-		// Emitted BEFORE commitFlushedBatch so the line exists even if the commit
-		// path exits; it never alters control flow.
+		// KI-CDC-DELETE-PATH-UNLOGGED: the success line records WHY the batch flushed
+		// and what landed. Emitted BEFORE commitFlushedBatch so the line exists even if
+		// the commit path exits; it never alters control flow.
 		logEvent("info", "cdc batch flushed",
 			"flush_reason", reason,
 			"table", batch.targetTable,
-			"tool", toolName,
+			"tool", strings.Join(tools, ","),
 			"rows", len(batch.rows),
-			"rows_sent", len(data),
-			"rows_written", writtenRows,
+			"rows_sent", rowsSent,
+			"rows_written", rowsWritten,
+			"deletes_sent", deletesSent,
+			"rows_deleted", rowsDeleted,
+			"calls", len(plan.calls),
 			"topic", batch.topic,
 			"partition", batch.partition,
 			"offset", batch.lastOffset)
-		b.landFlushedBatch(ctx, key, batch, result, sent, reason)
+		b.landFlushedBatch(ctx, key, batch, lastResult, plan.sent, reason)
 		return
 	}
 
@@ -2106,21 +2267,21 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	}
 	if isDestInfraFault(lastErr) {
 		var landed bool
-		var heldResult map[string]interface{}
 		lastErr, landed = holdForInfraFault(ctx, "cdc db batch", batch.targetTable, lastErr, func() error {
-			result, err := callDestinationTool(ctx, b.httpClient, b.cfg, b.destType, strings.TrimPrefix(toolName, b.destType+"_"), args)
-			if err != nil {
-				return err
+			// Resume at the call that failed: the ones before it landed.
+			for next < len(plan.calls) {
+				call := plan.calls[next]
+				result, n, err := b.applyCall(ctx, batch, call, next == len(plan.calls)-1)
+				if err != nil {
+					return err
+				}
+				landedCall(call, result, n)
+				next++
 			}
-			if _, ok := extractDestRowCount(result); !ok {
-				return fmt.Errorf("dest %s returned success without a write-count field (possible non-landing write); table=%s rows=%d",
-					toolName, batch.targetTable, len(batch.rows))
-			}
-			heldResult = result
 			return nil
 		})
 		if landed {
-			b.landFlushedBatch(ctx, key, batch, heldResult, sent, reason)
+			b.landFlushedBatch(ctx, key, batch, lastResult, plan.sent, reason)
 			return
 		}
 		if ctx.Err() != nil {
@@ -2149,8 +2310,16 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	// table. Before doing that, re-attempt the rows individually so only the
 	// genuinely-bad row(s) are condemned and every good row still lands. Only
 	// worth it for multi-row batches; single-row batches fall straight through.
+	//
+	// An append-only insert is not idempotent, so the rows of the calls that already
+	// landed are not written again; every other call is, and the rows are replayed
+	// in order from the first.
 	if len(batch.rows) > 1 {
-		b.flushBatchPerRow(ctx, key, batch, reason, lastErr)
+		var landedRows map[int]bool
+		if cdcAppendMode(b.cfg) {
+			landedRows = positionsOf(plan.calls[:next])
+		}
+		b.flushBatchPerRow(ctx, key, batch, reason, lastErr, landedRows)
 		return
 	}
 
@@ -2178,11 +2347,10 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 			}
 		}
 		// All bad records safely parked in the DLQ — commit offsets and advance the
-		// high-water mark so the failed batch is not redelivered.
-		_ = b.reader.CommitMessages(ctx, batch.messages...)
-		last := batch.messages[len(batch.messages)-1]
-		b.hw.advance(batch.topic, batch.partition, last.Offset)
-		atomic.StoreInt64(&b.metrics.lastCommittedOffset, last.Offset)
+		// high-water mark (to the partition's safe floor) so the failed batch is not
+		// redelivered.
+		floor := b.gate.landed(ctx, batch.topic, batch.partition, batch.firstOffset, batch.lastOffset)
+		atomic.StoreInt64(&b.metrics.lastCommittedOffset, floor)
 		atomic.StoreInt64(&b.metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 		// dlqRouted (aggregate + per-table) is bumped inside sendToDLQ, once per message.
 		// Report the loss on the way out: these rows are gone from the destination, and
@@ -2206,57 +2374,128 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 }
 
 // flushBatchPerRow is the per-row isolation recovery path (S1). It is called
-// after a whole-batch upsert has exhausted its retries, for multi-row batches
-// only. It writes each row in its own single-row upsert call (each carrying its
-// own kafka_offset for exactly-once), so a single poison row no longer discards
-// the good rows. Genuinely-bad rows are routed to the DLQ (or, with no DLQ,
+// after a whole-batch write has exhausted its retries, for multi-row batches
+// only. It writes each change in its own single-row call (each carrying its own
+// kafka_offset for exactly-once), in batch order, so a single poison row no longer
+// discards the good rows. Genuinely-bad rows are routed to the DLQ (or, with no DLQ,
 // trigger a fail-closed crash exactly as the whole-batch path would). On
 // completion it commits the whole batch's Kafka offsets and clears the batch.
-func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *cdcDBBatch, reason string, batchErr error) {
+//
+// skip holds positions already written by the whole-batch flush that must not be
+// written again (an append-only insert is not idempotent); they count as landed.
+func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *cdcDBBatch, reason string, batchErr error, skip map[int]bool) {
 	// Keyless + not append-mode → synthetic-PK path: upsert_data computes + upserts on
 	// _rsync_row_hash (see flushBatch). Only genuine append-mode keyless rows take the
 	// plain-INSERT import_data path. Keeps the per-row recovery path consistent with the
 	// whole-batch path so a retried keyless row doesn't NULL-violate _rsync_row_hash.
 	// Document DBs never synthesize a PK; add() already keyed a keyless row on its
 	// Kafka-record _id (withKeylessDocumentID), so it is never keyless here.
-	useSyntheticPK := len(batch.keyFields) == 0 && !cdcAppendMode(b.cfg) && !isDocumentDBConnector(b.destType)
-	toolBase := "upsert_data"
-	op := "upsert"
+	appendMode := cdcAppendMode(b.cfg)
+	useSyntheticPK := len(batch.keyFields) == 0 && !appendMode && !isDocumentDBConnector(b.destType)
+	upsertTool := "upsert_data"
+	upsertOp := "upsert"
 	if len(batch.keyFields) == 0 && !useSyntheticPK {
-		toolBase = "import_data"
-		op = "insert"
+		upsertTool = "import_data"
+		upsertOp = "insert"
 	}
 
 	good, bad := 0, 0
+	// rowLanded counts one written change exactly as the whole-batch landing does.
+	rowLanded := func(i int, m kafka.Message) {
+		good++
+		if i < len(batch.sms) && batch.sms[i] != nil {
+			counted, ackErr := persistCDCCount(ctx, b.pgDB, batch.sms[i], m)
+			if ackErr != nil {
+				logf("warning", "cdc counter write failed (non-fatal, totals restart from the last stored value): %v", ackErr)
+			}
+			switch strings.ToLower(strings.TrimSpace(batch.sms[i].CDCOp)) {
+			case "c":
+				if counted {
+					incrementCounter(b.cdcInserts, batch.sms[i].Table, 1)
+				}
+				atomic.AddUint64(&b.metrics.cdcInserts, 1)
+			case "r":
+				if counted {
+					incrementCounter(&b.metrics.cdcSnapshotRowsByTable, batch.sms[i].Table, 1)
+				}
+				atomic.AddUint64(&b.metrics.cdcReads, 1)
+			case "u":
+				if counted {
+					incrementCounter(b.cdcUpdates, batch.sms[i].Table, 1)
+				}
+				atomic.AddUint64(&b.metrics.cdcUpdates, 1)
+			case "d":
+				if counted {
+					incrementCounter(b.cdcDeletes, batch.sms[i].Table, 1)
+				}
+				atomic.AddUint64(&b.metrics.cdcDeletes, 1)
+			}
+			if counted {
+				incrementCounter(b.cdcBytes, batch.sms[i].Table, cdcRowBytes(batch.sms[i]))
+			}
+		}
+		atomic.AddUint64(&b.metrics.processed, 1)
+	}
+
 	for i := range batch.rows {
 		m := batch.messages[i]
-		args := map[string]interface{}{
-			"config":    b.destCfg,
-			"table":     batch.targetTable,
-			"data":      []map[string]interface{}{batch.rows[i]},
-			"operation": op,
-			"kafka_offset": map[string]interface{}{
-				"pipeline_id": b.cfg.PipelineID,
-				"topic":       m.Topic,
-				"partition":   m.Partition,
-				"offset":      m.Offset,
-			},
+		if skip[i] {
+			rowLanded(i, m)
+			continue
 		}
-		if len(batch.keyFields) > 0 {
+		// The partition's floor once this row lands — and never past this batch's own
+		// rows still to come, which have not landed yet.
+		durable := b.gate.floorIfLanded(batch.topic, batch.partition, batch.firstOffset, m.Offset)
+		if i+1 < len(batch.messages) {
+			durable = min(durable, batch.messages[i+1].Offset-1)
+		}
+		row := batch.rows[i]
+		toolBase, op := upsertTool, upsertOp
+		switch {
+		case appendMode && b.warehouse:
+			toolBase, op = "load", "insert"
+		case appendMode:
+			toolBase, op = "import_data", "insert"
+		case b.warehouse:
+			toolBase, op = "merge", "upsert"
+			if batch.kindOf(i) == cdcBatchDelete {
+				op = "delete"
+			}
+		case batch.kindOf(i) == cdcBatchDelete:
+			toolBase, op = relationalDeleteTool, "delete"
+		}
+		args := b.newCallArgs(batch, []map[string]interface{}{row}, op, []int{i})
+		args["kafka_offset"] = map[string]interface{}{
+			"pipeline_id": b.cfg.PipelineID,
+			"topic":       m.Topic,
+			"partition":   m.Partition,
+			"offset":      durable,
+		}
+		switch {
+		case appendMode:
+			if !b.warehouse {
+				args["column_types"] = mergeCDCIdentityColumnTypes(batch.columnTypes)
+			}
+		case b.warehouse:
+			args["primary_keys"] = batch.keyFields
+			args["key_fields"] = batch.keyFields
+		case toolBase == relationalDeleteTool:
 			args["key_fields"] = batch.keyFields
 			args["primary_key_fields"] = batch.keyFields
+		default:
+			if len(batch.keyFields) > 0 {
+				args["key_fields"] = batch.keyFields
+				args["primary_key_fields"] = batch.keyFields
+			}
+			// synthetic-PK path (decided once before the loop): tell upsert_data to compute
+			// and upsert on _rsync_row_hash, matching upsertTool/upsertOp above.
+			if useSyntheticPK {
+				args["synthetic_pk"] = true
+			}
+			if len(batch.columnTypes) > 0 {
+				args["column_types"] = batch.columnTypes
+			}
 		}
-		// synthetic-PK path (decided once before the loop): tell upsert_data to compute
-		// and upsert on _rsync_row_hash, matching toolBase/op above.
-		if useSyntheticPK {
-			args["synthetic_pk"] = true
-		}
-		if len(batch.columnTypes) > 0 {
-			args["column_types"] = batch.columnTypes
-		}
-		// Forward the destination namespace on the per-row write (batch.targetTable is
-		// bare); no-op when unset.
-		addNamespaceParam(args, batch.namespace)
 
 		var rowErr error
 		landed := false
@@ -2276,34 +2515,7 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 		}
 
 		if landed {
-			good++
-			if i < len(batch.sms) && batch.sms[i] != nil {
-				counted := true
-				if b.pgDB != nil {
-					counted = cdcAckCounts(persistCDCAckToPostgres(ctx, b.pgDB, batch.sms[i], 1, batch.targetTable, m.Topic, m.Partition, m.Offset))
-				}
-				switch strings.ToLower(strings.TrimSpace(batch.sms[i].CDCOp)) {
-				case "c":
-					if counted {
-						incrementCounter(b.cdcInserts, batch.sms[i].Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcInserts, 1)
-				case "r":
-					if counted {
-						incrementCounter(&b.metrics.cdcSnapshotRowsByTable, batch.sms[i].Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcReads, 1)
-				case "u":
-					if counted {
-						incrementCounter(b.cdcUpdates, batch.sms[i].Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcUpdates, 1)
-				}
-				if counted {
-					incrementCounter(b.cdcBytes, batch.sms[i].Table, cdcRowBytes(batch.sms[i]))
-				}
-			}
-			atomic.AddUint64(&b.metrics.processed, 1)
+			rowLanded(i, m)
 			continue
 		}
 
@@ -2353,11 +2565,9 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 	}
 
 	// Every row is now either written or parked in the DLQ → safe to commit the
-	// whole batch's offsets and advance the high-water mark.
-	_ = b.reader.CommitMessages(ctx, batch.messages...)
-	last := batch.messages[len(batch.messages)-1]
-	b.hw.advance(batch.topic, batch.partition, last.Offset)
-	atomic.StoreInt64(&b.metrics.lastCommittedOffset, last.Offset)
+	// whole batch's offsets and advance the high-water mark, to the partition's floor.
+	floor := b.gate.landed(ctx, batch.topic, batch.partition, batch.firstOffset, batch.lastOffset)
+	atomic.StoreInt64(&b.metrics.lastCommittedOffset, floor)
 	atomic.StoreInt64(&b.metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 	atomic.StoreInt64(&b.metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 	if len(batch.sms) > 0 {
@@ -2404,10 +2614,10 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 	// aws-s3, azure-blob); the deterministic object keys provide idempotency, so a
 	// redelivery overwrites the same key. This in-run check only avoids re-processing
 	// within a single run.
-	if b.hw.seen(msg.Topic, msg.Partition, msg.Offset) {
+	if b.gate.seen(msg.Topic, msg.Partition, msg.Offset) {
 		atomic.AddUint64(&b.metrics.skipped, 1)
 		logMsgEvent("debug", sm, msg, "cdc object-store dedup: offset at/below high-water, skipping")
-		_ = b.reader.CommitMessages(ctx, msg)
+		b.gate.handled(ctx, msg)
 		return
 	}
 
@@ -2435,7 +2645,7 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 			logf("error", "fatal dlq error: %v", dlqErr)
 			os.Exit(1)
 		}
-		_ = b.reader.CommitMessages(ctx, msg)
+		b.gate.handled(ctx, msg)
 		return
 	}
 
@@ -2447,7 +2657,7 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 			logf("error", "fatal dlq error: %v", dlqErr)
 			os.Exit(1)
 		}
-		_ = b.reader.CommitMessages(ctx, msg)
+		b.gate.handled(ctx, msg)
 		return
 	}
 
@@ -2522,10 +2732,11 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 		// No default prefix. A blank path_prefix means the bucket root — see
 		// tablePrefix. (This used to fall back to the literal "test-aws-s3".)
 		b.batches[key] = batch
+		b.gate.hold(msg.Topic, msg.Partition, msg.Offset)
 	}
 
 	// Flush on threshold BEFORE appending if we'd exceed max_events/max_bytes.
-	if len(batch.events) > 0 && (len(batch.events)+1 > b.params.maxEvents || batch.bytes+evtBytes > b.params.maxBytes) {
+	if len(batch.events) > 0 && ((b.params.maxEvents > 0 && len(batch.events)+1 > b.params.maxEvents) || batch.bytes+evtBytes > b.params.maxBytes) {
 		b.flushBatch(ctx, key, batch, "threshold_flush")
 		// Recreate batch after flush (flushBatch deletes/clears on success or DLQ).
 		batch = nil
@@ -2552,6 +2763,7 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 			}
 			// No default prefix — see the sibling construction above.
 			b.batches[key] = batch
+			b.gate.hold(msg.Topic, msg.Partition, msg.Offset)
 		}
 	}
 
@@ -2562,11 +2774,47 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 	batch.bytes += evtBytes
 	batch.lastOffset = msg.Offset
 	batch.lastAppendAt = now
+	held := bufferedChangeBytes(msg, sm, evt)
+	batch.heapBytes += held
+	b.budget.charge(held)
 
 	// Flush immediately if we hit thresholds exactly.
-	if len(batch.events) >= b.params.maxEvents || batch.bytes >= b.params.maxBytes {
+	if (b.params.maxEvents > 0 && len(batch.events) >= b.params.maxEvents) || batch.bytes >= b.params.maxBytes {
 		b.flushBatch(ctx, key, batch, "threshold_reached_flush")
 	}
+	b.enforceBudget(ctx)
+}
+
+// enforceBudget writes the largest open batches until the worker is back under its
+// buffer budget. Object flushes run inline on the consume goroutine, so nothing more
+// is fetched until this returns: the early write IS the fetch pause.
+func (b *cdcObjectBatcher) enforceBudget(ctx context.Context) {
+	for b.budget.over() {
+		key, batch := b.largestOpenBatch()
+		if batch == nil {
+			return
+		}
+		held := batch.heapBytes
+		b.flushBatch(ctx, key, batch, "memory_budget_flush")
+		if b.batches[key] == batch {
+			// The write did not land and the worker did not exit (only a test stubs
+			// that). Stop rather than spin on the same batch.
+			return
+		}
+		b.budget.noteEarlyFlush(batch.table, held)
+	}
+}
+
+// largestOpenBatch is the open batch holding the most heap, or nil when none is open.
+func (b *cdcObjectBatcher) largestOpenBatch() (string, *cdcObjectBatch) {
+	var bestKey string
+	var best *cdcObjectBatch
+	for key, batch := range b.batches {
+		if batch != nil && len(batch.events) > 0 && (best == nil || batch.heapBytes > best.heapBytes) {
+			bestKey, best = key, batch
+		}
+	}
+	return bestKey, best
 }
 
 func (b *cdcObjectBatcher) flushDue(ctx context.Context, now time.Time) {
@@ -2634,9 +2882,18 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 	} else if strings.TrimSpace(batch.bucket) != "" {
 		args["bucket"] = batch.bucket
 	}
+	// A batch in the map is held at its first offset (add holds it at creation); an
+	// oversized event's single-event batch never was.
+	heldAt := noHold
+	if b.batches[key] == batch {
+		heldAt = batch.firstOffset
+	}
 	if n := len(batch.messages); n > 0 {
-		first, last := batch.messages[0], batch.messages[n-1]
-		if md := cdcObjectMetadata(b.cfg.PipelineID, last.Topic, last.Partition, first.Offset, last.Offset); md != nil {
+		// The stamp is the partition's floor once this object lands, not its own last
+		// offset: get_cdc_offsets seeds the restart from the highest stamp, and a
+		// change another open batch still holds must not sit below it.
+		durable := b.gate.floorIfLanded(batch.topic, batch.partition, heldAt, batch.lastOffset)
+		if md := cdcObjectMetadata(b.cfg.PipelineID, batch.topic, batch.partition, batch.firstOffset, durable); md != nil {
 			args["object_metadata"] = md
 		}
 	}
@@ -2648,56 +2905,26 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 			lastErr = err
 		} else {
 			// Destination write succeeded. Object stores use deterministic keys for
-			// idempotency, so there is no per-destination offset table; the Postgres
-			// ledger write below is a best-effort audit only (non-fatal on error).
+			// idempotency, so there is no per-destination offset table; the counter
+			// write below only keeps the per-table totals restart-safe (non-fatal on
+			// error), in one statement for the whole batch.
 			ackOK := true
-			// Best-effort audit ledger for the ENTIRE batch in one (chunked) INSERT
-			// instead of one remote round-trip per message — the high-volume CDC
-			// throughput fix. Object stores use deterministic keys for idempotency
-			// (no offset table), so this ledger stays best-effort / non-fatal.
-			counted, ackErr := persistCDCAcksBatch(ctx, b.pgDB, batch.sms, batch.messages, destKey)
+			counted, ackErr := persistCDCCounts(ctx, b.pgDB, batch.sms, batch.messages)
 			if ackErr != nil {
-				logf("warning", "cdc ack-ledger batch write failed (non-fatal, audit only): %v", ackErr)
+				logf("warning", "cdc counter write failed (non-fatal, totals restart from the last stored value): %v", ackErr)
 			}
 
-			// Update per-table CDC counters (in-memory), skipping messages the ledger
-			// already held: a replay after a restart rewrites the same objects and
-			// must not count the same rows twice.
-			for i, sm := range batch.sms {
-				switch strings.ToLower(strings.TrimSpace(sm.CDCOp)) {
-				case "c":
-					if counted[i] {
-						incrementCounter(b.cdcInserts, sm.Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcInserts, 1)
-				case "r":
-					if counted[i] {
-						incrementCounter(&b.metrics.cdcSnapshotRowsByTable, sm.Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcReads, 1)
-				case "u":
-					if counted[i] {
-						incrementCounter(b.cdcUpdates, sm.Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcUpdates, 1)
-				case "d":
-					if counted[i] {
-						incrementCounter(b.cdcDeletes, sm.Table, 1)
-					}
-					atomic.AddUint64(&b.metrics.cdcDeletes, 1)
-				}
-				if counted[i] {
-					incrementCounter(b.cdcBytes, sm.Table, cdcRowBytes(sm))
-				}
-			}
+			// Update per-table CDC counters (in-memory), once per flush, skipping
+			// replays: a replay after a restart rewrites the same objects and must not
+			// count the same rows twice.
+			tallyLandedCDC(batch.sms, counted).apply(b.metrics, b.cdcInserts, b.cdcUpdates, b.cdcDeletes, b.cdcBytes)
 
 			if ackOK {
 				// Commit Kafka offsets only after flush succeeds, then advance the
-				// in-memory high-water mark.
-				_ = b.reader.CommitMessages(ctx, batch.messages...)
-				last := batch.messages[len(batch.messages)-1]
-				b.hw.advance(last.Topic, last.Partition, last.Offset)
-				atomic.StoreInt64(&b.metrics.lastCommittedOffset, last.Offset)
+				// in-memory high-water mark — to the partition's safe floor, never past
+				// a change another open batch still holds.
+				floor := b.gate.landed(ctx, batch.topic, batch.partition, heldAt, batch.lastOffset)
+				atomic.StoreInt64(&b.metrics.lastCommittedOffset, floor)
 				atomic.StoreInt64(&b.metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 				atomic.StoreInt64(&b.metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 
@@ -2709,7 +2936,12 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 				noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table), loadCounter(&b.metrics.cdcSnapshotRowsByTable, lastSM.Table)))
 
 				atomic.AddUint64(&b.metrics.processed, uint64(len(batch.events)))
-				delete(b.batches, key)
+				// Only the batch this key holds leaves the map: an oversized event's
+				// single-event batch (never in the map, never charged) shares its key.
+				if b.batches[key] == batch {
+					delete(b.batches, key)
+				}
+				b.budget.refund(batch.heapBytes)
 				return
 			}
 		}
@@ -3706,6 +3938,18 @@ const (
 	// is, so that flushDue treats every buffered batch as due and writes it before the
 	// worker exits.
 	shutdownDrainFlushHorizon = time.Hour
+
+	// defaultObjectFlushInterval is how long the object batcher holds a table's changes
+	// when no setting says otherwise: the 240s ceiling, so a quiet table still lands
+	// inside the 300s window explained above while a busy one rolls on bytes first.
+	// connector.py's DEFAULT_FLUSH_INTERVAL_SECONDS names it in its refusal; both are
+	// pinned to default_seconds in testdata/flush_interval_cases.json.
+	defaultObjectFlushInterval = maxObjectFlushIntervalSeconds * time.Second
+	// defaultObjectFileMaxBytes rolls a file at 32 MiB of bronze JSON, before
+	// compression — the size AWS DMS's S3 target waits for (CdcMinFileSize, 32000 KB).
+	// The per-worker buffer budget (cdc_buffer_budget.go) bounds what many such open
+	// files hold together.
+	defaultObjectFileMaxBytes = 32 << 20
 )
 
 // objectFlushIntervalOverride reads max_file_interval_seconds from a destination
@@ -3733,8 +3977,8 @@ func objectFlushIntervalOverride(destCfg map[string]interface{}) (time.Duration,
 		if len(got) > 32 {
 			got = got[:32] + "..."
 		}
-		return 0, false, fmt.Errorf("%s must be a whole number of seconds from %d to %d (got %q). Clear the setting to use the 30-second default",
-			objectFlushIntervalKey, minObjectFlushIntervalSeconds, maxObjectFlushIntervalSeconds, got)
+		return 0, false, fmt.Errorf("%s must be a whole number of seconds from %d to %d (got %q). Clear the setting to use the %d-second default",
+			objectFlushIntervalKey, minObjectFlushIntervalSeconds, maxObjectFlushIntervalSeconds, got, int64(defaultObjectFlushInterval/time.Second))
 	}
 	var n int64
 	switch v := raw.(type) {
@@ -3784,8 +4028,8 @@ func objectFlushIntervalOverride(destCfg map[string]interface{}) (time.Duration,
 // the restart would drop the buffer and redeliver the same records, and the timer
 // would start again: no loss, but the file would never be written. The window covers
 // the interval plus the time the flush itself may take (consumeLoopAliveWindow). A
-// disabled watchdog (0) stays disabled. With the 30s default this is exactly the 60s
-// default window.
+// disabled watchdog (0) stays disabled. With the 240s default interval the 60s default
+// window widens to 240s plus consumeLoopAliveWindow.
 func stallWindowCoveringFlush(stall, flushInterval time.Duration) time.Duration {
 	if stall <= 0 || flushInterval <= 0 {
 		return stall
@@ -3797,14 +4041,18 @@ func stallWindowCoveringFlush(stall, flushInterval time.Duration) time.Duration 
 }
 
 // consumerStallWindow is the window main() arms the stall watchdog with: the operator's
-// RSYNC_SINK_STALL_WATCHDOG_SECONDS window, widened by stallWindowCoveringFlush when this
-// worker batches CDC changes for object storage (cdcBatcher is nil otherwise).
-func consumerStallWindow(cdcBatcher *cdcObjectBatcher) time.Duration {
-	stall := stallWatchdogTimeout()
-	if cdcBatcher == nil {
-		return stall
+// RSYNC_SINK_STALL_WATCHDOG_SECONDS window, widened by stallWindowCoveringFlush to the
+// flush interval of whichever batcher this worker runs (object storage, or a relational
+// or warehouse destination; each is nil when unused).
+func consumerStallWindow(cdcBatcher *cdcObjectBatcher, dbBatcher *cdcDBBatcher) time.Duration {
+	var interval time.Duration
+	if cdcBatcher != nil {
+		interval = cdcBatcher.params.flushInterval
 	}
-	return stallWindowCoveringFlush(stall, cdcBatcher.params.flushInterval)
+	if dbBatcher != nil && dbBatcher.params.flushInterval > interval {
+		interval = dbBatcher.params.flushInterval
+	}
+	return stallWindowCoveringFlush(stallWatchdogTimeout(), interval)
 }
 
 // drainForShutdown writes every buffered batch, however recently it was opened, before
@@ -3878,6 +4126,9 @@ func main() {
 
 	gPipelineID.Store(strings.TrimSpace(cfg.PipelineID))
 	gExecutionID.Store(strings.TrimSpace(cfg.ExecutionID))
+	if !transforms.PIIHashKeyConfigured() {
+		logf("warning", "Startup check: %s", transforms.PIIHashKeyUnsetWarning)
+	}
 
 	metrics := &Metrics{startedAt: time.Now()}
 	// Graceful shutdown: cancel ctx on SIGINT/SIGTERM so in-flight retry loops
@@ -3987,11 +4238,14 @@ func main() {
 	// live broker it left the wedge rate unchanged (1/6 without, 4/18 with), because
 	// the wedge also happens when the topic is demonstrably present at join time.
 	// The remedy for that is watchConsumerStall below.
-	waitForTopicPartitions(cfg.KafkaBootstrapServers, groupTopics, topicResolveTimeout())
+	if !waitForTopicPartitions(ctx, cfg.KafkaBootstrapServers, groupTopics, topicResolveTimeout()) {
+		logf("info", "shutdown requested while waiting for subscribed topics; exiting without joining")
+		return
+	}
 
 	// Split, not wrapped: []string{cfg.KafkaBootstrapServers} made a multi-broker
 	// CSV one unresolvable hostname. Dialer carries TLS/SASL.
-	readerDialer, rderr := kafkaDialer(cfg.KafkaBootstrapServers)
+	readerDialer, rderr := groupReaderDialer(cfg.KafkaBootstrapServers)
 	if rderr != nil {
 		logf("error", "kafka dialer: %v", rderr)
 		os.Exit(2)
@@ -4031,42 +4285,14 @@ func main() {
 		StartOffset:            startOffset(cfg),
 	})
 	defer reader.Close()
+	// Every offset commit and high-water advance goes through the gate, which never
+	// marks a partition past a change an open batch still holds (cdc_commit_gate.go).
+	gate := newCommitGate(reader.CommitMessages, tracker)
 
-	eventsWriter := &kafka.Writer{
-		Addr:                   brokerAddr(cfg.KafkaBootstrapServers),
-		Transport:              kafkaTransport(),
-		Topic:                  kafkaclient.Topic("pipeline.domain.events"),
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		RequiredAcks:           kafka.RequireAll,
-	}
+	eventsWriter := newEventsWriter(cfg)
 	defer eventsWriter.Close()
 
-	// NOTE: Do not pin DLQ to a single topic; route per-message to "<source_topic>.dlq".
-	dlqBrokers := cfg.KafkaBootstrapServers
-	if strings.TrimSpace(cfg.DLQBootstrapServers) != "" {
-		dlqBrokers = strings.TrimSpace(cfg.DLQBootstrapServers)
-	}
-	dlqWriter := &kafka.Writer{
-		Addr:                   brokerAddr(dlqBrokers),
-		Transport:              kafkaTransport(),
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		RequiredAcks:           kafka.RequireAll,
-		// Fail-closed SLA: when the DLQ broker is unreachable the worker must halt
-		// quickly (orchestration surfaces the failure). kafka-go's defaults
-		// (WriteTimeout 10s, MaxAttempts 10) let a single WriteMessages block ~10s;
-		// sendToDLQ then retries it 3x, so a down DLQ took ~40s to fail — past the
-		// 30s halt SLA, leaving the pipeline looking alive. Bound it: each publish
-		// caps at 3s and does not internally retry, so the sendToDLQ retry budget
-		// exhausts in ~12s and the caller can os.Exit fail-closed well within SLA.
-		// Async stays false (the default) so WriteMessages returns the real error
-		// synchronously rather than buffering it; we set it explicitly to document
-		// that the fail-closed contract depends on synchronous writes.
-		WriteTimeout: 3 * time.Second,
-		MaxAttempts:  1,
-		Async:        false,
-	}
+	dlqWriter := newDLQWriter(cfg)
 	defer dlqWriter.Close()
 
 	// Dedicated transport: the sink streams many batches to the SAME destination
@@ -4099,6 +4325,17 @@ func main() {
 		ddl.Drift = driftWriter
 	}
 
+	// An API destination's key map (api_dest_rows.go): source row → the record the
+	// API made for it. Without the platform database nothing is mapped, so a re-run
+	// creates every record again and a Reload deletes none — say so once.
+	var apiStore apiRecordStore = noAPIRecords{}
+	if pgDB != nil {
+		apiStore = pgAPIRecords{db: pgDB, metrics: metrics}
+	} else if apiRecordWrites(ctx, httpClient, cfg, ddl, destType) {
+		logf("warning", "no platform database: API destination %s has no key map — a re-run creates every record again and a Reload deletes none", destType)
+	}
+	apiWriter := newAPIRowWriter(httpClient, cfg, destType, apiStore)
+
 	// Seed the high-water tracker from the destination's durable offset table so a
 	// restart skips any offsets already written (exactly-once on recovery). Tier-C
 	// object stores list this pipeline's objects and read the rsync_* metadata stamped
@@ -4123,11 +4360,14 @@ func main() {
 	var tableCDCDeletes sync.Map // map[string]int64
 	var tableCDCBytes sync.Map   // map[string]int64 — cumulative committed bytes per table
 
-	// Start the counters from the ack ledger, not from zero. They are cumulative and
-	// the projector keeps the larger of the stored and reported value, so a restart
-	// that began at zero froze a table's count below what had really been delivered.
+	// Start the counters from the stored totals, not from zero. They are cumulative
+	// and the projector keeps the larger of the stored and reported value, so a
+	// restart that began at zero froze a table's count below what had really been
+	// delivered. The offset floors seeded alongside them mark what the totals already
+	// hold, so a replay after the restart is not counted again (cdc_counter_ledger.go).
+	cdcFloors := newCDCFloorTracker()
 	if pgDB != nil && !strings.EqualFold(strings.TrimSpace(cfg.SinkMode), "batch") {
-		seedCDCCountersFromLedger(ctx, pgDB, cfg.PipelineID, cdcStatsExecutionID(cfg), &tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &metrics.cdcSnapshotRowsByTable)
+		seedCDCCounters(ctx, pgDB, cfg.PipelineID, cdcStatsExecutionID(cfg), cdcFloors, &tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &metrics.cdcSnapshotRowsByTable)
 	}
 
 	// Track written object keys per table so we can emit _MANIFEST.json + _SUCCESS at EOF.
@@ -4153,13 +4393,14 @@ func main() {
 
 	// CDC micro-batching for object storage destinations (append-only bronze).
 	// When enabled, offsets are committed ONLY after a flush succeeds.
-	cdcBatcher := newCDCObjectBatcher(cfg, destType, reader, tracker, pgDB, httpClient, eventsWriter, dlqWriter, metrics, dedup.ttl,
+	cdcBatcher := newCDCObjectBatcher(cfg, destType, gate, pgDB, httpClient, eventsWriter, dlqWriter, metrics, dedup.ttl,
 		&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes)
 
-	// CDC bulk-batching for relational DB destinations (PostgreSQL, MySQL, …).
-	// Accumulates up to 1000 rows per (topic|partition|table), flushes every 5 s or on threshold.
-	// Returns nil for object-storage / warehouse / non-CDC destinations so the caller is safe to nil-check.
-	dbBatcher := newCDCDBBatcher(cfg, destType, reader, tracker, pgDB, httpClient, ddl, eventsWriter, dlqWriter, metrics, dedup.ttl,
+	// CDC bulk-batching for relational DB and warehouse destinations (cdc_batch_apply.go).
+	// One batch per (topic|partition|table), flushed on its row / byte cap or interval
+	// (relational 2000 rows / 5 s, warehouse 10000 rows / 60 s, or the destination's
+	// batch_* settings). Returns nil for object storage so the caller is safe to nil-check.
+	dbBatcher := newCDCDBBatcher(cfg, destType, gate, pgDB, httpClient, ddl, eventsWriter, dlqWriter, metrics, dedup.ttl,
 		&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes)
 
 	// Stall watchdog: a kafka-go member that is handed an empty partition assignment
@@ -4171,7 +4412,7 @@ func main() {
 	// destination-outage hold reads as a wedge.
 	activity := newConsumerActivity(time.Now())
 	go watchConsumerStall(ctx, cfg.KafkaBootstrapServers, cfg.ConsumerGroup, groupTopics,
-		startOffset(cfg) == kafka.FirstOffset, activity, consumerStallWindow(cdcBatcher),
+		startOffset(cfg) == kafka.FirstOffset, activity, consumerStallWindow(cdcBatcher, dbBatcher),
 		func(detail string) {
 			gStallRestart.Store(true)
 			logEvent("error",
@@ -4183,6 +4424,8 @@ func main() {
 		})
 
 	for {
+		// Every pass, message or idle poll: write the transform audit once a window has passed.
+		cdcTransformAudit.writeDue(ctx, pgDB, time.Now())
 		// Use a short poll timeout so we can flush due CDC batches even when the topic is quiet.
 		activity.pollTick()
 		fetchCtx, cancelFetch := context.WithTimeout(ctx, 1*time.Second)
@@ -4217,6 +4460,7 @@ func main() {
 				if cdcBatcher != nil {
 					cdcBatcher.drainForShutdown(drainCtx, time.Now().UTC())
 				}
+				cdcTransformAudit.write(drainCtx, pgDB, time.Now())
 				drainCancel()
 				if gStallRestart.Load() {
 					// Not a clean stop: leave a non-zero code so the supervisor
@@ -4247,8 +4491,7 @@ func main() {
 				logf("error", "fatal dlq error: %v", dlqErr)
 				os.Exit(1)
 			}
-			_ = reader.CommitMessages(ctx, msg)
-			atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+			atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
 		}
@@ -4256,8 +4499,7 @@ func main() {
 
 		if sm.Ignore {
 			logMsgEvent("debug", sm, msg, "message marked ignore (tombstone/bootstrap), committing and skipping")
-			_ = reader.CommitMessages(ctx, msg)
-			atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+			atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
@@ -4269,6 +4511,7 @@ func main() {
 			// For object storage destinations: write _MANIFEST.json and _SUCCESS markers for the partition.
 			destType := canonicalConnectorType(cfg.DestinationConnector)
 			looksLikeObjectStorage := isObjectStorageConnector(destType)
+			filesFinal := noFileCount
 			if looksLikeObjectStorage {
 				st := ensureWriteState(writeStates, sm)
 
@@ -4280,6 +4523,7 @@ func main() {
 						keys, counts = k2, c2
 					}
 				}
+				filesFinal = objectFileCount(true, keys)
 
 				if len(keys) > 0 && len(keys) == len(counts) {
 					destCfg := cfg.DestinationConfig
@@ -4365,8 +4609,7 @@ func main() {
 							logf("error", "fatal dlq error: %v", dlqErr)
 							os.Exit(1)
 						}
-						_ = reader.CommitMessages(ctx, msg)
-						atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+						atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 						atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 						atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 						continue
@@ -4411,8 +4654,7 @@ func main() {
 							logf("error", "fatal dlq error: %v", dlqErr)
 							os.Exit(1)
 						}
-						_ = reader.CommitMessages(ctx, msg)
-						atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+						atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 						atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 						atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 						continue
@@ -4431,10 +4673,9 @@ func main() {
 				finalStatus = "degraded"
 			}
 			bytesFinal := loadMax(&tableMaxBytes, execTableKey)
-			noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", finalStatus, read, written, bytesFinal))
+			noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", finalStatus, read, written, bytesFinal, filesFinal))
 			atomic.AddUint64(&metrics.processed, 1)
-			_ = reader.CommitMessages(ctx, msg)
-			atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+			atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
@@ -4442,6 +4683,9 @@ func main() {
 
 		// Handle CDC events differently from batch
 		if sm.IsCDC {
+			// Decide here, in consume order, whether landing this message adds to the
+			// counters: the object batcher can flush a partition's batches out of order.
+			markCDCReplay(cdcFloors, sm, msg)
 			// For object storage destinations, prefer micro-batching and commit offsets on flush.
 			if cdcBatcher != nil {
 				// Apply consumer-hop transforms (masking / type-convert) BEFORE batching.
@@ -4461,7 +4705,7 @@ func main() {
 								logf("error", "fatal dlq error: %v", dlqErr)
 								os.Exit(1)
 							}
-							_ = reader.CommitMessages(ctx, msg)
+							gate.handled(ctx, msg)
 							continue
 						}
 						logMsgEvent("error", sm, msg, "cdc object-store consumer transform failed (no DLQ, will retry)", "reason", tErr.Error())
@@ -4479,98 +4723,30 @@ func main() {
 				continue
 			}
 
-			// For relational DB destinations, batch inserts/updates; process deletes immediately
-			// (a delete must flush any buffered rows for the same table first to preserve ordering).
+			// Relational and warehouse destinations: every change the batch can represent
+			// goes into it — upserts, deletes and append-only rows alike (cdc_batch_apply.go).
+			// Anything admit declines takes the single-event path below, after this table's
+			// open batch is flushed, so the order of changes to a table never changes.
 			if dbBatcher != nil {
-				// Append-only history mode routes EVERY op (c/r/u/d) through the single-event
-				// processCDCEvent → writeCDCToDestination path — the only append-aware writer
-				// (it forces <dest>_import_data, injects _rsync_cdc_* via withCDCIdentity, sends
-				// NO key_fields, and types the identity columns via mergeCDCIdentityColumnTypes).
-				// The cdcDBBatcher is upsert-only: it would write via <dest>_upsert_data keyed on
-				// the business PK, never populate identity values, and create a unique index that
-				// breaks the delete-tombstone insert. Default (upsert) mode keeps batching c/r/u
-				// unchanged; only deletes take the single-event path as before.
-				if sm.CDCOp == "d" || cdcAppendMode(cfg) {
-					// Flush any buffered rows for this table first to preserve ordering.
-					// (In append mode the batcher never accumulates, so this is a no-op then.)
-					flushed := dbBatcher.flushTable(ctx, msg.Topic, msg.Partition, sm.Table)
-					// KI-CDC-DELETE-PATH-UNLOGGED: record the ordering barrier itself.
-					// Gated on CDCOp == "d" because this branch is also entered for every
-					// op in append mode (see the comment above), where the batcher never
-					// accumulates and the flush is a no-op.
-					//
-					// Emitted even when nothing was flushed: rows_flushed=0 is itself the
-					// answer when investigating whether a delete raced its own table's
-					// buffered upserts.
-					if sm.CDCOp == "d" {
-						logMsgEvent("info", sm, msg, "cdc pre-delete flush",
-							"flush_reason", "pre_delete_flush",
-							"rows_flushed", flushed)
-					}
-					commit, err := processCDCEvent(ctx, tracker, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
-						&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes, dedup.ttl)
-					if err != nil {
-						metrics.setErr(err)
-						if isFatal(err) {
-							logf("error", "fatal cdc error (single-event): %v", err)
-							os.Exit(1)
-						}
-					}
-					// IN-PLACE bounded retry: re-process the SAME event on a transient failure;
-					// a continue-based retry never re-attempts it (FetchMessage advances forward,
-					// never redelivering an uncommitted offset in-session).
-					for attempt := 2; !commit && err != nil && !isPoison(err) && attempt <= maxBatchAttempts; attempt++ {
-						backoff := time.Duration(attempt-1) * 2 * time.Second
-						logf("warning", "cdc single-event failed (attempt %d/%d, retrying in %s): %v",
-							attempt-1, maxBatchAttempts, backoff, err)
-						if !ctxAwareSleep(ctx, backoff) {
-							return
-						}
-						commit, err = processCDCEvent(ctx, tracker, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
-							&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes, dedup.ttl)
-						if err != nil {
-							metrics.setErr(err)
-							if isFatal(err) {
-								logf("error", "fatal cdc error (single-event): %v", err)
-								os.Exit(1)
-							}
-						}
-					}
-					if commit {
-						delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-						_ = reader.CommitMessages(ctx, msg)
-						atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
-						atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
-					} else if err != nil {
-						if isPoison(err) {
-							logf("info", "cdc single-event is a poison message (not retryable), DLQ + commit to advance: %v", err)
-						} else {
-							logf("info", "cdc single-event failed %d times, DLQ + commit: %v", maxBatchAttempts, err)
-						}
-						if dlqErr := sendToDLQ(ctx, dlqWriter, msg, err, metrics, sm.Table); dlqErr != nil {
-							logf("error", "fatal dlq error: %v", dlqErr)
-							os.Exit(1)
-						}
-						delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-						_ = reader.CommitMessages(ctx, msg)
-						atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
-						atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
-					}
-				} else {
-					// Insert / update / snapshot read — accumulate in the batch (upsert mode only).
-					// Apply consumer-hop transforms (masking / type-convert) BEFORE batching.
-					// The relational CDC upsert-batcher path previously bypassed
-					// applyConsumerTransforms entirely (only the delete/append processCDCEvent
-					// path and the object-storage lane called it), so a pipeline configured to
-					// mask PII wrote PLAINTEXT to the relational destination for every c/u/r
-					// (insert/update/snapshot-read) event — a silent data-privacy leak, invisible
-					// to the #617 transform-monitoring rollup because no transform_execution_logs
-					// row was ever written. applyConsumerTransforms mutates sm.Data and re-syncs
-					// the CDC envelope (sm.After) for c/u/r ops; the sm.IsCDC guard passes here
-					// (this is inside the CDC branch), so the transform actually applies. Fail-
-					// closed: never batch untransformed data — mirror the object-storage lane above.
-					if pgDB != nil {
-						if tErr := applyConsumerTransforms(ctx, pgDB, cfg, sm); tErr != nil {
+				// Apply consumer-hop transforms (masking / type-convert) BEFORE batching:
+				// the chain can turn an update into a delete (a filter the updated row no
+				// longer passes), and admit must see the op that results. A message
+				// rewritten here is not rewritten again by processCDCEvent.
+				// The relational CDC upsert-batcher path previously bypassed
+				// applyConsumerTransforms entirely (only the delete/append processCDCEvent
+				// path and the object-storage lane called it), so a pipeline configured to
+				// mask PII wrote PLAINTEXT to the relational destination for every c/u/r
+				// (insert/update/snapshot-read) event — a silent data-privacy leak, invisible
+				// to the #617 transform-monitoring rollup because no transform_execution_logs
+				// row was ever written. applyConsumerTransforms mutates sm.Data and re-syncs
+				// the CDC envelope (sm.After) for c/u/r ops; the sm.IsCDC guard passes here
+				// (this is inside the CDC branch), so the transform actually applies. Fail-
+				// closed: never batch untransformed data — mirror the object-storage lane above.
+				opBefore := sm.CDCOp
+				admit := true
+				if pgDB != nil {
+					if tErr := applyConsumerTransforms(ctx, pgDB, cfg, sm); tErr != nil {
+						if !dbBatcher.warehouse && opBefore != "d" && !cdcAppendMode(cfg) {
 							atomic.AddUint64(&metrics.failed, 1)
 							metrics.setErr(tErr)
 							if dlqWriter != nil {
@@ -4578,26 +4754,49 @@ func main() {
 									logf("error", "fatal dlq error: %v", dlqErr)
 									os.Exit(1)
 								}
-								_ = reader.CommitMessages(ctx, msg)
+								gate.handled(ctx, msg)
 								continue
 							}
 							logMsgEvent("error", sm, msg, "cdc relational upsert consumer transform failed (no DLQ, will retry)", "reason", tErr.Error())
 							continue
 						}
+						// Deletes, append-only rows and warehouses failed a transform on the
+						// single-event path before batching existed; they still do, with its
+						// in-place retry and DLQ.
+						admit = false
 					}
-					dbBatcher.add(ctx, msg, sm)
+				}
+				if admit && dbBatcher.add(ctx, msg, sm) {
 					// Opportunistic interval flush even under constant load.
 					dbBatcher.flushDue(ctx, time.Now().UTC())
+					atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
+					if sm.SourceTS > 0 {
+						atomic.StoreInt64(&metrics.lastSourceTSUnixMs, sm.SourceTS)
+						atomic.StoreInt64(&metrics.lastSourceLagMs, time.Now().UTC().UnixMilli()-sm.SourceTS)
+					}
+					continue
 				}
-				atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
-				if sm.SourceTS > 0 {
-					atomic.StoreInt64(&metrics.lastSourceTSUnixMs, sm.SourceTS)
-					atomic.StoreInt64(&metrics.lastSourceLagMs, time.Now().UTC().UnixMilli()-sm.SourceTS)
+				// Flush any buffered rows for this table first to preserve ordering.
+				flushed := dbBatcher.flushTable(ctx, msg.Topic, msg.Partition, sm.Table)
+				// KI-CDC-DELETE-PATH-UNLOGGED: record the ordering barrier itself.
+				// Emitted even when nothing was flushed: rows_flushed=0 is itself the
+				// answer when investigating whether a delete raced its own table's
+				// buffered upserts.
+				if sm.CDCOp == "d" {
+					logMsgEvent("info", sm, msg, "cdc pre-delete flush",
+						"flush_reason", "pre_delete_flush",
+						"rows_flushed", flushed)
 				}
-				continue
+				if dbBatcher.warehouse {
+					// The single-event merge stages through the same table as a flush of
+					// this table's other partitions; let every lane finish first.
+					dbBatcher.lanes.waitAll()
+				}
+				// Falls through to the single-event path: in-place retry, the
+				// infrastructure / auth hold, then DLQ.
 			}
 
-			commit, err := processCDCEvent(ctx, tracker, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
+			commit, err := processCDCEvent(ctx, gate, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
 				&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes, dedup.ttl)
 			if err != nil {
 				metrics.setErr(err)
@@ -4619,7 +4818,7 @@ func main() {
 				if !ctxAwareSleep(ctx, backoff) {
 					return
 				}
-				commit, err = processCDCEvent(ctx, tracker, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
+				commit, err = processCDCEvent(ctx, gate, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
 					&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes, dedup.ttl)
 				if err != nil {
 					metrics.setErr(err)
@@ -4648,7 +4847,7 @@ func main() {
 			if !commit && err != nil && isDestInfraFault(err) {
 				var landed bool
 				err, landed = holdForInfraFault(ctx, "cdc single event", sm.Table, err, func() error {
-					c, e := processCDCEvent(ctx, tracker, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
+					c, e := processCDCEvent(ctx, gate, pgDB, httpClient, cfg, ddl, eventsWriter, dlqWriter, msg, sm, metrics,
 						&tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &tableCDCBytes, dedup.ttl)
 					if e != nil {
 						metrics.setErr(e)
@@ -4674,8 +4873,7 @@ func main() {
 			}
 			if commit {
 				delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-				_ = reader.CommitMessages(ctx, msg)
-				atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+				atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 				atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			} else if err != nil {
 				// Exhausted maxBatchAttempts → poison message: DLQ + commit so we advance.
@@ -4688,8 +4886,7 @@ func main() {
 					os.Exit(1)
 				}
 				delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-				_ = reader.CommitMessages(ctx, msg)
-				atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+				atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 				atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			}
 			atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
@@ -4746,8 +4943,7 @@ func main() {
 			if skipDup {
 				// Ack already exists -> redelivery after a lost offset commit; skip + advance.
 				atomic.AddUint64(&metrics.skipped, 1)
-				_ = reader.CommitMessages(ctx, msg)
-				atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+				atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 				atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 				atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 				continue
@@ -4802,8 +4998,7 @@ func main() {
 					os.Exit(1)
 				}
 				delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-				_ = reader.CommitMessages(ctx, msg)
-				atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+				atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 				atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 				atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 				continue
@@ -4827,10 +5022,10 @@ func main() {
 			readSoFar := addAndLoad(&tableMaxRead, execTableKey, 1)
 			writtenSoFar := addAndLoad(&tableMaxWritten, execTableKey, 1)
 			bytesSoFar := addAndLoad(&tableMaxBytes, execTableKey, committedBatchBytes(sm, 1))
-			noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", "running", readSoFar, writtenSoFar, bytesSoFar))
+			// One blob is one object copied, so the objects so far are the rows so far.
+			noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", "running", readSoFar, writtenSoFar, bytesSoFar, writtenSoFar))
 			atomic.AddUint64(&metrics.processed, 1)
-			_ = reader.CommitMessages(ctx, msg)
-			atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+			atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
@@ -4869,7 +5064,7 @@ func main() {
 					logf("error", "fatal dlq error: %v", dlqErr)
 					os.Exit(1)
 				}
-				_ = reader.CommitMessages(ctx, msg)
+				gate.handled(ctx, msg)
 				continue
 			}
 			// Claim-check (MinIO) messages never populate sm.Data in parseSinkMessage
@@ -4928,7 +5123,7 @@ func main() {
 						logf("error", "fatal dlq error: %v", dlqErr)
 						os.Exit(1)
 					}
-					_ = reader.CommitMessages(ctx, msg)
+					gate.handled(ctx, msg)
 					continue
 				}
 				// No DLQ configured: leave the offset uncommitted so kafka-go redelivers
@@ -4945,9 +5140,13 @@ func main() {
 		looksLikeObjectStorage := isObjectStorageConnector(destType)
 		st := ensureWriteState(writeStates, sm)
 		v2Batch := looksLikeObjectStorage && objectLayoutV2BatchEnabled(cfg, sm)
+		// A destination that names its records (a generated REST API) is written row by
+		// row through its key map and has no table to drop. The gateway refuses a Reload
+		// into one (reverse ETL); one that still arrives updates in place, deletes nothing.
+		apiRows := apiRecordWrites(ctx, httpClient, cfg, ddl, destType)
 		// Only attempt cleanup at the beginning of a table's batch stream. Layout v2 does
 		// its own clean (a new generation of the table folder) in the write loop below.
-		if !v2Batch && st.runMode == "reload" && !st.reloadCleaned && sm.BatchOffset == 0 {
+		if !v2Batch && !apiRows && st.runMode == "reload" && !st.reloadCleaned && sm.BatchOffset == 0 {
 			destCfg := cfg.DestinationConfig
 
 			if looksLikeObjectStorage {
@@ -5101,7 +5300,52 @@ func main() {
 		} else {
 			writeUnits = []objectWriteUnit{{rows: rows, partSegs: "", partSuffix: ""}}
 		}
-		for attempt := 1; attempt <= maxBatchAttempts; attempt++ {
+		// An API destination answers row by row, so the batch is acked row by row: the
+		// rows it wrote count as landed, only the rows it refused go to the DLQ (as an
+		// inline copy holding just those rows), and the ack carries why. Retries happen
+		// per row inside writeRows, so the whole-batch loop below does not run.
+		apiAcked := false
+		if apiRows {
+			targetTable := apiTargetTable(cfg, destType, sm)
+			res, apiErr := apiWriter.writeRows(ctx, apiScopeFor(sm, targetTable), sm.ExecutionID,
+				rows, sm.KeyFields, apiWriteParams(cfg, sm, targetTable))
+			if apiErr != nil {
+				// Only ctx-cancel (shutdown): the key map retries until it lands. Leave the
+				// offset uncommitted; the redelivery updates the records this one made.
+				logMsgEvent("error", sm, msg, "api destination write stopped (offset left uncommitted)", "reason", apiErr.Error())
+				return
+			}
+			for _, w := range res.warnings {
+				logMsgEvent("warning", sm, msg, w)
+			}
+			writtenRows = res.written
+			if len(res.failedRows) > 0 {
+				failErr := errors.New(res.errText)
+				atomic.AddUint64(&metrics.failed, 1)
+				metrics.setErr(failErr)
+				logMsgEvent("warning", sm, msg, "api destination refused rows: acking the rest, DLQ'ing these",
+					"written", fmt.Sprintf("%d", res.written), "failed", fmt.Sprintf("%d", len(res.failedRows)), "reason", res.errText)
+				if pgDB != nil {
+					if ackErr := persistPartialBatchAckToPostgresWithRetry(ctx,
+						pgDB, sm, writtenRows, rowsRead, res.errText,
+						msg.Topic, msg.Partition, msg.Offset, metrics); ackErr != nil {
+						return
+					}
+				}
+				if dlqErr := sendToDLQ(ctx, dlqWriter, dlqMessageForRows(msg, res.failedRows), failErr, metrics, sm.Table); dlqErr != nil {
+					logf("error", "fatal dlq error: %v", dlqErr)
+					os.Exit(1)
+				}
+			} else if pgDB != nil {
+				if ackErr := persistBatchAckToPostgresWithRetry(ctx,
+					pgDB, sm, writtenRows, rowsRead, "",
+					msg.Topic, msg.Partition, msg.Offset, metrics); ackErr != nil {
+					return
+				}
+			}
+			apiAcked = true
+		}
+		for attempt := 1; !apiAcked && attempt <= maxBatchAttempts; attempt++ {
 			writtenRows = 0
 			destKeys = destKeys[:0]
 			destCounts = destCounts[:0]
@@ -5175,8 +5419,7 @@ func main() {
 				os.Exit(1)
 			}
 			delete(batchAttempts, batchAttemptKey{partition: msg.Partition, offset: msg.Offset})
-			_ = reader.CommitMessages(ctx, msg)
-			atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+			atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
@@ -5209,8 +5452,8 @@ func main() {
 		// until either the ack lands or the worker is shut down. The
 		// partition stalls during a sustained Postgres outage — an
 		// observable, recoverable failure that is strictly better than
-		// silent duplicates.
-		if pgDB != nil {
+		// silent duplicates. (An API destination's batch was acked above.)
+		if pgDB != nil && !apiAcked {
 			ackErr := persistBatchAckToPostgresWithRetry(ctx,
 				pgDB, sm, writtenRows, rowsRead, destKey,
 				msg.Topic, msg.Partition, msg.Offset, metrics)
@@ -5243,11 +5486,14 @@ func main() {
 		bytesSoFar := addAndLoad(&tableMaxBytes, execTableKey, committedBatchBytes(sm, writtenRows))
 
 		// Emit destination-truth stats (monotonic). Projector uses GREATEST().
-		noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", "running", readSoFar, writtenSoFar, bytesSoFar))
+		filesSoFar := noFileCount
+		if looksLikeObjectStorage {
+			filesSoFar = objectFileCount(true, ensureWriteState(writeStates, sm).keys)
+		}
+		noteTableStatsEmit(metrics, sm, "batch", emitTableStats(ctx, eventsWriter, sm, "batch", "running", readSoFar, writtenSoFar, bytesSoFar, filesSoFar))
 
 		atomic.AddUint64(&metrics.processed, 1)
-		_ = reader.CommitMessages(ctx, msg)
-		atomic.StoreInt64(&metrics.lastCommittedOffset, msg.Offset)
+		atomic.StoreInt64(&metrics.lastCommittedOffset, gate.handled(ctx, msg))
 		atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 		atomic.StoreInt64(&metrics.lastProcessedAtUnixMs, time.Now().UTC().UnixMilli())
 	}
@@ -5311,7 +5557,7 @@ func resolveDedupConfig(cfg *WorkerConfig, destType string) (effectiveDedupConfi
 
 // processCDCEvent handles a single CDC (Debezium) event with idempotency.
 // Returns whether the Kafka offset should be committed.
-func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport,
+func processCDCEvent(ctx context.Context, gate *commitGate, pgDB *sql.DB, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport,
 	eventsWriter *kafka.Writer, dlqWriter *kafka.Writer, msg kafka.Message, sm *SinkMessage, metrics *Metrics,
 	cdcInserts, cdcUpdates, cdcDeletes, cdcBytes *sync.Map, ackTTL time.Duration) (commit bool, err error) {
 
@@ -5319,10 +5565,13 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 	// relational sinks the offset is written into _rsync_cdc_offsets in the same
 	// transaction as the delete, so any offset at/below the durable high-water mark
 	// has already been applied — skip it.
-	if hw.seen(msg.Topic, msg.Partition, msg.Offset) {
+	if gate.seen(msg.Topic, msg.Partition, msg.Offset) {
 		atomic.AddUint64(&metrics.skipped, 1)
 		return true, nil
 	}
+	// The durable offset this write stamps: the partition's floor once it lands, never
+	// past a change an open batch still holds (KI-CDC-SINK-COMMIT-PAST-HELD-CHANGES).
+	durableOffset := gate.floorIfLanded(msg.Topic, msg.Partition, noHold, msg.Offset)
 
 	// Apply consumer transforms (CDC path) before writing to destination.
 	if pgDB != nil {
@@ -5337,11 +5586,9 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 		}
 	}
 
-	// Apply CDC operation to destination
-	var writtenRows int64
-	var destKey string
-	// The per-table counter each applied op feeds. It is bumped only after the
-	// ledger write below says whether this offset was already counted.
+	// Apply CDC operation to destination.
+	// The per-table counter each applied op feeds. It is bumped only when this
+	// offset was not counted before (sm.cdcReplay, decided at consume time).
 	var tableCounter *sync.Map
 
 	switch sm.CDCOp {
@@ -5349,7 +5596,7 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 		if len(sm.Data) > 0 {
 			// Snapshot reads ("r") can re-send existing rows; treat as upsert to be idempotent.
 			// We also upsert for "c" to avoid duplicate-key failures on retries.
-			writtenRows, destKey, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "upsert")
+			_, _, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "upsert", durableOffset)
 			if err == nil {
 				tableCounter = cdcInserts
 				if sm.CDCOp == "r" {
@@ -5362,7 +5609,7 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 		}
 	case "u": // update - upsert
 		if len(sm.Data) > 0 {
-			writtenRows, destKey, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "upsert")
+			_, _, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "upsert", durableOffset)
 			if err == nil {
 				tableCounter = cdcUpdates
 				atomic.AddUint64(&metrics.cdcUpdates, 1)
@@ -5381,7 +5628,7 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 			// mode, which records deletes as tombstones without a PK.)
 			return false, poisonError{err: fmt.Errorf("CDC delete missing primary key in message key (required for deterministic deletes)")}
 		}
-		writtenRows, destKey, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "delete")
+		_, _, err = writeCDCToDestination(ctx, httpClient, cfg, ddl, msg, sm, "delete", durableOffset)
 		if err == nil {
 			tableCounter = cdcDeletes
 			atomic.AddUint64(&metrics.cdcDeletes, 1)
@@ -5402,16 +5649,14 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 		return false, err
 	}
 
-	// Advance the in-memory high-water mark now that the destination has the row.
-	// For Tier-A relational sinks the durable offset (_rsync_cdc_offsets) was written
-	// inside writeCDCToDestination's transaction; the tracker mirrors that so redelivered
-	// offsets are skipped without a round-trip. For Tier-B/C the tracker is best-effort.
-	hw.advance(msg.Topic, msg.Partition, msg.Offset)
+	// No high-water advance here: the caller's gate.handled commits the offset and
+	// raises the mark together, to the partition's floor. Advancing to msg.Offset here
+	// would mark a change another open batch still holds as written.
 
-	// Write to Postgres ledger (durable audit trail, best-effort — never fatal).
-	counted := true
-	if pgDB != nil {
-		counted = cdcAckCounts(persistCDCAckToPostgres(ctx, pgDB, sm, writtenRows, destKey, msg.Topic, msg.Partition, msg.Offset))
+	// Keep the per-table totals restart-safe (best-effort — never fatal).
+	counted, ackErr := persistCDCCount(ctx, pgDB, sm, msg)
+	if ackErr != nil {
+		logf("warning", "cdc counter write failed (non-fatal, totals restart from the last stored value): %v", ackErr)
 	}
 
 	// Emit CDC TABLE_STATS (running mode for streaming)
@@ -5687,8 +5932,11 @@ func safeTruncateSQL(table string) (string, bool) {
 	return fmt.Sprintf(`TRUNCATE TABLE "%s"."%s"`, schema, name), true
 }
 
-// writeCDCToDestination writes a CDC event to the destination with the specified operation
-func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport, msg kafka.Message, sm *SinkMessage, operation string) (int64, string, error) {
+// writeCDCToDestination writes a CDC event to the destination with the specified
+// operation. durableOffset is the restart point the write stamps (object metadata,
+// kafka_offset): the partition's floor from commitGate.floorIfLanded, which can sit
+// below msg.Offset while an open batch still holds an earlier change.
+func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport, msg kafka.Message, sm *SinkMessage, operation string, durableOffset int64) (int64, string, error) {
 	destCfg := cfg.DestinationConfig
 	destType := canonicalConnectorType(cfg.DestinationConnector)
 	looksLikeObjectStorage := isObjectStorageConnector(destType)
@@ -5802,7 +6050,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		params["format"] = format
 		params["file_format"] = format
 		params["compression"] = compression
-		if md := cdcObjectMetadata(cfg.PipelineID, msg.Topic, msg.Partition, msg.Offset, msg.Offset); md != nil {
+		if md := cdcObjectMetadata(cfg.PipelineID, msg.Topic, msg.Partition, msg.Offset, durableOffset); md != nil {
 			params["object_metadata"] = md
 		}
 	} else if appendMode {
@@ -5988,8 +6236,9 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 	// before applying CDC events. ensureDestinationTable performs net-additive
 	// reconciliation (CREATE TABLE IF NOT EXISTS + ADD COLUMN IF NOT EXISTS) against
 	// the live destination schema — that IS the schema-evolution gate. Additive changes
-	// are applied; destructive changes (DROP/RENAME/incompatible TYPE) are surfaced by
-	// the connector as errors and escalate (no offset commit). No external schema cache.
+	// are applied; a column dropped in the source is kept and reported; an incompatible
+	// type change is surfaced by the connector as an error and escalates (no offset
+	// commit). No external schema cache.
 	//
 	// Document DB (MongoDB): skip ensure_table entirely — collections auto-create on
 	// first write and _id is always present, so there is nothing to reconcile.
@@ -6025,12 +6274,12 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		// in <namespace>.<table> (mirrors the batch path). destNamespace is "" when the
 		// pipeline has no real namespace, which keeps ensure and write in agreement
 		// (both resolve config["database"]).
-		// Fail-closed drop gate only for full-image upserts (c/r/u). Delete images can
-		// be PK-only (non-FULL replica identity) and append-mode tombstones are
-		// intentional, so both are excluded to avoid false halts. A returned
-		// fatalError propagates up to the consumer loop's isFatal os.Exit.
-		failOnMissing := operation != "delete" && !appendMode
-		if err := ensureDestinationTable(ctx, httpClient, cfg, ddl, destType, targetTable, destNamespace, rowsForDDL, keyFieldsForDDL, colTypesForDDL, sm.PipelineID, true, failOnMissing, true); err != nil {
+		// Dropped-column detection only for full-image upserts (c/r/u). Delete images
+		// can be PK-only (non-FULL replica identity) and append-mode tombstones are
+		// intentional, so both are excluded to avoid reporting columns that were never
+		// dropped.
+		detectDropped := operation != "delete" && !appendMode
+		if err := ensureDestinationTable(ctx, httpClient, cfg, ddl, destType, targetTable, destNamespace, rowsForDDL, keyFieldsForDDL, colTypesForDDL, sm.PipelineID, true, detectDropped, true); err != nil {
 			return 0, "", err
 		}
 		// Forward the destination namespace on the relational write call too (the
@@ -6059,7 +6308,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			"pipeline_id": cfg.PipelineID,
 			"topic":       msg.Topic,
 			"partition":   msg.Partition,
-			"offset":      msg.Offset,
+			"offset":      durableOffset,
 		}
 	}
 
@@ -6107,8 +6356,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			// Some connectors may not implement upsert/delete; fall back to import_data when possible.
 			// (Skip for object storage since we already use import_data there.)
 			if !looksLikeObjectStorage && operation != "insert" {
-				errMsg := strings.ToLower(fmt.Sprint(res["error"]))
-				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "method not found") {
+				if destToolMissing(res) {
 					params["upsert"] = (operation == "upsert")
 					params["is_delete"] = (operation == "delete")
 					reqBody["params"].(map[string]interface{})["name"] = fmt.Sprintf("%s_import_data", destType)
@@ -6135,7 +6383,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			if !success {
 				// This host answered: its refusal is final — never replayed on an alias,
 				// never masked by an absent one (destinationHostCandidates).
-				return 0, destKey, fmt.Errorf("dest error: %v", res["error"])
+				return 0, destKey, fmt.Errorf("dest error: %s", destErrorText(res))
 			}
 		}
 
@@ -6294,7 +6542,7 @@ func writeBlobToDestination(ctx context.Context, httpClient *http.Client, cfg *W
 			res = nested
 		}
 		if success, _ := res["success"].(bool); !success {
-			return "", fmt.Errorf("blob dest error: %v", res["error"]) // answered: final
+			return "", fmt.Errorf("blob dest error: %s", destErrorText(res)) // answered: final
 		}
 		return destKey, nil
 	}
@@ -6432,6 +6680,8 @@ func buildCDCTableStatsEvent(sm *SinkMessage, inserts, updates, deletes, bytesCo
 			"lsn":       sm.LSN,
 			"source_ts": sm.SourceTS,
 		},
+		// bytes_committed and dlq_rows count from zero since this (table_stats_emit.go).
+		"counter_epoch_ms": processCounterEpochMs,
 	}
 	// The id the sink's own logs carry. Added ONLY when it says something execution_id
 	// does not: on this lane execution_id has been rewritten to pipeline_id, so without
@@ -6498,6 +6748,10 @@ func loadConfig() (*WorkerConfig, error) {
 	// every destination (only object storage uses it) so the rule matches the
 	// connector's pre-spawn check exactly.
 	if _, _, err := objectFlushIntervalOverride(cfg.DestinationConfig); err != nil {
+		return nil, err
+	}
+	// Same for the batch shape a relational or warehouse destination sets.
+	if err := batchSettingsError(cfg.DestinationConfig); err != nil {
 		return nil, err
 	}
 	if cfg.MetricsPort == 0 {
@@ -7448,7 +7702,15 @@ func decodeDecimalBase64(b64 string, scale int) (string, error) {
 		i.Sub(i, mod)
 	}
 	s := i.Text(10)
-	if scale <= 0 {
+	if scale < 0 {
+		// A negative scale multiplies by a power of ten: unscaled 123 at scale
+		// -2 is 12300. It used to come back as 123, silently dropping the zeros.
+		if s == "0" {
+			return s, nil
+		}
+		return s + strings.Repeat("0", -scale), nil
+	}
+	if scale == 0 {
 		return s, nil
 	}
 	neg := strings.HasPrefix(s, "-")
@@ -7689,7 +7951,11 @@ func mapConnectFieldToDDLType(destType string, schema map[string]interface{}) st
 			if hasSc {
 				return fmt.Sprintf("DECIMAL(38,%d)", sc)
 			}
-			return "DECIMAL(38,10)"
+			// No precision and no scale: a VariableScaleDecimal, i.e. an
+			// unconstrained PostgreSQL NUMERIC. No DECIMAL holds every value it
+			// can hold, and DECIMAL(38,10) rounded at the tenth place, so the
+			// exact value is stored as text (shared/unconstrained_numeric_golden.json).
+			return "TEXT"
 		case isDate:
 			return "DATE"
 		case isZonedTS || isMicroTS || isNanoTS || isTS:
@@ -7979,6 +8245,7 @@ func decodeMongoDocument(cfg *WorkerConfig, sm *SinkMessage, payload map[string]
 	sm.KeyFields = []string{"_id"}
 	sm.ColumnTypes = mongoPackedColumnTypes(canonicalConnectorType(cfg.DestinationConnector))
 	sm.ColumnTypesAreDDL = true
+	sm.mongoPacked = true
 	return nil
 }
 
@@ -8017,6 +8284,9 @@ func normalizeJSONNumbers(v interface{}) interface{} {
 	}
 }
 
+// toInt64 reads a whole number from a config value. A string may also be a whole
+// number in exponent form ("1e+06"): an orchestrator that flattened a JSON number
+// with %v sent that, and reading it as 0 silently dropped the setting.
 func toInt64(v interface{}) int64 {
 	switch t := v.(type) {
 	case int64:
@@ -8026,14 +8296,31 @@ func toInt64(v interface{}) int64 {
 	case float64:
 		return int64(t)
 	case json.Number:
-		n, _ := t.Int64()
+		n, err := t.Int64()
+		if err != nil {
+			return wholeFloatString(t.String())
+		}
 		return n
 	case string:
-		n, _ := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		s := strings.TrimSpace(t)
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return wholeFloatString(s)
+		}
 		return n
 	default:
 		return 0
 	}
+}
+
+// wholeFloatString parses s as a float that is a whole number within int64 range,
+// else 0.
+func wholeFloatString(s string) int64 {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f != math.Trunc(f) || f < math.MinInt64 || f >= math.MaxInt64 {
+		return 0
+	}
+	return int64(f)
 }
 
 // cfgBool reads a boolean destination-config value, accepting a native bool, the
@@ -8455,6 +8742,18 @@ func loadKeysAndCountsFromLedger(ctx context.Context, db *sql.DB, sm *SinkMessag
 }
 
 func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType, op string, args map[string]interface{}) (map[string]interface{}, error) {
+	res, err := callDestinationToolAnswer(ctx, httpClient, cfg, destType, op, args)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// callDestinationToolAnswer is callDestinationTool that also hands back the answer of a
+// call that said success=false, with the error. An API destination's upsert_data answers
+// one result a row (api_dest_rows.go), so a batch it half wrote still says which rows
+// made records — the sink acks those and DLQs only the rest.
+func callDestinationToolAnswer(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType, op string, args map[string]interface{}) (map[string]interface{}, error) {
 	toolName := fmt.Sprintf("%s_%s", destType, op)
 	reqBody := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -8491,15 +8790,11 @@ func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *Work
 		}
 		success, _ := res["success"].(bool)
 		if !success {
-			if e, ok := res["error"].(string); ok && strings.TrimSpace(e) != "" {
-				lastErr = fmt.Errorf("dest error: %s", e)
-			} else {
-				lastErr = fmt.Errorf("dest error: %v", res["error"])
-			}
+			lastErr = fmt.Errorf("dest error: %s", destErrorText(res))
 			// DIAG: destination tool call returned success=false. This is the silent-drop
 			// blind spot — surface the tool, host and error so 0-row writes are explainable.
 			logEvent("warn", "destination tool call failed", "tool", toolName, "host", host, "error", lastErr.Error())
-			return nil, lastErr // this host answered: its error is final (destinationHostCandidates)
+			return res, lastErr // this host answered: its error is final (destinationHostCandidates)
 		}
 		// DIAG: destination tool call succeeded — log tool + any returned row/table info
 		// so a "completed but 0 rows" run is fully traceable in the logs.
@@ -8614,14 +8909,34 @@ type DDLSupport struct {
 	mu       sync.Mutex
 	Enabled  bool
 	resolved bool // true once a get_capabilities probe returned a definitive answer
+	// RecordIDs: get_capabilities says record_ids — the destination is an API that
+	// names a record by an id it makes up, so the batch path writes it through the
+	// key map (api_dest_rows.go). Set with Enabled, under mu; read via recordIDs().
+	RecordIDs bool
 	// Ensured tracks per-table ensured columns so we can re-run ensure_table only when schema drifts.
 	// key: "<destType>:<schema.table>", value: map[column]struct{}
 	Ensured sync.Map
 	// Drift, when non-nil, receives one already-applied schema-change event per
-	// column the CDC apply path adds on its own (see reportAppliedSchemaDrift).
+	// column the CDC apply path adds on its own (see reportAppliedSchemaDrift) or
+	// sees dropped from the source (reportDroppedColumns).
 	// Nil disables reporting entirely — the batch path never reports from here,
 	// because the executor's detectAndEmitSchemaDrift is the only writer for batch.
 	Drift *kafka.Writer
+	// dropsSeen holds "<ensured key>\x00<column>" for every dropped column already
+	// reported, so a stream of rows without the column reports it once.
+	dropsSeen sync.Map
+}
+
+// firstDrops returns the columns of dropped not yet reported for the table at key,
+// and marks them reported.
+func (d *DDLSupport) firstDrops(key string, dropped []string) []string {
+	first := make([]string, 0, len(dropped))
+	for _, c := range dropped {
+		if _, seen := d.dropsSeen.LoadOrStore(key+"\x00"+c, struct{}{}); !seen {
+			first = append(first, c)
+		}
+	}
+	return first
 }
 
 // schemaDriftEnabled reports whether this installation runs the schema-drift loop.
@@ -8631,6 +8946,58 @@ type DDLSupport struct {
 // rsync.healer.* topics and starts their consumers only when it is on.
 func schemaDriftEnabled() bool {
 	return os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true"
+}
+
+// syncWriterBatchTimeout is how long a synchronous kafka.Writer waits for more
+// messages before it sends what it has. kafka-go's default is 1s, and with Async off
+// every WriteMessages call waits it out unless 100 messages arrive first: the sink
+// writes one TABLE_STATS event per flush, one DLQ record per parked row, and both run
+// on the consume goroutine, so each of those writes stalled the whole stream for a
+// second. 10ms still lets a burst share one produce request.
+const syncWriterBatchTimeout = 10 * time.Millisecond
+
+// newEventsWriter returns the writer for pipeline.domain.events (TABLE_STATS and the
+// sink's other pipeline events).
+func newEventsWriter(cfg *WorkerConfig) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:                   brokerAddr(cfg.KafkaBootstrapServers),
+		Transport:              kafkaTransport(),
+		Topic:                  kafkaclient.Topic("pipeline.domain.events"),
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
+		RequiredAcks:           kafka.RequireAll,
+		BatchTimeout:           syncWriterBatchTimeout,
+	}
+}
+
+// newDLQWriter returns the dead-letter writer. It is not pinned to a topic: each
+// message is routed to "<source_topic>.dlq".
+func newDLQWriter(cfg *WorkerConfig) *kafka.Writer {
+	dlqBrokers := cfg.KafkaBootstrapServers
+	if strings.TrimSpace(cfg.DLQBootstrapServers) != "" {
+		dlqBrokers = strings.TrimSpace(cfg.DLQBootstrapServers)
+	}
+	return &kafka.Writer{
+		Addr:                   brokerAddr(dlqBrokers),
+		Transport:              kafkaTransport(),
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
+		RequiredAcks:           kafka.RequireAll,
+		BatchTimeout:           syncWriterBatchTimeout,
+		// Fail-closed SLA: when the DLQ broker is unreachable the worker must halt
+		// quickly (orchestration surfaces the failure). kafka-go's defaults
+		// (WriteTimeout 10s, MaxAttempts 10) let a single WriteMessages block ~10s;
+		// sendToDLQ then retries it 3x, so a down DLQ took ~40s to fail — past the
+		// 30s halt SLA, leaving the pipeline looking alive. Bound it: each publish
+		// caps at 3s and does not internally retry, so the sendToDLQ retry budget
+		// exhausts in ~12s and the caller can os.Exit fail-closed well within SLA.
+		// Async stays false (the default) so WriteMessages returns the real error
+		// synchronously rather than buffering it; we set it explicitly to document
+		// that the fail-closed contract depends on synchronous writes.
+		WriteTimeout: 3 * time.Second,
+		MaxAttempts:  1,
+		Async:        false,
+	}
 }
 
 // newSchemaDriftWriter returns the writer for rsync.healer.schema-changes, or nil
@@ -8654,6 +9021,7 @@ func newSchemaDriftWriter(cfg *WorkerConfig) *kafka.Writer {
 		// than hold a committed batch waiting on the broker (see reportAppliedSchemaDrift).
 		WriteTimeout: 3 * time.Second,
 		MaxAttempts:  1,
+		BatchTimeout: syncWriterBatchTimeout,
 	}
 }
 
@@ -8698,25 +9066,38 @@ func reloadCanDropTable(destType string, ddlSupported func() bool) bool {
 // yet ready / non-JSON). Only a definitive reply is cacheable; a transient miss
 // must be retryable so a cold-start probe failure is not latched forever.
 func probeDDLSupport(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType string) (enabled bool, gotAnswer bool) {
+	caps, gotAnswer := probeDestCapabilities(ctx, httpClient, cfg, destType)
+	return caps.ddl, gotAnswer
+}
+
+// destCapabilities is what the sink reads from a destination's get_capabilities.
+type destCapabilities struct {
+	ddl       bool // supports_ddl && auto_create_destination_tables
+	recordIDs bool // record_ids: upsert_data/delete_data take the API's own record ids
+}
+
+// probeDestCapabilities is probeDDLSupport's one get_capabilities call, read for
+// every flag the sink acts on.
+func probeDestCapabilities(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType string) (destCapabilities, bool) {
 	if strings.TrimSpace(destType) == "" {
-		return false, true // nothing to create — a definitive "no DDL needed"
+		return destCapabilities{}, true // nothing to create — a definitive "no DDL needed"
 	}
 	res, err := callDestinationTool(ctx, httpClient, cfg, destType, "get_capabilities", map[string]interface{}{})
 	if err != nil || res == nil {
-		return false, false // transient — caller may retry later
+		return destCapabilities{}, false // transient — caller may retry later
 	}
 	// Capabilities may be present at top-level and/or under "capabilities".
-	supportsDDL := toBool(res["supports_ddl"])
-	autoCreate := toBool(res["auto_create_destination_tables"])
-	if caps, ok := res["capabilities"].(map[string]interface{}); ok && caps != nil {
-		if !supportsDDL {
-			supportsDDL = toBool(caps["supports_ddl"])
+	flag := func(name string) bool {
+		if toBool(res[name]) {
+			return true
 		}
-		if !autoCreate {
-			autoCreate = toBool(caps["auto_create_destination_tables"])
-		}
+		caps, ok := res["capabilities"].(map[string]interface{})
+		return ok && caps != nil && toBool(caps[name])
 	}
-	return supportsDDL && autoCreate, true
+	return destCapabilities{
+		ddl:       flag("supports_ddl") && flag("auto_create_destination_tables"),
+		recordIDs: flag("record_ids"),
+	}, true
 }
 
 // resolveDDLSupport runs the best-effort startup probe. A transient failure here
@@ -8727,8 +9108,8 @@ func probeDDLSupport(ctx context.Context, httpClient *http.Client, cfg *WorkerCo
 // class: previously a single cold-start probe miss latched Enabled=false and every
 // ensure_table call silently no-oped.
 func resolveDDLSupport(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType string) *DDLSupport {
-	enabled, gotAnswer := probeDDLSupport(ctx, httpClient, cfg, destType)
-	ddl := &DDLSupport{Enabled: enabled, resolved: gotAnswer}
+	caps, gotAnswer := probeDestCapabilities(ctx, httpClient, cfg, destType)
+	ddl := &DDLSupport{Enabled: caps.ddl, RecordIDs: caps.recordIDs, resolved: gotAnswer}
 	if !gotAnswer {
 		logf("warning", "destination DDL capability probe failed at startup (dest=%s); will re-probe lazily on first write so a cold-start race cannot disable auto-create-table", destType)
 	}
@@ -8747,18 +9128,36 @@ func (d *DDLSupport) supported(ctx context.Context, httpClient *http.Client, cfg
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.resolved {
-		return d.Enabled
+	d.resolveLocked(ctx, httpClient, cfg, destType)
+	return d.Enabled
+}
+
+// recordIDs reports whether the destination's get_capabilities says record_ids,
+// with supported()'s lazy re-probe.
+func (d *DDLSupport) recordIDs(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType string) bool {
+	if d == nil {
+		return false
 	}
-	enabled, gotAnswer := probeDDLSupport(ctx, httpClient, cfg, destType)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resolveLocked(ctx, httpClient, cfg, destType)
+	return d.RecordIDs
+}
+
+// resolveLocked re-probes get_capabilities while no probe has answered. Holds mu.
+func (d *DDLSupport) resolveLocked(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType string) {
+	if d.resolved {
+		return
+	}
+	caps, gotAnswer := probeDestCapabilities(ctx, httpClient, cfg, destType)
 	if gotAnswer {
-		d.Enabled = enabled
+		d.Enabled = caps.ddl
+		d.RecordIDs = caps.recordIDs
 		d.resolved = true
-		if enabled {
+		if caps.ddl {
 			logf("info", "destination DDL support resolved on retry (dest=%s): auto-create-table now enabled", destType)
 		}
 	}
-	return d.Enabled
 }
 
 func columnsFromRows(rows []map[string]interface{}) []string {
@@ -8796,18 +9195,17 @@ func columnsFromRows(rows []map[string]interface{}) []string {
 // `_rsync_pipelines` under ensure_table so reload-mode drop_table can
 // refuse to destroy another pipeline's tables. Empty string means
 // "no ownership tracking" (pre-round-4 behavior + CDC adhoc runs).
-// failOnMissingColumns turns the additive reconciler into a fail-closed gate:
-// when true, a column that was previously ensured but is ABSENT from the current
-// row is treated as a destructive source change (DROP/RENAME COLUMN or
-// incompatible type change) and returns a fatalError so the caller can halt.
+// detectDroppedColumns reads a column that was previously ensured but is ABSENT
+// from the current row as dropped in the source. The destination keeps it; the
+// drop is logged, and reported when reportDrift is set (reportDroppedColumns).
 // Callers MUST set it only for full-image upsert events (op c/r/u) — never for
 // delete images, which under non-FULL replica identity carry only the PK and
 // would otherwise look like "every data column was dropped".
-// reportDrift makes an additive reconcile visible to the control plane (see
-// reportAppliedSchemaDrift). ONLY the CDC apply paths set it: for batch, the
-// executor's detectAndEmitSchemaDrift is the sole drift producer, and reporting
-// here too would file every change twice.
-func ensureDestinationTable(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport, destType string, targetTable string, namespace string, rows []map[string]interface{}, keyFields []string, columnTypes map[string]string, pipelineID string, typesAreDDL bool, failOnMissingColumns bool, reportDrift bool) error {
+// reportDrift makes what CDC did on its own visible to the control plane (see
+// reportAppliedSchemaDrift and reportDroppedColumns). ONLY the CDC apply paths set
+// it: for batch, the executor's detectAndEmitSchemaDrift is the sole drift
+// producer, and reporting here too would file every change twice.
+func ensureDestinationTable(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, ddl *DDLSupport, destType string, targetTable string, namespace string, rows []map[string]interface{}, keyFields []string, columnTypes map[string]string, pipelineID string, typesAreDDL bool, detectDroppedColumns bool, reportDrift bool) error {
 	// supported() lazily re-resolves DDL capability when the startup probe missed
 	// (cold-start race), so a brand-new destination table is still created here
 	// instead of every INSERT failing with "relation does not exist".
@@ -8848,31 +9246,21 @@ func ensureDestinationTable(ctx context.Context, httpClient *http.Client, cfg *W
 		}
 	}
 
-	// Fail-closed schema-evolution gate. A column we previously ensured for this
-	// table that is now absent from a full-image row means the source dropped or
-	// renamed it (or changed it to an incompatible type). The additive reconciler
-	// below cannot express a removal, so it would silently keep writing the old
-	// schema while the source diverges — exactly the silent-corruption class. Halt
-	// instead, via a fatalError the CDC apply paths escalate to os.Exit. Runs
-	// BEFORE the "already ensured" short-circuit so a drop is caught even when no
-	// new columns were added. Guarded to full-image callers (see the doc comment).
-	if failOnMissingColumns && prev != nil {
-		curSet := make(map[string]struct{}, len(cols)+len(keys))
-		for _, c := range cols {
-			curSet[c] = struct{}{}
-		}
-		for _, c := range keys {
-			curSet[c] = struct{}{}
-		}
-		for c := range prev {
-			if strings.HasPrefix(c, "__pk__") {
-				continue
-			}
-			if _, present := curSet[c]; !present {
-				return fatalError{err: fmt.Errorf(
-					"destructive schema change on table %q: column %q was previously "+
-						"present but is absent from the source row (DROP/RENAME COLUMN or "+
-						"incompatible type change); halting fail-closed", targetTable, c)}
+	// A column we previously ensured for this table that is now absent from a
+	// full-image row was dropped (or renamed) in the source. The drift policy, the
+	// same for batch and CDC, handles that on its own: the destination keeps the
+	// column and its history, and rows simply stop carrying a value for it. So the
+	// stream keeps flowing and the drop is reported, once per column per process.
+	// The column stays in the ensured set because the destination still has it, so
+	// one that comes back is neither re-ensured nor reported as added. Runs BEFORE
+	// the "already ensured" short-circuit, which a drop alone always takes. Guarded
+	// to full-image callers (see the doc comment).
+	if detectDroppedColumns && prev != nil {
+		if dropped := ddl.firstDrops(key, droppedColumnNames(prev, cols, keys)); len(dropped) > 0 {
+			logEvent("info", "source dropped columns; the destination keeps them",
+				"table", targetTable, "columns", strings.Join(dropped, ","))
+			if reportDrift {
+				reportDroppedColumns(ctx, ddl.Drift, cfg, pipelineID, targetTable, namespace, dropped)
 			}
 		}
 	}
@@ -9005,15 +9393,38 @@ func addedColumnNames(prev, merged map[string]struct{}) []string {
 	return added
 }
 
+// droppedColumnNames returns the columns in prev that neither cols nor keys carries,
+// sorted for the same reason as addedColumnNames. __pk__ bookkeeping entries are not
+// columns and are excluded.
+func droppedColumnNames(prev map[string]struct{}, cols, keys []string) []string {
+	cur := make(map[string]struct{}, len(cols)+len(keys))
+	for _, c := range cols {
+		cur[c] = struct{}{}
+	}
+	for _, c := range keys {
+		cur[c] = struct{}{}
+	}
+	dropped := []string{}
+	for c := range prev {
+		if strings.HasPrefix(c, "__pk__") {
+			continue
+		}
+		if _, present := cur[c]; !present {
+			dropped = append(dropped, c)
+		}
+	}
+	sort.Strings(dropped)
+	return dropped
+}
+
 // reportAppliedSchemaDrift files one already-applied schema change per column the CDC
 // apply path just added to the destination by itself.
 //
 // CDC's ensure_table reconciler applies additive drift the moment a new column shows
-// up in a row and asks nobody. That is the design and it is NOT changed here. What was
-// missing is that it also TOLD nobody: the same `ALTER TABLE … ADD COLUMN` that stops a
-// BATCH pipeline and waits for a human in the Schema changes tab passed through a CDC
-// pipeline with no row, no badge and no notification. Two halves of the product
-// answered "who approves a schema change?" oppositely, and only one of them said so.
+// up in a row and asks nobody, which is the drift policy for batch and CDC alike: only
+// a dropped table waits for a person. What was once missing is that it also TOLD
+// nobody, so a column added mid-stream reached the destination with no row on the
+// schema changes page, no badge and no notification.
 //
 // applied=true is the whole point of the message: the healer records it as history
 // (status `applied`) instead of queueing an approval for a change that is already
@@ -9026,64 +9437,68 @@ func reportAppliedSchemaDrift(ctx context.Context, w *kafka.Writer, cfg *WorkerC
 	if w == nil || len(added) == 0 {
 		return
 	}
+	qualified := qualifiedDriftTable(table, namespace)
+	changes := make([]map[string]interface{}, 0, len(added))
+	for _, col := range added {
+		colType := "unknown"
+		if t, ok := columnTypes[col].(string); ok && strings.TrimSpace(t) != "" {
+			colType = strings.TrimSpace(t)
+		}
+		changes = append(changes, map[string]interface{}{
+			"change_type": "add_column",
+			"column_name": col,
+			"column_type": colType,
+			// Same deterministic shape the executor's batch detector emits, so the
+			// healer's parseAddColumnDDL reads either producer.
+			"ddl": fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", qualified, col, colType),
+		})
+	}
+	publishAppliedSchemaChanges(ctx, w, cfg, pipelineID, qualified, namespace, added, changes)
+}
+
+// reportDroppedColumns files one handled schema change per column the source dropped.
+// The destination keeps the column, so there is nothing to run and nothing to decide.
+// No DDL is sent: the healer files the dropped-column note (healer.DroppedColumnNote),
+// the one text the batch detector files too, so a column dropped is one row on the
+// schema changes page whichever path saw it first. Best-effort, like
+// reportAppliedSchemaDrift.
+func reportDroppedColumns(ctx context.Context, w *kafka.Writer, cfg *WorkerConfig, pipelineID, table, namespace string, dropped []string) {
+	if w == nil || len(dropped) == 0 {
+		return
+	}
+	changes := make([]map[string]interface{}, 0, len(dropped))
+	for _, col := range dropped {
+		changes = append(changes, map[string]interface{}{
+			"change_type": "drop_column",
+			"column_name": col,
+		})
+	}
+	publishAppliedSchemaChanges(ctx, w, cfg, pipelineID, qualifiedDriftTable(table, namespace), namespace, dropped, changes)
+}
+
+// qualifiedDriftTable qualifies the table the way the batch detector does, so both
+// producers' changes read the same in the UI. The destination connector re-resolves
+// the real namespace at apply time; this string is for the human.
+func qualifiedDriftTable(table, namespace string) string {
+	if ns := strings.TrimSpace(namespace); ns != "" && !strings.Contains(table, ".") {
+		return ns + "." + table
+	}
+	return table
+}
+
+// publishAppliedSchemaChanges writes one SCHEMA_CHANGE_DETECTED event per change,
+// each marked applied: CDC has already done what the change needed.
+func publishAppliedSchemaChanges(ctx context.Context, w *kafka.Writer, cfg *WorkerConfig, pipelineID, qualified, namespace string, columns []string, changes []map[string]interface{}) {
 	if strings.TrimSpace(pipelineID) == "" {
 		pipelineID = strings.TrimSpace(cfg.PipelineID)
 	}
 	if pipelineID == "" {
 		// schema_change_approvals.pipeline_id is NOT NULL and FK-checked; an
 		// unattributable change can only be dropped.
-		logEvent("warn", "schema drift applied but not reported: no pipeline_id", "table", table)
+		logEvent("warn", "schema drift applied but not reported: no pipeline_id", "table", qualified)
 		return
 	}
-
-	// Qualify the table the way the batch detector does, so both producers' DDL reads
-	// the same in the UI. The destination connector re-resolves the real namespace at
-	// apply time; this string is for the human.
-	qualified := table
-	if ns := strings.TrimSpace(namespace); ns != "" && !strings.Contains(table, ".") {
-		qualified = ns + "." + table
-	}
-
-	msgs := make([]kafka.Message, 0, len(added))
-	for _, col := range added {
-		colType := "unknown"
-		if t, ok := columnTypes[col].(string); ok && strings.TrimSpace(t) != "" {
-			colType = strings.TrimSpace(t)
-		}
-		// Same deterministic shape the executor's batch detector emits, so the
-		// healer's parseAddColumnDDL reads either producer.
-		ddlText := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", qualified, col, colType)
-		b, err := json.Marshal(map[string]interface{}{
-			"event_type":  "SCHEMA_CHANGE_DETECTED",
-			"pipeline_id": pipelineID,
-			"timestamp":   time.Now().UTC().Format(time.RFC3339),
-			"schema_change": map[string]interface{}{
-				"change_type": "add_column",
-				"table":       qualified,
-				"schema_name": strings.TrimSpace(namespace),
-				"column_name": col,
-				"column_type": colType,
-				"ddl":         ddlText,
-				"risk_level":  "low",
-				"detected_at": time.Now().UTC().Format(time.RFC3339),
-				// Already live in the destination — record it, don't queue it.
-				"applied": true,
-			},
-			"context": map[string]interface{}{
-				"source": "kafka_mcp_sink",
-				"mode":   "cdc",
-			},
-			// Nothing to decide: the change is applied. Kept explicit so a reader of
-			// the topic doesn't have to infer it from `applied`.
-			"action_needed": false,
-		})
-		if err != nil {
-			logEvent("warn", "schema drift applied but not reported: marshal failed",
-				"table", qualified, "column", col, "error", err.Error())
-			continue
-		}
-		msgs = append(msgs, kafka.Message{Key: []byte(pipelineID), Value: b})
-	}
+	msgs := appliedSchemaChangeMessages(pipelineID, qualified, namespace, changes)
 	if len(msgs) == 0 {
 		return
 	}
@@ -9094,11 +9509,45 @@ func reportAppliedSchemaDrift(ctx context.Context, w *kafka.Writer, cfg *WorkerC
 	defer cancel()
 	if err := w.WriteMessages(wctx, msgs...); err != nil {
 		logEvent("warn", "schema drift applied but not reported: publish failed",
-			"table", qualified, "columns", strings.Join(added, ","), "error", err.Error())
+			"table", qualified, "columns", strings.Join(columns, ","), "error", err.Error())
 		return
 	}
 	logEvent("info", "reported already-applied schema drift",
-		"table", qualified, "columns", strings.Join(added, ","))
+		"table", qualified, "columns", strings.Join(columns, ","))
+}
+
+// appliedSchemaChangeMessages builds the events publishAppliedSchemaChanges writes.
+func appliedSchemaChangeMessages(pipelineID, qualified, namespace string, changes []map[string]interface{}) []kafka.Message {
+	now := time.Now().UTC().Format(time.RFC3339)
+	msgs := make([]kafka.Message, 0, len(changes))
+	for _, change := range changes {
+		change["table"] = qualified
+		change["schema_name"] = strings.TrimSpace(namespace)
+		change["risk_level"] = "low"
+		change["detected_at"] = now
+		// Already handled in the destination — record it, don't queue it.
+		change["applied"] = true
+		b, err := json.Marshal(map[string]interface{}{
+			"event_type":    "SCHEMA_CHANGE_DETECTED",
+			"pipeline_id":   pipelineID,
+			"timestamp":     now,
+			"schema_change": change,
+			"context": map[string]interface{}{
+				"source": "kafka_mcp_sink",
+				"mode":   "cdc",
+			},
+			// Nothing to decide: the change is handled. Kept explicit so a reader of
+			// the topic doesn't have to infer it from `applied`.
+			"action_needed": false,
+		})
+		if err != nil {
+			logEvent("warn", "schema drift applied but not reported: marshal failed",
+				"table", qualified, "column", fmt.Sprint(change["column_name"]), "error", err.Error())
+			continue
+		}
+		msgs = append(msgs, kafka.Message{Key: []byte(pipelineID), Value: b})
+	}
+	return msgs
 }
 
 // writeToDestination writes one object-write unit (one physical object) for object
@@ -9326,8 +9775,7 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 			// Many append-only connectors (e.g. Google Sheets) don't implement upsert_data.
 			importDataTool := fmt.Sprintf("%s_import_data", destType)
 			if toolName != importDataTool {
-				errMsg := strings.ToLower(fmt.Sprint(res["error"]))
-				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "method not found") || strings.Contains(errMsg, "unknown tool") {
+				if destToolMissing(res) {
 					reqBody["params"].(map[string]interface{})["name"] = importDataTool
 					body, _ = json.Marshal(reqBody)
 					req, _ = http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
@@ -9350,11 +9798,7 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 				}
 			}
 			if !success {
-				if e, ok := res["error"].(string); ok && strings.TrimSpace(e) != "" {
-					lastErr = fmt.Errorf("dest error: %s", e)
-				} else {
-					lastErr = fmt.Errorf("dest error: %v", res["error"])
-				}
+				lastErr = fmt.Errorf("dest error: %s", destErrorText(res))
 				// This host answered: its refusal is final — never replayed on an alias,
 				// never masked by an absent one (destinationHostCandidates).
 				return 0, destKey, lastErr
@@ -9490,8 +9934,11 @@ func extractDestRowCount(res map[string]interface{}) (int64, bool) {
 // trying the next name would replay a write that already ran on compose, and on
 // Helm the absent alias's "no such host" would overwrite the real error — so a row
 // fault or a refused credential would be classified as an outage.
+//
+// A concrete version is a pin: only that version's names are listed. The
+// unversioned aliases name whichever container holds them, so falling back to one
+// could serve a pinned connection from another version.
 func destinationHostCandidates(connectorType, version string) []string {
-	// Prefer versioned container name used by compose/JIT: rsync-ai-<connector>-vX-Y-Z-mcp
 	connectorType = strings.TrimSpace(connectorType)
 	// Canonical connector IDs use kebab-case; the Kafka producer may send either form.
 	// Docker network aliases always use hyphens, so normalize here.
@@ -9502,7 +9949,11 @@ func destinationHostCandidates(connectorType, version string) []string {
 
 	candidates := make([]string, 0, 5)
 	if connectorType != "" && vPart != "" && vPart != "latest" {
-		candidates = append(candidates, fmt.Sprintf("rsync-ai-%s-v%s-mcp", connectorType, vPart))
+		// The container (<STACK_PREFIX>-<connector>-vX-Y-Z-mcp, as compose, the
+		// deployer and Helm name it), then its compose service name.
+		candidates = append(candidates, fmt.Sprintf("%s-%s-v%s-mcp", stackPrefix(), connectorType, vPart))
+		candidates = append(candidates, fmt.Sprintf("%s-v%s-mcp", connectorType, vPart))
+		return uniqStrings(candidates)
 	}
 	// Service name fallback (docker-compose): <connector>-mcp
 	candidates = append(candidates, fmt.Sprintf("%s-mcp", connectorType))
@@ -9519,6 +9970,15 @@ func destinationHostCandidates(connectorType, version string) []string {
 func answeredNotJSON(what, host string, resp *http.Response, err error) error {
 	return fmt.Errorf("%s response not json (HTTP %d %s from %s): %w",
 		what, resp.StatusCode, http.StatusText(resp.StatusCode), host, err)
+}
+
+// stackPrefix is the container-name prefix of this stack (STACK_PREFIX, default
+// rsync-ai), as the orchestrator's connectorpaths and the deployer read it.
+func stackPrefix() string {
+	if p := strings.TrimSpace(os.Getenv("STACK_PREFIX")); p != "" {
+		return p
+	}
+	return "rsync-ai"
 }
 
 func uniqStrings(in []string) []string {
@@ -9546,8 +10006,8 @@ func firstStr(m map[string]interface{}, keys ...string) string {
 	return ""
 }
 
-func emitTableStats(ctx context.Context, w *kafka.Writer, sm *SinkMessage, mode, status string, readRows, insertedRows, bytesCommitted int64) error {
-	event := buildTableStatsEvent(sm, mode, status, readRows, insertedRows, bytesCommitted)
+func emitTableStats(ctx context.Context, w *kafka.Writer, sm *SinkMessage, mode, status string, readRows, insertedRows, bytesCommitted, filesWritten int64) error {
+	event := buildTableStatsEvent(sm, mode, status, readRows, insertedRows, bytesCommitted, filesWritten)
 	b, _ := json.Marshal(event)
 
 	return w.WriteMessages(ctx, kafka.Message{
@@ -9559,11 +10019,52 @@ func emitTableStats(ctx context.Context, w *kafka.Writer, sm *SinkMessage, mode,
 	})
 }
 
+// noFileCount is the filesWritten of a destination that writes no files (a
+// database or warehouse table): the event then carries no files_written.
+const noFileCount int64 = -1
+
+// objectFileCount is the files_written a batch TABLE_STATS event carries: the
+// distinct objects written so far for an object-storage destination, or
+// noFileCount for any other destination.
+func objectFileCount(objectStorage bool, keys []string) int64 {
+	if !objectStorage {
+		return noFileCount
+	}
+	return int64(len(keys))
+}
+
 // buildTableStatsEvent builds the batch-mode TABLE_STATS payload. Split out from the
 // write for the same reason as buildCDCTableStatsEvent: the identity/counts contract
 // the api-gateway projector reads is then unit-testable without a broker.
-func buildTableStatsEvent(sm *SinkMessage, mode, status string, readRows, insertedRows, bytesCommitted int64) map[string]interface{} {
+// filesWritten is the objects landed in object storage, or noFileCount; the
+// projector stores it as pipeline_run_table_stats.files_written.
+func buildTableStatsEvent(sm *SinkMessage, mode, status string, readRows, insertedRows, bytesCommitted, filesWritten int64) map[string]interface{} {
 	table, tableName := tableIdentityForStats(sm)
+	counts := map[string]interface{}{
+		"read_rows":       readRows,
+		"inserted_rows":   insertedRows,
+		"bytes_committed": bytesCommitted,
+	}
+	if filesWritten >= 0 {
+		counts["files_written"] = filesWritten
+	}
+
+	metadata := map[string]interface{}{
+		"source":     "kafka_mcp_sink",
+		"mode":       mode,
+		"status":     status,
+		"table":      table,
+		"counts":     counts,
+		"started_at": time.Now().UTC().Format(time.RFC3339),
+		// bytes_committed counts from zero since this (table_stats_emit.go).
+		"counter_epoch_ms": processCounterEpochMs,
+	}
+	// completed_at is the end-of-table marker: a per-flush "running" event that
+	// carried it (read == written on every flush) let the projector complete the
+	// table mid-copy.
+	if status != "running" {
+		metadata["completed_at"] = time.Now().UTC().Format(time.RFC3339)
+	}
 
 	event := map[string]interface{}{
 		"schema_version": 2,
@@ -9576,19 +10077,7 @@ func buildTableStatsEvent(sm *SinkMessage, mode, status string, readRows, insert
 		"stage_group":    "executing",
 		"status":         "processing",
 		"message":        fmt.Sprintf("Table statistics update: %s", tableName),
-		"metadata": map[string]interface{}{
-			"source": "kafka_mcp_sink",
-			"mode":   mode,
-			"status": status,
-			"table":  table,
-			"counts": map[string]interface{}{
-				"read_rows":       readRows,
-				"inserted_rows":   insertedRows,
-				"bytes_committed": bytesCommitted,
-			},
-			"started_at":   time.Now().UTC().Format(time.RFC3339),
-			"completed_at": time.Now().UTC().Format(time.RFC3339),
-		},
+		"metadata":       metadata,
 	}
 	return event
 }
@@ -10115,203 +10604,47 @@ func persistNegativeBatchAckToPostgres(ctx context.Context, db *sql.DB, sm *Sink
 	return err
 }
 
-// pgAckLedger* bound the multi-row ack INSERT so cols*chunk stays under
-// PostgreSQL's 65535 bind-parameter cap (16 * 4000 = 64000).
-const (
-	pgAckLedgerCols  = 16
-	pgAckLedgerChunk = 4000
-)
-
-// persistCDCAcksBatch writes the best-effort audit-ledger rows for an ENTIRE
-// flushed CDC batch in one (chunked) multi-row INSERT instead of one remote
-// round-trip per message. This is the high-volume throughput fix: the previous
-// per-message loop issued len(batch) serial INSERTs to the remote ledger
-// Postgres on the consume goroutine (~1000 round-trips ≈ tens of seconds per
-// flush), starving Kafka consumption. Semantics are identical to the
-// per-message persistCDCAckToPostgres it replaces on the batch lanes:
-// writtenRows is 1 per message (one CDC event = one row), the same
-// (pipeline_id, execution_id, table_name, kafka_topic, kafka_partition,
-// kafka_offset) idempotency key is used, and the write stays best-effort /
-// non-fatal — exactly-once is enforced by _rsync_cdc_offsets committed in the
-// destination upsert transaction, NOT by this ledger.
-//
-// It also reports, per message, whether the message should feed the per-table CDC
-// counters: true when this INSERT added its ledger row, false when the ledger
-// already held it (a replay — counted once already, possibly by the process before a
-// restart). When the ledger cannot answer (no db, a failed chunk) every affected
-// message is reported true, which is how the counters behaved before the ledger
-// was consulted.
-func persistCDCAcksBatch(ctx context.Context, db *sql.DB, sms []*SinkMessage, messages []kafka.Message, destKey string) ([]bool, error) {
-	counted := make([]bool, len(sms))
-	for i := range counted {
-		counted[i] = true
-	}
-	if db == nil {
-		return counted, nil
-	}
-	// CDC keys the ledger by execution_id == pipeline_id (parseCDCMessage), and no
-	// executions row exists for that id — so every ack INSERT below used to fail
-	// fk_batch_acks_execution (23503) and pipeline_batch_acks stayed permanently empty
-	// for CDC. Pre-create the same synthetic executions row the transform-log path
-	// already relies on. Once per flush (not per message), ON CONFLICT DO NOTHING, and
-	// still best-effort: the helper only logs, and the ack write stays non-fatal.
-	if len(sms) > 0 && sms[0] != nil {
-		ensureExecutionRowForCDCAudit(ctx, db, sms[0].PipelineID, sms[0].ExecutionID)
-	}
-	var firstErr error
-	for _, ins := range buildCDCAckInserts(sms, messages, destKey, time.Now().UTC()) {
-		added, err := execCDCAckInsert(ctx, db, ins)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		markNewCDCAcks(counted, sms, messages, ins, added)
-	}
-	return counted, firstErr
+// persistPartialBatchAckToPostgresWithRetry records a PARTIAL ack: the rows of the
+// batch the destination took (rows_written) and why it refused the rest (last_error).
+// Only an API destination with record_ids answers per row (api_dest_rows.go), so
+// only it writes one; the refused rows go to the DLQ after this, as one message.
+// Same retry-forever-until-cancel semantics as the positive and negative acks.
+func persistPartialBatchAckToPostgresWithRetry(
+	ctx context.Context,
+	db *sql.DB,
+	sm *SinkMessage,
+	writtenRows, rowsRead int64,
+	errMsg, kafkaTopic string,
+	partition int,
+	offset int64,
+	metrics *Metrics,
+) error {
+	return retryUntilSuccessOrCancel(ctx, "partial ack persist", metrics, func(c context.Context) error {
+		return persistPartialBatchAckToPostgres(c, db, sm, writtenRows, rowsRead, errMsg, kafkaTopic, partition, offset)
+	})
 }
 
-// cdcAckInsert is one chunked multi-row INSERT (statement + bind args) covering
-// sms[start:end].
-type cdcAckInsert struct {
-	query      string
-	args       []interface{}
-	start, end int
-}
-
-// cdcAckKey is a ledger row's identity within one worker's pipeline and execution.
-type cdcAckKey struct {
-	table     string
-	topic     string
-	partition int64
-	offset    int64
-}
-
-// execCDCAckInsert runs one chunk and returns the keys of the rows it added. Rows
-// skipped by ON CONFLICT are not returned.
-func execCDCAckInsert(ctx context.Context, db *sql.DB, ins cdcAckInsert) ([]cdcAckKey, error) {
-	rows, err := db.QueryContext(ctx, ins.query, ins.args...)
-	if err != nil {
-		return nil, err
+// persistPartialBatchAckToPostgres is persistNegativeBatchAckToPostgres with the
+// rows that landed: the executor's sumBatchAcks counts them, and last_error makes
+// the run say why the rest did not.
+func persistPartialBatchAckToPostgres(ctx context.Context, db *sql.DB, sm *SinkMessage, writtenRows, rowsRead int64, errMsg, kafkaTopic string, partition int, offset int64) error {
+	if len(errMsg) > maxAckErrLen {
+		errMsg = errMsg[:maxAckErrLen]
 	}
-	defer rows.Close()
-	var added []cdcAckKey
-	for rows.Next() {
-		var k cdcAckKey
-		if err := rows.Scan(&k.table, &k.topic, &k.partition, &k.offset); err != nil {
-			return nil, err
-		}
-		added = append(added, k)
-	}
-	return added, rows.Err()
-}
-
-// markNewCDCAcks sets counted[i] for the messages in ins that the INSERT added and
-// clears it for the ones the ledger already held. A message repeated inside one
-// chunk is added once, so only its first occurrence counts. If a returned key
-// matches no message in the chunk, the keys are not comparable and nothing in the
-// chunk is cleared: an unexplained answer must not silently zero the counts.
-func markNewCDCAcks(counted []bool, sms []*SinkMessage, messages []kafka.Message, ins cdcAckInsert, added []cdcAckKey) {
-	pending := make(map[cdcAckKey][]int, ins.end-ins.start)
-	for i := ins.start; i < ins.end; i++ {
-		k := cdcAckKey{table: sms[i].Table, topic: messages[i].Topic, partition: int64(messages[i].Partition), offset: messages[i].Offset}
-		pending[k] = append(pending[k], i)
-	}
-	isNew := make([]bool, len(counted))
-	for _, k := range added {
-		idx := pending[k]
-		if len(idx) == 0 {
-			logf("warning", "cdc ack-ledger returned a row this flush did not write (table=%s partition=%d offset=%d); counting the whole chunk", k.table, k.partition, k.offset)
-			return
-		}
-		isNew[idx[0]] = true
-		pending[k] = idx[1:]
-	}
-	for i := ins.start; i < ins.end; i++ {
-		counted[i] = isNew[i]
-	}
-}
-
-// buildCDCAckInserts renders a flushed CDC batch's best-effort audit rows into
-// chunked multi-row INSERTs, each ≤ pgAckLedgerChunk rows so cols*rows stays
-// under PostgreSQL's 65535 bind-parameter cap. Pure (no I/O) for testability.
-// rows_written is fixed at 1 per message, matching the per-message path it
-// replaces, and the same idempotency key is used so redelivery is a no-op.
-func buildCDCAckInserts(sms []*SinkMessage, messages []kafka.Message, destKey string, now time.Time) []cdcAckInsert {
-	n := len(sms)
-	if n == 0 || len(messages) < n {
-		return nil
-	}
-	const prefix = `INSERT INTO pipeline_batch_acks (` +
-		`pipeline_id, execution_id, table_name, batch_offset, ` +
-		`rows_written, rows_read, dest_key, storage_type, ` +
-		`kafka_topic, kafka_partition, kafka_offset, ` +
-		`cdc_op, cdc_tx_id, cdc_lsn, cdc_source_ts, acked_at) VALUES `
-	const suffix = ` ON CONFLICT (pipeline_id, execution_id, table_name, kafka_topic, kafka_partition, kafka_offset) DO NOTHING` +
-		` RETURNING table_name, kafka_topic, kafka_partition, kafka_offset`
-	out := make([]cdcAckInsert, 0, (n+pgAckLedgerChunk-1)/pgAckLedgerChunk)
-	for start := 0; start < n; start += pgAckLedgerChunk {
-		end := start + pgAckLedgerChunk
-		if end > n {
-			end = n
-		}
-		tuples := make([]string, 0, end-start)
-		args := make([]interface{}, 0, (end-start)*pgAckLedgerCols)
-		for i := start; i < end; i++ {
-			sm := sms[i]
-			m := messages[i]
-			base := len(args)
-			ph := make([]string, pgAckLedgerCols)
-			for c := 0; c < pgAckLedgerCols; c++ {
-				ph[c] = "$" + strconv.Itoa(base+c+1)
-			}
-			tuples = append(tuples, "("+strings.Join(ph, ",")+")")
-			args = append(args,
-				sm.PipelineID, sm.ExecutionID, sm.Table, m.Offset,
-				int64(1), sm.RowCount, destKey, "cdc",
-				m.Topic, m.Partition, m.Offset,
-				sm.CDCOp, sm.TxID, sm.LSN, sm.SourceTS, now)
-		}
-		out = append(out, cdcAckInsert{query: prefix + strings.Join(tuples, ",") + suffix, args: args, start: start, end: end})
-	}
-	return out
-}
-
-// persistCDCAckToPostgres writes a CDC ACK to the durable Postgres ledger and
-// reports whether it added the row (false: the ledger already held this offset).
-func persistCDCAckToPostgres(ctx context.Context, db *sql.DB, sm *SinkMessage, writtenRows int64, destKey, kafkaTopic string, partition int, offset int64) (bool, error) {
-	// The batch lane anchors the executions row once per flush. This single-row lane
-	// can run before any flush (append-only mode never batches), so anchor it once
-	// per process here or every ack fails fk_batch_acks_execution.
-	ensureExecutionRowForCDCAuditOnce(ctx, db, sm.PipelineID, sm.ExecutionID)
 	query := `
 		INSERT INTO pipeline_batch_acks (
 			pipeline_id, execution_id, table_name, batch_offset,
 			rows_written, rows_read, dest_key, storage_type,
-			kafka_topic, kafka_partition, kafka_offset,
-			cdc_op, cdc_tx_id, cdc_lsn, cdc_source_ts, acked_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			kafka_topic, kafka_partition, kafka_offset, last_error, acked_at
+		) VALUES ($1, $2, $3, $4, $5, $6, '', $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (pipeline_id, execution_id, table_name, kafka_topic, kafka_partition, kafka_offset) DO NOTHING
 	`
-	// For CDC, use kafka offset as batch_offset for legacy readers; the
-	// real idempotency key is (pipeline_id, execution_id, table_name,
-	// kafka_topic, kafka_partition, kafka_offset).
-	res, err := db.ExecContext(ctx, query,
-		sm.PipelineID, sm.ExecutionID, sm.Table, offset,
-		writtenRows, sm.RowCount, destKey, "cdc",
-		kafkaTopic, partition, offset,
-		sm.CDCOp, sm.TxID, sm.LSN, sm.SourceTS, time.Now().UTC(),
+	_, err := db.ExecContext(ctx, query,
+		sm.PipelineID, sm.ExecutionID, sm.Table, sm.BatchOffset,
+		writtenRows, rowsRead, sm.StorageType,
+		kafkaTopic, partition, offset, errMsg, time.Now().UTC(),
 	)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		// The row was written; the driver just can't say whether it was new.
-		return true, nil
-	}
-	return n > 0, nil
+	return err
 }
 
 // topicResolveTimeout bounds how long the worker waits for its subscribed topics
@@ -10336,8 +10669,9 @@ func topicResolveTimeout() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// waitForTopicPartitions blocks until every topic reports at least one partition,
-// or until timeout elapses.
+// waitForTopicPartitions blocks until every topic reports at least one partition.
+// It returns true once they all do, or straight away when there is nothing to wait
+// for or the wait is disabled (timeout <= 0), and false only when ctx ends first.
 //
 // Why this exists (KI-CDC-1, round 2). Debezium creates its per-table topics
 // LAZILY — only when the first change event is emitted — so the sink routinely
@@ -10364,9 +10698,20 @@ func topicResolveTimeout() time.Duration {
 // by the time we join, the topics exist and makeAssignments always sees their
 // partitions. WatchPartitionChanges stays enabled as a second line of defence
 // for partitions added to an already-assigned topic later.
-func waitForTopicPartitions(broker string, topics []string, timeout time.Duration) {
+//
+// It never joins while a topic is still missing (KI-SINK-MISSING-TOPIC-REJOIN-STORM).
+// This used to give up at the timeout and join anyway, which on a broker with
+// auto-create off is worse than waiting: the partition watcher's first
+// readPartitions fails on the missing topic, the generation ends with no error,
+// and kafka-go rejoins at once with no backoff (consumergroup.go run() only backs
+// off on errors). Each rejoin opens fresh broker connections, so one worker
+// reached ~800 new connections a second, filled the shared sink container's
+// ephemeral ports with TIME_WAIT sockets, and every other pipeline's sink on that
+// container failed with "cannot assign requested address". Past the timeout the
+// wait now only slows down and says so, and joins the moment the topics appear.
+func waitForTopicPartitions(ctx context.Context, broker string, topics []string, timeout time.Duration) bool {
 	if len(topics) == 0 || timeout <= 0 {
-		return
+		return true
 	}
 
 	pending := make(map[string]bool, len(topics))
@@ -10376,49 +10721,151 @@ func waitForTopicPartitions(broker string, topics []string, timeout time.Duratio
 		}
 	}
 	if len(pending) == 0 {
-		return
+		return true
 	}
 
 	started := time.Now()
 	deadline := started.Add(timeout)
+	var lastWarned time.Time
 	for attempt := 0; ; attempt++ {
-		if conn, err := dialBroker("tcp", broker); err == nil {
-			for t := range pending {
-				// A Metadata request. Under auto-create this is also what brings the
-				// topic into being, which is precisely the point: we would rather
-				// create it here, deterministically, than have the partition watcher
-				// create it behind our back after the assignment is already fixed.
-				if parts, perr := conn.ReadPartitions(t); perr == nil && len(parts) > 0 {
-					delete(pending, t)
-				}
-			}
-			conn.Close()
-		}
+		probeTopicPartitions(broker, pending)
 
 		if len(pending) == 0 {
 			if attempt > 0 {
 				logf("info", "all %d subscribed topic(s) resolved after %s; joining consumer group",
 					len(topics), time.Since(started).Round(time.Millisecond))
 			}
-			return
+			return true
 		}
 
-		if !time.Now().Before(deadline) {
-			missing := make([]string, 0, len(pending))
-			for t := range pending {
-				missing = append(missing, t)
+		interval := topicWaitFastInterval
+		if now := time.Now(); !now.Before(deadline) {
+			interval = topicWaitSlowInterval
+			if lastWarned.IsZero() || now.Sub(lastWarned) >= topicWaitRewarnInterval {
+				lastWarned = now
+				missing := make([]string, 0, len(pending))
+				for t := range pending {
+					missing = append(missing, t)
+				}
+				sort.Strings(missing)
+				// Loud on purpose, and repeated: until these exist this worker moves
+				// nothing, and nothing else in the process says why.
+				logf("warning", "topic(s) [%s] still report no partitions after %s; NOT joining the consumer "+
+					"group until they exist (re-checking every %s). Nothing is consumed meanwhile. Each "+
+					"topic needs a creator: the orchestrator pre-creates pipeline topics, or the broker "+
+					"must allow auto-creation.",
+					strings.Join(missing, ", "), time.Since(started).Round(time.Second), interval)
 			}
-			sort.Strings(missing)
-			// Loud on purpose: the failure this guards against is otherwise SILENT —
-			// a member assigned no partitions logs nothing at all while data flows past.
-			logf("warning", "topic(s) [%s] still report no partitions after %s; joining the group anyway. "+
-				"If the producer creates them later, this member may be assigned no partitions until a "+
-				"rebalance occurs and rows will be silently skipped.",
-				strings.Join(missing, ", "), timeout)
-			return
 		}
-		time.Sleep(500 * time.Millisecond)
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(interval):
+		}
 	}
+}
+
+// Seams for topic_wait_test.go; production uses these values.
+var (
+	topicWaitFastInterval   = 500 * time.Millisecond
+	topicWaitSlowInterval   = 5 * time.Second
+	topicWaitRewarnInterval = 5 * time.Minute
+	probeTopicPartitions    = probeTopicPartitionsOnBroker
+)
+
+// probeTopicPartitionsOnBroker removes from pending every topic the broker reports
+// at least one partition for. A failed dial leaves pending as it was.
+func probeTopicPartitionsOnBroker(broker string, pending map[string]bool) {
+	conn, err := dialBroker("tcp", broker)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	for t := range pending {
+		// A Metadata request. Under auto-create this is also what brings the
+		// topic into being, which is precisely the point: we would rather
+		// create it here, deterministically, than have the partition watcher
+		// create it behind our back after the assignment is already fixed.
+		if parts, perr := conn.ReadPartitions(t); perr == nil && len(parts) > 0 {
+			delete(pending, t)
+		}
+	}
+}
+
+// dialBudget caps how fast the consumer-group reader opens new broker
+// connections (KI-SINK-MISSING-TOPIC-REJOIN-STORM). kafka-go rejoins a group with
+// no backoff whenever a generation ends without an error — which is what its
+// partition watcher does when a subscribed topic is deleted under a running
+// member — and every rejoin dials afresh. waitForTopicPartitions keeps a worker
+// from joining with a topic missing; this bounds the case it cannot see, a topic
+// that disappears after the join. A healthy reader dials a handful of times at
+// startup and on each rebalance and otherwise reuses its connections, so the
+// burst covers normal use and only a storm ever waits.
+type dialBudget struct {
+	mu     sync.Mutex
+	tokens float64
+	burst  float64
+	rate   float64 // tokens added per second
+	last   time.Time
+}
+
+const (
+	readerDialBurst     = 32
+	readerDialPerSecond = 4
+)
+
+func newDialBudget(burst int, perSecond float64) *dialBudget {
+	return &dialBudget{tokens: float64(burst), burst: float64(burst), rate: perSecond, last: time.Now()}
+}
+
+// wait takes one token, blocking until one is available or ctx ends.
+func (b *dialBudget) wait(ctx context.Context) error {
+	for {
+		b.mu.Lock()
+		now := time.Now()
+		b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
+		b.last = now
+		if b.tokens >= 1 {
+			b.tokens--
+			b.mu.Unlock()
+			return nil
+		}
+		short := time.Duration((1 - b.tokens) / b.rate * float64(time.Second))
+		b.mu.Unlock()
+
+		t := time.NewTimer(short)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// groupReaderDialer is the consumer-group reader's dialer: kafkaDialer's TLS and
+// SASL, with every new connection drawn from a dial budget.
+func groupReaderDialer(bootstrap string) (*kafka.Dialer, error) {
+	d, err := kafkaDialer(bootstrap)
+	if err != nil {
+		return nil, err
+	}
+	return withDialBudget(d, newDialBudget(readerDialBurst, readerDialPerSecond)), nil
+}
+
+// withDialBudget makes every connection d opens draw on budget. It dials the way
+// kafka-go does when DialFunc is unset (dialer.go dialContext), so TLS and SASL,
+// which kafka-go layers on afterwards, are unchanged.
+func withDialBudget(d *kafka.Dialer, budget *dialBudget) *kafka.Dialer {
+	nd := &net.Dialer{LocalAddr: d.LocalAddr, FallbackDelay: d.FallbackDelay, KeepAlive: d.KeepAlive}
+	d.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if err := budget.wait(ctx); err != nil {
+			return nil, err
+		}
+		return nd.DialContext(ctx, network, address)
+	}
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -10670,14 +11117,43 @@ func unconsumedRecords(ctx context.Context, broker, groupID string, topics []str
 	if err != nil {
 		return false, "", fmt.Errorf("offset fetch: %w", err)
 	}
+	return waitingRecords(offsets, committed, fromEarliest, baseline, act)
+}
 
+// waitingRecords is the broker-free half of unconsumedRecords: given the partitions'
+// first and end offsets and the group's committed offsets, it reports whether any
+// partition still holds records past waitingFloor.
+//
+// It decides only on a complete reading. An offset the broker did not give — an
+// OffsetFetch error (top-level or per partition), a partition missing from the
+// answer, a ListOffsets partition error — is an error, never a value: read as
+// "never committed" it made a briefly unavailable group coordinator (a broker
+// restart, prod 2026-10-01) look like a wedge, and two healthy sinks were restarted.
+// A group that genuinely never committed answers offset -1 with no error, and that
+// still counts as -1: it is the empty-assignment wedge this watchdog exists for.
+func waitingRecords(offsets *kafka.ListOffsetsResponse, committed *kafka.OffsetFetchResponse, fromEarliest bool, baseline map[string]int64, act *consumerActivity) (bool, string, error) {
+	if committed.Error != nil {
+		return false, "", fmt.Errorf("offset fetch: %w", committed.Error)
+	}
 	committedBy := map[string]int64{}
 	for topic, cps := range committed.Topics {
 		for _, cp := range cps {
+			key := fmt.Sprintf("%s/%d", topic, cp.Partition)
 			if cp.Error != nil {
-				continue
+				return false, "", fmt.Errorf("offset fetch %s: %w", key, cp.Error)
 			}
-			committedBy[fmt.Sprintf("%s/%d", topic, cp.Partition)] = cp.CommittedOffset
+			committedBy[key] = cp.CommittedOffset
+		}
+	}
+	for topic, pos := range offsets.Topics {
+		for _, po := range pos {
+			key := fmt.Sprintf("%s/%d", topic, po.Partition)
+			if po.Error != nil {
+				return false, "", fmt.Errorf("list offsets %s: %w", key, po.Error)
+			}
+			if _, ok := committedBy[key]; !ok {
+				return false, "", fmt.Errorf("offset fetch: no committed offset returned for %s", key)
+			}
 		}
 	}
 
@@ -10687,10 +11163,7 @@ func unconsumedRecords(ctx context.Context, broker, groupID string, topics []str
 			if _, seen := baseline[key]; !seen {
 				baseline[key] = po.LastOffset
 			}
-			committedAt, ok := committedBy[key]
-			if !ok {
-				committedAt = -1
-			}
+			committedAt := committedBy[key]
 			pos := partitionPosition{first: po.FirstOffset, end: po.LastOffset, committed: committedAt,
 				baseline: baseline[key], fetchedNext: act.fetchedNext(topic, po.Partition)}
 			if floor := waitingFloor(pos, fromEarliest); pos.end > floor {

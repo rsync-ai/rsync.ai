@@ -28,6 +28,7 @@ import base64
 import ipaddress
 import json
 import logging
+import re
 import time
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
@@ -400,6 +401,253 @@ def _find_int(value: Any, default: int, path: str) -> int:
     if isinstance(value, float) and value != number:
         raise FindRequestError(f"invalid_{path}", f"{path} must be an integer", path)
     return number
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation pipelines (`aggregate` preview, `materialize` models)           #
+# --------------------------------------------------------------------------- #
+#
+# A MongoDB model is an aggregation pipeline whose result rsync.ai writes to a
+# collection. The gateway enforces these same lists before any network hop
+# (api-gateway/internal/validators/document_aggregate.go), and a Go test parses
+# the two frozensets below out of this file so the lists cannot drift apart.
+#
+# Stages are an allowlist, like FIND_QUERY_OPERATORS: a stage MongoDB adds later
+# stays rejected until someone decides it is safe. $out and $merge are absent
+# because the only write a model may make is the one rsync.ai appends, to its own
+# target. Admin and diagnostic stages ($currentOp, $collStats, $indexStats,
+# $listSessions, $changeStream, ...) are absent because they read server state,
+# not documents.
+#
+# Expression operators number in the hundreds and grow every release, so they are
+# not allowlisted. Instead the walk refuses, at ANY depth, the operators that run
+# server-side JavaScript and the two write stages, so none of them can hide inside
+# $facet, $lookup.pipeline or $unionWith.pipeline.
+AGGREGATE_STAGES = frozenset({
+    "$match", "$project", "$addFields", "$set", "$unset", "$group", "$sort",
+    "$limit", "$skip", "$unwind", "$count", "$lookup", "$unionWith",
+    "$graphLookup", "$replaceRoot", "$replaceWith", "$sortByCount", "$bucket",
+    "$bucketAuto", "$facet", "$sample", "$setWindowFields", "$densify", "$fill",
+    "$redact",
+})
+AGGREGATE_DENIED_OPERATORS = frozenset({"$function", "$accumulator", "$where", "$out", "$merge"})
+
+AGGREGATE_MAX_STAGES = 50
+AGGREGATE_MAX_DEPTH = 32
+AGGREGATE_MAX_PIPELINE_BYTES = 128 * 1024
+
+# A model's target collection follows the gateway's validateModelTarget rule
+# (modelIdentPart), so the staging name, suffix included, is still a legal name.
+MATERIALIZE_TARGET_PART_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,51}")
+MATERIALIZE_STAGING_SUFFIX = "__rsync_new"
+MATERIALIZE_DEFAULT_TIMEOUT_SECONDS = 1800  # the gateway's modelRunTimeout
+
+
+def _validate_aggregate_collection(raw: Any, path: str) -> str:
+    """A collection a stage reads from ($lookup / $graphLookup / $unionWith).
+
+    A plain name is always a collection in the pipeline's own database, so the
+    rules are find's: no '$', no NUL, no system collections."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise FindRequestError("invalid_collection", "must name a collection in this database", path)
+    try:
+        return _validate_find_collection(raw)
+    except FindRequestError as e:
+        raise FindRequestError(e.code, str(e), path)
+
+
+def _check_aggregate_key(key: Any, path: str) -> None:
+    if not isinstance(key, str) or "\x00" in key:
+        raise FindRequestError("invalid_pipeline", "field names must be strings without NUL", path)
+
+
+def _walk_aggregate_node(node: Any, path: str, depth: int) -> None:
+    """Depth, the Extended JSON single-key rule, and the denied operators."""
+    if not isinstance(node, (dict, list)):
+        return
+    if depth > AGGREGATE_MAX_DEPTH:
+        raise FindRequestError(
+            "pipeline_too_deep", f"pipeline nesting exceeds {AGGREGATE_MAX_DEPTH} levels", path)
+    if isinstance(node, list):
+        for i, item in enumerate(node):
+            _walk_aggregate_node(item, f"{path}[{i}]", depth + 1)
+        return
+    wrapper = next((k for k in node if k in FIND_EXTJSON_WRAPPERS), None)
+    if wrapper is not None:
+        if len(node) != 1:
+            raise FindRequestError(
+                "invalid_pipeline", f"{wrapper} must be the only key in its object", _find_path(path, wrapper))
+        return  # the wrapped value's shape is checked when it is decoded
+    for key, value in node.items():
+        _check_aggregate_key(key, path)
+        child = _find_path(path, key)
+        if key in AGGREGATE_DENIED_OPERATORS:
+            raise FindRequestError("operator_not_allowed", f"operator {key} is not allowed", child)
+        _walk_aggregate_node(value, child, depth + 1)
+
+
+def _split_foreign_stage(name: str, body: Any, path: str) -> Tuple[Any, Dict[str, Any]]:
+    """Check the collection a $lookup / $graphLookup / $unionWith reads, and split
+    off its sub-pipeline so it is walked as stages, not as plain values.
+
+    Returns (the rest of the body, {"pipeline": sub-pipeline} or {})."""
+    if name == "$unionWith" and isinstance(body, str):
+        _validate_aggregate_collection(body, path)
+        return None, {}
+    if not isinstance(body, dict):
+        raise FindRequestError("invalid_pipeline", f"{name} must be an object", path)
+    source_key = "coll" if name == "$unionWith" else "from"
+    _validate_aggregate_collection(body.get(source_key), _find_path(path, source_key))
+    if name == "$graphLookup" or "pipeline" not in body:
+        return body, {}
+    return {k: v for k, v in body.items() if k != "pipeline"}, {"pipeline": body["pipeline"]}
+
+
+def _walk_aggregate_stages(stages: Any, path: str, depth: int) -> None:
+    if depth > AGGREGATE_MAX_DEPTH:
+        raise FindRequestError(
+            "pipeline_too_deep", f"pipeline nesting exceeds {AGGREGATE_MAX_DEPTH} levels", path)
+    if not isinstance(stages, list):
+        raise FindRequestError("invalid_pipeline", "a pipeline must be a JSON array of stages", path)
+    if len(stages) > AGGREGATE_MAX_STAGES:
+        raise FindRequestError(
+            "pipeline_too_long", f"a pipeline accepts at most {AGGREGATE_MAX_STAGES} stages", path)
+    for i, stage in enumerate(stages):
+        spath = f"{path}[{i}]"
+        if not isinstance(stage, dict) or len(stage) != 1:
+            raise FindRequestError("invalid_pipeline", "each stage must be an object with exactly one key", spath)
+        name, body = next(iter(stage.items()))
+        _check_aggregate_key(name, spath)
+        bpath = _find_path(spath, name)
+        if name not in AGGREGATE_STAGES:
+            code = "operator_not_allowed" if name in AGGREGATE_DENIED_OPERATORS else "stage_not_allowed"
+            raise FindRequestError(code, f"stage {name[:64]} is not allowed", bpath)
+        nested: Dict[str, Any] = {}
+        if name in ("$lookup", "$graphLookup", "$unionWith"):
+            body, nested = _split_foreign_stage(name, body, bpath)
+        elif name == "$facet":
+            if not isinstance(body, dict) or not body:
+                raise FindRequestError("invalid_pipeline", "$facet must map names to pipelines", bpath)
+            body, nested = None, dict(body)
+        if body is not None:
+            _walk_aggregate_node(body, bpath, depth + 1)
+        for key, sub in nested.items():
+            _check_aggregate_key(key, bpath)
+            if key.startswith("$"):
+                raise FindRequestError("invalid_pipeline", "a $facet output name cannot start with '$'", bpath)
+            _walk_aggregate_stages(sub, _find_path(bpath, key), depth + 2)
+
+
+def _validate_aggregate_pipeline(pipeline: Any) -> List[Dict[str, Any]]:
+    """Check a pipeline against the stage allowlist, the denied operators and the
+    limits, then decode its Extended JSON wrappers. Returns it ready for pymongo."""
+    if pipeline is None:
+        raise FindRequestError("invalid_pipeline", "Missing 'pipeline' parameter", "pipeline")
+    # Structure and depth first, so an absurdly nested pipeline never reaches
+    # json.dumps' own recursion limit.
+    _walk_aggregate_stages(pipeline, "pipeline", 1)
+    try:
+        size = len(json.dumps(pipeline, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        raise FindRequestError("invalid_pipeline", "pipeline must be plain JSON", "pipeline")
+    if size > AGGREGATE_MAX_PIPELINE_BYTES:
+        raise FindRequestError(
+            "pipeline_too_large", f"pipeline exceeds {AGGREGATE_MAX_PIPELINE_BYTES // 1024} KB", "pipeline")
+    return _decode_find_extjson(pipeline, "pipeline")
+
+
+def _materialize_target(connector: Any, config: Dict[str, Any], raw: Any, source_db: str) -> Tuple[str, str]:
+    """(database, collection) a model writes. ``target`` is ``collection`` (the
+    pipeline's own database) or ``database.collection``; the database passes the
+    same scope rule a read does, so a connection that names a database writes
+    only there."""
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text:
+        raise FindRequestError("invalid_target", "Missing 'target' collection", "target")
+    parts = text.split(".")
+    if len(parts) > 2 or not all(MATERIALIZE_TARGET_PART_RE.fullmatch(p) for p in parts):
+        raise FindRequestError(
+            "invalid_target",
+            "target must be collection or database.collection: a letter or _, then letters, digits or _ "
+            "(52 characters at most)", "target")
+    if len(parts) == 1:
+        return source_db, parts[0]
+    try:
+        return _find_database(connector, config, parts[0]), parts[1]
+    except FindRequestError as e:
+        raise FindRequestError("invalid_target", str(e), "target")
+
+
+def _materialize_timeout(value: Any) -> int:
+    """``timeout_seconds`` as a positive int, else the model run's own limit."""
+    if isinstance(value, bool):
+        return MATERIALIZE_DEFAULT_TIMEOUT_SECONDS
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return MATERIALIZE_DEFAULT_TIMEOUT_SECONDS
+    return seconds if seconds > 0 else MATERIALIZE_DEFAULT_TIMEOUT_SECONDS
+
+
+def _serialize_documents(raw_docs: List[Dict[str, Any]], limit: int, hide_id: bool = False) -> Dict[str, Any]:
+    """Relaxed Extended JSON for up to ``limit`` documents, inside the response
+    budget. ``cut_short`` means the budget stopped the page early."""
+    from bson import json_util
+    documents: List[Dict[str, Any]] = []
+    columns: List[str] = []
+    warnings: List[str] = []
+    used_bytes = 0
+    truncated_bytes = False
+    cut_short = False
+    last_id = None
+    for position, doc in enumerate(raw_docs[:limit]):
+        doc_id = doc.get("_id")
+        if hide_id:
+            doc = {k: v for k, v in doc.items() if k != "_id"}
+        text = json_util.dumps(doc, json_options=json_util.RELAXED_JSON_OPTIONS)
+        size = len(text.encode("utf-8"))
+        if used_bytes + size > FIND_MAX_RESPONSE_BYTES:
+            if documents:
+                truncated_bytes = cut_short = True
+                break
+            # One document larger than the whole budget: return only its _id so
+            # paging still advances, and say how to see the rest.
+            text = json_util.dumps({"_id": doc_id}, json_options=json_util.RELAXED_JSON_OPTIONS)
+            size = len(text.encode("utf-8"))
+            truncated_bytes = True
+            warnings.append(
+                f"Document {position + 1} exceeds the {FIND_MAX_RESPONSE_BYTES // (1024 * 1024)} MB response "
+                "budget; only its _id is shown. Use a projection to view selected fields.")
+        parsed = json.loads(text)
+        documents.append(parsed)
+        used_bytes += size
+        last_id = doc_id
+        for key in parsed:
+            if key not in columns:
+                columns.append(key)
+    if "_id" in columns:
+        columns.remove("_id")
+        columns.insert(0, "_id")
+    return {"documents": documents, "columns": columns, "warnings": warnings,
+            "truncated_bytes": truncated_bytes, "cut_short": cut_short, "last_id": last_id}
+
+
+def _mongo_failure(e: Exception, op: str, limit_text: str) -> Dict[str, Any]:
+    """A driver exception as a failed tool result that never quotes a value.
+
+    The server's errmsg can quote filter and document values, so only the error's
+    code name reaches the caller."""
+    from pymongo.errors import ConnectionFailure, ExecutionTimeout, OperationFailure
+    if isinstance(e, ExecutionTimeout):
+        return {"success": False, "error_code": "query_timeout",
+                "error": f"Query exceeded {limit_text}. Add a filter on an indexed field."}
+    if isinstance(e, OperationFailure):
+        code_name = (getattr(e, "details", None) or {}).get("codeName") or f"code {getattr(e, 'code', '?')}"
+        return {"success": False, "error_code": "query_failed", "mongo_code": getattr(e, "code", None),
+                "error": f"MongoDB rejected the query ({code_name})"}
+    if isinstance(e, ConnectionFailure):
+        return {"success": False, "error_code": "connection_failed", "error": f"{type(e).__name__}: {str(e)[:300]}"}
+    return {"success": False, "error_code": "query_failed", "error": f"{op} failed ({type(e).__name__})"}
 
 
 def _export_cursor(last_id: Any) -> Any:
@@ -1295,6 +1543,12 @@ class MongodbMCPServer(BaseMCPConnector):
                 {"name": "find", "method": "mongodb_find", "type": "source",
                  "description": "Read-only document browse for the Data Explorer (allowlisted filter, "
                                 "projection, sort, keyset/skip paging, Relaxed Extended JSON)"},
+                {"name": "aggregate", "method": "mongodb_aggregate", "type": "source",
+                 "description": "Read-only aggregation preview (allowlisted stages, first page, "
+                                "Relaxed Extended JSON)"},
+                {"name": "materialize", "method": "mongodb_materialize", "type": "destination",
+                 "description": "Run a MongoDB model: $out an allowlisted pipeline into its target "
+                                "collection, built aside and swapped in"},
                 {"name": "import_data", "method": "mongodb_import_data", "type": "destination",
                  "description": "Insert documents into a collection (batch / CDC insert)"},
                 {"name": "upsert_data", "method": "mongodb_upsert_data", "type": "destination",
@@ -1449,13 +1703,7 @@ class MongodbMCPServer(BaseMCPConnector):
         params = params or {}
         started = time.monotonic()
         try:
-            raw_config = params.get("config")
-            if isinstance(raw_config, str):
-                try:
-                    raw_config = json.loads(raw_config)
-                except ValueError:
-                    raise FindRequestError("invalid_config", "config is not valid JSON", "config")
-            config = self._get_config({"config": raw_config})
+            config = self._request_config(params)
             db_name = _find_database(self, config, params.get("database"))
             read_preference = _find_read_preference(config)
 
@@ -1501,7 +1749,6 @@ class MongodbMCPServer(BaseMCPConnector):
         except FindRequestError as e:
             return {"success": False, "error": str(e), "error_code": e.code, "path": e.path}
 
-        from pymongo.errors import ConnectionFailure, ExecutionTimeout, OperationFailure
         client = None
         try:
             client = self._get_client(config)
@@ -1511,57 +1758,15 @@ class MongodbMCPServer(BaseMCPConnector):
             cursor = (coll.find(query, query_projection)
                       .sort(sort_keys).skip(skip).limit(limit + 1).max_time_ms(max_time_ms))
             raw_docs = list(cursor)
-        except ExecutionTimeout:
-            return {"success": False, "error_code": "query_timeout",
-                    "error": f"Query exceeded {max_time_ms} ms. Add a filter on an indexed field."}
-        except OperationFailure as e:
-            # The server's errmsg can quote filter values, so only the code name is surfaced.
-            code_name = (getattr(e, "details", None) or {}).get("codeName") or f"code {getattr(e, 'code', '?')}"
-            return {"success": False, "error_code": "query_failed", "mongo_code": getattr(e, "code", None),
-                    "error": f"MongoDB rejected the query ({code_name})"}
-        except ConnectionFailure as e:
-            return {"success": False, "error_code": "connection_failed", "error": f"{type(e).__name__}: {str(e)[:300]}"}
         except Exception as e:
-            return {"success": False, "error_code": "query_failed", "error": f"find failed ({type(e).__name__})"}
+            return _mongo_failure(e, "find", f"{max_time_ms} ms")
         finally:
             self._close_client(client)
 
-        from bson import json_util
-        has_more = len(raw_docs) > limit
-        documents: List[Dict[str, Any]] = []
-        columns: List[str] = []
-        warnings: List[str] = []
-        used_bytes = 0
-        truncated_bytes = False
-        last_id = None
-        for position, doc in enumerate(raw_docs[:limit]):
-            doc_id = doc.get("_id")
-            if hide_id:
-                doc = {k: v for k, v in doc.items() if k != "_id"}
-            text = json_util.dumps(doc, json_options=json_util.RELAXED_JSON_OPTIONS)
-            size = len(text.encode("utf-8"))
-            if used_bytes + size > FIND_MAX_RESPONSE_BYTES:
-                if documents:
-                    truncated_bytes = has_more = True
-                    break
-                # One document larger than the whole budget: return only its _id so
-                # paging still advances, and say how to see the rest.
-                text = json_util.dumps({"_id": doc_id}, json_options=json_util.RELAXED_JSON_OPTIONS)
-                size = len(text.encode("utf-8"))
-                truncated_bytes = True
-                warnings.append(
-                    f"Document {position + 1} exceeds the {FIND_MAX_RESPONSE_BYTES // (1024 * 1024)} MB response "
-                    "budget; only its _id is shown. Use a projection to view selected fields.")
-            parsed = json.loads(text)
-            documents.append(parsed)
-            used_bytes += size
-            last_id = doc_id
-            for key in parsed:
-                if key not in columns:
-                    columns.append(key)
-        if "_id" in columns:
-            columns.remove("_id")
-            columns.insert(0, "_id")
+        page = _serialize_documents(raw_docs, limit, hide_id)
+        documents, columns, warnings = page["documents"], page["columns"], page["warnings"]
+        truncated_bytes, last_id = page["truncated_bytes"], page["last_id"]
+        has_more = len(raw_docs) > limit or page["cut_short"]
 
         next_cursor = None
         next_skip = None
@@ -1587,6 +1792,155 @@ class MongodbMCPServer(BaseMCPConnector):
             "execution_time_ms": int((time.monotonic() - started) * 1000),
             "truncated_bytes": truncated_bytes,
             "warnings": warnings,
+        }
+
+    def _request_config(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """The connection config of a find / aggregate / materialize request. The
+        orchestrator's delegated path may send it as a JSON string."""
+        raw_config = params.get("config")
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except ValueError:
+                raise FindRequestError("invalid_config", "config is not valid JSON", "config")
+        return self._get_config({"config": raw_config})
+
+    def aggregate(self, params: Dict = None) -> Dict[str, Any]:
+        """Read-only aggregation preview: the first page of a pipeline's result.
+
+        This is what the Data Explorer shows while a MongoDB model is written, and
+        what an agent reads to check one. The pipeline passes the stage allowlist
+        (AGGREGATE_STAGES) and the denied-operator walk; a $limit of ``limit`` + 1
+        (max 500) is appended, maxTimeMS is capped at 15 s, and documents come back
+        as Relaxed Extended JSON inside the same 5 MB budget as ``find``.
+
+        It never writes: no allowed stage writes, and $out / $merge are refused at
+        any depth. ``materialize`` is the one tool that writes, and only to a
+        model's own target.
+        """
+        params = params or {}
+        started = time.monotonic()
+        try:
+            config = self._request_config(params)
+            db_name = _find_database(self, config, params.get("database"))
+            read_preference = _find_read_preference(config)
+            collection = _validate_find_collection(params.get("collection") or params.get("table"))
+            pipeline = _validate_aggregate_pipeline(params.get("pipeline"))
+            limit = max(1, min(_find_int(params.get("limit"), FIND_DEFAULT_LIMIT, "limit"), FIND_MAX_LIMIT))
+            max_time_ms = max(1, min(_find_int(params.get("max_time_ms"), FIND_MAX_TIME_MS, "max_time_ms"),
+                                     FIND_MAX_TIME_MS))
+        except FindRequestError as e:
+            return {"success": False, "error": str(e), "error_code": e.code, "path": e.path}
+
+        client = None
+        try:
+            client = self._get_client(config)
+            coll = client[db_name][collection]
+            if read_preference is not None:
+                coll = coll.with_options(read_preference=read_preference)
+            raw_docs = list(coll.aggregate(pipeline + [{"$limit": limit + 1}], maxTimeMS=max_time_ms))
+        except Exception as e:
+            return _mongo_failure(e, "aggregate", f"{max_time_ms} ms")
+        finally:
+            self._close_client(client)
+
+        page = _serialize_documents(raw_docs, limit)
+        return {
+            "success": True,
+            "collection": collection,
+            "documents": page["documents"],
+            "columns": page["columns"],
+            "returned": len(page["documents"]),
+            "has_more": len(raw_docs) > limit or page["cut_short"],
+            "execution_time_ms": int((time.monotonic() - started) * 1000),
+            "truncated_bytes": page["truncated_bytes"],
+            "warnings": page["warnings"],
+        }
+
+    def materialize(self, params: Dict = None) -> Dict[str, Any]:
+        """Build a MongoDB model: run a pipeline and write its result to a collection.
+
+        The write is a $out that this method appends; the pipeline itself can name
+        no write stage. $out builds its result in a temporary collection and swaps
+        it in only at the end, so a pipeline that fails leaves the previous result
+        untouched. That is the build-then-swap guarantee the SQL engines get from
+        their staging table (api-gateway saved_query_models.go
+        buildMaterializationPlan).
+
+        ``replace`` is the gateway's target_owned. Until one run has proved that
+        this model created the target, the result goes to
+        ``<target>__rsync_new`` and is renamed onto the target WITHOUT dropTarget,
+        so MongoDB itself refuses to take over a collection rsync.ai did not create.
+        Once owned, $out writes the target directly, and a target someone dropped
+        is simply rebuilt.
+
+        Reads the primary, may spill to disk, and is bounded by maxTimeMS =
+        ``timeout_seconds``. Never retried: the caller decides that.
+        ``rows_affected`` is the target's document count afterwards.
+        """
+        params = params or {}
+        started = time.monotonic()
+        try:
+            config = self._request_config(params)
+            source_db = _find_database(self, config, params.get("database"))
+            collection = _validate_find_collection(params.get("collection") or params.get("table"))
+            pipeline = _validate_aggregate_pipeline(params.get("pipeline"))
+            target_db, target = _materialize_target(self, config, params.get("target"), source_db)
+            replace = params.get("replace") is True
+            timeout = _materialize_timeout(params.get("timeout_seconds"))
+        except FindRequestError as e:
+            return {"success": False, "error": str(e), "error_code": e.code, "path": e.path}
+
+        from pymongo import ReadPreference
+        from pymongo.errors import CollectionInvalid, OperationFailure
+        staging = target + MATERIALIZE_STAGING_SUFFIX
+        write_to = target if replace else staging
+        # The string form works on every server version; {db, coll} needs 4.4+.
+        out = write_to if target_db == source_db else {"db": target_db, "coll": write_to}
+        client = None
+        failure = None
+        rows_affected = None
+        try:
+            client = self._get_client(config)
+            coll = client[source_db][collection].with_options(read_preference=ReadPreference.PRIMARY)
+            coll.aggregate(pipeline + [{"$out": out}], allowDiskUse=True, maxTimeMS=timeout * 1000)
+            if not replace:
+                tdb = client[target_db]
+                try:
+                    tdb[staging].rename(target, dropTarget=False)
+                except OperationFailure as e:
+                    if getattr(e, "code", None) != 26:  # NamespaceNotFound: $out wrote nothing
+                        raise
+                    tdb.create_collection(target)
+            try:
+                rows_affected = int(client[target_db][target].estimated_document_count())
+            except Exception:
+                rows_affected = None
+        except (CollectionInvalid, OperationFailure) as e:
+            if isinstance(e, CollectionInvalid) or getattr(e, "code", None) == 48:  # NamespaceExists
+                failure = {
+                    "success": False, "error_code": "target_exists",
+                    "error": f"Collection {target_db}.{target} already exists and this model did not create it. "
+                             "Choose another target, or rename or drop that collection first."}
+            else:
+                failure = _mongo_failure(e, "materialize", f"the model's {timeout} s limit")
+        except Exception as e:
+            failure = _mongo_failure(e, "materialize", f"the model's {timeout} s limit")
+        finally:
+            if failure is not None and not replace and client is not None:
+                try:
+                    client[target_db].drop_collection(staging)
+                except Exception:
+                    pass
+            self._close_client(client)
+        if failure is not None:
+            return failure
+        return {
+            "success": True,
+            "executed": True,
+            "rows_affected": rows_affected,
+            "target": f"{target_db}.{target}",
+            "execution_time_ms": int((time.monotonic() - started) * 1000),
         }
 
     # ------------------------------------------------------------------ #

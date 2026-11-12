@@ -15,9 +15,9 @@ export type StartupSettingProblem = {
  *
  * Only a production server is checked (NODE_ENV=production, which the image sets):
  * under `next dev` the localhost defaults in @/lib/config/api are intentional.
- * These are ERROR lines, never a refusal to start: the start-path census for
- * issue #24 found ORCHESTRATOR_INTERNAL_URL missing from the Helm chart and the
- * secret absent on the dev compose, and the rest of the app works without them.
+ * These are ERROR lines, never a refusal to start: the rest of the app works
+ * without them. Each setting checked here is one the frontend reads (the test
+ * startup-settings-check.test.ts fails on a check whose reader is gone).
  */
 export function frontendStartupProblems(
   env: Record<string, string | undefined>,
@@ -38,28 +38,17 @@ export function frontendStartupProblems(
         "example http://api-gateway:8080.",
     })
   }
-  if (unset("ORCHESTRATOR_INTERNAL_URL")) {
-    problems.push({
-      setting: "ORCHESTRATOR_INTERNAL_URL",
-      sensitive: false,
-      message:
-        "ORCHESTRATOR_INTERNAL_URL is not set, empty or only spaces, so the dashboard's pipeline " +
-        "statistics are fetched from the built-in default http://localhost:8081. That only works " +
-        "when the orchestrator runs on the same host as this server; otherwise the statistics " +
-        "stay empty. Set it to the orchestrator's in-network address, for example " +
-        "http://orchestrator:8080.",
-    })
-  }
   if (unset("INTERNAL_SERVICE_SECRET")) {
     problems.push({
       setting: "INTERNAL_SERVICE_SECRET",
       sensitive: true,
       message:
-        "INTERNAL_SERVICE_SECRET is not set, empty or only spaces. The dashboard's pipeline " +
-        "statistics stay empty whenever the orchestrator runs with ENVIRONMENT=production, because " +
-        "it refuses the request. Give the frontend the same INTERNAL_SERVICE_SECRET as api-gateway, " +
-        "orchestrator and temporal-adapter (if none exists yet, generate one, for example with " +
-        "openssl rand -hex 32, and give it to all four).",
+        "INTERNAL_SERVICE_SECRET is not set, empty or only spaces, so this server refuses " +
+        "api-gateway's requests to draw a chart as a picture or a dashboard as a PDF for a " +
+        "workflow's email: a chart step fails on a plotted chart, and a dashboard step's email " +
+        "goes without its PDF. Give the " +
+        "frontend the same INTERNAL_SERVICE_SECRET as api-gateway, orchestrator and temporal-adapter " +
+        "(if none exists yet, generate one, for example with openssl rand -hex 32, and give it to all four).",
     })
   }
   return problems

@@ -61,6 +61,18 @@ const (
 	SeverityInfo    Severity = "info"
 )
 
+// Schema drift codes. Only SCHEMA_DRIFT_DETECTED asks the user to decide something:
+// FromDiagnosis emits it, the healer keeps it for a dropped source table, and the
+// api-gateway notifier gives exactly that code Slack Approve/Reject buttons. A change
+// the healer handled on its own is relabelled with one of the other two, so an alert
+// that needs nothing never offers a decision. Each has copy in the api-gateway
+// notifier catalog (catalog.go).
+const (
+	CodeSchemaDriftDetected    = "SCHEMA_DRIFT_DETECTED"
+	CodeSchemaDriftHandled     = "SCHEMA_DRIFT_HANDLED"
+	CodeSchemaDriftApplyFailed = "SCHEMA_DRIFT_APPLY_FAILED"
+)
+
 // Remediation carries the actionable fix. All fields optional — populate
 // what makes sense per error code; the UI renders only what's present.
 type Remediation struct {
@@ -283,14 +295,17 @@ func FromDiagnosis(d Diagnosis, s Signal) *StructuredError {
 
 	case CategorySchemaDrift:
 		se.FailureType = FailureTypeConfigError
-		se.Code = "SCHEMA_DRIFT_DETECTED"
+		se.Code = CodeSchemaDriftDetected
 		se.Audience = AudienceUser
-		se.UserMessage = "The source schema has changed (column added/removed/retyped) and the destination is out of sync."
+		// No apostrophes: the healer scrubs this copy, and llmscrub masks everything
+		// after an unpaired quote.
+		se.UserMessage = "The source schema has changed and the destination may be out of sync. " +
+			"rsync.ai handles added, retyped and dropped columns on its own; only a dropped table waits for your decision."
 		se.Remediation = &Remediation{
 			Steps: []string{
-				"Open the pipeline's Schema tab to see the detected drift",
-				"Approve the proposed schema migration, OR",
-				"Run the pipeline in 'reload' mode to recreate destination tables",
+				"Open the schema changes page for this pipeline (the Review change link) to see what changed and what rsync.ai did with it",
+				"A dropped source table waits for a decision: Approve drops the destination table, Reject keeps it, and either way the table leaves the pipeline",
+				"If the destination is still out of sync, run the pipeline in reload mode to recreate its tables",
 			},
 			DocURL:           ErrorDocURL("schema-drift"),
 			EstimatedMinutes: 10,
@@ -512,13 +527,13 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 
 	case strings.Contains(low, "resume token") || strings.Contains(low, "resume of change stream") || strings.Contains(low, "changestreamhistorylost") || strings.Contains(low, "change stream history lost") || strings.Contains(low, "resume point may no longer be in the oplog"):
 		se.Code = "MONGODB_RESUME_TOKEN_INVALID"
-		se.UserMessage = "The MongoDB change-stream resume token is no longer in the oplog, so streaming can't continue from where it left off. rsync.ai re-snapshots the affected collections from a fresh position; no data is lost, but the snapshot re-reads them."
+		se.UserMessage = "The MongoDB change-stream resume token is no longer in the oplog, so streaming can't continue from where it left off. Retrying, Resume and Reload all start from that lost position and fail the same way, and rsync.ai does not re-snapshot on its own: the connector's stored position has to be cleared, which re-snapshots the affected collections."
 		se.Severity = SeverityWarning
 		se.Remediation = &Remediation{
 			Steps: []string{
-				"No manual SQL is needed — rsync.ai re-snapshots from a fresh change-stream position",
+				"Clear the lost position with a CDC recovery: POST /api/v1/pipelines/<pipeline-id>/cdc/recover with reset_offsets: true and snapshot_mode: \"initial\" (needs CDC_RECOVERY_ENABLED=true; send dry_run: true first to see the plan)",
+				"The connector then re-snapshots the affected collections from a fresh change-stream position and streams on from there",
 				"To prevent recurrence, size the oplog so tokens survive longer downtime (commands below)",
-				"Re-run or resume this pipeline",
 			},
 			CommandsToRun: []string{
 				"// Inspect the current oplog window (mongosh):",
@@ -573,14 +588,4 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 			EstimatedMinutes: 5,
 		}
 	}
-}
-
-// FromError is a convenience wrapper for places that have only a raw error
-// (no Signal context). Prefer FromDiagnosis when you have a Signal.
-func FromError(err error, code string, failureType FailureType, audience Audience, userMessage string) *StructuredError {
-	se := NewStructuredError(code, failureType, audience, userMessage)
-	if err != nil {
-		se.InternalMessage = err.Error()
-	}
-	return se
 }

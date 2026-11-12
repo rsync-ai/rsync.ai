@@ -18,10 +18,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.utils.kafka_topics import (  # noqa: E402
+from src.utils.kafka_topics import (
     DEFAULT_TOPIC_PREFIX,
     ENV_TOPIC_PREFIX,
-    in_namespace,
     topic,
     topic_prefix,
     topics,
@@ -124,20 +123,3 @@ def test_prefix_of_only_illegal_characters_disables_qualification(monkeypatch):
 def test_empty_name_stays_empty():
     assert topic("") == ""
     assert topic("   ") == ""
-
-
-def test_in_namespace_matches_prefixed_and_legacy_names():
-    """Guards that classify a topic ("is this a batch topic?", "does this
-    pipeline own it?") must keep matching topics created before the prefix
-    existed, or a legacy topic gets misclassified and orphaned."""
-    assert in_namespace("rsync.pipeline.abc12345.data", "pipeline.")
-    assert in_namespace("pipeline.abc12345.data", "pipeline.")
-    assert not in_namespace("rsync.cdc.abc12345", "pipeline.")
-    assert not in_namespace("", "pipeline.")
-    assert not in_namespace("rsync.pipeline.abc12345.data", "")
-
-
-def test_in_namespace_works_with_qualification_disabled(monkeypatch):
-    monkeypatch.setenv(ENV_TOPIC_PREFIX, "")
-    assert in_namespace("pipeline.abc12345.data", "pipeline.")
-    assert not in_namespace("cdc.abc12345", "pipeline.")

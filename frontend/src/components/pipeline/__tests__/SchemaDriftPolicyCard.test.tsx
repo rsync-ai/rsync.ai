@@ -72,10 +72,14 @@ describe("SchemaDriftPolicyCard", () => {
 
     expect(await screen.findByRole("switch", { name: "Watch for schema changes" })).toBeChecked()
     expect(screen.getByRole("checkbox", { name: "New tables and columns" })).toBeChecked()
-    expect(screen.getByRole("checkbox", { name: "Dropped tables and columns" })).not.toBeChecked()
+    expect(screen.getByRole("checkbox", { name: "Dropped columns" })).not.toBeChecked()
     const typeChange = screen.getByRole("checkbox", { name: /column type changes/i })
     expect(typeChange).toBeChecked()
     expect(typeChange).toBeDisabled()
+    // Opting out of dropped columns never opts out of a dropped table: that one waits for a decision.
+    const dropTable = screen.getByRole("checkbox", { name: /dropped tables/i })
+    expect(dropTable).toBeChecked()
+    expect(dropTable).toBeDisabled()
     expect(authFetch.mock.calls[0][0]).toContain("/pipelines/p1/schema-drift-policy")
   })
 
@@ -96,10 +100,10 @@ describe("SchemaDriftPolicyCard", () => {
     const user = userEvent.setup()
     render(<SchemaDriftPolicyCard pipelineId="p1" isCDC={false} />)
 
-    await user.click(await screen.findByRole("checkbox", { name: "Dropped tables and columns" }))
+    await user.click(await screen.findByRole("checkbox", { name: "Dropped columns" }))
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("insufficient workspace role"))
-    expect(screen.getByRole("checkbox", { name: "Dropped tables and columns" })).toBeChecked()
+    expect(screen.getByRole("checkbox", { name: "Dropped columns" })).toBeChecked()
     expect(screen.queryByText("Saved")).toBeNull()
   })
 
@@ -110,7 +114,7 @@ describe("SchemaDriftPolicyCard", () => {
     expect(await screen.findByRole("switch", { name: "Watch for schema changes" })).not.toBeChecked()
     expect(screen.getByText("Off for this pipeline: no changes are checked.")).toBeInTheDocument()
     expect(screen.getByRole("checkbox", { name: "New tables and columns" })).toBeDisabled()
-    expect(screen.getByRole("checkbox", { name: "Dropped tables and columns" })).toBeDisabled()
+    expect(screen.getByRole("checkbox", { name: "Dropped columns" })).toBeDisabled()
     // The switch itself stays usable, so it can be turned back on.
     expect(screen.getByRole("switch", { name: "Watch for schema changes" })).toBeEnabled()
   })

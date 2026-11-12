@@ -124,7 +124,7 @@ func CreatePipelineSchedule(c *gin.Context) {
 			"error":      msg,
 			"message":    msg,
 			"error_code": "schedules_not_supported_for_cdc",
-			"sync_mode": mode,
+			"sync_mode":  mode,
 		})
 		return
 	}
@@ -187,8 +187,13 @@ func CreatePipelineSchedule(c *gin.Context) {
 		return
 	}
 
+	// From here the create outlives its caller. On the request's context, a tab closed
+	// after Temporal accepted the schedule cancelled the transaction, so the commit
+	// failed, the clean-up below was skipped, and the schedule ran with no row behind it.
+	ctx := context.WithoutCancel(c.Request.Context())
+
 	// Begin transaction
-	tx, err := database.BeginTx(c.Request.Context(), &sql.TxOptions{})
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
 		return
@@ -228,7 +233,7 @@ func CreatePipelineSchedule(c *gin.Context) {
 	}
 
 	// Create Temporal schedule
-	err = createTemporalSchedule(c.Request.Context(), scheduleID, pipelineID, req.ScheduleType, req.ScheduleSpec)
+	err = createTemporalSchedule(ctx, scheduleID, pipelineID, req.ScheduleType, req.ScheduleSpec)
 	if err != nil {
 		log.Errorf("Failed to create Temporal schedule: %v", err)
 		respondError(c, http.StatusInternalServerError, "temporal_schedule_create_failed", "Failed to create schedule in Temporal", err)
@@ -240,7 +245,7 @@ func CreatePipelineSchedule(c *gin.Context) {
 		// Commit failures can be ambiguous (e.g., network issues). Only cleanup Temporal if we
 		// successfully rolled back the DB transaction (i.e., we know the row is not persisted).
 		if rerr := tx.Rollback(); rerr == nil {
-			_ = deleteTemporalSchedule(c.Request.Context(), scheduleID)
+			_ = deleteTemporalSchedule(ctx, scheduleID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit schedule"})
 			return
 		}
@@ -399,8 +404,9 @@ func PausePipelineSchedule(c *gin.Context) {
 		return
 	}
 
-	// Pause in Temporal
-	err = pauseTemporalSchedule(c.Request.Context(), schedule.TemporalScheduleID, req.Reason)
+	// Pause in Temporal. Not on the request's context: a hang-up during the call can
+	// leave Temporal paused and the row still active.
+	err = pauseTemporalSchedule(context.WithoutCancel(c.Request.Context()), schedule.TemporalScheduleID, req.Reason)
 	if err != nil {
 		log.Errorf("Failed to pause Temporal schedule: %v", err)
 		respondError(c, http.StatusInternalServerError, "schedule_pause_failed", "Failed to pause schedule", err)
@@ -474,7 +480,7 @@ func ResumePipelineSchedule(c *gin.Context) {
 	}
 
 	// Resume in Temporal
-	err = resumeTemporalSchedule(c.Request.Context(), schedule.TemporalScheduleID)
+	err = resumeTemporalSchedule(context.WithoutCancel(c.Request.Context()), schedule.TemporalScheduleID)
 	if err != nil {
 		log.Errorf("Failed to resume Temporal schedule: %v", err)
 		respondError(c, http.StatusInternalServerError, "schedule_resume_failed", "Failed to resume schedule", err)
@@ -596,7 +602,7 @@ func DeletePipelineSchedule(c *gin.Context) {
 	}
 
 	// Delete from Temporal
-	err = deleteTemporalSchedule(c.Request.Context(), schedule.TemporalScheduleID)
+	err = deleteTemporalSchedule(context.WithoutCancel(c.Request.Context()), schedule.TemporalScheduleID)
 	if err != nil {
 		log.Errorf("Failed to delete Temporal schedule: %v", err)
 		respondError(c, http.StatusInternalServerError, "schedule_delete_failed", "Failed to delete schedule", err)
@@ -682,7 +688,7 @@ func UpdatePipelineSchedule(c *gin.Context) {
 	}
 
 	// Update Temporal schedule (try Update first, fallback to delete+create)
-	err = updateTemporalSchedule(c.Request.Context(), schedule.TemporalScheduleID, schedule.PipelineID, req.ScheduleType, req.ScheduleSpec)
+	err = updateTemporalSchedule(context.WithoutCancel(c.Request.Context()), schedule.TemporalScheduleID, schedule.PipelineID, req.ScheduleType, req.ScheduleSpec)
 	if err != nil {
 		log.Errorf("Failed to update Temporal schedule: %v", err)
 		respondError(c, http.StatusInternalServerError, "schedule_update_failed", "Failed to update schedule", err)
@@ -722,7 +728,7 @@ func UpdatePipelineSchedule(c *gin.Context) {
 // Helper Functions
 // ============================================================================
 
-// pipelineAllowsScheduling returns false if the pipeline is CDC (pipeline-level override or source-connection default).
+// pipelineAllowsScheduling returns false if the pipeline is CDC (see schedulingMode).
 // We treat schedules as a batch-only feature.
 func pipelineAllowsScheduling(database *sql.DB, pipelineID string) (bool, string, error) {
 	var syncMode sql.NullString
@@ -738,23 +744,25 @@ func pipelineAllowsScheduling(database *sql.DB, pipelineID string) (bool, string
 	if err != nil {
 		return false, "", err
 	}
+	allowed, mode := schedulingMode(syncMode.String, cdcMode.Valid, sourceSyncMode.String)
+	return allowed, mode, nil
+}
 
-	// If pipeline explicitly indicates CDC, treat as CDC.
-	if (syncMode.Valid && strings.EqualFold(strings.TrimSpace(syncMode.String), "cdc")) || (cdcMode.Valid && strings.TrimSpace(cdcMode.String) != "") {
-		return false, "cdc", nil
+// schedulingMode is pipelineListIsCDCSQL in Go: the pipeline's own sync_mode wins,
+// its cdc_mode counts only when sync_mode is unset, and the source connection's
+// sync_mode only when the pipeline has neither. Asking the source first refused a
+// schedule on every batch pipeline reading from a CDC-enabled connection.
+func schedulingMode(syncMode string, hasCDCMode bool, sourceSyncMode string) (bool, string) {
+	mode := strings.ToLower(strings.TrimSpace(syncMode))
+	switch {
+	case mode == "cdc":
+		return false, "cdc"
+	case mode != "":
+		return true, mode
+	case hasCDCMode, strings.EqualFold(strings.TrimSpace(sourceSyncMode), "cdc"):
+		return false, "cdc"
 	}
-
-	// Otherwise fall back to source connection mode, if present.
-	if sourceSyncMode.Valid && strings.EqualFold(strings.TrimSpace(sourceSyncMode.String), "cdc") {
-		return false, "cdc", nil
-	}
-
-	// Default: batch
-	mode := "batch"
-	if syncMode.Valid && strings.TrimSpace(syncMode.String) != "" {
-		mode = strings.ToLower(strings.TrimSpace(syncMode.String))
-	}
-	return true, mode, nil
+	return true, "batch"
 }
 
 // pipelineHasTableSelection reports whether `pipelines.config->'selected_tables'`
@@ -872,6 +880,13 @@ func scheduleBlockedReason(database *sql.DB, pipelineID string) string {
 		return ""
 	}
 
+	// The checks the scheduled wrapper asks before each tick (plan, GB, LLM
+	// spend, a draft connector, a Reload into an API). A refused tick writes no
+	// run, so this is the one place the user sees why the schedule is idle.
+	if check, cErr := checkScheduledRun(context.Background(), database, pipelineID); cErr == nil && !check.Allowed {
+		return "Scheduled runs are skipped: " + check.Message
+	}
+
 	// No park right now, but a missing table selection means the NEXT run parks.
 	if hasTables, tErr := pipelineHasTableSelection(database, pipelineID); tErr == nil && !hasTables {
 		return "No tables are selected for this pipeline. Scheduled runs will stop and wait for a table selection instead of moving data."
@@ -951,6 +966,32 @@ func validateScheduleSpec(scheduleType string, spec ScheduleSpec) error {
 // Temporal Schedule Operations
 // ============================================================================
 
+// scheduleCatchupWindow is how late a pipeline or model schedule may still take
+// a fire it missed: the machine slept, or Temporal or the worker was down, at
+// the fire time. Within it the fire runs once when Temporal is back; SKIP
+// overlap drops the rest of a backlog, so a long outage still costs one run.
+// It was 1 minute, which dropped a nightly fire whenever the host slept
+// through it. Edits and the startup reconcile widen schedules made with the
+// old window (withScheduleCatchupWindow, ReconcileScheduleCatchupWindows).
+const scheduleCatchupWindow = 24 * time.Hour
+
+// withScheduleCatchupWindow returns a copy of p whose catch-up window is at
+// least scheduleCatchupWindow, the rest unchanged. It only ever widens: zero
+// is Temporal's default (a year) and is left alone, as is any wider window.
+func withScheduleCatchupWindow(p *client.SchedulePolicies) *client.SchedulePolicies {
+	if p == nil {
+		return &client.SchedulePolicies{
+			Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+			CatchupWindow: scheduleCatchupWindow,
+		}
+	}
+	out := *p
+	if out.CatchupWindow != 0 && out.CatchupWindow < scheduleCatchupWindow {
+		out.CatchupWindow = scheduleCatchupWindow
+	}
+	return &out
+}
+
 func createTemporalSchedule(ctx context.Context, scheduleID, pipelineID, scheduleType string, spec ScheduleSpec) error {
 	scheduleSpec := client.ScheduleSpec{}
 
@@ -982,7 +1023,7 @@ func createTemporalSchedule(ctx context.Context, scheduleID, pipelineID, schedul
 			WorkflowRunTimeout: 5 * time.Minute,
 		},
 		Overlap:       enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
-		CatchupWindow: 1 * time.Minute,
+		CatchupWindow: scheduleCatchupWindow,
 		Paused:        false,
 	})
 
@@ -996,6 +1037,9 @@ func createTemporalSchedule(ctx context.Context, scheduleID, pipelineID, schedul
 // does the durable work. Idempotency: callers create at most one schedule per
 // chat pipeline (fresh pipeline id), so no pre-existence check is needed.
 func attachScheduleForChat(ctx context.Context, database *sql.DB, pipelineID, userID, scheduleType string, spec ScheduleSpec) error {
+	// The row, the Temporal schedule and the row's clean-up must not stop between
+	// steps when the caller hangs up (CreatePipelineSchedule says why).
+	ctx = context.WithoutCancel(ctx)
 	if database == nil {
 		return fmt.Errorf("database not connected")
 	}
@@ -1082,8 +1126,10 @@ func updateTemporalSchedule(ctx context.Context, scheduleID, pipelineID, schedul
 				Schedule: &client.Schedule{
 					Spec:   &scheduleSpec,
 					Action: input.Description.Schedule.Action, // Keep same action
-					Policy: input.Description.Schedule.Policy, // Keep same policy
-					State:  input.Description.Schedule.State,  // Keep same state
+					// Keep the same policy, but widen a catch-up window left from
+					// before scheduleCatchupWindow: an edit must not carry it forward.
+					Policy: withScheduleCatchupWindow(input.Description.Schedule.Policy),
+					State:  input.Description.Schedule.State, // Keep same state
 				},
 			}, nil
 		},

@@ -142,5 +142,89 @@
   {
     "input": "partition_key=customer_id",
     "expected": "partition_key=customer_id"
+  },
+  {
+    "input": "spec fetch failed: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/main/PublicApiSpecs/CRM/Contacts/Rollouts/424/v3/contacts.json returned 404",
+    "expected": "spec fetch failed: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/main/PublicApiSpecs/CRM/Contacts/Rollouts/424/v3/contacts.json returned 404"
+  },
+  {
+    "input": "The API spec at https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json is 11.2 MB; rsync.ai reads specs up to 5 MB. Download it, trim it to the endpoints you need, and paste it instead.",
+    "expected": "The API spec at https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json is 11.2 MB; rsync.ai reads specs up to 5 MB. Download it, trim it to the endpoints you need, and paste it instead."
+  },
+  {
+    "input": "The API spec is 5,000,001 bytes; rsync.ai reads specs up to 5,000,000 bytes.",
+    "expected": "The API spec is 5,000,001 bytes; rsync.ai reads specs up to 5,000,000 bytes."
+  },
+  {
+    "input": "GET https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit#gid=0 failed",
+    "expected": "GET https://docs.google.com/spreadsheets/d/[redacted]/edit#gid=0 failed"
+  },
+  {
+    "input": "POST https://hooks.example.com/services/T0ABCDE12/B0ABCDE34/aB3dE5fG7hI9jK1lM3nO5pQ7 failed",
+    "expected": "POST https://hooks.example.com/services/T0ABCDE12/B0ABCDE34/[redacted] failed"
+  },
+  {
+    "input": "GET https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/getMe failed",
+    "expected": "GET https://api.telegram.org/bot[num-redacted]:[redacted]/getMe failed"
+  },
+  {
+    "input": "GET https://maps.googleapis.com/maps/api/geocode/json?key=AIzaSyA1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvW&address=x returned 403",
+    "expected": "GET https://maps.googleapis.com/maps/api/geocode/json?key=[redacted]&address=x returned 403"
+  },
+  {
+    "input": "callback https://app.example.com/oauth/callback?code=4/0AY0e-g7abcDEF&state=xyz",
+    "expected": "callback https://app.example.com/oauth/callback?code=[redacted]&state=xyz"
+  },
+  {
+    "input": "GET https://bucket.s3.amazonaws.com/obj.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404 returned 403",
+    "expected": "GET https://bucket.s3.amazonaws.com/obj.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=[redacted]&X-Amz-Date=[num-redacted]T000000Z&X-Amz-Signature=[redacted] returned 403"
+  },
+  {
+    "input": "GET https://api.example.com/v1/items?api_key=abc123def456&page=2 returned 401",
+    "expected": "GET https://api.example.com/v1/items?api_key=[redacted] returned 401"
+  },
+  {
+    "input": "redis connect failed: redis://:hunter2@cache:6379/0",
+    "expected": "redis connect failed: redis://[redacted]@cache:6379/0"
+  },
+  {
+    "input": "lookup db.internal.example.com: no such host",
+    "expected": "lookup [host-redacted]: no such host"
+  },
+  {
+    "input": "dial tcp: lookup _mongodb._tcp.c0.x.mongodb.net on 10.0.0.1:53: no such host",
+    "expected": "dial tcp: lookup [host-redacted] on [ip-redacted]:53: no such host"
+  },
+  {
+    "input": "dial tcp db.example.com:5432: i/o timeout",
+    "expected": "dial tcp [host-redacted]:5432: i/o timeout"
+  },
+  {
+    "input": "could not translate host name \"db.example.com\" to address: Name or service not known",
+    "expected": "could not translate host name \"[host-redacted]\" to address: Name or service not known"
+  },
+  {
+    "input": "connection to server at \"db.example.com\" (10.0.0.1), port 5432 failed: Connection refused",
+    "expected": "connection to server at \"[host-redacted]\" ([ip-redacted]), port 5432 failed: Connection refused"
+  },
+  {
+    "input": "DNS lookup DB.Example.COM failed",
+    "expected": "DNS lookup [host-redacted] failed"
+  },
+  {
+    "input": "dial tcp: lookup postgres: no such host",
+    "expected": "dial tcp: lookup postgres: no such host"
+  },
+  {
+    "input": "relation public.orders does not exist",
+    "expected": "relation public.orders does not exist"
+  },
+  {
+    "input": "lookup failed: schema.table missing",
+    "expected": "lookup failed: schema.table missing"
+  },
+  {
+    "input": "syntax error at or near 'john\\",
+    "expected": "syntax error at or near '[redacted]'"
   }
 ]

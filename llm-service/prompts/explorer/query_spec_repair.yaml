@@ -31,7 +31,7 @@ user: |
   <SCHEMA>
   {% for table in tables %}
   - {{ table.schema }}.{{ table.name }}
-    Columns: {% for col in table.columns %}{{ col.name }} ({{ col.type }}){% if not loop.last %}, {% endif %}{% endfor %}
+    Columns: {% for col in table.columns %}{{ col.name }} ({{ col.type }}){% if not loop.last %}, {% endif %}{% endfor +%}
   {% endfor %}
   </SCHEMA>
 
@@ -58,3 +58,14 @@ user: |
   {% endfor %}
 
   Return corrected QuerySpec JSON only.
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  dialect: enum
+  question: user_text
+  tables: catalog
+  relationships: identifier
+  previous_spec: model_output
+  errors: rsync_text
+  fix_hints: rsync_text

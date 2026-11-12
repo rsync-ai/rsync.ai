@@ -30,6 +30,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -38,8 +39,10 @@ import (
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/assessor"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
+	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
 )
 
 // AssessmentHandler runs and persists pre-flight assessments for pipelines.
@@ -187,6 +190,16 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 		return
 	}
 
+	// A selected table that vanished from a batch source is drift, not a setup
+	// error: the run leaves it out and files a drop decision for the Schema
+	// changes tab, so blocking that run would hide the decision. CDC keeps the
+	// block — its start provisions every selected table, missing ones included.
+	if !(assessor.Input{SyncMode: syncMode}).IsCDC() {
+		if missing := missingSourceTables(result); len(missing) > 0 {
+			warnTablesAwaitingDropDecision(result, executor.TablesAwaitingDropDecision(c, h.db, pipelineID, missing))
+		}
+	}
+
 	row, err := h.persistResult(c, pipelineID, sourceConnID, result)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "persist failed: " + err.Error()})
@@ -201,6 +214,46 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 	}).Info("🛫 Pre-flight assessment run")
 
 	c.JSON(http.StatusOK, row)
+}
+
+const codeTableNotFoundInSource = "CDC_TABLE_NOT_FOUND_IN_SOURCE"
+
+// missingSourceTables lists the tables a failed CDC_TABLE_NOT_FOUND_IN_SOURCE
+// check names.
+func missingSourceTables(r *assessor.Result) []string {
+	var out []string
+	for _, ch := range r.Checks {
+		if ch.Code == codeTableNotFoundInSource && !ch.Passed && ch.Object != "" {
+			out = append(out, ch.Object)
+		}
+	}
+	return out
+}
+
+// warnTablesAwaitingDropDecision turns the missing-table error for each table
+// in awaiting into a warning that says what the run does with it, then
+// re-summarizes so the result no longer blocks on it. Pure.
+func warnTablesAwaitingDropDecision(r *assessor.Result, awaiting map[string]bool) {
+	if len(awaiting) == 0 {
+		return
+	}
+	for i, ch := range r.Checks {
+		if ch.Code != codeTableNotFoundInSource || ch.Passed || !awaiting[ch.Object] {
+			continue
+		}
+		r.Checks[i].Severity = assessor.SeverityWarning
+		r.Checks[i].Message = fmt.Sprintf("Table %s no longer exists in the source. The run leaves it out and asks for a drop decision on the Schema changes tab.", ch.Object)
+		r.Checks[i].Remediation = &diagnose.Remediation{
+			Steps: []string{
+				"Approve the drop on the Schema changes tab to drop the destination table and remove the table from the pipeline",
+				"Reject it to keep the destination table and remove the table from the pipeline",
+				"Or restore the table in the source",
+			},
+			DocURL:           diagnose.ErrorDocURL("cdc-table-not-found"),
+			EstimatedMinutes: 2,
+		}
+	}
+	assessor.Summarize(r)
 }
 
 // GetLatest returns the most recent assessment for a pipeline.

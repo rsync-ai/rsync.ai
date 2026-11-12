@@ -113,7 +113,7 @@ describe("Table statistics — a run that moved nothing", () => {
     serve({ lastDataRun: null })
     render(<TableStatisticsPanel pipelineId="p1" executionId={LATEST} mode="batch" />)
     await waitFor(() => expect(authFetch).toHaveBeenCalled())
-    await screen.findByText("Summary")
+    await screen.findByRole("region", { name: "Tables" })
     expect(screen.queryByTestId("table-stats-run-banner")).toBeNull()
     expect(new Set(requestedExecutions())).toEqual(new Set([LATEST]))
   })
@@ -121,7 +121,7 @@ describe("Table statistics — a run that moved nothing", () => {
   it("stays on a run that moved rows", async () => {
     serve()
     render(<TableStatisticsPanel pipelineId="p1" executionId={RELOAD} mode="batch" />)
-    await screen.findByText("Summary")
+    await screen.findByRole("region", { name: "Tables" })
     expect(screen.queryByTestId("table-stats-run-banner")).toBeNull()
     expect(new Set(requestedExecutions())).toEqual(new Set([RELOAD]))
   })

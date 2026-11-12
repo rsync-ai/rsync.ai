@@ -15,7 +15,9 @@ import { setActiveWorkspaceId } from "@/lib/workspace/active-workspace"
 // P5b-UI #3: the /invite/[token] landing page body. The preview is PUBLIC (an
 // invitee inspects the workspace before authenticating); accept is AUTHED and
 // email-bound server-side. We mirror only what improves UX:
-//   - logged out  → login/signup CTAs carrying ?next back here so they return
+//   - logged out  → login/signup CTAs carrying ?next back here so they return;
+//     signup also carries the invite, claimed at sign-up (on a single-workspace
+//     install, sign-up after the first user is invite-only and this is the way in)
 //   - logged in, matching email → Accept (joins, marks active, goes home)
 //   - logged in, different email → block + offer an account switch (the backend
 //     would 403; don't make the user discover that by clicking)
@@ -224,7 +226,7 @@ export default function InviteLanding({ token }: { token: string }) {
               <Link href={`/login?next=${encodeURIComponent(returnPath)}`}>Log in to accept</Link>
             </Button>
             <Button asChild variant="outline" className="w-full">
-              <Link href={`/signup?next=${encodeURIComponent(returnPath)}`}>Create an account</Link>
+              <Link href={`/signup?workspace_invite=${encodeURIComponent(token)}&next=${encodeURIComponent(returnPath)}`}>Create an account</Link>
             </Button>
           </>
         )}

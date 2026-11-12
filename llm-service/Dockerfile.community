@@ -46,9 +46,10 @@ RUN useradd -m -u 1000 appuser
 # ── ALLOWLIST COPY — moat-free modules ONLY ─────────────────────────────────────
 # Keep in lockstep with oss-strip-list.txt (enforced by tests/test_oss_image_boundary.py).
 COPY src/__init__.py ./src/__init__.py
+COPY src/egress/ ./src/egress/
 COPY src/gateway/ ./src/gateway/
 COPY src/lifecycle/ ./src/lifecycle/
-COPY src/models/ ./src/models/
+COPY src/lineage/ ./src/lineage/
 COPY src/text2sql/ ./src/text2sql/
 COPY src/utils/ ./src/utils/
 
@@ -80,11 +81,17 @@ COPY src/agents/tool_generator/templates/ ./src/agents/tool_generator/templates/
 COPY src/agents/tool_generator/validation/ ./src/agents/tool_generator/validation/
 
 # prompts/standards + prompts/tool_generator are generation prompts — stripped.
+COPY prompts/assistant/ ./prompts/assistant/
 COPY prompts/chat/ ./prompts/chat/
 COPY prompts/diagnose/ ./prompts/diagnose/
 COPY prompts/explorer/ ./prompts/explorer/
 COPY prompts/hitl/ ./prompts/hitl/
 COPY prompts/planner/ ./prompts/planner/
+COPY prompts/suggestions/ ./prompts/suggestions/
+
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 RUN chown -R appuser:appuser /app
 

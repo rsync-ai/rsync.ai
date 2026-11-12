@@ -18,7 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Loader2, Eye, EyeOff, CheckCircle2, AlertCircle, Zap, Clock, Info, Database, Radio, Container, Play, ShieldCheck } from "lucide-react"
+import { Loader2, Eye, EyeOff, CheckCircle2, AlertCircle, Zap, Clock, Info, Container, Play, ShieldCheck } from "lucide-react"
 import {
   ConfigProperty,
   MCPConnector,
@@ -28,7 +28,8 @@ import {
 import { testMCPConnection } from "@/lib/api/mcp-connectors"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { APIRequestError, parseAPIError, ErrorCodes } from "@/lib/errors/api-errors"
+import { APIRequestError, parseAPIError } from "@/lib/errors/api-errors"
+import { withErrorDetails } from "@/lib/utils/error-handling"
 import { connectorDeployingErrorMessage, isConnectorDeployingResponse } from "@/lib/errors/connector-deploying"
 import { OAuthConnectButton } from "@/components/oauth/OAuthConnectButton"
 import { AuthMethodPicker } from "@/components/connectors/AuthMethodPicker"
@@ -74,7 +75,7 @@ type BYOAppStatus = {
  * Parse and improve database connection error messages
  * Makes MySQL/PostgreSQL errors more user-friendly
  */
-function improveErrorMessage(error: string, connectorType: string): string {
+function improveErrorMessage(error: string): string {
   // API Gateway sometimes wraps structured validation errors inside a string:
   // "Test service returned error (HTTP 400): { ...json... }"
   // Unwrap and show a readable bullet list.
@@ -302,6 +303,13 @@ export function parseNumberInput(
   return type === "integer" ? Math.trunc(n) : n
 }
 
+// The config key that pins a source to one namespace, by its table_namespace.
+// A schema-namespace connector has none: its Scope always applies.
+const SCOPE_PIN_KEYS: Record<string, string[]> = {
+  database: ["database", "db_name", "db"],
+  dataset: ["dataset_id"],
+}
+
 export function GenericConnectorForm({
   connector,
   onSave,
@@ -334,7 +342,6 @@ export function GenericConnectorForm({
   // HITL questionnaire state
   const [useCase, setUseCase] = useState<UseCase>("")
   const [freshnessRequirement, setFreshnessRequirement] = useState<FreshnessRequirement>("")
-  const [showQuestions, setShowQuestions] = useState(false)
   const [recommendedMode, setRecommendedMode] = useState<SyncMode | null>(null)
   const [formData, setFormData] = useState<Record<string, unknown>>(() => {
     // If editing, use the existing config
@@ -551,17 +558,15 @@ export function GenericConnectorForm({
 
   // Scope step (#31): a source whose connector lists its databases or schemas
   // can narrow which ones it reads. A database-namespace connection (MySQL,
-  // MongoDB, ClickHouse) that names a database is pinned to it, as the server
-  // pins it (orchestrator connectionScope); the Scope applies server-level.
+  // MongoDB, ClickHouse) that names a database is pinned to it, and a BigQuery
+  // one to its dataset_id (discovery reads only that dataset), as the server
+  // pins them (orchestrator connectionScope); the Scope applies server-level.
   const namespaceModels = useNamespaceModels()
   const showScope = connectionType === "source" && listsNamespaces(namespaceModels, connector.name)
   const tableNamespace = namespaceModelFor(namespaceModels, connector.name).table_namespace
-  const scopePinnedDatabase =
-    tableNamespace === "database"
-      ? ["database", "db_name", "db"]
-          .map((k) => formData[k])
-          .find((v): v is string => typeof v === "string" && v.trim() !== "")
-      : undefined
+  const scopePinnedNamespace = (SCOPE_PIN_KEYS[tableNamespace] ?? [])
+    .map((k) => formData[k])
+    .find((v): v is string => typeof v === "string" && v.trim() !== "")
   const setScope = (v: ScopeValue) =>
     setFormData((prev) => ({ ...prev, [NAMESPACE_FILTER_MODE_KEY]: v.mode, [NAMESPACE_FILTER_PATTERNS_KEY]: v.patterns }))
 
@@ -571,14 +576,6 @@ export function GenericConnectorForm({
       console.log(`[GenericConnectorForm] Initialized for ${connector.name} - Available types: ${availableTypes.join(', ')}`)
     }
   }, [])
-  
-  // Show questionnaire when connection type is set to source and connector supports CDC
-  useEffect(() => {
-    if (connectionType === "source" && connector.supports_cdc && !initialData?.syncMode) {
-      // Keep the form compact by default; user can expand “Help me choose”.
-      setShowQuestions(false)
-    }
-  }, [connectionType, connector.supports_cdc])
 
   // Keep CDC defaults sane without forcing additional “extra” screens in the modal.
   useEffect(() => {
@@ -855,12 +852,15 @@ export function GenericConnectorForm({
     // Check if Docker container needs to be started
     const needsDockerStart = connector.docker_status === "stopped" || 
                             connector.docker_status === "not_deployed"
+    // Dismissed when the test ends: left up, it stacked over Save Connection on
+    // a narrow window long after the button had stopped saying "Starting".
+    let startingToastId: string | number | undefined
 
     try {
       // If Docker is not running, show starting state
       if (needsDockerStart) {
         setDockerStarting(true)
-        toast.info("Starting connector...", {
+        startingToastId = toast.info("Starting connector...", {
           description: `Spinning up ${connector.display_name} Docker container`,
         })
         // Add a small delay to simulate startup
@@ -913,21 +913,19 @@ export function GenericConnectorForm({
         result.retryable = true
       } else if (!result.success && result.message) {
         // Improve error messages for better UX
-        result.message = improveErrorMessage(result.message, connector.name)
+        result.message = improveErrorMessage(result.message)
       }
       
+      // The inline result says it; a success toast repeated it over the form.
       setTestResult(result)
-      
-      if (result.success && needsDockerStart) {
-        toast.success("Connector started successfully!")
-      }
     } catch (err) {
       const rawMessage = err instanceof Error ? err.message : "Connection test failed"
       setTestResult({
         success: false,
-        message: improveErrorMessage(rawMessage, connector.name),
+        message: improveErrorMessage(rawMessage),
       })
     } finally {
+      if (startingToastId !== undefined) toast.dismiss(startingToastId)
       setTesting(false)
       setDockerStarting(false)
 
@@ -1056,7 +1054,7 @@ export function GenericConnectorForm({
     }
 
     // A Scope the server would refuse (fail closed) is not saved.
-    if (showScope && !scopePinnedDatabase) {
+    if (showScope && !scopePinnedNamespace) {
       const scopeError = scopeConfigError(formData)
       if (scopeError) {
         setError({
@@ -1203,8 +1201,10 @@ export function GenericConnectorForm({
         // Focus the problematic field if identified; otherwise the banner.
         const fieldElement = field ? document.getElementById(field) : null
         focusErrorBanner.current = !fieldElement
+        // The gateway's `error` is a label ("Invalid oauth_token_id"); the
+        // reason is in `details`.
         setError({
-          message: err.message,
+          message: withErrorDetails(err.message, err.details),
           suggestion: err.suggestion,
           field,
           code: err.code,
@@ -1218,7 +1218,7 @@ export function GenericConnectorForm({
         const parsed = parseAPIError(err)
         focusErrorBanner.current = true
         setError({
-          message: parsed.message,
+          message: withErrorDetails(parsed.message, parsed.details),
           suggestion: parsed.suggestion,
           field: parsed.field,
           code: parsed.code,
@@ -1254,7 +1254,7 @@ export function GenericConnectorForm({
             value={value as string}
             onValueChange={(v) => handleInputChange(key, v)}
           >
-            <SelectTrigger>
+            <SelectTrigger id={key}>
               <SelectValue placeholder={`Select ${formatLabel(key)}...`} />
             </SelectTrigger>
             <SelectContent>
@@ -1645,7 +1645,6 @@ export function GenericConnectorForm({
                   type="button"
                   onClick={() => {
                     setRecommendedMode(null)
-                    setShowQuestions(true)
                     setUseCase("")
                     setFreshnessRequirement("")
                   }}
@@ -1711,7 +1710,7 @@ export function GenericConnectorForm({
                     Real-time (CDC)
                   </span>
                   {!connector.supports_cdc && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400">
                       Not Available
                     </span>
                   )}
@@ -1733,9 +1732,9 @@ export function GenericConnectorForm({
                   </AccordionTrigger>
                   <AccordionContent className="px-4 pb-4 space-y-4">
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">Start mode</Label>
+                      <Label htmlFor="cdc-start-mode" className="text-sm font-medium">Start mode</Label>
                       <Select value={cdcMode} onValueChange={(v) => setCdcMode(v as CDCMode)}>
-                        <SelectTrigger>
+                        <SelectTrigger id="cdc-start-mode">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -2184,7 +2183,7 @@ export function GenericConnectorForm({
           namespaceKind={tableNamespace}
           value={scopeFromConfig(formData)}
           onChange={setScope}
-          pinnedDatabase={scopePinnedDatabase}
+          pinnedNamespace={scopePinnedNamespace}
           loadNamespaces={loadScopeNamespaces}
         />
       )}

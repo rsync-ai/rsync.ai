@@ -653,6 +653,14 @@ func TestToInt64(t *testing.T) {
 		{json.Number("200"), 200},
 		{"300", 300},
 		{nil, 0},
+		// A JSON number the orchestrator flattened with %v.
+		{"1e+06", 1000000},
+		{json.Number("1e+06"), 1000000},
+		{"2.5e+07", 25000000},
+		// Not a whole number, or not a number: unset.
+		{"1.5", 0},
+		{"abc", 0},
+		{"1e+30", 0},
 	}
 
 	for _, tc := range tests {

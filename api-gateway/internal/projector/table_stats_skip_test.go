@@ -104,9 +104,9 @@ func TestUpsertTableStats_EverySkipIsCountedAndLoggedByReason(t *testing.T) {
 				t.Fatalf("unexpected database activity: %v", err)
 			}
 
-			counts := p.TableStatsSkipCounts()
+			counts := skipCounts(p)
 			if len(counts) != int(numTableStatsSkipReasons) {
-				t.Errorf("TableStatsSkipCounts has %d reasons, want all %d (including zeros)", len(counts), numTableStatsSkipReasons)
+				t.Errorf("skipCounts has %d reasons, want all %d (including zeros)", len(counts), numTableStatsSkipReasons)
 			}
 			for name, n := range counts {
 				want := uint64(0)
@@ -158,7 +158,7 @@ func TestUpsertTableStats_SkipWarningsAreSampled(t *testing.T) {
 		}
 	}
 
-	if got := p.TableStatsSkipCounts()["missing_table"]; got != 5 {
+	if got := skipCounts(p)["missing_table"]; got != 5 {
 		t.Errorf("missing_table count = %d, want 5", got)
 	}
 	entries := skipEntries(hook)
@@ -213,7 +213,7 @@ func TestUpsertTableStats_WellFormedEventIsNotASkip(t *testing.T) {
 	if err := p.upsertTableStats(validSkipTestEvent()); !errors.Is(err, sentinel) {
 		t.Fatalf("upsertTableStats = %v, want the Begin error: a well-formed event must reach the database", err)
 	}
-	for name, n := range p.TableStatsSkipCounts() {
+	for name, n := range skipCounts(p) {
 		if n != 0 {
 			t.Errorf("skip count %s = %d for a well-formed event", name, n)
 		}
@@ -221,4 +221,15 @@ func TestUpsertTableStats_WellFormedEventIsNotASkip(t *testing.T) {
 	if n := len(skipEntries(hook)); n != 0 {
 		t.Errorf("%d skip log line(s) for a well-formed event", n)
 	}
+}
+
+// skipCounts reports how many TABLE_STATS events p has dropped, per reason, since it
+// started. Reasons that never fired are included with 0 so a test can tell "none
+// dropped" from "not reported".
+func skipCounts(p *EventProjector) map[string]uint64 {
+	out := make(map[string]uint64, numTableStatsSkipReasons)
+	for r := tableStatsSkipReason(0); r < numTableStatsSkipReasons; r++ {
+		out[r.String()] = p.tableStatsSkips[r].Load()
+	}
+	return out
 }

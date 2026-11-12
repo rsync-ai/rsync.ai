@@ -20,11 +20,24 @@ The reference implementation for every rule below is the database template
 | Method | Required when | Returns (success) |
 |---|---|---|
 | `import_data(params)` | `supports_destination=true` (append) | `{"success": true, "rows_inserted": <int>}` |
-| `upsert_data(params)` | resource exposes an update/PATCH/PUT verb **or** `synthetic_pk` | `{"success": true, "rows_upserted": <int>}` |
-| `delete_data(params)` | resource exposes a DELETE verb | `{"success": true, "rows_deleted": <int>}` |
+| `upsert_data(params)` | resource exposes an update/PATCH/PUT verb **or** `synthetic_pk` | `{"success": true, "rows_upserted": <int>, "results": [...]}` (§4) |
+| `delete_data(params)` | resource exposes a DELETE verb | `{"success": true, "rows_deleted": <int>, "results": [...]}` (§4) |
 
 `ensure_table`, `drop_table`, `get_cdc_offsets` are **DB/warehouse-only**. A SaaS
 connector MUST NOT advertise `supports_cdc=true`.
+
+**An API destination is reverse ETL, with no Reload.** A destination whose `metadata.json`
+says `category: api_saas` (every generated REST/GraphQL connector, `stripe`,
+`shopify-admin-graphql`, `google-sheets`) has no table to rebuild: a run updates the
+records it wrote before (for a connector whose `get_capabilities` says `record_ids`,
+through the sink's key map, §3) and creates the rest, and the sink deletes nothing in the
+app. The gateway refuses a Reload into one with 422 `reload_not_supported`
+([`apiDestinationReloadRefusal`](../../api-gateway/internal/handlers/pipelines.go:3283))
+and no page offers one. `delete_data` with `record_ids` stays in the template for a future
+delete opt-in.
+An API as a **source** is unchanged: a re-run reads incrementally where the API allows, and a
+Reload rewrites the warehouse table. History:
+KI-API-DEST-RELOAD-APPENDS.
 
 ### Honest capability advertising (`metadata.json`)
 - `supports_destination` = `true` **iff** at least one resource has a write verb
@@ -67,6 +80,21 @@ when the destination supports identity.
 3. **`key_fields` empty + no `synthetic_pk`:** `import_data` (append) is the only
    honest option; the connector MUST NOT claim `upsert` in `destination_modes`.
 
+**How a generated REST connector does 1 and 2: the key map.** A REST API names a
+record by an id it makes up, so a source key cannot address it. The template's
+`get_capabilities` says `record_ids: true`, and the kafka-mcp-sink then keeps a map
+from each source row (sha256 of its key values, or of the whole row when the source
+has no key) to the id the API gave its record, in the platform table
+`api_destination_records` (migration 144). It sends `upsert_data` a `record_ids`
+list aligned with `data`: the record's id, or `""` for a row never written. An id
+updates that record (PUT/PATCH on the item route; a 404/410 creates it again); no
+id creates one. `key_fields` name source columns and never address a record. A
+caller that sends no `record_ids` (an MCP client writing back records it read from
+the same API) addresses a row by the resource's own id field. Append mode
+(`cdc_write_mode: append`) skips the map: every row is a new record, as asked
+([api_dest_rows.go](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/api_dest_rows.go)). Was
+KI-API-DEST-UPSERT-NOT-IDEMPOTENT.
+
 `import_data` (append) is **not** required to be idempotent, but it MUST return an
 accurate `rows_inserted` count so the executor can reconcile.
 
@@ -80,6 +108,23 @@ accurate `rows_inserted` count so the executor can reconcile.
   (`rows_inserted` / `rows_upserted` / `rows_deleted`) reflecting rows actually
   persisted — never echo the input length blindly. Partial failures go in
   `errors: [...]` with the count reflecting only successes.
+
+**Per-row results (`record_ids` connectors).** `upsert_data` and `delete_data`
+answer `results`, one per row, in order: `created` or `updated` with the record's
+`id`, `deleted`, `failed` with `error` and `retryable` (no answer, 408, 429 or a
+5xx), or `pending`, not sent because the call's `time_budget_s` ran out. The sink
+sends a budget of half its HTTP timeout (60 s of the default 120 s), so the
+connector answers while the sink is still waiting and writes nothing after it has
+gone. `success` is `true` only when every row landed, and the sink reads `results`
+either way:
+- pending rows are sent again at once; retryable ones after a backoff, for up to 5
+  rounds that write nothing new;
+- a row that still fails goes to the DLQ alone, and the batch's ack counts the rows
+  that landed, with the reason;
+- an answer without one result a row is retried whole.
+
+Was KI-API-DEST-PARTIAL-BATCH-RESENT
+and KI-API-DEST-BATCH-OUTLASTS-SINK-TIMEOUT.
 
 ---
 

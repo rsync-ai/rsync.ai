@@ -38,6 +38,18 @@ const mysql = {
 
 const gcs = { ...mysql, name: "gcs", display_name: "GCS" } as unknown as MCPConnector
 
+// BigQuery's table namespace is the dataset (metadata.json namespace_model), and
+// discovery reads only the dataset_id the connection names.
+const bigquery = {
+  ...mysql,
+  name: "bigquery",
+  display_name: "BigQuery",
+  configuration_schema: {
+    properties: { project_id: { type: "string" }, dataset_id: { type: "string" } },
+    required: ["project_id"],
+  },
+} as unknown as MCPConnector
+
 function renderForm(
   connector: MCPConnector,
   config: Record<string, unknown>,
@@ -115,6 +127,18 @@ describe("GenericConnectorForm Scope step", () => {
   it("a connection naming a database is pinned to it", () => {
     renderForm(mysql, { host: "db", user: "u", database: "shop" })
     expect(screen.getByTestId("connection-scope-pinned")).toHaveTextContent("shop")
+  })
+
+  it("a BigQuery connection naming a dataset is pinned to it, with no Scope to choose", () => {
+    renderForm(bigquery, { project_id: "acme", dataset_id: "analytics" })
+    expect(screen.getByTestId("connection-scope-pinned")).toHaveTextContent("analytics")
+    expect(screen.queryByRole("radiogroup", { name: "Scope" })).toBeNull()
+  })
+
+  it("control: a BigQuery connection with no dataset yet still offers the Scope", () => {
+    renderForm(bigquery, { project_id: "acme" })
+    expect(screen.queryByTestId("connection-scope-pinned")).toBeNull()
+    expect(screen.getByRole("radiogroup", { name: "Scope" })).toBeInTheDocument()
   })
 
   it("is absent for a destination and for a connector with nothing to list", () => {

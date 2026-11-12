@@ -9,7 +9,6 @@ import logging
 import json
 import contextvars
 from typing import Optional, Dict, Any, Tuple
-from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from src.utils.openai_client import env_bool
@@ -70,8 +69,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-from opentelemetry.propagate import set_global_textmap, get_global_textmap, inject, extract
-from opentelemetry.trace import Status, StatusCode, SpanKind
+from opentelemetry.propagate import set_global_textmap, inject
+from opentelemetry.trace import Status, StatusCode
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
@@ -265,8 +264,8 @@ def init_tracer(service_name: str, service_version: str = "1.0.0") -> trace.Trac
     provider = TracerProvider(resource=resource)
     
     # Create OTLP exporter -- only when an operator says a collector exists.
-    # The provider is still installed either way, so every start_span() call site
-    # keeps working; it just has nothing attached to ship the spans anywhere.
+    # The provider is still installed either way, so every span the service opens
+    # still works; it just has nothing attached to ship the spans anywhere.
     if otel_enabled():
         try:
             exporter = OTLPSpanExporter(
@@ -360,51 +359,6 @@ def instrument_requests():
         logger.warning(f"⚠️ Failed to instrument requests: {e}")
 
 
-@contextmanager
-def start_span(name: str, kind: SpanKind = SpanKind.INTERNAL, attributes: Dict[str, Any] = None):
-    """
-    Context manager for creating spans
-    
-    Usage:
-        with start_span("process_request", attributes={"request_id": "123"}) as span:
-            # do work
-            span.set_attribute("result", "success")
-    """
-    tracer = get_tracer()
-    with tracer.start_as_current_span(name, kind=kind) as span:
-        if attributes:
-            for key, value in attributes.items():
-                span.set_attribute(key, str(value) if value is not None else "")
-        try:
-            yield span
-        except Exception as e:
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR, str(e)))
-            raise
-
-
-def start_span_from_context(name: str, carrier: Dict[str, str], kind: SpanKind = SpanKind.SERVER):
-    """
-    Start a span from trace context in headers/carrier
-    
-    Args:
-        name: Span name
-        carrier: Dict containing trace context headers (traceparent, tracestate)
-        kind: Span kind
-        
-    Returns:
-        Tuple of (context, span)
-    """
-    tracer = get_tracer()
-    propagator = get_global_textmap()
-    
-    # Extract context from carrier
-    ctx = propagator.extract(carrier=carrier)
-    
-    # Start span as child of extracted context
-    return tracer.start_span(name, context=ctx, kind=kind)
-
-
 def inject_trace_context(carrier: Dict[str, str]):
     """
     Inject current trace context into a carrier dict
@@ -415,19 +369,6 @@ def inject_trace_context(carrier: Dict[str, str]):
     inject(carrier)
 
 
-def extract_trace_context(carrier: Dict[str, str]):
-    """
-    Extract trace context from a carrier dict
-    
-    Args:
-        carrier: Dict containing trace headers
-        
-    Returns:
-        Context object
-    """
-    return extract(carrier=carrier)
-
-
 def get_current_trace_id() -> Optional[str]:
     """Get the current trace ID as a 32-char hex string (OTel standard)"""
     span = trace.get_current_span()
@@ -436,128 +377,9 @@ def get_current_trace_id() -> Optional[str]:
     return None
 
 
-def get_current_trace_id_uuid() -> Optional[str]:
-    """
-    Get the current trace ID formatted as a UUID string for PostgreSQL.
-    Converts 32-char hex to UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    """
-    trace_id = get_current_trace_id()
-    if trace_id:
-        return trace_id_to_uuid(trace_id)
-    return None
-
-
-def get_current_span_id() -> Optional[str]:
-    """Get the current span ID as a string"""
-    span = trace.get_current_span()
-    if span and span.get_span_context().is_valid:
-        return format(span.get_span_context().span_id, '016x')
-    return None
-
-
 # =============================================================================
 # TRACE ID FORMAT UTILITIES (Ensures consistency across Go/Python/PostgreSQL)
 # =============================================================================
-
-def trace_id_to_uuid(trace_id: str) -> str:
-    """
-    Convert a 32-char hex trace_id to UUID format for PostgreSQL storage.
-    
-    OpenTelemetry generates 32-char hex: 0af7651916cd43dd8448eb211c80319c
-    PostgreSQL UUID format: 0af76519-16cd-43dd-8448-eb211c80319c
-    
-    Args:
-        trace_id: 32-character hex string
-        
-    Returns:
-        UUID-formatted string
-    """
-    if not trace_id or len(trace_id) < 32:
-        return trace_id
-    
-    # Remove any existing dashes
-    clean_id = trace_id.replace("-", "")
-    
-    # Format as UUID: 8-4-4-4-12
-    return f"{clean_id[:8]}-{clean_id[8:12]}-{clean_id[12:16]}-{clean_id[16:20]}-{clean_id[20:32]}"
-
-
-def uuid_to_trace_id(uuid_str: str) -> str:
-    """
-    Convert a UUID string back to 32-char hex trace_id format.
-    
-    PostgreSQL UUID: 0af76519-16cd-43dd-8448-eb211c80319c
-    OpenTelemetry format: 0af7651916cd43dd8448eb211c80319c
-    
-    Args:
-        uuid_str: UUID-formatted string
-        
-    Returns:
-        32-character hex string
-    """
-    if not uuid_str:
-        return uuid_str
-    return uuid_str.replace("-", "").lower()
-
-
-def normalize_trace_id(trace_id: str, format: str = "hex") -> str:
-    """
-    Normalize a trace_id to the specified format.
-    
-    Args:
-        trace_id: Trace ID in any format (hex or uuid)
-        format: Target format - "hex" (32-char) or "uuid"
-        
-    Returns:
-        Normalized trace ID string
-    """
-    if not trace_id:
-        return trace_id
-    
-    # First, convert to canonical 32-char hex
-    clean_id = trace_id.replace("-", "").lower()
-    
-    if format == "uuid":
-        return trace_id_to_uuid(clean_id)
-    else:
-        return clean_id
-
-
-def is_valid_trace_id(trace_id: str) -> bool:
-    """
-    Validate that a trace_id is properly formatted.
-    
-    Args:
-        trace_id: Trace ID string to validate
-        
-    Returns:
-        True if valid, False otherwise
-    """
-    if not trace_id:
-        return False
-    
-    clean_id = trace_id.replace("-", "").lower()
-    # Reject the all-zero trace id (represents "invalid" in many OTel SDKs).
-    if clean_id == "0" * 32:
-        return False
-    
-    # Must be exactly 32 hex characters
-    if len(clean_id) != 32:
-        return False
-    
-    try:
-        int(clean_id, 16)
-        return True
-    except ValueError:
-        return False
-
-
-def add_span_attributes(**attributes):
-    """Add attributes to the current span"""
-    span = trace.get_current_span()
-    if span and span.is_recording():
-        for key, value in attributes.items():
-            span.set_attribute(key, str(value) if value is not None else "")
 
 
 def record_exception(exception: Exception, attributes: Dict[str, Any] = None):
@@ -566,43 +388,3 @@ def record_exception(exception: Exception, attributes: Dict[str, Any] = None):
     if span and span.is_recording():
         span.record_exception(exception, attributes=attributes)
         span.set_status(Status(StatusCode.ERROR, str(exception)))
-
-
-def set_span_status(success: bool, description: str = ""):
-    """Set the status of the current span"""
-    span = trace.get_current_span()
-    if span and span.is_recording():
-        if success:
-            span.set_status(Status(StatusCode.OK, description))
-        else:
-            span.set_status(Status(StatusCode.ERROR, description))
-
-
-class TracedOperation:
-    """
-    Decorator for tracing function calls
-    
-    Usage:
-        @TracedOperation("process_data")
-        def process_data(data):
-            return transformed_data
-    """
-    
-    def __init__(self, name: str, kind: SpanKind = SpanKind.INTERNAL):
-        self.name = name
-        self.kind = kind
-    
-    def __call__(self, func):
-        def wrapper(*args, **kwargs):
-            with start_span(self.name, kind=self.kind) as span:
-                span.set_attribute("function", func.__name__)
-                try:
-                    result = func(*args, **kwargs)
-                    span.set_status(Status(StatusCode.OK))
-                    return result
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_status(Status(StatusCode.ERROR, str(e)))
-                    raise
-        return wrapper
-

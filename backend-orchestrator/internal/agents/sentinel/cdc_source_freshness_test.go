@@ -1,11 +1,20 @@
 package sentinel
 
 import (
+	"context"
+	"database/sql/driver"
 	"encoding/json"
-	"os"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
 )
 
 // The bug this file guards (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL): a MongoDB source
@@ -27,7 +36,19 @@ import (
 type freshTick struct {
 	at          time.Duration // since the first tick
 	fingerprint string
+	// unobserved says no poll read this connector since the previous tick (it was paused,
+	// stopped, or Connect did not answer). Otherwise the sentinel polled it every
+	// freshnessTestPoll in between and saw the previous tick's position.
+	unobserved bool
 }
+
+// freshnessTestPoll is the poll interval the tick helpers run the sentinel at: the
+// shipped SentinelPollInterval, so the observation-gap rule sees real cadence.
+const freshnessTestPoll = SentinelPollInterval
+
+// testHeartbeatEvery is the shipped heartbeat interval (heartbeat.interval.ms=300000).
+// Four of them is the 20m bound the tick tests set, so it never moves that bound.
+const testHeartbeatEvery = 5 * time.Minute
 
 // runFreshnessTicks feeds ticks through observeSourceFreshness the way
 // checkSourceFreshness does, and returns each tick's alarm verdict.
@@ -36,13 +57,22 @@ func runFreshnessTicks(t *testing.T, ticks []freshTick) []bool {
 	return runFreshnessTicksFor(t, "conn-1", ticks)
 }
 
+// runFreshnessTicksFor also replays the polls between two ticks, at the previous tick's
+// position, unless the later tick is marked unobserved. A test lists only the readings
+// it asserts on; the sentinel in production reads the connector on every poll.
 func runFreshnessTicksFor(t *testing.T, connector string, ticks []freshTick) []bool {
 	t.Helper()
 	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
-	s := &CDCSentinel{} // no map on purpose: a bare literal must not panic
+	s := &CDCSentinel{pollInterval: freshnessTestPoll} // no map on purpose: a bare literal must not panic
 	got := make([]bool, len(ticks))
 	for i, tk := range ticks {
-		got[i], _ = s.observeSourceFreshness(connector, tk.fingerprint, freshnessStart.Add(tk.at))
+		if i > 0 && !tk.unobserved {
+			prev := ticks[i-1]
+			for at := prev.at + freshnessTestPoll; at < tk.at; at += freshnessTestPoll {
+				s.observeSourceFreshness(connector, prev.fingerprint, testHeartbeatEvery, freshnessStart.Add(at))
+			}
+		}
+		got[i], _ = s.observeSourceFreshness(connector, tk.fingerprint, testHeartbeatEvery, freshnessStart.Add(tk.at))
 	}
 	return got
 }
@@ -114,6 +144,36 @@ func TestSourceFreshness_FirstReadingOnlyStartsTheClock(t *testing.T) {
 	assertFreshnessAlarms(t, got, []bool{false})
 }
 
+// A paused or stopped connector stays registered in Connect, so forgetSourceFreshness
+// keeps its bookkeeping, but it is not RUNNING and nobody observes it. On resume its
+// committed position is the one it held before the pause, and until the first heartbeat
+// commits a new one that position matches the remembered fingerprint, with a movingAt from
+// before the pause. Without a gap check, a resume more than 20 minutes after a pause
+// alarmed on its first tick. A gap in observation says nothing about whether the
+// connector moved, so it must restart the clock, exactly like a first reading.
+func TestSourceFreshnessRestartsTheClockAfterAStop(t *testing.T) {
+	got := runFreshnessTicks(t, []freshTick{
+		{at: 0, fingerprint: "tok-A"},
+		{at: 1 * time.Minute, fingerprint: "tok-A"},                    // still streaming, pipeline then paused
+		{at: 45 * time.Minute, fingerprint: "tok-A", unobserved: true}, // resumed 44m later, same position: not a stall
+		{at: 64 * time.Minute, fingerprint: "tok-A"},                   // 19m frozen since the resume: not yet
+		{at: 65 * time.Minute, fingerprint: "tok-A"},                   // 20m frozen since the resume: alarm
+	})
+	assertFreshnessAlarms(t, got, []bool{false, false, false, false, true})
+}
+
+// The gap that restarts the clock is a few missed polls, not one. A single slow or
+// skipped tick (a Connect call that timed out) must not reset a stall that was about to
+// fire, or a connector whose Connect is slow would never alarm.
+func TestSourceFreshnessOneSkippedPollKeepsTheClock(t *testing.T) {
+	got := runFreshnessTicks(t, []freshTick{
+		{at: 0, fingerprint: "tok-A"},
+		{at: 17 * time.Minute, fingerprint: "tok-A"},
+		{at: 20 * time.Minute, fingerprint: "tok-A", unobserved: true}, // two polls missed, a 3-poll gap: still 20m frozen
+	})
+	assertFreshnessAlarms(t, got, []bool{false, false, true})
+}
+
 // decideSourceFreshnessAlarm's `seen` flag, exercised directly.
 //
 // Through observeSourceFreshness the flag looks redundant — a first reading has a zero
@@ -124,7 +184,7 @@ func TestSourceFreshness_FirstReadingOnlyStartsTheClock(t *testing.T) {
 // behaviour so that it stays correct if one ever does.
 func TestDecideSourceFreshnessAlarm_UnseenConnectorNeverAlarms(t *testing.T) {
 	var zero sourceFreshnessState
-	next, alarm := decideSourceFreshnessAlarm(zero, false, "", freshnessStart, 20*time.Minute)
+	next, alarm := decideSourceFreshnessAlarm(zero, false, "", freshnessStart, 20*time.Minute, 3*time.Minute)
 	if alarm {
 		t.Fatal("a connector observed for the first time alarmed")
 	}
@@ -138,7 +198,7 @@ func TestDecideSourceFreshnessAlarm_UnseenConnectorNeverAlarms(t *testing.T) {
 // healthy one, and a healthy one must not mask a stuck one.
 func TestSourceFreshness_ConnectorsAreIndependent(t *testing.T) {
 	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
-	s := &CDCSentinel{}
+	s := &CDCSentinel{pollInterval: time.Hour} // hourly polls: the sparse readings below are consecutive
 
 	type step struct {
 		conn      string
@@ -154,7 +214,7 @@ func TestSourceFreshness_ConnectorsAreIndependent(t *testing.T) {
 		{"stuck", 30 * time.Minute, "frozen", true},
 		{"healthy", 30 * time.Minute, "moving-2", false},
 	} {
-		alarm, _ := s.observeSourceFreshness(st.conn, st.fp, freshnessStart.Add(st.at))
+		alarm, _ := s.observeSourceFreshness(st.conn, st.fp, testHeartbeatEvery, freshnessStart.Add(st.at))
 		if alarm != st.wantAlarm {
 			t.Fatalf("step %d (%s @ %s): alarm=%v, want %v", i, st.conn, st.at, alarm, st.wantAlarm)
 		}
@@ -165,11 +225,11 @@ func TestSourceFreshness_ConnectorsAreIndependent(t *testing.T) {
 // be the age of the freeze, not the age of the connector.
 func TestSourceFreshness_ReportsHowLongThePositionHasBeenFrozen(t *testing.T) {
 	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
-	s := &CDCSentinel{}
+	s := &CDCSentinel{pollInterval: time.Hour} // hourly polls: the sparse readings below are consecutive
 
-	s.observeSourceFreshness("c", "tok-A", freshnessStart)
-	s.observeSourceFreshness("c", "tok-B", freshnessStart.Add(time.Hour)) // moved at T+1h
-	_, frozenFor := s.observeSourceFreshness("c", "tok-B", freshnessStart.Add(90*time.Minute))
+	s.observeSourceFreshness("c", "tok-A", testHeartbeatEvery, freshnessStart)
+	s.observeSourceFreshness("c", "tok-B", testHeartbeatEvery, freshnessStart.Add(time.Hour)) // moved at T+1h
+	_, frozenFor := s.observeSourceFreshness("c", "tok-B", testHeartbeatEvery, freshnessStart.Add(90*time.Minute))
 
 	if frozenFor != 30*time.Minute {
 		t.Fatalf("frozen for %s, want 30m — the clock must run from the last MOVE, not from the first sighting", frozenFor)
@@ -183,8 +243,8 @@ func TestSourceFreshness_ForgettingAConnectorResetsItsClock(t *testing.T) {
 	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
 	s := &CDCSentinel{}
 
-	s.observeSourceFreshness("gone", "tok-A", freshnessStart)
-	s.observeSourceFreshness("kept", "tok-A", freshnessStart)
+	s.observeSourceFreshness("gone", "tok-A", testHeartbeatEvery, freshnessStart)
+	s.observeSourceFreshness("kept", "tok-A", testHeartbeatEvery, freshnessStart)
 
 	s.forgetSourceFreshness(map[string]bool{"kept": true})
 
@@ -198,7 +258,7 @@ func TestSourceFreshness_ForgettingAConnectorResetsItsClock(t *testing.T) {
 	// The recreated connector reports the same position it had before (a fresh snapshot
 	// can legitimately produce one), 25 minutes later. Because its history was dropped,
 	// this is a first reading and must only start the clock.
-	alarm, _ := s.observeSourceFreshness("gone", "tok-A", freshnessStart.Add(25*time.Minute))
+	alarm, _ := s.observeSourceFreshness("gone", "tok-A", testHeartbeatEvery, freshnessStart.Add(25*time.Minute))
 	if alarm {
 		t.Fatal("a recreated connector alarmed on its first reading — it inherited the deleted one's clock")
 	}
@@ -318,8 +378,9 @@ func TestSourceHeartbeatEnabled(t *testing.T) {
 }
 
 // #12 gave PostgreSQL sources a heartbeat. It acknowledges filtered WAL, but on a
-// database with no writes it repeats the same LSN, so it is not a liveness beacon and
-// must not arm the stall alarm. Only MongoDB's heartbeat moves an idle position.
+// database with no writes it repeats the same LSN, so its position alone is not a
+// liveness beacon. Only MongoDB's heartbeat moves an idle position; PostgreSQL and MySQL
+// are judged by their heartbeat topic as well (TestSourceFreshness_PostgresHeartbeatTopicFrozenAlarms).
 func TestHeartbeatAdvancesAnIdlePosition(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -472,45 +533,415 @@ func TestTraceFromConnectorState(t *testing.T) {
 	}
 }
 
-// The alarm's description must NOT contain the phrases diagnose.go's re-snapshot rule
-// matches. A frozen position has several possible causes (unreachable source, a permanent
-// error retried forever, a lost resume token); naming one of them in the boilerplate
-// would make the diagnoser confidently pick that one every single time, including for a
-// network partition. Only the connector's own error text, appended after it, may carry
-// those phrases.
+// The alarm's description must not decide the diagnosis. A frozen position has several
+// possible causes (unreachable source, a permanent error retried forever, a lost resume
+// token); a phrase in the boilerplate that matches one of diagnose.go's rules would make
+// the Healer confidently pick that one every single time, including for a network
+// partition. So the bare description must fall through to "nothing matched", and only the
+// connector's own error text, appended after it, may steer the classification.
 func TestSourceStalledDescriptionDoesNotPreJudgeTheCause(t *testing.T) {
-	// Lifted from pkg/diagnose/diagnose.go's re-snapshot rule.
-	triggers := []string{
-		"resume token",
-		"resume of change stream was not possible",
-		"resume point may no longer be in the oplog",
-		"changestreamhistorylost",
-		"change stream history lost",
-		"invalidresumetoken",
+	d := diagnose.New()
+	diagnoseText := func(description string) diagnose.Diagnosis {
+		// Built as heal/issue_sweep.go builds it for a sentinel issue.
+		return d.Diagnose(diagnose.Signal{
+			PipelineID:     hbTestPipeline,
+			ErrorMessage:   description,
+			ExecutorStatus: string(IssueTypeSourceStreamStalled),
+			Stage:          "sentinel",
+			LastEvents:     []string{"sentinel issue source_stream_stalled (severity critical)"},
+		})
 	}
-	raw, err := os.ReadFile("cdc_source_freshness.go")
-	if err != nil {
-		t.Fatalf("could not read the source under guard: %v", err)
+	for _, tc := range []struct {
+		rung             string
+		byHeartbeatTopic bool
+	}{
+		{"mongodb position", false},
+		{"postgres/mysql heartbeat topic", true},
+	} {
+		t.Run(tc.rung, func(t *testing.T) {
+			description := sourceStalledDescription(hbTestConnector, 21*time.Minute, testHeartbeatEvery, tc.byHeartbeatTopic)
+			// Non-vacuity: this really is the stall description.
+			if !strings.Contains(description, "has not advanced its committed source position") {
+				t.Fatalf("not the stall description:\n%s", description)
+			}
+			if got := diagnoseText(description); got.Category != diagnose.CategoryUnknown || got.SuggestedAction != diagnose.ActionEscalate {
+				t.Fatalf("the bare description already matches a diagnose.go rule (%s/%s: %s), so every stall "+
+					"would get that action whatever its cause:\n%s", got.Category, got.SuggestedAction, got.Rationale, description)
+			}
+			// And the appended connector error decides it, including for a rule that sits
+			// below the provisioning rule (network), which a provisioning phrase in the
+			// boilerplate would shadow.
+			for cause, want := range map[string]diagnose.Action{
+				"Caused by: com.mongodb.MongoCommandException: Command failed with error 286 (ChangeStreamHistoryLost)":    diagnose.ActionReSnapshot,
+				"Caused by: org.postgresql.util.PSQLException: Connection to db.internal:5432 refused: connection refused": diagnose.ActionBackoffRetry,
+			} {
+				if got := diagnoseText(description + ": " + cause); got.SuggestedAction != want {
+					t.Errorf("connector error %q → %s, want %s: the description is shadowing it", cause, got.SuggestedAction, want)
+				}
+			}
+		})
 	}
-	src := string(raw)
-	// The description is the one fmt.Sprintf in checkSourceFreshness.
-	start := strings.Index(src, "description := fmt.Sprintf(")
-	if start < 0 {
-		t.Fatal("could not find the stall description — this guard is vacuous, fix the anchor")
+	if got := sourceStalledDescription(hbTestConnector, 21*time.Minute, testHeartbeatEvery, true); !strings.Contains(got, "every 5m0s") {
+		t.Fatalf("the heartbeat-topic description does not say how often the connector heartbeats:\n%s", got)
 	}
-	end := strings.Index(src[start:], "connectorName, stalledFor")
-	if end < 0 {
-		t.Fatal("could not find the end of the stall description — this guard is vacuous, fix the anchor")
+}
+
+// The executor names the topic <topic.heartbeat.prefix>.<topic.prefix> (heartbeatTopicFor),
+// which is also Debezium's own rule; the legacy heartbeat.topics.prefix key names nothing.
+func TestSourceHeartbeatTopic(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config map[string]interface{}
+		want   string
+		wantOK bool
+	}{
+		{"as the executor builds it", postgresHeartbeatConfig(), hbTestTopic, true},
+		{"legacy key only: Debezium's default prefix", map[string]interface{}{
+			"topic.prefix": "rsync.cdc-aaaaaaaa", "heartbeat.topics.prefix": "rsync.heartbeat",
+		}, "__debezium-heartbeat.rsync.cdc-aaaaaaaa", true},
+		{"custom delimiter", map[string]interface{}{
+			"topic.prefix": "p", "topic.heartbeat.prefix": "hb", "topic.delimiter": "_",
+		}, "hb_p", true},
+		{"no topic.prefix", map[string]interface{}{"topic.heartbeat.prefix": "rsync.heartbeat"}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := sourceHeartbeatTopic(tc.config)
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("sourceHeartbeatTopic = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
 	}
-	description := strings.ToLower(src[start : start+end])
-	for _, trig := range triggers {
-		if strings.Contains(description, trig) {
-			t.Fatalf("the stall description contains %q, which makes diagnose.go's re-snapshot rule "+
-				"fire for every frozen position — including an unreachable source", trig)
+}
+
+// The offset keys are Debezium 3.1's: PostgreSQL writes snapshot=<type>,
+// last_snapshot_record and snapshot_completed while snapshotting; the binlog connectors
+// write snapshot=<type>; connectors before 2.x wrote snapshot=true.
+func TestSourceOffsetsMidSnapshot(t *testing.T) {
+	offsets := func(offset map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"offsets": []interface{}{map[string]interface{}{
+			"partition": map[string]interface{}{"server": "p"}, "offset": offset,
+		}}}
+	}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]interface{}
+		want    bool
+	}{
+		{"postgres mid-snapshot", offsets(map[string]interface{}{"lsn": 1.0, "snapshot": "INITIAL", "last_snapshot_record": false}), true},
+		{"postgres last snapshot record", offsets(map[string]interface{}{"lsn": 1.0, "snapshot": "INITIAL", "last_snapshot_record": true}), false},
+		{"postgres streaming", streamingPostgresOffsets(), false},
+		{"mysql mid-snapshot", offsets(map[string]interface{}{"file": "binlog.000003", "pos": 157.0, "snapshot": "INITIAL"}), true},
+		{"pre-2.x connector mid-snapshot", offsets(map[string]interface{}{"lsn": 1.0, "snapshot": true}), true},
+		{"snapshot false", offsets(map[string]interface{}{"lsn": 1.0, "snapshot": false}), false},
+		{"no offsets", map[string]interface{}{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sourceOffsetsMidSnapshot(tc.payload); got != tc.want {
+				t.Fatalf("sourceOffsetsMidSnapshot = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSourceFreshnessStallBound(t *testing.T) {
+	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
+	for _, tc := range []struct {
+		every, want time.Duration
+	}{
+		{0, 20 * time.Minute},
+		{5 * time.Minute, 20 * time.Minute},
+		{10 * time.Minute, 40 * time.Minute},
+	} {
+		if got := sourceFreshnessStallBound(tc.every); got != tc.want {
+			t.Errorf("sourceFreshnessStallBound(%s) = %s, want %s", tc.every, got, tc.want)
 		}
 	}
-	// Non-vacuity: the anchor really did capture the sentence.
-	if !strings.Contains(description, "has not advanced its position") {
-		t.Fatalf("the captured text is not the stall description:\n%s", description)
+}
+
+// --- PostgreSQL and MySQL: the heartbeat topic is the beacon ---
+//
+// Their heartbeat does not move an idle connector's committed position (see
+// TestHeartbeatAdvancesAnIdlePosition), so the position alone cannot tell a quiet source
+// from a dead connector. Every heartbeat is still a record on the connector's heartbeat
+// topic, though, and a connector retrying a permanent error writes none. So for these
+// sources progress is the position OR the heartbeat topic's end offset moving.
+
+const (
+	hbTestPipeline  = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	hbTestConnector = "cdc-aaaaaaaa"
+	// What the executor names it: heartbeatTopicFor(debeziumTopicPrefixFor(params)),
+	// <topic.heartbeat.prefix>.<topic.prefix>, prefix FIRST.
+	hbTestTopic = "rsync.heartbeat.rsync.cdc-aaaaaaaa"
+)
+
+// postgresHeartbeatConfig is the shape _build_config gives a PostgreSQL source.
+func postgresHeartbeatConfig() map[string]interface{} {
+	return map[string]interface{}{
+		"connector.class":         "io.debezium.connector.postgresql.PostgresConnector",
+		"heartbeat.interval.ms":   "300000",
+		"topic.prefix":            "rsync.cdc-aaaaaaaa",
+		"topic.heartbeat.prefix":  "rsync.heartbeat",
+		"heartbeat.topics.prefix": "rsync.heartbeat",
+	}
+}
+
+// streamingPostgresOffsets is a committed PostgreSQL position after the snapshot.
+func streamingPostgresOffsets() map[string]interface{} {
+	return map[string]interface{}{"offsets": []interface{}{map[string]interface{}{
+		"partition": map[string]interface{}{"server": "rsync.cdc-aaaaaaaa"},
+		"offset":    map[string]interface{}{"lsn": float64(31458328), "txId": float64(812), "ts_usec": float64(1760600000000000)},
+	}}}
+}
+
+// heartbeatHarness is a Kafka Connect serving one connector's config and committed
+// offsets, plus a heartbeat topic whose end offset the test sets.
+type heartbeatHarness struct {
+	s       *CDCSentinel
+	mock    sqlmock.Sqlmock
+	config  map[string]interface{}
+	offsets map[string]interface{}
+	end     int64 // the heartbeat topic's end offset
+	exists  bool  // whether the heartbeat topic exists
+	asked   []string
+}
+
+func newHeartbeatHarness(t *testing.T) *heartbeatHarness {
+	t.Helper()
+	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	h := &heartbeatHarness{mock: mock, config: postgresHeartbeatConfig(), offsets: streamingPostgresOffsets(), end: 42, exists: true}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/connectors/" + hbTestConnector + "/config":
+			_ = json.NewEncoder(w).Encode(h.config)
+		case "/connectors/" + hbTestConnector + "/offsets":
+			_ = json.NewEncoder(w).Encode(h.offsets)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h.s = &CDCSentinel{db: db, connectURL: srv.URL, httpClient: srv.Client(), pollInterval: freshnessTestPoll}
+	h.s.heartbeatEndOffset = func(topic string) (int64, bool, error) {
+		h.asked = append(h.asked, topic)
+		return h.end, h.exists, nil
+	}
+	return h
+}
+
+// tick is one sentinel poll of the connector, which Connect reports RUNNING.
+func (h *heartbeatHarness) tick() {
+	h.s.checkSourceFreshness(context.Background(), hbTestPipeline, hbTestConnector, nil)
+}
+
+// age pretends the connector's current reading has held for d, read on every poll.
+func (h *heartbeatHarness) age(d time.Duration) {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	st, ok := h.s.sourceFreshness[hbTestConnector]
+	if !ok {
+		return
+	}
+	st.movingAt = st.movingAt.Add(-d)
+	st.observedAt = st.observedAt.Add(-freshnessTestPoll)
+	h.s.sourceFreshness[hbTestConnector] = st
+}
+
+// observed reports whether any tick read the connector far enough to start its clock.
+func (h *heartbeatHarness) observed() bool {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	_, ok := h.s.sourceFreshness[hbTestConnector]
+	return ok
+}
+
+func (h *heartbeatHarness) expectResolved() {
+	h.mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM sentinel_active_issues WHERE id = $1 RETURNING severity, detected_at")).
+		WithArgs(sourceStalledIssueID(hbTestPipeline)).
+		WillReturnRows(sqlmock.NewRows([]string{"severity", "detected_at"})) // nothing was open
+}
+
+func (h *heartbeatHarness) expectStalled(detectedBy string) {
+	h.mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO sentinel_active_issues")).
+		WithArgs(
+			sourceStalledIssueID(hbTestPipeline),
+			string(IssueTypeSourceStreamStalled),
+			string(IssueSeverityCritical),
+			hbTestPipeline,
+			string(ComponentTypeCDCPipeline),
+			sqlmock.AnyArg(),
+			detectedByArg(detectedBy),
+		).
+		WillReturnRows(detectedAtRow())
+}
+
+// detectedByArg matches the issue metadata JSON on its detected_by.
+type detectedByArg string
+
+func (d detectedByArg) Match(v driver.Value) bool {
+	var b []byte
+	switch x := v.(type) {
+	case []byte:
+		b = x
+	case string:
+		b = []byte(x)
+	default:
+		return false
+	}
+	var meta map[string]interface{}
+	if json.Unmarshal(b, &meta) != nil {
+		return false
+	}
+	return meta["detected_by"] == string(d)
+}
+
+// A PostgreSQL connector Connect calls RUNNING whose position AND heartbeat topic are
+// both frozen past the bound is stalled. Before the heartbeat-topic rung, no
+// PostgreSQL or MySQL pipeline could raise this alarm at all.
+func TestSourceFreshness_PostgresHeartbeatTopicFrozenAlarms(t *testing.T) {
+	h := newHeartbeatHarness(t)
+	// The first reading only starts the clock, and clears nothing: it has not seen a move.
+	h.expectStalled("heartbeat_topic")
+
+	h.tick()
+	h.age(21 * time.Minute)
+	h.tick()
+
+	if err := h.mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("a PostgreSQL connector frozen for 21m with no new heartbeat raised no stall: %v", err)
+	}
+	if len(h.asked) == 0 {
+		t.Fatal("the heartbeat topic was never read")
+	}
+	for _, topic := range h.asked {
+		if topic != hbTestTopic {
+			t.Fatalf("read heartbeat topic %q, want %q (<topic.heartbeat.prefix>.<topic.prefix>)", topic, hbTestTopic)
+		}
+	}
+}
+
+// The controls. Each one would alarm if the rung judged the position alone, or judged a
+// connector that is not streaming yet.
+func TestSourceFreshness_IdleOrSnapshottingPostgresNeverAlarms(t *testing.T) {
+	t.Run("idle source, heartbeats landing", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		for i := 0; i < 3; i++ { // every reading after the first saw a heartbeat land
+			h.expectResolved()
+		}
+		for i := 0; i < 4; i++ {
+			h.tick()
+			h.age(25 * time.Minute) // the position never moves...
+			h.end++                 // ...but a heartbeat lands before every tick
+		}
+		if err := h.mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("an idle PostgreSQL source whose heartbeats keep landing was not read as alive: %v", err)
+		}
+	})
+
+	// The executor pre-creates the topic, so a connector still in its first snapshot has a
+	// topic with nothing on it.
+	t.Run("heartbeat topic still empty", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		h.end = 0
+		h.tick()
+		h.tick()
+		if h.observed() {
+			t.Fatal("a connector that has never written a heartbeat started a stall clock")
+		}
+	})
+
+	t.Run("heartbeat topic not created", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		h.exists = false
+		h.tick()
+		h.tick()
+		if h.observed() {
+			t.Fatal("a connector with no heartbeat topic started a stall clock")
+		}
+	})
+
+	t.Run("heartbeat topic unreadable", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		h.s.heartbeatEndOffset = func(string) (int64, bool, error) { return 0, true, errors.New("kafka: broker not available") }
+		h.tick()
+		h.tick()
+		if h.observed() {
+			t.Fatal("a Kafka read error started a stall clock")
+		}
+	})
+
+	// A re-snapshot writes no heartbeats, but the topic still holds an earlier run's.
+	t.Run("blocking snapshot running", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		h.offsets = map[string]interface{}{"offsets": []interface{}{map[string]interface{}{
+			"partition": map[string]interface{}{"server": "rsync.cdc-aaaaaaaa"},
+			"offset": map[string]interface{}{
+				"lsn": float64(31458328), "snapshot": "INITIAL",
+				"last_snapshot_record": false, "snapshot_completed": false,
+			},
+		}}}
+		h.tick()
+		h.tick()
+		if h.observed() {
+			t.Fatal("a connector mid-snapshot started a stall clock")
+		}
+	})
+
+	t.Run("no Kafka client", func(t *testing.T) {
+		h := newHeartbeatHarness(t)
+		h.s.heartbeatEndOffset = nil // and kafkaManager is nil, as before wiring
+		h.tick()
+		if h.observed() {
+			t.Fatal("a sentinel that cannot read Kafka started a stall clock")
+		}
+	})
+}
+
+// A MongoDB heartbeat moves the position itself, so its rung never reads the topic.
+func TestSourceFreshness_MongoNeverReadsTheHeartbeatTopic(t *testing.T) {
+	h := newHeartbeatHarness(t)
+	h.config = map[string]interface{}{
+		"connector.class":       "io.debezium.connector.mongodb.MongoDbConnector",
+		"heartbeat.interval.ms": "300000",
+		"topic.prefix":          "rsync.cdc-aaaaaaaa",
+	}
+	h.expectStalled("cdc_sentinel_source_freshness")
+
+	h.tick()
+	h.age(21 * time.Minute)
+	h.tick()
+
+	if err := h.mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("the MongoDB rung changed: %v", err)
+	}
+	if len(h.asked) != 0 {
+		t.Fatalf("the MongoDB rung read the heartbeat topic %v", h.asked)
+	}
+}
+
+// The bound is four heartbeats, never fewer: a connector configured to heartbeat every
+// ten minutes is only stalled after forty, or one late heartbeat would page somebody.
+func TestSourceFreshnessBoundCoversFourHeartbeats(t *testing.T) {
+	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "20m")
+	s := &CDCSentinel{pollInterval: time.Hour} // hourly polls: the sparse readings below are consecutive
+
+	every := 10 * time.Minute
+	s.observeSourceFreshness("slow", "tok-A", every, freshnessStart)
+	if alarm, _ := s.observeSourceFreshness("slow", "tok-A", every, freshnessStart.Add(25*time.Minute)); alarm {
+		t.Fatal("alarmed after 25m on a 10m heartbeat: that is two and a half heartbeats, not a stall")
+	}
+	if alarm, _ := s.observeSourceFreshness("slow", "tok-A", every, freshnessStart.Add(40*time.Minute)); !alarm {
+		t.Fatal("no alarm after four missed 10m heartbeats")
+	}
+
+	// The configured bound still wins when it is the longer one.
+	t.Setenv("CDC_SOURCE_FRESHNESS_STALL_AFTER", "1h")
+	s.observeSourceFreshness("patient", "tok-A", testHeartbeatEvery, freshnessStart)
+	if alarm, _ := s.observeSourceFreshness("patient", "tok-A", testHeartbeatEvery, freshnessStart.Add(45*time.Minute)); alarm {
+		t.Fatal("alarmed at 45m although CDC_SOURCE_FRESHNESS_STALL_AFTER is 1h")
 	}
 }

@@ -16,8 +16,15 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 )
 
+// cdcStopBudget bounds one Stop: the connector stop, the best-effort sink stop and the
+// status write. It runs detached from the request (context.WithoutCancel): a caller that
+// goes away — a closed tab, a gateway that stops waiting — used to cancel the Stop between
+// the connector and the status write, and the row kept saying running. The gateway's
+// cdcStopProxyTimeout still outlasts it, so the caller hears how the Stop ended.
+const cdcStopBudget = 25 * time.Second
+
 // cdcStopSinkBudget bounds the best-effort sink stop so a slow sink service cannot
-// hold the user's Stop open past the gateway's 15 s wait.
+// spend the rest of cdcStopBudget before the status write.
 const cdcStopSinkBudget = 8 * time.Second
 
 // StopCDCPipeline stops a CDC pipeline and keeps its position, for every Debezium
@@ -55,7 +62,9 @@ func stopCDCPipeline(db *sql.DB, sinks sinkStopExecutor, tm *kafka.TopologyManag
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcStopBudget)
+		defer stopCancel()
+		ctx, cancel := context.WithTimeout(stopCtx, 10*time.Second)
 		defer cancel()
 
 		connectorName, err := findConnectorName(ctx, db, pipelineID)
@@ -80,7 +89,7 @@ func stopCDCPipeline(db *sql.DB, sinks sinkStopExecutor, tm *kafka.TopologyManag
 		// and its group keeps the offsets either way.
 		var warnings []string
 		if sinks != nil {
-			sinkCtx, sinkCancel := context.WithTimeout(c.Request.Context(), cdcStopSinkBudget)
+			sinkCtx, sinkCancel := context.WithTimeout(stopCtx, cdcStopSinkBudget)
 			names := pipelineKafkaNames{id8: utils.SafeID8(pipelineID), uuid: pipelineID}
 			if id8IsUnique(sinkCtx, db, pipelineID, names.id8) {
 				warnings = stopSinkWorkers(sinkCtx, sinks, pipelineID, discoverSinkGroups(sinkCtx, tm, names))
@@ -90,7 +99,7 @@ func stopCDCPipeline(db *sql.DB, sinks sinkStopExecutor, tm *kafka.TopologyManag
 			sinkCancel()
 		}
 
-		if _, err := db.ExecContext(c.Request.Context(),
+		if _, err := db.ExecContext(stopCtx,
 			`UPDATE pipelines SET status = 'stopped', updated_at = NOW() WHERE id = $1`, pipelineID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"success": false, "pipeline_id": pipelineID, "connector_name": connectorName,

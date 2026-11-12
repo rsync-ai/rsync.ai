@@ -119,6 +119,25 @@ _DIALECT_CASES = [
     ("clickhouse", "Date", "date"),
     ("clickhouse", "DateTime64(3)", "timestamp"),
     ("clickhouse", "Array(String)", "json"),
+    # ---- BigQuery (SchemaField.field_type: legacy and standard SQL names) ----
+    ("bigquery", "STRING", "string"),
+    ("bigquery", "BYTES", "binary"),                       # NOT string
+    ("bigquery", "INTEGER", "integer"),
+    ("bigquery", "INT64", "integer"),                      # NOT string
+    ("bigquery", "FLOAT", "number"),
+    ("bigquery", "FLOAT64", "number"),                     # NOT string
+    ("bigquery", "NUMERIC", "decimal"),
+    ("bigquery", "BIGNUMERIC", "string"),                  # precision 76 exceeds NUMERIC(38)
+    ("bigquery", "BOOLEAN", "boolean"),
+    ("bigquery", "BOOL", "boolean"),
+    ("bigquery", "TIMESTAMP", "timestamp"),
+    ("bigquery", "DATETIME", "timestamp"),
+    ("bigquery", "DATE", "date"),
+    ("bigquery", "TIME", "time"),
+    ("bigquery", "RECORD", "json"),                        # NOT string
+    ("bigquery", "STRUCT", "json"),
+    ("bigquery", "JSON", "json"),
+    ("bigquery", "GEOGRAPHY", "string"),
     # ---- Oracle multi-word token: LONG RAW is binary, not the character LONG ----
     ("oracle", "LONG RAW", "binary"),
     ("oracle", "LONG", "string"),

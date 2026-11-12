@@ -61,7 +61,3 @@ export function RsyncLogo({ className, size = "md", showText }: RsyncLogoProps) 
     </div>
   )
 }
-
-export function RsyncIcon({ className }: { className?: string }) {
-  return <LogoIcon size={28} className={className} />
-}

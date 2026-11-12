@@ -31,14 +31,18 @@ type fakeStatRow struct {
 
 // fakeStatsDB is the state behind the fake driver. arriveAfter delays a row until the
 // stats query has been answered that many times — a TABLE_STATS still in flight.
+// sinkAcked is whether the kafka sink acked a batch for the execution. awaitingDrop
+// is the pipeline's tables with a pending drop_table decision.
 type fakeStatsDB struct {
-	mu          sync.Mutex
-	rows        []fakeStatRow
-	late        []fakeStatRow
-	arriveAfter int
-	statsReads  int
-	selected    []string
-	failStats   bool
+	mu           sync.Mutex
+	rows         []fakeStatRow
+	late         []fakeStatRow
+	arriveAfter  int
+	statsReads   int
+	selected     []string
+	awaitingDrop []string
+	failStats    bool
+	sinkAcked    bool
 }
 
 func (s *fakeStatsDB) snapshot() []fakeStatRow {
@@ -123,8 +127,16 @@ func (s *fakeStatsStmt) Query([]driver.Value) (driver.Rows, error) {
 		}
 		return &fakeRows{cols: []string{"tbl", "bare", "st"}, data: out}, nil
 	case strings.Contains(q, "selected_tables"):
+		// missingSelectedTables: the selection, and the tables awaiting a drop decision
 		b, _ := json.Marshal(s.state.selected)
-		return &fakeRows{cols: []string{"text"}, data: [][]driver.Value{{string(b)}}}, nil
+		a, _ := json.Marshal(s.state.awaitingDrop)
+		if s.state.awaitingDrop == nil {
+			a = []byte("[]")
+		}
+		return &fakeRows{cols: []string{"text", "text"}, data: [][]driver.Value{{string(b), string(a)}}}, nil
+	case strings.Contains(q, "pipeline_batch_acks") && strings.Contains(q, "EXISTS"):
+		// sinkCarriedExecution
+		return &fakeRows{cols: []string{"exists"}, data: [][]driver.Value{{s.state.sinkAcked}}}, nil
 	case strings.Contains(q, "pipeline_batch_acks"):
 		return &fakeRows{cols: []string{"max"}, data: [][]driver.Value{{nil}}}, nil
 	}
@@ -154,6 +166,13 @@ func shrinkSettleWindow(t *testing.T, grace, interval time.Duration) {
 	oldG, oldI := statsSettleGrace, statsSettleInterval
 	statsSettleGrace, statsSettleInterval = grace, interval
 	t.Cleanup(func() { statsSettleGrace, statsSettleInterval = oldG, oldI })
+}
+
+func shrinkFirstRowWindow(t *testing.T, window time.Duration) {
+	t.Helper()
+	old := statsFirstRowWindow
+	statsFirstRowWindow = window
+	t.Cleanup(func() { statsFirstRowWindow = old })
 }
 
 const settleExecID = "65f0c413-0000-0000-0000-000000000000"
@@ -256,18 +275,111 @@ func TestPostflightStillFailsAGenuinelyMissingTable(t *testing.T) {
 	}
 }
 
-// No stats rows at all means the stats path isn't live for this run; the guard judges
-// nothing, so the wait must not hold every such run for the full grace.
-func TestPostflightDoesNotWaitWhenNoStatsReported(t *testing.T) {
+// A table whose drop decision is pending was left out of the run on purpose
+// (executor withoutTablesAwaitingDrop), so it has no stats row. Found on prod
+// 2026-10-05: the guard read it as "selected but never reported" and failed the run
+// as a silent drop. It neither holds up the settle wait nor fails the run.
+func TestPostflightLeavesOutATableAwaitingADropDecision(t *testing.T) {
+	shrinkSettleWindow(t, 40*time.Millisecond, 5*time.Millisecond)
+	newState := func(awaiting []string) *fakeStatsDB {
+		return &fakeStatsDB{
+			selected:     []string{"app.team", "app.list_task"},
+			awaitingDrop: awaiting,
+			rows:         []fakeStatRow{completed("app.team", 12)},
+		}
+	}
+
+	t.Run("control: without the pending decision the table reads as dropped", func(t *testing.T) {
+		db := openFakeStatsDB(t, newState(nil))
+		reason, drop := postflightSilentDropCheck(context.Background(), db, settleExecID)
+		if !drop || !strings.Contains(reason, "list_task") {
+			t.Fatalf("control must reproduce the prod failure; got drop=%v reason=%q", drop, reason)
+		}
+	})
+
+	t.Run("a table awaiting a drop decision is not a silent drop", func(t *testing.T) {
+		db := openFakeStatsDB(t, newState([]string{"list_task"}))
+		start := time.Now()
+		if !awaitTableStatsSettled(context.Background(), db, settleExecID, nil) {
+			t.Fatal("the stats of every table the run read are in; the run must count as settled")
+		}
+		if elapsed := time.Since(start); elapsed >= 40*time.Millisecond {
+			t.Fatalf("waited %v (the whole grace) for a table the run left out", elapsed)
+		}
+		if reason, drop := postflightSilentDropCheck(context.Background(), db, settleExecID); drop {
+			t.Fatalf("a table left out pending its drop decision failed the run: %q", reason)
+		}
+	})
+}
+
+// A fast run reaches the postflight before the projector has written its first stats
+// row, and zero rows used to count as settled: the guard judged an empty table and passed
+// whatever the run had dropped. A run the sink acked has stats on the way, so zero rows
+// waits a short first-row window — then proceeds, judging nothing, well inside the grace.
+func TestPostflightWaitsTheFirstRowWindowWhenNoStatsReported(t *testing.T) {
 	shrinkSettleWindow(t, 5*time.Second, 5*time.Millisecond)
+	shrinkFirstRowWindow(t, 60*time.Millisecond)
+	db := openFakeStatsDB(t, &fakeStatsDB{selected: []string{"public.users"}, sinkAcked: true})
+
+	start := time.Now()
+	if !awaitTableStatsSettled(context.Background(), db, settleExecID, nil) {
+		t.Fatal("zero stats rows after the first-row window should count as settled")
+	}
+	elapsed := time.Since(start)
+	if elapsed < 60*time.Millisecond {
+		t.Fatalf("proceeded after %v, before the first-row window — a fast run's stats are judged before any arrive", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("waited %v on a run with no stats rows; the first-row window is 60ms", elapsed)
+	}
+}
+
+// The bug itself, replayed: the drop's stats row lands after the postflight starts. The
+// control shows the immediate judgement passing the run; after the wait the drop is caught.
+func TestPostflightJudgesStatsThatArriveAfterItStarts(t *testing.T) {
+	shrinkSettleWindow(t, 2*time.Second, 5*time.Millisecond)
+	shrinkFirstRowWindow(t, time.Second)
+	newState := func() *fakeStatsDB {
+		return &fakeStatsDB{
+			selected:    []string{"public.users"},
+			sinkAcked:   true,
+			late:        []fakeStatRow{{table: "public.users", bare: "users", read: 5005, landed: 0, status: "completed"}},
+			arriveAfter: 2,
+		}
+	}
+
+	t.Run("control: judged immediately, nothing to judge", func(t *testing.T) {
+		db := openFakeStatsDB(t, newState())
+		if reason, drop := postflightSilentDropCheck(context.Background(), db, settleExecID); drop {
+			t.Fatalf("control must reproduce the vacuous pass; got a drop: %q", reason)
+		}
+	})
+
+	t.Run("after waiting for the first row, the drop is caught", func(t *testing.T) {
+		db := openFakeStatsDB(t, newState())
+		if !awaitTableStatsSettled(context.Background(), db, settleExecID, nil) {
+			t.Fatal("stats should have settled once the late row arrived")
+		}
+		reason, drop := postflightSilentDropCheck(context.Background(), db, settleExecID)
+		if !drop || !strings.Contains(reason, "public.users: read=5005 landed=0") {
+			t.Fatalf("the late row's drop must be judged; got drop=%v reason=%q", drop, reason)
+		}
+	})
+}
+
+// A run the sink never acked (a direct-write destination) emits no stats at all, and
+// that is knowable up front: it must not pay the first-row window.
+func TestPostflightDoesNotWaitForStatsARunNeverEmits(t *testing.T) {
+	shrinkSettleWindow(t, 5*time.Second, 5*time.Millisecond)
+	shrinkFirstRowWindow(t, 5*time.Second)
 	db := openFakeStatsDB(t, &fakeStatsDB{selected: []string{"public.users"}})
 
 	start := time.Now()
 	if !awaitTableStatsSettled(context.Background(), db, settleExecID, nil) {
-		t.Fatal("zero stats rows should count as settled")
+		t.Fatal("zero stats rows on a run the sink never carried should count as settled")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("waited %v on a run with no stats rows", elapsed)
+		t.Fatalf("waited %v on a run that emits no stats", elapsed)
 	}
 }
 

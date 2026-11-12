@@ -10,28 +10,32 @@ import (
 )
 
 // CDC Stop keeps the replication slot and publication: they are the position
-// Start resumes from. The periodic reapers must therefore select only rows of a
-// DELETED pipeline; only the WAL watchdog may drop a stopped pipeline's slot.
+// Start resumes from. Every reaper — the periodic one and the WAL watchdog's
+// named one — must therefore select only rows of a DELETED pipeline, and never
+// by pipeline status: WAL pressure starts a stopped pipeline, it does not drop
+// its slot.
 func TestReapableQueriesKeepStoppedPipelines(t *testing.T) {
 	for _, rt := range []string{"replication_slot", "publication"} {
-		q := reapableResourceQuery(rt, false)
-		if strings.Contains(q, "'stopped'") {
-			t.Errorf("%s: periodic reaper selects stopped pipelines:\n%s", rt, q)
+		q := reapableResourceQuery(rt)
+		if strings.Contains(q, "p.status") {
+			t.Errorf("%s: reaper selects on pipeline status, so an existing pipeline can lose its position:\n%s", rt, q)
 		}
 		if !strings.Contains(q, "cr.pipeline_id IS NULL OR p.id IS NULL") {
-			t.Errorf("%s: periodic reaper no longer selects deleted pipelines:\n%s", rt, q)
+			t.Errorf("%s: reaper no longer selects deleted pipelines:\n%s", rt, q)
 		}
 		if !strings.Contains(q, "cr.resource_type = '"+rt+"'") {
 			t.Errorf("%s: wrong resource type:\n%s", rt, q)
 		}
 	}
-	if q := reapableResourceQuery("replication_slot", true); !strings.Contains(q, "p.status = 'stopped'") {
-		t.Errorf("WAL-pressure query must include stopped pipelines:\n%s", q)
-	}
 }
 
-func TestReapSlotsUnderWALPressureTouchesOnlyNamedSlots(t *testing.T) {
-	mockDB, mock, err := sqlmock.New()
+func TestReapNamedOrphanedSlotsTouchesOnlyNamedSlotsOfDeletedPipelines(t *testing.T) {
+	var seen string
+	matcher := sqlmock.QueryMatcherFunc(func(expected, actual string) error {
+		seen = actual
+		return sqlmock.QueryMatcherRegexp.Match(expected, actual)
+	})
+	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
@@ -41,23 +45,26 @@ func TestReapSlotsUnderWALPressureTouchesOnlyNamedSlots(t *testing.T) {
 		"resource_type", "resource_name", "status",
 		"database_type", "metadata", "created_at", "deleted_at", "last_verified_at",
 	}
-	mock.ExpectQuery(`p.status = 'stopped'`).
+	mock.ExpectQuery(`cr.pipeline_id IS NULL OR p.id IS NULL`).
 		WillReturnRows(sqlmock.NewRows(cols).
-			AddRow("r1", "p1", "conn1", nil, "replication_slot", "debezium_other_slot", "active",
+			AddRow("r1", nil, "conn1", nil, "replication_slot", "debezium_other_slot", "active",
 				"postgresql", []byte(`{}`), time.Unix(1700000000, 0), nil, nil))
 
 	// The only reapable row is not one the watchdog measured as CRITICAL, so
 	// nothing is dropped and no connection config is ever read.
-	n, err := NewPostgreSQLManager(mockDB).ReapSlotsUnderWALPressure(context.Background(), []string{"debezium_critical_slot"})
+	n, err := NewPostgreSQLManager(mockDB).ReapNamedOrphanedSlots(context.Background(), []string{"debezium_critical_slot"})
 	if err != nil || n != 0 {
 		t.Fatalf("dropped=%d err=%v, want 0 <nil>", n, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
+	if strings.Contains(seen, "p.status") {
+		t.Errorf("named reap selects on pipeline status:\n%s", seen)
+	}
 
 	// No names → no query at all.
-	if n, err := NewPostgreSQLManager(mockDB).ReapSlotsUnderWALPressure(context.Background(), nil); err != nil || n != 0 {
+	if n, err := NewPostgreSQLManager(mockDB).ReapNamedOrphanedSlots(context.Background(), nil); err != nil || n != 0 {
 		t.Fatalf("dropped=%d err=%v", n, err)
 	}
 }
@@ -68,22 +75,21 @@ func TestReapableGettersSQL(t *testing.T) {
 	var seen string
 	matcher := sqlmock.QueryMatcherFunc(func(_, actual string) error { seen = actual; return nil })
 	for _, c := range []struct {
-		name        string
-		call        func(ctx context.Context, m *PostgreSQLManager) error
-		wantStopped bool
+		name string
+		call func(ctx context.Context, m *PostgreSQLManager) error
 	}{
 		{"GetReapableSlots", func(ctx context.Context, m *PostgreSQLManager) error {
 			_, err := GetReapableSlots(ctx, m.db)
 			return err
-		}, false},
+		}},
 		{"GetReapablePublications", func(ctx context.Context, m *PostgreSQLManager) error {
 			_, err := GetReapablePublications(ctx, m.db)
 			return err
-		}, false},
-		{"GetWALPressureReapableSlots", func(ctx context.Context, m *PostgreSQLManager) error {
-			_, err := GetWALPressureReapableSlots(ctx, m.db)
+		}},
+		{"ReapNamedOrphanedSlots", func(ctx context.Context, m *PostgreSQLManager) error {
+			_, err := m.ReapNamedOrphanedSlots(ctx, []string{"debezium_slot"})
 			return err
-		}, true},
+		}},
 	} {
 		mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
 		if err != nil {
@@ -92,8 +98,11 @@ func TestReapableGettersSQL(t *testing.T) {
 		mock.ExpectQuery("").WillReturnRows(sqlmock.NewRows([]string{"id"}))
 		seen = ""
 		_ = c.call(context.Background(), NewPostgreSQLManager(mockDB))
-		if got := strings.Contains(seen, "'stopped'"); got != c.wantStopped {
-			t.Errorf("%s: selects stopped=%v, want %v\n%s", c.name, got, c.wantStopped, seen)
+		if seen == "" {
+			t.Errorf("%s: ran no query, so this check proved nothing", c.name)
+		}
+		if strings.Contains(seen, "p.status") {
+			t.Errorf("%s: selects on pipeline status:\n%s", c.name, seen)
 		}
 		mockDB.Close()
 	}

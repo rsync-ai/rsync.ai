@@ -32,16 +32,18 @@ def _sse_enabled() -> bool:
 
 
 def _gzip_enabled() -> bool:
-    # Default-off, like the other data-plane flags (RSYNC_PG_BULK_COPY etc.).
-    return _env("RSYNC_CLAIM_CHECK_GZIP", "").strip().lower() == "true"
+    # Default-ON. Opt out with RSYNC_CLAIM_CHECK_GZIP=false (or 0/no/off). Safe to
+    # flip either way at any time: read_from_staging autodetects gzip by its magic
+    # bytes, so objects written before the flip still read back.
+    return _env("RSYNC_CLAIM_CHECK_GZIP", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
 def _maybe_gzip(body: bytes) -> Tuple[bytes, bool]:
-    """Gzip the claim-check body when RSYNC_CLAIM_CHECK_GZIP=true; else passthrough.
+    """Gzip the claim-check body unless RSYNC_CLAIM_CHECK_GZIP=false; else passthrough.
 
-    Snappy already covers the Kafka *message*, but the claim-check object in MinIO
-    is uncompressed JSON — this is the one structured payload on the data plane
-    that ships raw. ~10x smaller for typical batches (see e2e/test_claim_check_gzip).
+    Snappy already covers the Kafka *message*, but without this the claim-check
+    object in MinIO would be raw JSON, the one structured payload on the data plane
+    that ships uncompressed. ~10x smaller for typical batches (test_claim_check_gzip.py).
     """
     if _gzip_enabled():
         return gzip.compress(body), True

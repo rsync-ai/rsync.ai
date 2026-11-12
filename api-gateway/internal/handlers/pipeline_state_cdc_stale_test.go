@@ -244,7 +244,7 @@ func TestApplyStateStaleness_StreamingCDC_RealStallsStillSurface(t *testing.T) {
 				expectDeps(m, "healthy", "healthy")
 			},
 			wantElapsed: 20 * time.Minute,
-			wantReason:  "42 changes are waiting to be written, but nothing has reached the destination for 20m",
+			wantReason:  "42 changes are waiting to be written. The last change reached the destination 20m ago.",
 		},
 		{
 			name: "one change waiting",
@@ -263,6 +263,16 @@ func TestApplyStateStaleness_StreamingCDC_RealStallsStillSurface(t *testing.T) {
 			},
 			wantElapsed: 20 * time.Minute,
 			wantReason:  "health checks have not all passed",
+		},
+		{
+			// A day and a half of a quiet source read "2117m 17s", and only as a stall.
+			name: "quiet for a day and a half, a dependency degraded",
+			setup: func(m sqlmock.Sqlmock) {
+				expectLiveness(m, ago(35*time.Hour+17*time.Minute), 0)
+				expectDeps(m, "healthy", "degraded")
+			},
+			wantElapsed: 35*time.Hour + 17*time.Minute,
+			wantReason:  "No changes have reached the destination for 1d 11h and none are waiting, so the source may simply have had no changes.",
 		},
 		{
 			// No dependency manifest (older pipelines): /runtime reads this as idle too.
@@ -454,6 +464,12 @@ type stateFixture struct {
 	execStatus string
 	execEnd    *time.Time
 	extra      func(sqlmock.Sqlmock)
+	// A parked row: blocking_reason_type/description, message and metadata.
+	// Empty keeps the running-executor row every CDC case uses.
+	blockingType string
+	blockingDesc string
+	message      string
+	metadata     string
 }
 
 func serveState(t *testing.T, f stateFixture) map[string]interface{} {
@@ -469,6 +485,17 @@ func serveState(t *testing.T, f stateFixture) map[string]interface{} {
 
 	now := time.Now()
 	heartbeat := now.Add(-10 * time.Minute)
+	var blockingType, blockingDesc interface{}
+	if f.blockingType != "" {
+		blockingType, blockingDesc = f.blockingType, f.blockingDesc
+	}
+	message, metadata := "Executing pipeline", "{}"
+	if f.message != "" {
+		message = f.message
+	}
+	if f.metadata != "" {
+		metadata = f.metadata
+	}
 
 	mock.ExpectQuery(gateRoleQuery).
 		WithArgs(gatePipeID, gateUserID, activeWS).
@@ -487,8 +514,8 @@ func serveState(t *testing.T, f stateFixture) map[string]interface{} {
 			"executing", "running", now.Add(-time.Hour), heartbeat,
 			nil, 1, 3, "executor completed",
 			88, 6, 7,
-			nil, nil, nil,
-			"Executing pipeline", "{}", now.Add(-2*time.Hour), heartbeat,
+			blockingType, blockingDesc, nil,
+			message, metadata, now.Add(-2*time.Hour), heartbeat,
 		))
 	mock.ExpectQuery(`SELECT status, updated_at, sync_mode\s+FROM pipelines`).
 		WithArgs(gatePipeID).
@@ -643,5 +670,22 @@ func TestGetPipelineState_RunningCDC_StageSummaryStillShown(t *testing.T) {
 	})
 	if body["summary"] != "executor completed" {
 		t.Fatalf("summary = %v, want the stage_summary", body["summary"])
+	}
+}
+
+// A duration reads in its two largest units: "2117m 17s" was a day and a half.
+func TestFormatDuration_TwoLargestUnits(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		45 * time.Second:                               "45s",
+		20 * time.Minute:                               "20m",
+		20*time.Minute + 5*time.Second:                 "20m 5s",
+		3*time.Hour + 12*time.Minute:                   "3h 12m",
+		5 * time.Hour:                                  "5h",
+		35*time.Hour + 17*time.Minute + 17*time.Second: "1d 11h",
+		48 * time.Hour:                                 "2d",
+	} {
+		if got := formatDuration(d); got != want {
+			t.Errorf("formatDuration(%s) = %q, want %q", d, got, want)
+		}
 	}
 }

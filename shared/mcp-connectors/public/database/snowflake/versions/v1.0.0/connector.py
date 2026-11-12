@@ -67,6 +67,18 @@ except ImportError:  # pragma: no cover - dev/test path
         os.path.dirname(__file__), "..", "..", "..", "..")))
     from canonical_types import canonical_to_ddl  # noqa: E402
 
+# Stable batch paging (KI-WAREHOUSE-BATCH-PAGING-UNORDERED), shipped the same
+# way: `COPY --from=shared sql_paging.py`.
+try:
+    import sql_paging  # noqa: E402
+except ImportError:  # pragma: no cover - dev/test path
+    sys.path.insert(0, os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..")))
+    try:
+        import sql_paging  # noqa: E402
+    except ImportError:
+        sql_paging = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -398,8 +410,12 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return {"success": False, "error": f"Listing namespaces failed: {e}"}
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
-        """Optimized paginated read (keyset preferred, offset fallback, verbatim
-        query single-page). Returns paging_mode/has_more/next_cursor/truncated."""
+        """One page of a table, or a verbatim query as a single page.
+
+        A table pages through ``sql_paging``: Snowflake never enforces a
+        primary key, so a sweep orders by every orderable column
+        (``cursor_column`` first) and pins its pages to one time-travel point
+        (KI-WAREHOUSE-BATCH-PAGING-UNORDERED)."""
         params = params or {}
         config = self._get_config(params)
         table = (params.get("table") or params.get("object") or "").strip()
@@ -417,36 +433,17 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
         raw_cursor = str(raw_cursor).strip()
         cursor_column = ""
         if raw_cursor:
-            # keyset correctness also requires cursor_column be UNIQUE; a
-            # non-unique column can skip rows sharing a boundary value across a
-            # page. Callers pass a unique/primary key here (hence the alias).
             cursor_column = self._safe_identifier(raw_cursor)
             if cursor_column is None:
                 return {"success": False,
                         "error": f"Unsafe cursor_column identifier: {raw_cursor!r}"}
-        cursor_value = params.get("cursor_value")
 
         if not table and not raw_query:
             return {"success": False, "error": "Missing 'table' (or 'query') parameter"}
-
-        sql_params: Optional[List[Any]] = None
-        offset = 0
-        if raw_query:
-            paging_mode, sql = "query", raw_query
-        elif cursor_column:
-            paging_mode = "keyset"
-            fq = self._qualify_table(config, table)
-            where = ""
-            if cursor_value is not None:
-                where = f'WHERE "{cursor_column}" > %s '
-                sql_params = [cursor_value]
-            sql = (f'SELECT * FROM {fq} {where}'
-                   f'ORDER BY "{cursor_column}" ASC LIMIT {limit}')
-        else:
-            paging_mode = "offset"
-            offset = int(params.get("offset", 0) or 0)
-            fq = self._qualify_table(config, table)
-            sql = f'SELECT * FROM {fq} LIMIT {limit} OFFSET {offset}'
+        if not raw_query and sql_paging is None:
+            return {"success": False,
+                    "error": "sql_paging.py is missing from this connector image; rebuild it"}
+        fq = self._qualify_table(config, table) if not raw_query else ""
 
         try:
             conn = self._connect(config)
@@ -454,48 +451,90 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return {"success": False, "error": str(e)}
         try:
             cur = self._dict_cursor(conn)
-            if sql_params is not None:
-                cur.execute(sql, sql_params)
-            else:
-                cur.execute(sql)
-            rows = cur.fetchall()
-            data = [dict(r) for r in rows]
+            if not raw_query:
+                return sql_paging.export_page(conn, cur, sql_paging.SNOWFLAKE, fq, fq, params,
+                                              limit=limit, nominated=cursor_column or None)
+            cur.execute(raw_query)
+            # At most ``limit`` rows leave the warehouse; the rest stay unread.
+            data = [dict(r) for r in cur.fetchmany(limit)]
+            columns = [d[0] for d in (cur.description or [])]
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
         finally:
             self._safe_close(conn)
+        if not columns and data:
+            columns = list(data[0].keys())
 
-        full_page = len(data) == limit
-        truncated = (paging_mode == "query") and full_page
-        has_more = (paging_mode != "query") and full_page
-        next_cursor = None
-        # Offset mode MUST leave next_cursor=None. The executor advances `offset`
-        # itself only when the connector returns no cursor (executor.go:
-        # `if cursor == nil { offset += ... }`). Emitting str(offset+limit) here
-        # makes the executor treat offset paging as keyset — it never advances
-        # offset, re-reads page 1, trips the non-advancing-cursor guard, and
-        # silently truncates keyless tables at `limit`. Matches the postgresql
-        # connector + connector_database.py.j2 (keyset-only next_cursor).
-        if has_more and paging_mode == "keyset":
-            next_cursor = self._row_value(data[-1], cursor_column, None) \
-                if data else None
-            if next_cursor is None:
-                # Full page but the cursor column is absent from the rows —
-                # can't emit a resumable cursor; fail loud rather than
-                # silently truncate or restart from the top next call.
-                return {"success": False,
-                        "error": (f"keyset cursor column '{cursor_column}' "
-                                  "missing from result rows; cannot continue")}
-
+        # A verbatim query is one page; a full one may have been cut short.
         return {
             "success": True,
             "data": data,
+            "columns": columns,
             "total_records": len(data),
-            "paging_mode": paging_mode,
-            "has_more": has_more,
-            "next_cursor": next_cursor,
-            "truncated": truncated,
+            "paging_mode": "query",
+            "has_more": False,
+            "next_cursor": None,
+            "truncated": len(data) == limit,
         }
+
+    # =========================================================================
+    # EXECUTE (models: one statement, verbatim)
+    # =========================================================================
+    def execute(self, params: Dict = None) -> Dict[str, Any]:
+        """Run exactly ONE statement verbatim — the models feature's DDL/DML.
+
+        ``timeout_seconds`` becomes the driver's ``execute(timeout=)``, which
+        aborts the statement server-side when it fires. Never retried: DDL is
+        not idempotent. Autocommit is the session default (Snowflake's
+        AUTOCOMMIT parameter, TRUE unless the account overrides it), so the
+        statement is committed explicitly and a failed COMMIT is reported.
+        ``rows_affected`` is the driver's rowcount (DML affected rows)."""
+        params = params or {}
+        config = self._get_config(params)
+        sql = self._statement_text(params)
+        if not sql:
+            return {"success": False,
+                    "error": "Missing 'query' (or 'sql'/'statement') parameter"}
+        timeout = self._timeout_seconds(params)
+        try:
+            conn = self._connect(config)
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": str(e)}
+        try:
+            cur = conn.cursor()
+            if timeout:
+                cur.execute(sql, timeout=timeout)
+            else:
+                cur.execute(sql)
+            rowcount = getattr(cur, "rowcount", None)
+            conn.commit()
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": str(e)}
+        finally:
+            self._safe_close(conn)
+        rows_affected = rowcount if isinstance(rowcount, int) and rowcount >= 0 else None
+        return {"success": True, "executed": True, "rows_affected": rows_affected}
+
+    @staticmethod
+    def _statement_text(params: Dict) -> str:
+        """The first non-empty of ``query``/``sql``/``statement`` (same text)."""
+        for key in ("query", "sql", "statement"):
+            v = params.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    @staticmethod
+    def _timeout_seconds(params: Dict) -> Optional[int]:
+        """``timeout_seconds`` as a positive int, else None (no deadline)."""
+        v = params.get("timeout_seconds")
+        if isinstance(v, bool):
+            return None
+        try:
+            t = int(v)
+        except (TypeError, ValueError):
+            return None
+        return t if t > 0 else None
 
     # =========================================================================
     # DESTINATION WRITE
@@ -932,6 +971,7 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 {"name": "merge", "type": "destination", "method": "merge"},
                 {"name": "ensure_table", "type": "destination", "method": "ensure_table"},
                 {"name": "drop_table", "type": "destination", "method": "drop_table"},
+                {"name": "execute", "type": "destination", "method": "execute"},
             ],
         }
 
@@ -962,7 +1002,12 @@ def create_http_app():
 
     @app.post("/mcp")
     async def mcp(request: dict):
-        return server.handle_request(request)
+        # Every tool call is a blocking driver round-trip (a model's statement
+        # can run for minutes), so it runs on a worker thread: one slow call
+        # must not stall /health or other pipelines' calls on the event loop.
+        # The shared server is safe here — no tool reads per-call state off it.
+        import asyncio
+        return await asyncio.to_thread(server.handle_request, request)
 
     @app.post("/invoke/{tool_name}")
     async def invoke(tool_name: str, params: dict = {}):
@@ -1008,6 +1053,11 @@ def create_http_app():
     @app.post("/import_data")
     async def import_data(params: dict = {}):
         return server.import_data(params)
+
+    @app.post("/execute")
+    async def execute(params: dict = {}):
+        import asyncio
+        return await asyncio.to_thread(server.execute, params)
 
     return app
 

@@ -32,7 +32,7 @@ This directory contains **service-scoped** documentation in two layers:
 - **Kafka Connect (Debezium)**: `shared/internal/infra/kafka-connect/`
   - `docs/services/kafka-connect/HLD.md`
   - `docs/services/kafka-connect/LLD.md`
-- **MCP Connector Runtime (generic)**: `shared/mcp-connectors/<connector>/`
+- **MCP Connector Runtime (generic)**: `shared/mcp-connectors/public/[<category>/]<connector>/versions/<current_version>/` (internal ones: `shared/mcp-connectors/internal/<connector>/`)
   - `docs/services/mcp-connector-runtime/HLD.md`
   - `docs/services/mcp-connector-runtime/LLD.md`
 

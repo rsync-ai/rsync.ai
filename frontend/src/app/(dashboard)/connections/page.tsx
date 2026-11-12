@@ -6,24 +6,9 @@ import Link from "next/link"
 import { PageHeader } from "@/components/layout/PageHeader"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import {
-  Database,
-  Plus,
-  Search,
-  Edit,
-  Trash2,
-  RefreshCw,
-  Cloud,
-  Server,
-  MoreHorizontal,
-  ArrowRight,
-  Zap,
-  Clock,
-  PlayCircle,
-  AlertTriangle,
-} from "lucide-react"
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Database, Plus, Search, Edit, Trash2, RefreshCw, MoreHorizontal, PlayCircle } from "lucide-react"
 import { OAuthConnectButton } from "@/components/oauth/OAuthConnectButton"
 import {
   DropdownMenu,
@@ -49,8 +34,12 @@ import {
   isConnectorDeployingResponse,
 } from "@/lib/errors/connector-deploying"
 import { ConnectionLogo } from "@/components/connectors/ConnectionLogo"
-import { ConnectionTestBadge, LastTestErrorLine } from "@/components/connectors/ConnectionTestStatus"
-import { formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
+import { ConnectionTestBadge, LastTestErrorLine, connectionTestState } from "@/components/connectors/ConnectionTestStatus"
+import { EmptyState } from "@/components/kit/EmptyState"
+import { FilterChips } from "@/components/kit/FilterChips"
+import { RowsSkeleton } from "@/components/kit/PageSkeleton"
+import { StatusPill } from "@/components/kit/StatusPill"
+import { MAX_PIPELINE_PAGES, PIPELINE_PAGE_SIZE, listAllPipelines, pipelinesByConnection } from "@/lib/pipeline/listAllPipelines"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { getConnectorDisplayName } from "@/lib/types/mcp-connector"
 import { httpErrorFromResponse, parseApiError, classifyError, type AppError } from "@/lib/utils/error-handling"
@@ -97,14 +86,24 @@ type BlockingPipeline = {
   role?: "source" | "destination" | "unknown"
 }
 
-function formatDate(dateStr: string): string {
-  const date = new Date(dateStr)
-  return date.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  })
+type RoleFilter = "all" | "source" | "destination"
+
+/** How a source reads; a destination has no mode of its own. */
+function modeLabel(connection: Connection): string {
+  if (connection.type !== "source" || !connection.sync_mode) return "—"
+  if (connection.sync_mode === "batch") return "Batch"
+  return connection.cdc_mode === "streaming_only" ? "CDC, new changes only" : "CDC"
 }
+
+const PIPELINE_CAP = (MAX_PIPELINE_PAGES * PIPELINE_PAGE_SIZE).toLocaleString("en-US")
+
+/** "3 pipelines"; with a "+" when the pipeline list stopped at its cap, so the count is a floor. */
+function usedByText(count: number, truncated: boolean): string {
+  if (count === 0 && !truncated) return "No pipelines"
+  return `${count.toLocaleString("en-US")}${truncated ? "+" : ""} ${count === 1 && !truncated ? "pipeline" : "pipelines"}`
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
 export default function ConnectionsPage() {
   // Role gate: creating/testing connections is member+ (mirrors the backend
@@ -117,7 +116,10 @@ export default function ConnectionsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<AppError | null>(null)
   const [searchQuery, setSearchQuery] = useState("")
-  const [activeTab, setActiveTab] = useState<"all" | "source" | "destination">("all")
+  const [activeTab, setActiveTab] = useState<RoleFilter>("all")
+  // How many pipelines use each connection; null until the pipeline list is in.
+  const [usedBy, setUsedBy] = useState<{ counts: Map<string, number>; truncated: boolean } | null>(null)
+  const [usedByFailed, setUsedByFailed] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [connectionToDelete, setConnectionToDelete] = useState<Connection | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -179,6 +181,26 @@ export default function ConnectionsPage() {
     }
   }
 
+  const fetchUsedBy = async () => {
+    const isStale = captureWorkspace()
+    // Until this read answers, the column shows a dash rather than counts from
+    // the last read, which after a workspace switch were another workspace's.
+    setUsedBy(null)
+    setUsedByFailed(false)
+    try {
+      const { pipelines, truncated } = await listAllPipelines()
+      if (isStale()) return
+      const counts = new Map([...pipelinesByConnection(pipelines)].map(([id, list]) => [id, list.length]))
+      setUsedBy({ counts, truncated })
+      setUsedByFailed(false)
+    } catch {
+      if (isStale()) return
+      // The column says it could not count; the list itself still shows.
+      setUsedBy(null)
+      setUsedByFailed(true)
+    }
+  }
+
   const handleReconnectSuccess = async (connectionId: string, newTokenId: string) => {
     try {
       setReconnectingId(connectionId)
@@ -217,6 +239,7 @@ export default function ConnectionsPage() {
   useEffect(() => {
     fetchConnections()
     fetchOAuthTokens()
+    fetchUsedBy()
   }, [])
 
   // Re-fetch when the active workspace changes (header switcher / other tab) so
@@ -227,6 +250,7 @@ export default function ConnectionsPage() {
       onActiveWorkspaceChange(() => {
         fetchConnections()
         fetchOAuthTokens()
+        fetchUsedBy()
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -336,9 +360,22 @@ export default function ConnectionsPage() {
 
   const sourceCount = connections.filter(c => c.type === "source").length
   const destinationCount = connections.filter(c => c.type === "destination").length
+  // The chips count only a list the table shows: "All 0" beside grey rows or
+  // an error reads as an empty workspace.
+  const listed = !loading && !error
+
+  // The Reconnect button's own test: an expired OAuth token that no later test has passed.
+  const reconnectToken = (connection: Connection) => {
+    const token = getConnectionToken(connection)
+    return token?.expired && !connection.is_connected ? token : null
+  }
+  const failingCount = connections.filter((c) => connectionTestState(c) === "failed").length
+  const reconnectCount = connections.filter(
+    (c) => connectionTestState(c) === "expired" || reconnectToken(c) !== null,
+  ).length
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader
         heading="Connections"
         description="Manage your data source and destination connections"
@@ -353,58 +390,33 @@ export default function ConnectionsPage() {
         )}
       </PageHeader>
 
-      {/* Filters */}
-      <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">
-        {/* Tabs */}
-        <div className="flex gap-2 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-xl">
-          <button
-            onClick={() => setActiveTab("all")}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeTab === "all"
-                ? "bg-white dark:bg-zinc-700 shadow-sm text-zinc-900 dark:text-white"
-                : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white"
-            }`}
-          >
-            All
-            <Badge variant="secondary" className="ml-2">
-              {connections.length}
-            </Badge>
-          </button>
-          <button
-            onClick={() => setActiveTab("source")}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeTab === "source"
-                ? "bg-white dark:bg-zinc-700 shadow-sm text-zinc-900 dark:text-white"
-                : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white"
-            }`}
-          >
-            <Server className="h-4 w-4 inline mr-1" />
-            Sources
-            <Badge variant="secondary" className="ml-2">
-              {sourceCount}
-            </Badge>
-          </button>
-          <button
-            onClick={() => setActiveTab("destination")}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              activeTab === "destination"
-                ? "bg-white dark:bg-zinc-700 shadow-sm text-zinc-900 dark:text-white"
-                : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white"
-            }`}
-          >
-            <Cloud className="h-4 w-4 inline mr-1" />
-            Destinations
-            <Badge variant="secondary" className="ml-2">
-              {destinationCount}
-            </Badge>
-          </button>
+      {/* One row: the role chips with their counts, a pill for each kind of
+          problem, so a failing test shows without scrolling, and the search. */}
+      <div className="flex flex-col gap-3 @md:flex-row @md:items-center @md:justify-between">
+        <div className="flex flex-wrap items-center gap-3">
+          <FilterChips
+            label="Connection role"
+            value={activeTab}
+            onChange={setActiveTab}
+            chips={[
+              { value: "all", label: "All", count: listed ? connections.length : undefined },
+              { value: "source", label: "Sources", count: listed ? sourceCount : undefined },
+              { value: "destination", label: "Destinations", count: listed ? destinationCount : undefined },
+            ]}
+          />
+          {!loading && failingCount > 0 && (
+            <StatusPill tone="fail">{plural(failingCount, "test failing", "tests failing")}</StatusPill>
+          )}
+          {!loading && reconnectCount > 0 && (
+            <StatusPill tone="err">{plural(reconnectCount, "needs reconnect", "need reconnect")}</StatusPill>
+          )}
         </div>
 
-        {/* Search */}
-        <div className="relative w-full sm:w-80">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
+        <div className="relative w-full @md:w-72">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" aria-hidden />
           <Input
-            placeholder="Search connections..."
+            placeholder="Search connections"
+            aria-label="Search connections"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-10"
@@ -412,220 +424,188 @@ export default function ConnectionsPage() {
         </div>
       </div>
 
-      {/* Loading state */}
       {loading && (
-        <div className="flex items-center justify-center py-12">
-          <RefreshCw className="h-8 w-8 animate-spin text-zinc-400" />
-        </div>
+        <Card className="px-4 py-2">
+          <RowsSkeleton rows={5} label="Loading connections…" />
+        </Card>
       )}
 
-      {/* Error state */}
       {error && !loading && (
         <Card className="p-6">
           <ErrorBanner error={error} onRetry={fetchConnections} />
         </Card>
       )}
 
-      {/* Empty state */}
       {!loading && !error && connections.length === 0 && (
-        <Card className="flex flex-col items-center justify-center py-16 border-zinc-200 dark:border-zinc-800">
-          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-500 mb-6">
-            <Database className="h-8 w-8 text-white" />
-          </div>
-          <h3 className="text-xl font-semibold text-zinc-900 dark:text-white mb-2">
-            No Connections Yet
-          </h3>
-          <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6 text-center max-w-md">
-            Create your first connection to start building data pipelines.
-            Browse our connectors catalog to add a source or destination.
-          </p>
-          {canCreate ? (
-            <Button className="gap-2 bg-gradient-to-r from-violet-600 to-indigo-600" asChild>
-              <Link href="/connectors">
-                <Plus className="h-4 w-4" />
-                Browse Connectors
-              </Link>
-            </Button>
-          ) : (
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              You have view-only access to this workspace.
-            </p>
-          )}
+        <Card>
+          <EmptyState
+            icon={Database}
+            title="No connections yet"
+            description="A connection is a source to read from or a destination to write to. Add one from the connectors catalog to build a pipeline."
+            action={
+              canCreate ? (
+                <Button asChild>
+                  <Link href="/connectors">
+                    <Plus className="h-4 w-4 mr-2" />
+                    Browse connectors
+                  </Link>
+                </Button>
+              ) : (
+                <p className="text-sm text-zinc-500 dark:text-zinc-400">You have view-only access to this workspace.</p>
+              )
+            }
+          />
         </Card>
       )}
 
-      {/* Connections list */}
+      {/* One row per connection (each was a tall card). The actions column
+          sticks to the right edge, so a narrow window scrolls the table
+          sideways rather than pushing the actions out of reach. */}
       {!loading && !error && filteredConnections.length > 0 && (
-        <div className="grid gap-4">
-          {filteredConnections.map((connection) => (
-            <Card
-              key={connection.id}
-              className="p-6 border-zinc-200 dark:border-zinc-800 hover:border-violet-300 dark:hover:border-violet-800 transition-colors"
-            >
-              <div className="flex items-start justify-between">
-                <div className="flex items-start gap-4">
-                  <ConnectionLogo 
-                    connectorType={connection.connector_type} 
-                    size="md"
-                    category="database"
-                  />
-                  <div>
-                    <div className="flex items-center gap-3 mb-1">
-                      <h3 className="font-semibold text-zinc-900 dark:text-white">
-                        {connection.name}
-                      </h3>
-                      <Badge
-                        variant="outline"
-                        className={connection.type === "source" 
-                          ? "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-800" 
-                          : "bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:border-purple-800"
-                        }
-                      >
-                        {connection.type === "source" ? (
-                          <Server className="h-3 w-3 mr-1" />
+        <Card className="overflow-hidden">
+          <div className="relative w-full overflow-x-auto">
+            <table className="w-full caption-bottom text-sm" aria-label="Connections">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead className="hidden @xl:table-cell">Role</TableHead>
+                  <TableHead className="hidden @3xl:table-cell">Mode</TableHead>
+                  <TableHead>Last test</TableHead>
+                  <TableHead className="hidden @xl:table-cell">Used by</TableHead>
+                  <TableHead className="sticky right-0 z-20 border-l border-zinc-200 bg-background text-right dark:border-zinc-800">
+                    <span className="sr-only">Actions</span>
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filteredConnections.map((connection) => {
+                  const token = reconnectToken(connection)
+                  const count = usedBy?.counts.get(connection.id) ?? 0
+                  const typeName = getConnectorDisplayName(connection.connector_type)
+                  return (
+                    <TableRow key={connection.id} className="group hover:bg-zinc-50 dark:hover:bg-zinc-900/50">
+                      <TableCell>
+                        <div className="flex min-w-0 items-center gap-3">
+                          <ConnectionLogo connectorType={connection.connector_type} size="sm" category="database" />
+                          <div className="min-w-0">
+                            <Link
+                              href={`/connections/${connection.id}?type=${connection.type}`}
+                              className="block max-w-xs truncate font-medium text-zinc-900 hover:underline dark:text-white"
+                              title={connection.name}
+                            >
+                              {connection.name}
+                            </Link>
+                            <div
+                              className="max-w-xs truncate text-xs text-zinc-500 dark:text-zinc-400"
+                              title={connection.description ? `${typeName} · ${connection.description}` : undefined}
+                            >
+                              {typeName}
+                              {connection.description && ` · ${connection.description}`}
+                            </div>
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden text-zinc-600 dark:text-zinc-400 @xl:table-cell">
+                        {connection.type === "source" ? "Source" : "Destination"}
+                      </TableCell>
+                      <TableCell className="hidden whitespace-nowrap text-zinc-600 dark:text-zinc-400 @3xl:table-cell">
+                        {modeLabel(connection)}
+                      </TableCell>
+                      <TableCell>
+                        <ConnectionTestBadge connection={connection} />
+                        <div className="mt-1 max-w-xs">
+                          <LastTestErrorLine connection={connection} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden whitespace-nowrap text-zinc-600 dark:text-zinc-400 @xl:table-cell">
+                        {usedBy ? (
+                          <span title={usedBy.truncated ? `Counted from the first ${PIPELINE_CAP} pipelines` : undefined}>
+                            {usedByText(count, usedBy.truncated)}
+                          </span>
                         ) : (
-                          <Cloud className="h-3 w-3 mr-1" />
+                          <span title={usedByFailed ? "The pipeline list did not load" : undefined}>—</span>
                         )}
-                        {connection.type}
-                      </Badge>
-                      <ConnectionTestBadge connection={connection} />
-                      {/* Sync Mode Badge - Only for sources */}
-                      {connection.type === "source" && connection.sync_mode && (
-                        <Badge
-                          variant="outline"
-                          className={connection.sync_mode === "cdc"
-                            ? connection.cdc_mode === "streaming_only"
-                              ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800"
-                              : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:border-emerald-800"
-                            : "bg-slate-50 text-slate-700 border-slate-200 dark:bg-slate-900/30 dark:text-slate-300 dark:border-slate-800"
-                          }
-                        >
-                          {connection.sync_mode === "cdc" ? (
-                            <Zap className="h-3 w-3 mr-1" />
-                          ) : (
-                            <Clock className="h-3 w-3 mr-1" />
+                      </TableCell>
+                      <TableCell className="sticky right-0 z-10 border-l border-zinc-200 bg-background/95 text-right backdrop-blur supports-[backdrop-filter]:bg-background/80 group-hover:bg-zinc-50 dark:border-zinc-800 dark:group-hover:bg-zinc-900/50">
+                        <div className="flex items-center justify-end gap-2">
+                          {/* Reconnect for an expired OAuth token, hidden once a test passes. */}
+                          {mounted && token && (
+                            <OAuthConnectButton
+                              provider={token.provider}
+                              displayName={token.provider}
+                              label="Reconnect"
+                              variant="outline"
+                              size="sm"
+                              disabled={reconnectingId === connection.id}
+                              onSuccess={(newTokenId) => handleReconnectSuccess(connection.id, newTokenId)}
+                              className="border-orange-300 text-orange-700 hover:bg-orange-50 dark:border-orange-700 dark:text-orange-300 dark:hover:bg-orange-950/30"
+                            />
                           )}
-                          {connection.sync_mode === "cdc"
-                            ? connection.cdc_mode === "streaming_only"
-                              ? "CDC (Streaming)"
-                              : "CDC (Full Sync)"
-                            : "Batch"}
-                        </Badge>
-                      )}
-                      {/* Expired OAuth token badge */}
-                      {(() => {
-                        const token = getConnectionToken(connection)
-                        // Suppress "Reconnect required" when is_connected=true — test just passed
-                        return token?.expired && !connection.is_connected ? (
-                          <Badge
-                            variant="outline"
-                            className="bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-800"
-                          >
-                            <AlertTriangle className="h-3 w-3 mr-1" />
-                            Reconnect required
-                          </Badge>
-                        ) : null
-                      })()}
-                    </div>
-                    <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-2">
-                      {connection.description || `${getConnectorDisplayName(connection.connector_type)} connection`}
-                    </p>
-                    <LastTestErrorLine connection={connection} />
-                    <div className="flex items-center gap-4 text-xs text-zinc-400">
-                      <span>Type: {getConnectorDisplayName(connection.connector_type)}</span>
-                      <span>Created: {formatDate(connection.created_at)}</span>
-                      {connection.last_tested_at && (
-                        <span title={formatAbsoluteTime(connection.last_tested_at)}>
-                          Tested: {formatRelativeTime(connection.last_tested_at)}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  {/* Reconnect button for expired OAuth tokens */}
-                  {mounted && (() => {
-                    const token = getConnectionToken(connection)
-                    // Hide Reconnect button when connection is already verified working
-                    if (!token?.expired || connection.is_connected) return null
-                    return (
-                      <OAuthConnectButton
-                        provider={token.provider}
-                        displayName={token.provider}
-                        label="Reconnect"
-                        variant="outline"
-                        size="sm"
-                        disabled={reconnectingId === connection.id}
-                        onSuccess={(newTokenId) => handleReconnectSuccess(connection.id, newTokenId)}
-                        className="border-orange-300 text-orange-700 hover:bg-orange-50 dark:border-orange-700 dark:text-orange-300 dark:hover:bg-orange-950/30"
-                      />
-                    )
-                  })()}
-                  <Button variant="ghost" size="sm" asChild>
-                    <Link href={`/connections/${connection.id}?type=${connection.type}`}>
-                      View Details
-                      <ArrowRight className="h-4 w-4 ml-1" />
-                    </Link>
-                  </Button>
-                  {mounted && (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      {/* Name it after the connection, not a constant: there is one of
-                          these per row, and N identical "Actions" buttons are unusable
-                          in a screen-reader element list. */}
-                      <Button variant="ghost" size="icon" aria-label={`Actions for ${connection.name}`}>
-                        <MoreHorizontal className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        onClick={() => handleTestConnection(connection)}
-                        disabled={testingId === connection.id}
-                      >
-                        {testingId === connection.id ? (
-                          <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
-                        ) : (
-                          <PlayCircle className="h-4 w-4 mr-2" />
-                        )}
-                        Test Connection
-                      </DropdownMenuItem>
-                      <DropdownMenuItem asChild>
-                        <Link href={`/connections/${connection.id}?type=${connection.type}`}>
-                          <Edit className="h-4 w-4 mr-2" />
-                          Edit
-                        </Link>
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        className="text-red-600"
-                        onClick={() => {
-                          setDeleteBlockedBy(null)
-                          setConnectionToDelete(connection)
-                          setDeleteDialogOpen(true)
-                        }}
-                      >
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                  )}
-                </div>
-              </div>
-            </Card>
-          ))}
-        </div>
+                          {mounted && (
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                {/* Name it after the connection, not a constant: there is one of
+                                    these per row, and N identical "Actions" buttons are unusable
+                                    in a screen-reader element list. */}
+                                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label={`Actions for ${connection.name}`}>
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onClick={() => handleTestConnection(connection)}
+                                  disabled={testingId === connection.id}
+                                >
+                                  {testingId === connection.id ? (
+                                    <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                                  ) : (
+                                    <PlayCircle className="h-4 w-4 mr-2" />
+                                  )}
+                                  Test Connection
+                                </DropdownMenuItem>
+                                <DropdownMenuItem asChild>
+                                  {/* `edit=1` asks the detail page to open its edit form;
+                                      without it this was the View Details link. */}
+                                  <Link href={`/connections/${connection.id}?type=${connection.type}&edit=1`}>
+                                    <Edit className="h-4 w-4 mr-2" />
+                                    Edit
+                                  </Link>
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  className="text-red-600"
+                                  onClick={() => {
+                                    setDeleteBlockedBy(null)
+                                    setConnectionToDelete(connection)
+                                    setDeleteDialogOpen(true)
+                                  }}
+                                >
+                                  <Trash2 className="h-4 w-4 mr-2" />
+                                  Delete
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </table>
+          </div>
+        </Card>
       )}
 
-      {/* No results */}
       {!loading && !error && connections.length > 0 && filteredConnections.length === 0 && (
-        <div className="text-center py-12">
-          <Search className="h-12 w-12 mx-auto text-zinc-300 dark:text-zinc-700 mb-4" />
-          <p className="text-zinc-500 dark:text-zinc-400">
-            No connections found matching &quot;{searchQuery}&quot;
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            size="sm"
+            icon={Search}
+            title="No connection matches"
+            description={searchQuery ? `Nothing named or typed like "${searchQuery}" in this view.` : "No connection has this role."}
+          />
+        </Card>
       )}
 
       {/* Delete confirmation dialog */}

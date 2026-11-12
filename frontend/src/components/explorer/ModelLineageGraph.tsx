@@ -12,7 +12,8 @@ import { AlertTriangle, Loader2 } from "lucide-react"
 import { cn, formatRelativeTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { formatDuration, type ScheduledQuery } from "@/components/explorer/scheduledModel"
+import { type ScheduledQuery } from "@/components/explorer/scheduledModel"
+import { formatDurationOrDash } from "@/lib/duration"
 import { AFTER_UPSTREAM, type Fetched, type RunningModelsResponse } from "@/components/explorer/liveState"
 import {
   LINEAGE_NODE_HEIGHT,
@@ -27,6 +28,7 @@ import {
   lookupFromResponse,
   needsOlderRuns,
   nextRunsCursor,
+  runPool,
   type LineageNode,
   type LineageNodeView,
   type LineageTone,
@@ -34,6 +36,7 @@ import {
   type NodeLookup,
 } from "@/components/explorer/modelLineage"
 import { getJson } from "@/components/explorer/getJson"
+import { DOWNSTREAM_MEANING, UPSTREAM_MEANING } from "@/components/explorer/lineageLinks"
 import { buildRunGrid } from "@/components/explorer/modelRunGrid"
 import { ModelRunGridTable } from "@/components/explorer/ModelRunGridTable"
 import { ModelRunPanel, type RunPanelTarget, type RunSelection } from "@/components/explorer/ModelRunPanel"
@@ -111,19 +114,6 @@ async function lookupNode(node: LineageNode, signal: AbortSignal): Promise<NodeL
   }
 }
 
-async function runPool<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
-  let next = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const item = items[next++]
-      await work(item)
-    }
-  })
-  await Promise.all(workers)
-}
-
-
-
 const TONE_TEXT: Record<LineageTone, string> = {
   success: "text-emerald-700 dark:text-emerald-400",
   failed: "text-red-700 dark:text-red-400",
@@ -149,7 +139,7 @@ const TONE_BORDER: Record<LineageTone, string> = {
 }
 
 function statusLine(v: LineageNodeView): string {
-  const status = v.durationMs === null ? v.status : `${v.status} in ${formatDuration(v.durationMs)}`
+  const status = v.durationMs === null ? v.status : `${v.status} in ${formatDurationOrDash(v.durationMs)}`
   if (!v.at || Number.isNaN(Date.parse(v.at))) return status
   return `${status} · ${formatRelativeTime(v.at)}`
 }
@@ -682,16 +672,20 @@ function LineageList({
   const paused = new Set(lineage.edges.filter((e) => e.inactive).map((e) => e.to))
   const counted = (label: string, drawn: number, found: number) =>
     found > drawn ? `${label} (${drawn} of ${found})` : `${label} (${drawn})`
-  const sections: [string, LineageNode[]][] = [
-    [counted("Upstream", ups.length, lineage.upstreamsFound), ups],
-    ["This model", root],
-    [counted("Downstream", downs.length, lineage.downstreamsFound), downs],
+  // The meaning sits under the heading rather than in it: the heading is set in capitals.
+  const sections: [string, string | null, LineageNode[]][] = [
+    [counted("Upstream", ups.length, lineage.upstreamsFound), UPSTREAM_MEANING, ups],
+    ["This model", null, root],
+    [counted("Downstream", downs.length, lineage.downstreamsFound), DOWNSTREAM_MEANING, downs],
   ]
   return (
     <div className="divide-y dark:divide-zinc-800">
-      {sections.map(([heading, rows]) => (
+      {sections.map(([heading, meaning, rows]) => (
         <section key={heading} className="px-4 py-3">
-          <h3 className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{heading}</h3>
+          <h3 className={cn("text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400", meaning ? "mb-0.5" : "mb-2")}>
+            {heading}
+          </h3>
+          {meaning && <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">{meaning}.</p>}
           {rows.length === 0 ? (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">None.</p>
           ) : (

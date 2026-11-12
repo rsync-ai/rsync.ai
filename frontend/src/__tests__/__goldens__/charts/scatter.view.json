@@ -1,0 +1,72 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "scatter",
+    "description": "Discount against Order amount",
+    "points": {
+      "x": {
+        "field": "x",
+        "label": "Order amount",
+        "format": "decimal"
+      },
+      "y": {
+        "field": "y",
+        "label": "Discount",
+        "format": "decimal"
+      },
+      "rows": {
+        "field": "n",
+        "label": "Rows",
+        "format": "integer"
+      }
+    },
+    "series": {
+      "values": [
+        {
+          "key": "",
+          "label": "Discount",
+          "color": "series-1"
+        }
+      ]
+    }
+  },
+  "rows": [
+    {
+      "x": 40,
+      "y": 4,
+      "n": 5
+    },
+    {
+      "x": 12.5,
+      "y": 0,
+      "n": 2
+    },
+    {
+      "x": 40,
+      "y": 2.5,
+      "n": 1
+    },
+    {
+      "x": 75.25,
+      "y": 6,
+      "n": 1
+    },
+    {
+      "x": 120,
+      "y": 9.5,
+      "n": 1
+    },
+    {
+      "x": 180,
+      "y": 12,
+      "n": 1
+    },
+    {
+      "x": 260,
+      "y": 20,
+      "n": 1
+    }
+  ],
+  "series": [],
+  "notes": []
+}

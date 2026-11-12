@@ -10,15 +10,13 @@ from pathlib import Path
 
 # Import the FastAPI app
 import sys
-# Ensure we import *this repo's* `src/...` package (not any site-packages `src`).
-# Add the llm-service root to sys.path so `import src.*` resolves correctly, and
-# purge any previously-imported foreign `src` modules (some deps use `src` too).
+# Add the llm-service root to sys.path so `import src.*` resolves to this repo.
+# Never drop `src.*` from sys.modules here: files collected earlier already hold
+# those modules, and a second copy splits their classes and registries
+# (test_no_test_file_purges_imported_modules.py).
 repo_root = str(Path(__file__).parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
-for k in list(sys.modules.keys()):
-    if k == "src" or k.startswith("src."):
-        del sys.modules[k]
 from src.gateway.main import app
 
 
@@ -73,9 +71,9 @@ _EXPLORER_REPLY = json.dumps({
     "ambiguous_columns": None,
     # read by /explorer/nl/next-steps
     "suggestions": [
-        {"action_type": "metabase", "title": "Create dashboard",
-         "description": "Visualize these results in Metabase",
-         "confidence": 0.9, "required_inputs": ["dashboard_name"], "cta": "Create"},
+        {"action_type": "slack", "title": "Share to Slack",
+         "description": "Send these results to a channel",
+         "confidence": 0.9, "required_inputs": ["channel"], "cta": "Share"},
         {"action_type": "download_csv", "title": "Download CSV",
          "description": "Export the result set",
          "confidence": 0.8, "required_inputs": [], "cta": "Download"},
@@ -390,8 +388,53 @@ class TestSQLGenerateEndpoint:
         
         assert response.status_code == 200
         data = response.json()
-        
+
         assert "sql" in data
+
+    def test_an_undeclared_key_is_refused(self, client):
+        """api-gateway sends only the declared keys. A key the model does not
+        declare was dropped without a word, so a caller that thought it had
+        passed something (row samples, a connection's settings) never learned
+        it went nowhere."""
+        response = client.post(
+            "/api/v1/sql/generate",
+            json={
+                "question": "Count all users",
+                "dialect": "postgresql",
+                "schema": "users(id)",
+                "sample_rows": [{"email": "alice@example.com"}],
+            },
+        )
+
+        assert response.status_code == 422, response.text
+
+    def test_a_legacy_schema_column_that_is_not_a_name_never_reaches_the_prompt(self, client, monkeypatch):
+        """The legacy `t(col, col)` string was split on commas and every piece
+        sent as a column name, so a value written into it reached the model."""
+        from src.gateway import main as gateway_main
+
+        prompts = []
+
+        def reply(kwargs):
+            prompts.append("\n".join(str(m.get("content", "")) for m in kwargs.get("messages") or []))
+            return _sql_reply(kwargs)
+
+        monkeypatch.setattr(gateway_main, "sql_client", _StubClient(reply))
+        response = client.post(
+            "/api/v1/sql/generate",
+            json={
+                "question": "Count all users",
+                "dialect": "postgresql",
+                "schema": "users(id, created_at, alice@example.com, ssn = '078-05-1120')",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert prompts, "the stub saw no prompt"
+        # Control: the real column names are sent, so the prompt carries the schema.
+        assert "created_at" in prompts[0]
+        assert "alice@example.com" not in prompts[0]
+        assert "078-05-1120" not in prompts[0]
 
 
 class TestNextStepsEndpoint:
@@ -434,9 +477,42 @@ class TestNextStepsEndpoint:
         assert response.status_code == 200
         data = response.json()
         
-        allowed_types = {"metabase", "download_csv", "slack", "email"}
+        allowed_types = {"download_csv", "slack", "email"}
         for suggestion in data["suggestions"]:
             assert suggestion["action_type"] in allowed_types
+
+    @pytest.mark.parametrize(
+        "dialect, query_sent",
+        [("postgresql", True), (None, False)],
+    )
+    def test_the_dialect_decides_whether_the_query_reaches_the_model(self, client, monkeypatch, dialect, query_sent):
+        """The guard swaps the query's literals for placeholders, and it can
+        only find them knowing the dialect. The request had no dialect field,
+        so every next-steps prompt carried "(withheld: …)" instead of the query."""
+        from src.agents.explorer import api as explorer_api
+        from src.egress import WITHHELD_SQL
+
+        prompts = []
+
+        def reply(kwargs):
+            prompts.append("\n".join(str(m.get("content", "")) for m in kwargs.get("messages") or []))
+            return _EXPLORER_REPLY
+
+        monkeypatch.setattr(explorer_api, "explorer_client", _StubClient(reply))
+        body = {
+            "question": "paid orders",
+            "sql": "SELECT id FROM orders WHERE status = 'paid-canary'",
+            "result_profile": {"row_count": 3, "columns": ["id"]},
+        }
+        if dialect:
+            body["dialect"] = dialect
+        response = client.post("/api/v1/explorer/nl/next-steps", json=body)
+
+        assert response.status_code == 200, response.text
+        assert len(prompts) == 1
+        assert "paid-canary" not in prompts[0]
+        assert ("SELECT id FROM orders WHERE status = {{L1:str}}" in prompts[0]) is query_sent
+        assert (WITHHELD_SQL in prompts[0]) is not query_sent
 
 
 class TestHealthEndpoint:
@@ -497,3 +573,113 @@ class TestNLTestSet:
             )
             
             assert response.status_code == 200, f"Failed for case: {case['id']}"
+
+
+# ---------------------------------------------------------------------------
+# An unusable model reply is not a server error.
+#
+# Bug class: "the model's reply is trusted to be a well-formed JSON object of the
+# expected shape". All three NL endpoints parsed the reply with json.loads and
+# built the response from it inside one try/except that answered 500 — so an
+# empty reply (seen in the 2026-09-16 demo run after a provider 503 retry), a
+# refusal in prose, a JSON array, or one malformed entry turned a question the
+# user can still answer by hand into an error page. The reply is the model's, not
+# the user's request and not our code: it degrades to "nothing matched, pick it
+# yourself" for tables and columns, and to the rule-based list for next steps
+# (the same list served when no LLM is configured).
+# ---------------------------------------------------------------------------
+
+_UNUSABLE_REPLIES = {
+    "empty": "",
+    "whitespace": "   \n  ",
+    "prose": "Sorry, I can't help with that request.",
+    "json_array": "[1, 2, 3]",
+    "json_string": '"users"',
+    "truncated": '{"candidates": [{"table": "users", "confidence": 0.9',
+}
+
+# Parses as an object, but every entry is the wrong shape.
+_MALFORMED_REPLY = json.dumps({
+    "candidates": [{"reason": "no table named"}, "users", {"table": 5, "confidence": "high"}],
+    "confidence_overall": "high",
+    "columns": "users.name",
+    "join_plan": ["users", {"left_table": ["x"]}],
+    "confidence": "very",
+    "suggestions": [{"action_type": "slack"}, "email"],
+})
+
+
+def _reply_with(monkeypatch, content):
+    from src.agents.explorer import api as explorer_api
+
+    monkeypatch.setattr(explorer_api, "explorer_client", _StubClient(lambda _kw: content))
+
+
+_ALL_BAD_REPLIES = list(_UNUSABLE_REPLIES.items()) + [("malformed_entries", _MALFORMED_REPLY)]
+
+
+class TestUnusableModelReply:
+    @pytest.mark.parametrize("label,content", _ALL_BAD_REPLIES, ids=[k for k, _ in _ALL_BAD_REPLIES])
+    def test_resolve_tables_asks_the_user_instead_of_500(self, client, sample_schema, monkeypatch, label, content):
+        _reply_with(monkeypatch, content)
+        response = client.post(
+            "/api/v1/explorer/nl/resolve-tables",
+            json={"question": "Show me all users", "tables": sample_schema},
+        )
+        assert response.status_code == 200, f"{label}: {response.status_code} {response.text}"
+        data = response.json()
+        assert data["candidates"] == []
+        assert data["needs_hitl"] is True
+        assert data["hitl_reason"], "the user must be told why they are picking by hand"
+        assert 0.0 <= data["confidence_overall"] <= 1.0
+
+    @pytest.mark.parametrize("label,content", _ALL_BAD_REPLIES, ids=[k for k, _ in _ALL_BAD_REPLIES])
+    def test_resolve_columns_asks_the_user_instead_of_500(self, client, sample_schema, monkeypatch, label, content):
+        _reply_with(monkeypatch, content)
+        response = client.post(
+            "/api/v1/explorer/nl/resolve-columns",
+            json={"question": "Show me user names", "selected_tables": sample_schema[:2]},
+        )
+        assert response.status_code == 200, f"{label}: {response.status_code} {response.text}"
+        data = response.json()
+        cols = data["columns"]
+        assert cols["select_cols"] == [] and cols["where_cols"] == []
+        assert cols["group_by_cols"] == [] and cols["order_by_cols"] == []
+        assert data["join_plan"] == []
+        assert data["needs_hitl"] is True
+        assert data["hitl_reason"]
+        assert 0.0 <= data["confidence"] <= 1.0
+
+    @pytest.mark.parametrize("label,content", _ALL_BAD_REPLIES, ids=[k for k, _ in _ALL_BAD_REPLIES])
+    def test_next_steps_falls_back_to_the_rule_based_list(self, client, monkeypatch, label, content):
+        _reply_with(monkeypatch, content)
+        response = client.post(
+            "/api/v1/explorer/nl/next-steps",
+            json={
+                "question": "Show me all users",
+                "sql": "SELECT * FROM users",
+                "result_profile": {"row_count": 50, "columns": ["id", "name"]},
+            },
+        )
+        assert response.status_code == 200, f"{label}: {response.status_code} {response.text}"
+        types = [s["action_type"] for s in response.json()["suggestions"]]
+        # The list _mock_next_steps serves for a 50-row result.
+        assert types == ["download_csv", "slack"]
+
+    def test_a_valid_candidate_survives_a_malformed_sibling(self, client, sample_schema, monkeypatch):
+        _reply_with(monkeypatch, json.dumps({
+            "candidates": [
+                {"table": "users", "schema_name": "public", "confidence": 0.9, "reason": "named"},
+                {"reason": "no table"},
+            ],
+            "confidence_overall": 0.9,
+            "needs_hitl": False,
+        }))
+        response = client.post(
+            "/api/v1/explorer/nl/resolve-tables",
+            json={"question": "Show me all users", "tables": sample_schema},
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert [c["table"] for c in data["candidates"]] == ["users"]
+        assert data["needs_hitl"] is False

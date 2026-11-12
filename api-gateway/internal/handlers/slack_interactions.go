@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -166,40 +167,70 @@ func (h *SlackInteractionsHandler) HandleInteractions(c *gin.Context) {
 	// (7) Act via the SAME core the UI uses.
 	switch action.actionID {
 	case slack.ActionApproveSchemaChange:
-		actioned, dispatched, err := approveSchemaChangeCore(c.Request.Context(), h.db, h.kafka, action.pipelineID, changeID, rsyncEmail)
+		d, err := approveSchemaChangeCore(c.Request.Context(), h.db, h.kafka, action.pipelineID, changeID, rsyncEmail)
 		if err != nil {
 			log.WithError(err).Error("slack interactions: approve failed")
-			c.JSON(http.StatusOK, slackEphemeral("Approval failed — please try again from rsync-ai."))
+			c.JSON(http.StatusOK, slackEphemeral(slackDecisionFailure("Approval", err)))
 			return
 		}
-		if !actioned {
+		if !d.Actioned {
 			c.JSON(http.StatusOK, slackReplace("That schema change was already actioned."))
 			return
 		}
-		log.WithFields(log.Fields{"pipeline_id": action.pipelineID, "change_id": changeID, "by": rsyncEmail, "dispatched": dispatched}).Info("slack interactions: schema change approved")
+		log.WithFields(log.Fields{"pipeline_id": action.pipelineID, "change_id": changeID, "by": rsyncEmail, "dispatched": d.Dispatched, "drop_table": d.DropTable}).Info("slack interactions: schema change approved")
 		// Say which of the two things approval did. A bare "approved" on DDL nobody
 		// will run reads as "handled" and the change quietly never happens.
-		msg := "✅ Schema change *approved* by " + rsyncEmail + " via Slack."
-		if !dispatched {
+		var msg string
+		switch {
+		case d.DropTable && d.Dispatched:
+			msg = "✅ Table drop *approved* by " + rsyncEmail +
+				" via Slack — the table was removed from the pipeline and its destination table is being dropped."
+		case d.DropTable:
+			msg = "✅ Table drop *approved* by " + rsyncEmail +
+				" via Slack — the table was removed from the pipeline. Its destination table was *not dropped*; drop it manually."
+		case d.Dispatched:
+			msg = "✅ Schema change *approved* by " + rsyncEmail + " via Slack."
+		default:
 			msg = "✅ Schema change *approved* by " + rsyncEmail +
 				" via Slack — decision recorded only. This DDL is *not auto-applied*; run it manually on the destination."
 		}
 		c.JSON(http.StatusOK, slackReplace(msg))
 	case slack.ActionRejectSchemaChange:
-		actioned, err := rejectSchemaChangeCore(c.Request.Context(), h.db, action.pipelineID, changeID, rsyncEmail)
+		d, err := rejectSchemaChangeCore(c.Request.Context(), h.db, action.pipelineID, changeID, rsyncEmail)
 		if err != nil {
 			log.WithError(err).Error("slack interactions: reject failed")
-			c.JSON(http.StatusOK, slackEphemeral("Rejection failed — please try again from rsync-ai."))
+			c.JSON(http.StatusOK, slackEphemeral(slackDecisionFailure("Rejection", err)))
 			return
 		}
-		if !actioned {
+		if !d.Actioned {
 			c.JSON(http.StatusOK, slackReplace("That schema change was already actioned."))
 			return
 		}
-		log.WithFields(log.Fields{"pipeline_id": action.pipelineID, "change_id": changeID, "by": rsyncEmail}).Info("slack interactions: schema change rejected")
-		c.JSON(http.StatusOK, slackReplace("❌ Schema change *rejected* by "+rsyncEmail+" via Slack."))
+		log.WithFields(log.Fields{"pipeline_id": action.pipelineID, "change_id": changeID, "by": rsyncEmail, "drop_table": d.DropTable}).Info("slack interactions: schema change rejected")
+		msg := "❌ Schema change *rejected* by " + rsyncEmail + " via Slack."
+		if d.DropTable {
+			msg = "❌ Table drop *rejected* by " + rsyncEmail +
+				" via Slack — the table was removed from the pipeline and its destination table is kept."
+		}
+		c.JSON(http.StatusOK, slackReplace(msg))
 	default:
 		c.JSON(http.StatusOK, slackEphemeral("Unknown action."))
+	}
+}
+
+// slackDecisionFailure is the ephemeral reply for a decision that was not saved.
+// A dropped table that could not be taken out of the pipeline says why, in the
+// same words the app shows; anything else stays generic.
+func slackDecisionFailure(what string, err error) string {
+	var removal *tableRemovalError
+	switch {
+	case errors.Is(err, errLastSelectedTable):
+		return what + " not saved: this is the only table the pipeline syncs, so it cannot be removed from the pipeline. " +
+			"Add another table to the pipeline, or delete the pipeline."
+	case errors.As(err, &removal):
+		return what + " not saved: " + removal.public
+	default:
+		return what + " failed — please try again from rsync-ai."
 	}
 }
 

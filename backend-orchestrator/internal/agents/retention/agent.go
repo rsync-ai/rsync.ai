@@ -269,8 +269,7 @@ func (a *Agent) GetBulkLoadProgress(
 		return 0, nil, &BulkLoadNotFoundError{ID: bulkLoadID}
 	}
 
-	progress, progressMap := a.offsetTracker.GetBulkLoadProgress(ctx, bl)
-	return progress, progressMap, nil
+	return a.offsetTracker.GetBulkLoadProgress(ctx, bl)
 }
 
 // === Background Loops ===

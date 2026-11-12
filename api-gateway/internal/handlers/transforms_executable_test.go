@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// The builder's 9 producer operations, as frontend/src/app/(dashboard)/transforms/page.tsx
+// The editor's 9 producer operations, as frontend/src/components/transforms/transformOperations.tsx
 // offers them. Every one of these has to survive validateExecutableTransform, or the
 // operator gets a 400 for a card the UI told them to click.
 func TestValidateExecutableTransform_AcceptsEveryOfferedOperation(t *testing.T) {
@@ -28,7 +28,7 @@ func TestValidateExecutableTransform_AcceptsEveryOfferedOperation(t *testing.T) 
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateExecutableTransform(tc.cfg, 0); err != nil {
+			if _, err := validateExecutableTransform(tc.cfg, 0); err != nil {
 				t.Fatalf("offered operation %q was rejected: %v", tc.name, err)
 			}
 		})
@@ -53,7 +53,7 @@ func TestValidateExecutableTransform_RejectsOperationsNoEngineCanRun(t *testing.
 	for _, cfg := range unrunnable {
 		op := cfg["operation"].(string)
 		t.Run(op, func(t *testing.T) {
-			if err := validateExecutableTransform(cfg, 0); err == nil {
+			if _, err := validateExecutableTransform(cfg, 0); err == nil {
 				t.Fatalf("operation %q was accepted, but no engine can execute it", op)
 			}
 		})
@@ -65,7 +65,7 @@ func TestValidateExecutableTransform_RejectsOperationsNoEngineCanRun(t *testing.
 // only defers the DLQ. The validator therefore judges every rule as if it were on.
 func TestValidateExecutableTransform_IgnoresTheCallersEnabledFlag(t *testing.T) {
 	cfg := map[string]interface{}{"operation": "aggregate", "enabled": false}
-	if err := validateExecutableTransform(cfg, 0); err == nil {
+	if _, err := validateExecutableTransform(cfg, 0); err == nil {
 		t.Fatal("a disabled unrunnable rule was accepted; enabling it later would reach the sink unchecked")
 	}
 }
@@ -82,7 +82,7 @@ func TestValidateExecutableTransform_DoesNotMutateTheCallersConfig(t *testing.T)
 		"requires_full_dataset": false,
 	}
 
-	if err := validateExecutableTransform(cfg, 0); err != nil {
+	if _, err := validateExecutableTransform(cfg, 0); err != nil {
 		t.Fatalf("unexpected rejection: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestValidateExecutableTransform_DoesNotMutateTheCallersConfig(t *testing.T)
 // The rejection message is what the operator sees in place of a silent later failure,
 // so it has to name the operation rather than an index alone.
 func TestValidateExecutableTransform_ErrorNamesTheOperation(t *testing.T) {
-	err := validateExecutableTransform(map[string]interface{}{"operation": "python_udf"}, 3)
+	_, err := validateExecutableTransform(map[string]interface{}{"operation": "python_udf"}, 3)
 	if err == nil {
 		t.Fatal("expected a rejection")
 	}

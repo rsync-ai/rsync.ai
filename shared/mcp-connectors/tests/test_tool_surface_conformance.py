@@ -50,7 +50,7 @@ SHARED_PUBLIC = os.path.join(CONNECTOR_ROOT, "public")
 # They do not inherit list_tools, so this contract does not apply to them. Pinned as an
 # exact set: a connector dropping out of the subclass tree must break this suite loudly
 # rather than quietly stop being checked.
-NON_SUBCLASS_CONNECTORS = {"debezium", "minio", "sample-data"}
+NON_SUBCLASS_CONNECTORS = {"debezium", "minio", "nse-india", "sample-data"}
 
 # Floors. A conformance suite that silently probes nothing passes just as green as one
 # that probes everything, so both the denominator and the probed count are asserted.

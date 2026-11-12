@@ -17,11 +17,16 @@ import {
 } from "@/components/ui/dialog"
 import { formatSpan } from "@/components/explorer/liveState"
 
-// "Alert if older than…" on the model page. The gateway stores the deadline in
+// "Flag Overdue after…" on the model page. The gateway stores the deadline in
 // saved_queries.freshness_deadline_seconds (PUT /explorer/saved/:id/freshness,
 // saved_query_freshness.go SetSavedQueryFreshness) and the sweep opens a breach when the
 // last successful rebuild is older than it. Breaches already show on this page
 // (OverdueBadge); this is the control that sets the promise they are measured against.
+//
+// GET /explorer/saved/:id/freshness also answers the longest wait the schedules above the
+// model can leave between two rebuilds (model_rebuild_interval.go). A deadline at or under
+// it flags a healthy model Overdue on every cycle — Loan portfolio, 6h against a daily
+// rebuild — so both the row and the dialog say so. Saving such a deadline stays allowed.
 
 /** saved_query_freshness.go freshnessDeadlineMin / freshnessDeadlineMax, in seconds. */
 export const FRESHNESS_MIN_SECONDS = 60
@@ -62,14 +67,35 @@ export function deadlineFrom(amount: string, unit: Unit): { seconds: number } | 
   return { seconds }
 }
 
+/**
+ * A deadline the schedule leaves room for: the longest gap plus a tenth of it (at least a
+ * minute) for the rebuild to land, rounded up to a unit formatSpan prints exactly. Null
+ * when that is past the one-year cap, so there is no deadline to offer.
+ */
+export function suggestDeadline(rebuildIntervalSeconds: number): number | null {
+  const want = rebuildIntervalSeconds + Math.max(Math.ceil(rebuildIntervalSeconds / 10), 60)
+  const step = want >= 7 * 86400 ? 86400 : want >= 6 * 3600 ? 3600 : want >= 3600 ? 900 : 60
+  const seconds = Math.ceil(want / step) * step
+  return seconds <= FRESHNESS_MAX_SECONDS ? seconds : null
+}
+
+/** Whether a deadline flags the model Overdue in the gap its schedule can leave. */
+function underInterval(deadline: number | null, interval: number | null): interval is number {
+  return deadline != null && interval != null && deadline <= interval
+}
+
 // Tagged with the id it was read for, so a stale answer reads as loading, not as this model's.
-type Loaded = { id: string; status: "ok"; deadline: number | null } | { id: string; status: "error" }
+// interval is null when the gateway cannot predict the gap (CDC upstream, nothing scheduled…).
+type Loaded =
+  | { id: string; status: "ok"; deadline: number | null; interval: number | null }
+  | { id: string; status: "error" }
 
 export function ModelFreshnessDeadline({
   savedQueryId,
   materialization,
   canEdit,
   disabledReason,
+  scheduleKey,
   onSaved,
 }: {
   savedQueryId: string
@@ -78,6 +104,8 @@ export function ModelFreshnessDeadline({
   canEdit: boolean
   /** Shown as the Edit control's tooltip when canEdit is false. */
   disabledReason?: string
+  /** Changes when the model's own schedule does, so the rebuild interval is read again. */
+  scheduleKey?: string
   /** After a save lands, so the page can re-read breaches and its Updated time. */
   onSaved?: () => void
 }) {
@@ -90,13 +118,21 @@ export function ModelFreshnessDeadline({
     let alive = true
     ;(async () => {
       try {
-        const res = await authFetch(`/api/v1/explorer/saved/${encodeURIComponent(savedQueryId)}`, {
+        const res = await authFetch(`/api/v1/explorer/saved/${encodeURIComponent(savedQueryId)}/freshness`, {
           cache: "no-store",
         })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = await res.json()
-        const v = data?.freshness_deadline_seconds
-        if (alive) setAnswer({ id: savedQueryId, status: "ok", deadline: typeof v === "number" ? v : null })
+        const v = data?.deadline_seconds
+        const gap = data?.rebuild_interval_seconds
+        if (alive) {
+          setAnswer({
+            id: savedQueryId,
+            status: "ok",
+            deadline: typeof v === "number" ? v : null,
+            interval: typeof gap === "number" ? gap : null,
+          })
+        }
       } catch {
         if (alive) setAnswer({ id: savedQueryId, status: "error" })
       }
@@ -104,11 +140,12 @@ export function ModelFreshnessDeadline({
     return () => {
       alive = false
     }
-  }, [savedQueryId])
+  }, [savedQueryId, scheduleKey])
 
   const loaded = answer?.id === savedQueryId ? answer : { status: "loading" as const }
   const tracked = materialization === "table"
   const deadline = loaded.status === "ok" ? loaded.deadline : null
+  const interval = loaded.status === "ok" ? loaded.interval : null
 
   return (
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5" data-testid="model-freshness-deadline">
@@ -118,7 +155,7 @@ export function ModelFreshnessDeadline({
         <span className="text-zinc-400">Could not load the deadline</span>
       ) : deadline != null ? (
         <>
-          <span title={`${deadline.toLocaleString()} seconds`}>Alert if older than {formatSpan(deadline)}</span>
+          <span title={`${deadline.toLocaleString()} seconds`}>Flag Overdue after {formatSpan(deadline)}</span>
           {!tracked && (
             <span
               className="text-amber-600 dark:text-amber-400"
@@ -130,6 +167,18 @@ export function ModelFreshnessDeadline({
         </>
       ) : (
         <span className="text-zinc-400">No deadline</span>
+      )}
+      {loaded.status === "ok" && tracked && underInterval(deadline, interval) && (
+        <p
+          role="note"
+          className="flex basis-full items-start gap-1 text-xs text-amber-700 dark:text-amber-400"
+          title="Worked out from this model's schedule and every pipeline, model and workflow that can start it"
+        >
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+          <span>
+            Its schedule can leave {formatSpan(interval)} between rebuilds, so it shows Overdue between them.
+          </span>
+        </p>
       )}
       {loaded.status === "ok" && (
         <button
@@ -154,8 +203,10 @@ export function ModelFreshnessDeadline({
           savedQueryId={savedQueryId}
           current={deadline}
           tracked={tracked}
+          rebuildInterval={interval}
           onSaved={(next) => {
-            setAnswer({ id: savedQueryId, status: "ok", deadline: next })
+            // A deadline does not move the schedule, so the interval read with it still holds.
+            setAnswer({ id: savedQueryId, status: "ok", deadline: next, interval })
             setOpen(false)
             onSaved?.()
           }}
@@ -171,6 +222,7 @@ function FreshnessDeadlineDialog({
   savedQueryId,
   current,
   tracked,
+  rebuildInterval,
   onSaved,
 }: {
   open: boolean
@@ -178,6 +230,8 @@ function FreshnessDeadlineDialog({
   savedQueryId: string
   current: number | null
   tracked: boolean
+  /** The longest gap the schedules above the model can leave, or null when unknown. */
+  rebuildInterval: number | null
   onSaved: (deadline: number | null) => void
 }) {
   // Keyed by opening, so these start from what is stored, not from an abandoned edit.
@@ -189,6 +243,8 @@ function FreshnessDeadlineDialog({
 
   const parsed = deadlineFrom(amount, unit)
   const unchanged = "seconds" in parsed && parsed.seconds === current
+  const tooShort = tracked && "seconds" in parsed && underInterval(parsed.seconds, rebuildInterval)
+  const suggested = tooShort ? suggestDeadline(rebuildInterval!) : null
 
   async function put(deadlineSeconds: number | null) {
     setBusy(deadlineSeconds == null ? "remove" : "save")
@@ -205,7 +261,7 @@ function FreshnessDeadlineDialog({
         return
       }
       const stored = typeof data?.deadline_seconds === "number" ? data.deadline_seconds : null
-      toast.success(stored == null ? "Freshness deadline removed" : `Alert if older than ${formatSpan(stored)}`)
+      toast.success(stored == null ? "Freshness deadline removed" : `Flag Overdue after ${formatSpan(stored)}`)
       onSaved(stored)
     } catch {
       setServerError("The deadline was not saved: the request did not reach the server.")
@@ -215,13 +271,13 @@ function FreshnessDeadlineDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
+    <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)} closeOnOutsideClick={false}>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>Freshness deadline</DialogTitle>
           <DialogDescription>
             Flag this model Overdue when its table has not been rebuilt successfully for longer than this.
-            Checked every minute; the flag shows here and on Scheduled Queries.
+            Checked every minute; the flag shows here, on Models and on Home. It sends no message.
           </DialogDescription>
         </DialogHeader>
 
@@ -269,7 +325,7 @@ function FreshnessDeadlineDialog({
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="freshness-amount">Alert if older than</Label>
+            <Label htmlFor="freshness-amount">Flag Overdue after</Label>
             <div className="flex gap-2">
               <Input
                 id="freshness-amount"
@@ -306,10 +362,41 @@ function FreshnessDeadlineDialog({
               {"error" in parsed
                 ? parsed.error
                 : current != null && parsed.seconds > current
-                  ? "Widening the deadline closes an open alert as “deadline widened”, not as fixed."
+                  ? "Widening the deadline clears an Overdue flag as “deadline widened”, not as fixed."
                   : "Between 1 minute and 365 days."}
             </p>
           </div>
+
+          {tooShort && (
+            <div
+              role="note"
+              className="flex gap-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+              <div className="space-y-1.5">
+                <p>
+                  Its schedule can leave {formatSpan(rebuildInterval!)} between rebuilds, so this deadline flags it
+                  Overdue between them even when every run succeeds.
+                </p>
+                {suggested != null && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => {
+                      const next = splitDeadline(suggested)
+                      setAmount(next.amount)
+                      setUnit(next.unit)
+                      setServerError(null)
+                    }}
+                  >
+                    Use {formatSpan(suggested)}
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
 
           {serverError && (
             <p role="alert" className="text-xs text-red-600">

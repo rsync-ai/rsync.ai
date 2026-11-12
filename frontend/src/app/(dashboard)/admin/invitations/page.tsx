@@ -41,12 +41,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { authFetch } from "@/lib/api/auth-fetch"
-import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { AdminReadFailureState, LoadingState } from "@/components/admin/AdminStates"
 import { toast } from "sonner"
 import { copyTextToClipboard } from "@/lib/clipboard"
 import { Plus, Copy, Trash2 } from "lucide-react"
-import type { AdminInvitation } from "@/lib/api/admin"
+import type { AdminInvitation, AdminReadFailure } from "@/lib/api/admin"
 import { adminCreateInvitation, adminListInvitations, adminRevokeInvitation } from "@/lib/api/admin"
 import { formatAbsoluteTime } from "@/lib/utils"
 
@@ -59,8 +58,7 @@ const statusBadgeVariant: Record<string, "default" | "secondary" | "outline" | "
 export default function AdminInvitationsPage() {
   const [invitations, setInvitations] = useState<AdminInvitation[]>([])
   const [loading, setLoading] = useState(true)
-  const [pageStatus, setPageStatus] = useState<number | null>(null)
-  const [retryAfter, setRetryAfter] = useState<number | null>(null)
+  const [failure, setFailure] = useState<AdminReadFailure | null>(null)
 
   // Create dialog
   const [showCreate, setShowCreate] = useState(false)
@@ -73,22 +71,10 @@ export default function AdminInvitationsPage() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    setPageStatus(null)
-    try {
-      const res = await authFetch("/api/v1/admin/invitations", { method: "GET" })
-      if (res.status === 401) { window.location.href = `/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`; return }
-      if (res.status === 403) { setPageStatus(403); setLoading(false); return }
-      if (res.status === 429) {
-        setPageStatus(429)
-        setRetryAfter(parseInt(res.headers.get("Retry-After") || "", 10))
-        setLoading(false)
-        return
-      }
-      const json = await res.json()
-      setInvitations(json.data || [])
-    } catch {
-      toast.error("Failed to load invitations")
-    }
+    setFailure(null)
+    const r = await adminListInvitations()
+    if (r.ok) setInvitations(r.data.data || [])
+    else setFailure(r)
     setLoading(false)
   }, [])
 
@@ -129,16 +115,14 @@ export default function AdminInvitationsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader heading="Admin" description="Invite link management" />
       <AdminNav />
 
       {loading ? (
         <LoadingState />
-      ) : pageStatus === 403 ? (
-        <AccessDeniedState />
-      ) : pageStatus === 429 ? (
-        <RateLimitExceededState retryAfterSeconds={retryAfter} />
+      ) : failure ? (
+        <AdminReadFailureState failure={failure} onRetry={load} />
       ) : (
         <Card className="p-4">
           <div className="flex items-center justify-between mb-4">
@@ -155,9 +139,9 @@ export default function AdminInvitationsPage() {
                 <TableHead>Email Hint</TableHead>
                 <TableHead>Role</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="hidden md:table-cell">Created By</TableHead>
-                <TableHead className="hidden md:table-cell">Expires</TableHead>
-                <TableHead className="hidden lg:table-cell">Used By</TableHead>
+                <TableHead className="hidden @xl:table-cell">Created By</TableHead>
+                <TableHead className="hidden @xl:table-cell">Expires</TableHead>
+                <TableHead className="hidden @3xl:table-cell">Used By</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -178,13 +162,13 @@ export default function AdminInvitationsPage() {
                     <TableCell>
                       <Badge variant={statusBadgeVariant[inv.status] || "outline"}>{inv.status}</Badge>
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                    <TableCell className="hidden @xl:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                       {inv.created_by_email}
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                    <TableCell className="hidden @xl:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                       {formatAbsoluteTime(inv.expires_at)}
                     </TableCell>
-                    <TableCell className="hidden lg:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                    <TableCell className="hidden @3xl:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                       {inv.used_by_email || "-"}
                     </TableCell>
                     <TableCell className="text-right">
@@ -220,7 +204,7 @@ export default function AdminInvitationsPage() {
       )}
 
       {/* Create Invitation Dialog */}
-      <Dialog open={showCreate} onOpenChange={setShowCreate}>
+      <Dialog open={showCreate} onOpenChange={setShowCreate} closeOnOutsideClick={false}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Create Invitation</DialogTitle>
@@ -252,9 +236,9 @@ export default function AdminInvitationsPage() {
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">Optional hint shown on the signup page.</p>
               </div>
               <div className="space-y-2">
-                <Label>Role</Label>
+                <Label htmlFor="admin-invite-role">Role</Label>
                 <Select value={role} onValueChange={setRole}>
-                  <SelectTrigger>
+                  <SelectTrigger id="admin-invite-role">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>

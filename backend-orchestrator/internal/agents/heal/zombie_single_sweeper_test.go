@@ -36,7 +36,7 @@ func TestZombieSweeperRunsTheOneCanonicalStatement(t *testing.T) {
 	// QueryMatcherEqual, so this passes only if the SQL is sweepZombiesQuery itself —
 	// not a near-copy, not a reformatted equivalent.
 	mock.ExpectQuery(sweepZombiesQuery).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "reconciled", "pipelines_closed"}))
+		WillReturnRows(zombieSweepRows())
 
 	s := &ZombieExecutionSweeper{DB: db}
 	if err := s.Sweep(context.Background()); err != nil {
@@ -64,9 +64,9 @@ func TestSweepZombiesWritesAHealEventPerReapedExecution(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	mock.ExpectQuery(`WITH swept AS`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "reconciled", "pipelines_closed"}).
-			AddRow("exec-1", "pipe-1", 1, 1).
-			AddRow("exec-2", "pipe-2", 1, 1))
+		WillReturnRows(zombieSweepRows().
+			AddRow("exec-1", "pipe-1", 1, 1, false).
+			AddRow("exec-2", "pipe-2", 1, 1, false))
 	mock.ExpectExec(`INSERT INTO pipeline_run_events`).
 		WithArgs("pipe-1", "exec-1", sqlmock.AnyArg(), "healer_zombie_swept", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))

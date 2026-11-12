@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"api-gateway/internal/db"
@@ -168,6 +169,13 @@ func TestRunPipeline_MemberCanRunSharedPipeline(t *testing.T) {
 			"natural_language_request", "created_by", "config", "dataset", "default_run_mode",
 		}).AddRow("shared-p", "ready", nil, nil, nil, creator, []byte("{}"), nil, nil))
 
+	// No other run is open: RunPipeline and enqueuePipelineRun each ask once.
+	for i := 0; i < 2; i++ {
+		mock.ExpectQuery(`FROM executions e\s+LEFT JOIN pipeline_progress pp`).
+			WithArgs(wsScopePipeline, sqlmock.AnyArg()).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "waiting", "recent"}))
+	}
+
 	// Status flip + execution record (no-snapshot branch: connections are NULL).
 	mock.ExpectExec(`UPDATE pipelines SET status = 'running', updated_at = NOW\(\) WHERE id = \$1`).
 		WithArgs(wsScopePipeline).
@@ -189,6 +197,10 @@ func TestRunPipeline_MemberCanRunSharedPipeline(t *testing.T) {
 	}
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 (orchestration unavailable — i.e. authorized past the access SELECT), got %d: %s", w.Code, w.Body.String())
+	}
+	// The run-overlap check also answers 503 when it cannot read the runs.
+	if strings.Contains(w.Body.String(), "run_check_failed") {
+		t.Fatalf("stopped at the run-overlap check, not the orchestration terminal: %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("db expectations: %v", err)

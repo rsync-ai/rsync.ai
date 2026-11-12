@@ -54,11 +54,11 @@ func TestGetConnection_MemberCanReadSharedConnection(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "user_id", "name", "type", "connector_type", "connector_version",
 			"sync_mode", "cdc_mode", "description", "config", "status",
-			"last_tested_at", "last_test_status", "last_test_error", "created_at", "updated_at",
+			"last_tested_at", "last_test_status", "last_test_error", "last_table_check", "created_at", "updated_at", "week_start", "fiscal_year_start_month",
 		}).AddRow(
 			wsScopeConnection, connCreator, "shared-conn", "source", "postgresql", nil,
 			nil, nil, nil, enc, "active",
-			nil, nil, nil, now, now,
+			nil, nil, nil, nil, now, now, 7, 4,
 		))
 
 	r := wsScopeRouter(http.MethodGet, "/api/v1/connections/:id", GetConnection)
@@ -68,6 +68,10 @@ func TestGetConnection_MemberCanReadSharedConnection(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 (member reads shared connection), got %d: %s", w.Code, w.Body.String())
+	}
+	// The connection's calendar for chart grains (migration 147).
+	if resp := decodeBody(t, w); resp["week_start"] != float64(7) || resp["fiscal_year_start_month"] != float64(4) {
+		t.Fatalf("calendar = week %v, fiscal month %v; want 7 and 4", resp["week_start"], resp["fiscal_year_start_month"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("db expectations: %v", err)

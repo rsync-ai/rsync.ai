@@ -54,3 +54,13 @@ user: |
 parameters:
   temperature: 0.1
   max_tokens: 500
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  node_id: identifier
+  node_kind: enum
+  hitl_prompt: rsync_text
+  node_context: config_keys
+  required_fields: rsync_text
+  user_response: user_text

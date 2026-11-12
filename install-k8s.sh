@@ -101,7 +101,7 @@ SETTLE_TIMEOUT_S="${RSYNC_SETTLE_TIMEOUT_S:-90}"
 # (connectors.sampleData). A guard (test_install_k8s_defaults_work.py) compares
 # this list with the tree, so a new connector cannot ship without being
 # installable here.
-KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 oracle:v1.0.0 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 widgets-graphql:v1.0.0"
+KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 nse-india:v1.0.0 oracle:v1.0.0 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 widgets-graphql:v1.0.0"
 # Enough for the two documented paths (PG -> Mongo CDC, and object storage) plus
 # MySQL, which is the third most asked-for source. ~0.5 GiB of requests.
 DEFAULT_CONNECTORS="postgresql,mysql,mongodb,aws-s3,gcs"
@@ -180,6 +180,24 @@ generate_secret() {
     die "Could not generate a 32-character secret (got ${#raw}). Install openssl and re-run."
   fi
   printf '%s' "${raw:0:32}"
+}
+
+# MinIO's KMS key, `rsync-ai-kms:<base64 of 32 random bytes>` (SSE-S3 for the
+# claim-check objects minio-mcp writes encrypted). MinIO exits at start on any
+# other shape, so the shape is checked here. Same rule as above: `head` bounds
+# the input, never the output.
+generate_kms_key() {
+  local b64=""
+  if command -v openssl >/dev/null 2>&1; then
+    b64=$(openssl rand -base64 32)
+  else
+    b64=$(head -c 32 /dev/urandom | base64)
+  fi
+  b64=$(printf '%s' "$b64" | LC_ALL=C tr -d '\n\r ')
+  if [[ ! "$b64" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    die "Could not generate MinIO's KMS key (got ${#b64} base64 characters, need 44). Install openssl and re-run."
+  fi
+  printf 'rsync-ai-kms:%s' "$b64"
 }
 
 # YAML double-quoted scalar. Backslash first, or the escapes added for the quote
@@ -370,6 +388,18 @@ load_settings() {
 # Secret calls the warehouse password DEMO_WAREHOUSE_PASSWORD.
 SECRET_KEYS="JWT_SECRET ENCRYPTION_KEY INTERNAL_SERVICE_SECRET POSTGRES_PASSWORD REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY BLOB_STAGING_ACCESS_KEY BLOB_STAGING_SECRET_KEY RSYNC_DEMO_WAREHOUSE_PASSWORD"
 
+# Generated on a first install only, then kept like the rest. It keys the
+# HMAC-SHA256 mask and salts every sha256/md5 mask hash, so giving it to an
+# install that already hashes data would change every digest written from then
+# on -- an upgrade never gains one it did not have (add it by hand to opt in).
+FRESH_ONLY_SECRET_KEYS="RSYNC_PII_HASH_SALT"
+
+# MinIO's KMS key: its own list because its shape is not generate_secret's.
+# Reused from the cluster like the rest -- a new value makes everything MinIO
+# encrypted under the old one unreadable -- and generated when there is none,
+# upgrades included: a MinIO that never had a key has nothing encrypted under one.
+KMS_SECRET_KEYS="MINIO_KMS_SECRET_KEY"
+
 cluster_secret_key() {
   case "$1" in
     RSYNC_DEMO_WAREHOUSE_PASSWORD) echo DEMO_WAREHOUSE_PASSWORD ;;
@@ -385,7 +415,7 @@ cluster_secret_key() {
 import_from_cluster() {
   local secret="${RELEASE}-secrets" key ckey val n=0
   kc -n "$NAMESPACE" get secret "$secret" >/dev/null 2>&1 || return 0
-  for key in $SECRET_KEYS; do
+  for key in $SECRET_KEYS $FRESH_ONLY_SECRET_KEYS $KMS_SECRET_KEYS; do
     [[ -z "$(env_value "$key")" ]] || continue
     ckey="$(cluster_secret_key "$key")"
     val="$(kc -n "$NAMESPACE" get secret "$secret" -o "go-template={{index .data \"${ckey}\"}}" 2>/dev/null | base64 -d 2>/dev/null || true)"
@@ -455,7 +485,7 @@ EOF
 }
 
 ensure_secrets() {
-  local file="${INSTALL_DIR}/${ENV_FILE}" key generated=0
+  local file="${INSTALL_DIR}/${ENV_FILE}" key generated=0 first_install kms_key
   if [[ ! -f "$file" ]]; then
     write_env_skeleton
     info "Created ${file}"
@@ -464,13 +494,35 @@ ensure_secrets() {
     chmod 600 "$file"
     NEW_ENV=false
   fi
-  if [[ "$RENDER_ONLY" != "true" ]]; then import_from_cluster; fi
+  first_install="$NEW_ENV"
+  if [[ "$RENDER_ONLY" != "true" ]]; then
+    # A Secret left by an earlier install makes this an upgrade, even with a lost .env.
+    if kc -n "$NAMESPACE" get secret "${RELEASE}-secrets" >/dev/null 2>&1; then first_install=false; fi
+    import_from_cluster
+  fi
   for key in $SECRET_KEYS; do
     if [[ -z "$(env_value "$key")" ]]; then
       set_env_value "$key" "$(generate_secret)"
       generated=$((generated + 1))
     fi
   done
+  for key in $KMS_SECRET_KEYS; do
+    if [[ -z "$(env_value "$key")" ]]; then
+      # Into a variable first: as an argument's "$(...)", die would exit only
+      # that subshell and an empty key would be written.
+      kms_key=$(generate_kms_key)
+      set_env_value "$key" "$kms_key"
+      generated=$((generated + 1))
+    fi
+  done
+  if [[ "$first_install" == "true" ]]; then
+    for key in $FRESH_ONLY_SECRET_KEYS; do
+      if [[ -z "$(env_value "$key")" ]]; then
+        set_env_value "$key" "$(generate_secret)"
+        generated=$((generated + 1))
+      fi
+    done
+  fi
   if (( generated > 0 )); then
     info "Generated ${generated} secret(s) into ${file} (chmod 600)"
   fi
@@ -741,10 +793,13 @@ write_values() {
     echo "  redisPassword: $(yq "$(env_value REDIS_PASSWORD)")"
     echo "  minioAccessKey: $(yq "$(env_value MINIO_ACCESS_KEY)")"
     echo "  minioSecretKey: $(yq "$(env_value MINIO_SECRET_KEY)")"
+    echo "  minioKmsSecretKey: $(yq "$(env_value MINIO_KMS_SECRET_KEY)")"
     # Its own login, not the MinIO pair: connector pods can reach this store.
     echo "  blobStagingAccessKey: $(yq "$(env_value BLOB_STAGING_ACCESS_KEY)")"
     echo "  blobStagingSecretKey: $(yq "$(env_value BLOB_STAGING_SECRET_KEY)")"
     echo "  demoWarehousePassword: $(yq "$(env_value RSYNC_DEMO_WAREHOUSE_PASSWORD)")"
+    # Only when there is one: an empty key would still be a key the chart writes.
+    [[ -z "$(env_value RSYNC_PII_HASH_SALT)" ]] || echo "  piiHashKey: $(yq "$(env_value RSYNC_PII_HASH_SALT)")"
     [[ -z "$OPENAI_KEY" ]] || echo "  openaiApiKey: $(yq "$OPENAI_KEY")"
     echo "frontend:"
     echo "  apiUrl: $(yq "$API_URL")"

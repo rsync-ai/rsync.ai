@@ -49,7 +49,6 @@ vi.mock("@/components/chat/ChatMessageItem", () => ({
   ),
 }))
 vi.mock("@/components/chat/PipelineAccordionView", () => ({ PipelineAccordionView: () => <div /> }))
-vi.mock("@/components/chat/ChatRightPanel", () => ({ ChatRightPanel: () => null }))
 vi.mock("@/components/chat/ActivePipelinesList", () => ({ ActivePipelinesList: () => null }))
 // Records what the chat hands the suggestions step (see the destination-type test).
 const suggestionsProps = vi.hoisted(() => ({ last: null as null | Record<string, unknown> }))
@@ -59,7 +58,6 @@ vi.mock("@/components/chat/SuggestionsReviewDialog", () => ({
     return null
   },
 }))
-vi.mock("@/components/pipeline/PipelineMonitoringPanel", () => ({ PipelineMonitoringPanel: () => null }))
 vi.mock("@/components/pipeline/PipelineConnectionSelector", () => ({
   PipelineConnectionSelector: () => null,
 }))

@@ -45,5 +45,18 @@ export function ThemedToaster() {
   // catches a stuck pointer — or is raised in a backgrounded tab — therefore
   // stays up indefinitely with no way to dismiss it. The close button is the
   // manual escape hatch; without it the only exit is a page reload.
-  return <Toaster richColors closeButton position="bottom-right" offset={96} theme={theme} />
+  //
+  // mobileOffset: at ≤600 px sonner ignores `offset` and uses this instead, whose
+  // default 16 px bottom put toasts on a form's bottom action row (Save Connection
+  // at ~470 px). Same 96 px clearance as on desktop.
+  return (
+    <Toaster
+      richColors
+      closeButton
+      position="bottom-right"
+      offset={96}
+      mobileOffset={{ bottom: 96 }}
+      theme={theme}
+    />
+  )
 }

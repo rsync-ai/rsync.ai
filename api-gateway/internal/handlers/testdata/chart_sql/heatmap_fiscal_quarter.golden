@@ -1,0 +1,71 @@
+# settings: {"version":2,"type":"heatmap","roles":{"x":[{"column":"day","grain":"quarter"}],"y":[{"column":"region"}],"measure":[{"aggregate":"count"}]}}
+
+-- postgres
+SELECT DATE_TRUNC('quarter', src."day" - INTERVAL '3 months') + INTERVAL '3 months' AS "day", src."region" AS "region", COUNT(*) AS "count"
+FROM "gold"."orders" src
+WHERE src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+GROUP BY DATE_TRUNC('quarter', src."day" - INTERVAL '3 months') + INTERVAL '3 months', src."region"
+ORDER BY DATE_TRUNC('quarter', src."day" - INTERVAL '3 months') + INTERVAL '3 months' ASC, src."region" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT (MAKEDATE(YEAR((src.`day` - INTERVAL 3 MONTH)), 1) + INTERVAL (QUARTER((src.`day` - INTERVAL 3 MONTH)) - 1) QUARTER) + INTERVAL 3 MONTH AS `day`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+GROUP BY (MAKEDATE(YEAR((src.`day` - INTERVAL 3 MONTH)), 1) + INTERVAL (QUARTER((src.`day` - INTERVAL 3 MONTH)) - 1) QUARTER) + INTERVAL 3 MONTH, src.`region`
+ORDER BY (MAKEDATE(YEAR((src.`day` - INTERVAL 3 MONTH)), 1) + INTERVAL (QUARTER((src.`day` - INTERVAL 3 MONTH)) - 1) QUARTER) + INTERVAL 3 MONTH ASC, src.`region` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) DATEADD(month, 3, DATEFROMPARTS(YEAR(DATEADD(month, -3, src.[day])), (DATEPART(quarter, DATEADD(month, -3, src.[day])) - 1) * 3 + 1, 1)) AS [day], src.[region] AS [region], COUNT_BIG(*) AS [count]
+FROM [gold].[orders] src
+WHERE src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+GROUP BY DATEADD(month, 3, DATEFROMPARTS(YEAR(DATEADD(month, -3, src.[day])), (DATEPART(quarter, DATEADD(month, -3, src.[day])) - 1) * 3 + 1, 1)), src.[region]
+ORDER BY DATEADD(month, 3, DATEFROMPARTS(YEAR(DATEADD(month, -3, src.[day])), (DATEPART(quarter, DATEADD(month, -3, src.[day])) - 1) * 3 + 1, 1)) ASC, src.[region] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(src.`day`), INTERVAL 3 MONTH), QUARTER), INTERVAL 3 MONTH) AS `day`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+GROUP BY DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(src.`day`), INTERVAL 3 MONTH), QUARTER), INTERVAL 3 MONTH), src.`region`
+ORDER BY DATE_ADD(DATE_TRUNC(DATE_SUB(DATE(src.`day`), INTERVAL 3 MONTH), QUARTER), INTERVAL 3 MONTH) ASC, src.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT DATEADD('MONTH', 3, DATE_TRUNC('QUARTER', DATEADD('MONTH', -3, src."DAY"))) AS "DAY", src."REGION" AS "REGION", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY DATEADD('MONTH', 3, DATE_TRUNC('QUARTER', DATEADD('MONTH', -3, src."DAY"))), src."REGION"
+ORDER BY DATEADD('MONTH', 3, DATE_TRUNC('QUARTER', DATEADD('MONTH', -3, src."DAY"))) ASC, src."REGION" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT ADD_MONTHS(DATE_TRUNC('QUARTER', ADD_MONTHS(src.`day`, -3)), 3) AS `day`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+WHERE src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+GROUP BY ADD_MONTHS(DATE_TRUNC('QUARTER', ADD_MONTHS(src.`day`, -3)), 3), src.`region`
+ORDER BY ADD_MONTHS(DATE_TRUNC('QUARTER', ADD_MONTHS(src.`day`, -3)), 3) ASC, src.`region` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT addMonths(toStartOfQuarter(subtractMonths(toDate(src.`day`), 3)), 3) AS `day`, src.`region` AS `region`, COUNT(*) AS `count`
+FROM `gold`.`orders` src
+GROUP BY addMonths(toStartOfQuarter(subtractMonths(toDate(src.`day`), 3)), 3), src.`region`
+ORDER BY addMonths(toStartOfQuarter(subtractMonths(toDate(src.`day`), 3)), 3) ASC, src.`region` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT ADD_MONTHS(TRUNC(ADD_MONTHS(src."DAY", -3), 'Q'), 3) AS "DAY", src."REGION" AS "REGION", COUNT(*) AS "COUNT"
+FROM "GOLD"."ORDERS" src
+GROUP BY ADD_MONTHS(TRUNC(ADD_MONTHS(src."DAY", -3), 'Q'), 3), src."REGION"
+ORDER BY ADD_MONTHS(TRUNC(ADD_MONTHS(src."DAY", -3), 'Q'), 3) ASC, src."REGION" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

@@ -384,7 +384,7 @@ func TestModelProducedTables(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := modelProducedTables("m1", "Orders", tc.materialization, tc.target, tc.sqlText)
+			got := modelProducedTables("postgresql", "m1", "Orders", tc.materialization, tc.target, tc.sqlText)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %+v\nwant %+v", got, tc.want)
 			}
@@ -396,7 +396,7 @@ func TestModelProducedTables(t *testing.T) {
 // over: one producer per table its SQL writes.
 func statementWrites(t *testing.T, id, name, sqlText string) []tableProducer {
 	t.Helper()
-	tables := modelProducedTables(id, name, matStatement, "", sqlText)
+	tables := modelProducedTables("postgresql", id, name, matStatement, "", sqlText)
 	if len(tables) == 0 {
 		t.Fatalf("statement model %s writes nothing: %q", id, sqlText)
 	}
@@ -527,6 +527,58 @@ func TestResolveUpstreams_HandsStatementModelsToTheBuilder(t *testing.T) {
 	want := []string{
 		"model:Day dim<-analytics.day_dim",
 		"model:Load daily orders<-analytics.orders_daily",
+	}
+	if got := offered(resp); !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates: got %v, want %v", got, want)
+	}
+	if len(resp.Unresolved) != 0 {
+		t.Fatalf("both inputs have a producer; unresolved = %v", resp.Unresolved)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// The upstream suggestion is the asset graph's sibling and had the same blind spot: it
+// parsed a MongoDB model's stored pipeline as SQL, found no table, and returned before
+// looking for a producer. Gold here reads silver's collection and joins, with $lookup,
+// the bare-named target of another model on the same database; both are offered, by the
+// names the graph gives them.
+func TestResolveUpstreams_ReadsADocumentModelsPipeline(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	in := upstreamLookup{
+		SavedQueryID:  "m-gold",
+		ConnectorType: "mongodb",
+		SQLText: `{"database":"rsync_layers_test","collection":"subscriptions_silver","pipeline":[
+			{"$lookup":{"from":"plan_prices","localField":"plan","foreignField":"_id","as":"price"}}]}`,
+		ConnectionID: connA,
+		WorkspaceID:  "ws-1",
+		UserID:       "u-1",
+	}
+
+	mock.ExpectQuery(`FROM pipeline_run_table_stats s`).
+		WithArgs(in.WorkspaceID, in.ConnectionID, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "dest", "table"}))
+	mock.ExpectQuery(`FROM saved_queries sq`).
+		WithArgs(in.WorkspaceID, in.ConnectionID, in.UserID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "materialization", "target_table", "sql_text"}).
+			AddRow("m-silver", "Subscriptions silver", matTable, "rsync_layers_test.subscriptions_silver",
+				`{"database":"rsync_layers_test","collection":"subscriptions","pipeline":[{"$match":{}}]}`).
+			AddRow("m-prices", "Plan prices", matTable, "plan_prices",
+				`{"database":"rsync_layers_test","collection":"plans","pipeline":[{"$match":{}}]}`))
+
+	resp, err := resolveUpstreams(context.Background(), mockDB, in)
+	if err != nil {
+		t.Fatalf("resolveUpstreams: %v", err)
+	}
+	want := []string{
+		"model:Plan prices<-rsync_layers_test.plan_prices",
+		"model:Subscriptions silver<-rsync_layers_test.subscriptions_silver",
 	}
 	if got := offered(resp); !reflect.DeepEqual(got, want) {
 		t.Fatalf("candidates: got %v, want %v", got, want)

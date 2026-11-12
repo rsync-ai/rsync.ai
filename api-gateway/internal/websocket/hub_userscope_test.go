@@ -54,7 +54,7 @@ func TestBroadcastDomainEvent_OnlyDeliversToOwner(t *testing.T) {
 	registerAndWait(t, h, other)
 
 	const pipelineID = "11111111-1111-1111-1111-111111111111"
-	h.cachePipelineOwner(pipelineID, "user-A")
+	cachePipelineOwner(h, pipelineID, "user-A")
 
 	h.BroadcastDomainEvent(pipelineID, map[string]interface{}{
 		"event_type":  "STAGE_COMPLETED",
@@ -111,7 +111,7 @@ func TestBroadcastEvent_ScopesWhenDataCarriesPipelineID(t *testing.T) {
 	registerAndWait(t, h, other)
 
 	const pipelineID = "33333333-3333-3333-3333-333333333333"
-	h.cachePipelineOwner(pipelineID, "user-A")
+	cachePipelineOwner(h, pipelineID, "user-A")
 
 	// A pipeline_id in the data map makes BroadcastEvent scope the event by
 	// owner via extractPipelineID.
@@ -152,3 +152,10 @@ func TestBroadcastEvent_GlobalFallbackWhenNoPipelineID(t *testing.T) {
 	}
 }
 
+// cachePipelineOwner primes h's owner cache so a test needs no database.
+// Production code resolves owners via PipelineOwner (which falls back to Postgres).
+func cachePipelineOwner(h *Hub, pipelineID, userID string) {
+	h.ownerMu.Lock()
+	h.pipelineOwners[pipelineID] = userID
+	h.ownerMu.Unlock()
+}

@@ -90,7 +90,7 @@ func TestReaperDeletesTheSQLServerTopicDebeziumWrites(t *testing.T) {
 	}
 	r := newRemovedTopicReaper(admin, offsets, connect, &fakeExcluder{},
 		func(context.Context, string) []string { return []string{"sink-5a1e0001-stream"} },
-		2*time.Millisecond, time.Minute)
+		nil, 2*time.Millisecond, time.Minute)
 	t.Cleanup(r.Stop)
 
 	r.Schedule(reapPipeline, "cdc-5a1e0001", after, []string{"dbo.orders"})

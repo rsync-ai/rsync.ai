@@ -2,14 +2,14 @@ package handlers
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"api-gateway/internal/db"
+	"api-gateway/internal/retention"
 	"api-gateway/internal/security"
+	"api-gateway/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,13 +38,13 @@ import (
 //     destination-committed bytes (append-only ledger data_transfer_usage_events is the
 //     billing truth). Plan allowance = plans.included_gb via resolvePlanQuota. This is
 //     DISPLAY-ONLY in v1 — no enforcement (Phase 2 adds the run gate).
+//   - NL→SQL queries this month → monthlyQueriesUsed (plan_quota.go), the meter
+//     checkWorkspaceQueryOK enforces against plans.included_queries.
 //
-// NOT captured yet:
-//   - NL→SQL / query counts: not counted anywhere yet. (Ship 3.)
-//
-// Caveat surfaced to the UI: pipeline_run_table_stats is subject to the opt-in
-// retention sweep, so "to-date" is really "within the retention window" when
-// retention is enabled. retention_enabled + retention_days let the UI say so.
+// Caveat surfaced to the UI: with PIPELINE_RUN_RETENTION_TABLE_STATS=true the
+// run-history sweep also trims finished batch runs' pipeline_run_table_stats rows, so
+// "to-date" is really "within the retention window". retention_enabled +
+// retention_days let the UI say so.
 
 // GetPlanSummary returns the ACTIVE workspace's plan banner data (plan,
 // pipelines_used, pipelines_limit, trial_ends_at) — the lightweight counterpart
@@ -70,6 +70,58 @@ func GetPlanSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, planSummary(c.Request.Context(), database, wsID))
+}
+
+// PlanUsage is a workspace's plan and how much of it is used: counts and limits
+// only, never a member's e-mail or transfer volume. A nil limit is unlimited.
+type PlanUsage struct {
+	Plan          string
+	PipelineLimit *int
+	PipelinesUsed int
+	QueryLimit    *int64
+	QueriesUsed   int64
+	Members       int
+}
+
+// PlanUsageAs is the plan and usage of actor's workspace, for Ask rsync.ai's
+// get_usage tool. It reads the same resolver and meters as GET /api/v1/usage/plan
+// and GET /api/v1/usage, so its numbers are the ones the Usage page shows and the
+// create and query gates enforce. Unlike planSummary it fails when a meter cannot
+// be read: a count it could not read would reach the model as 0.
+func PlanUsageAs(c *gin.Context, actor services.Actor) (*PlanUsage, error) {
+	if err := services.Authorize(actor, services.ActionUsageRead); err != nil {
+		return nil, refusePlan("forbidden", http.StatusForbidden,
+			"This token lacks the %s scope. Create a token that has it.", services.ScopeMetadataRead)
+	}
+	database := db.GetDB()
+	if database == nil {
+		return nil, fmt.Errorf("database not connected")
+	}
+	ctx, ws := c.Request.Context(), actor.WorkspaceID
+	quota := resolvePlanQuota(ctx, database, ws)
+	out := &PlanUsage{Plan: quota.plan}
+	var err error
+	if out.PipelinesUsed, err = countWorkspacePipelines(ctx, database, ws); err != nil {
+		return nil, fmt.Errorf("count pipelines: %w", err)
+	}
+	if out.QueriesUsed, err = monthlyQueriesUsed(ctx, database, ws); err != nil {
+		return nil, fmt.Errorf("count NL→SQL queries: %w", err)
+	}
+	// The members ListWorkspaceMembers lists, counted: no e-mail is read.
+	if err := database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workspace_members wm JOIN users u ON u.id = wm.user_id WHERE wm.workspace_id = $1`,
+		ws).Scan(&out.Members); err != nil {
+		return nil, fmt.Errorf("count members: %w", err)
+	}
+	if quota.effectiveLimit >= 0 {
+		limit := quota.effectiveLimit
+		out.PipelineLimit = &limit
+	}
+	if quota.includedQueries.Valid && quota.includedQueries.Int64 >= 0 {
+		limit := quota.includedQueries.Int64
+		out.QueryLimit = &limit
+	}
+	return out, nil
 }
 
 // pipelineUsageRow is one pipeline's transfer rollup within a workspace.
@@ -132,11 +184,7 @@ func GetWorkspaceUsage(c *gin.Context) {
 	// Current-month NL→SQL query count (the metered queries/month dimension). Same
 	// period-guard as bytes: reads 0 when the stored counter is from a prior month
 	// not yet rolled by the charge fn.
-	var monthlyQueries int64
-	_ = database.QueryRow(
-		`SELECT CASE WHEN monthly_query_period = to_char(now(),'YYYY-MM')
-		             THEN monthly_query_count ELSE 0 END
-		   FROM workspaces WHERE id = $1`, wsID).Scan(&monthlyQueries)
+	monthlyQueries, _ := monthlyQueriesUsed(c.Request.Context(), database, wsID)
 
 	// Per-pipeline transfer rollup, to-date across all runs. LEFT JOIN so a
 	// pipeline with no run stats still appears (all-zero row). records_processed
@@ -511,21 +559,17 @@ func queryLimitOrNil(includedQueries sql.NullInt64) interface{} {
 	return nil
 }
 
-// pipelineStatsRetentionEnabled reports whether the opt-in run-stats retention
-// sweep is active. When true, "to-date" transfer totals only cover the retention
-// window. Mirrors internal/retention/pipeline_run_retention.go env parsing.
+// pipelineStatsRetentionEnabled reports whether the run-history sweep trims the
+// run-stats rows the usage totals read. The sweep itself is on by default, but it keeps
+// pipeline_run_table_stats unless PIPELINE_RUN_RETENTION_TABLE_STATS=true; only then do
+// "to-date" totals cover just the retention window.
 func pipelineStatsRetentionEnabled() bool {
-	return os.Getenv("ENABLE_PIPELINE_RUN_RETENTION") == "true"
+	cfg := retention.CurrentPipelineRunRetentionConfig()
+	return cfg.Enabled && cfg.PruneTableStats
 }
 
-// pipelineStatsRetentionDays returns the effective retention window in days
-// (default 90). Only meaningful when retention is enabled.
+// pipelineStatsRetentionDays returns the effective retention window in days, after the
+// sweep's own parsing and floor. Only meaningful when retention is enabled.
 func pipelineStatsRetentionDays() int {
-	days := 90
-	if v := strings.TrimSpace(os.Getenv("PIPELINE_RUN_RETENTION_DAYS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			days = n
-		}
-	}
-	return days
+	return retention.CurrentPipelineRunRetentionConfig().RetentionDays
 }

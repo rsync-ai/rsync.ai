@@ -119,14 +119,6 @@ export function useTelemetry(): TelemetryContextType {
 }
 
 /**
- * Hook to get just the trace ID (lightweight alternative)
- */
-export function useTraceId(): string {
-  const { traceId } = useTelemetry()
-  return traceId
-}
-
-/**
  * DevTools component to display current trace ID (development only)
  */
 export function TelemetryDevTools() {

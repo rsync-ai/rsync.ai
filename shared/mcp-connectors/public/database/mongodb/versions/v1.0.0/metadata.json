@@ -328,6 +328,90 @@
       ]
     },
     {
+      "name": "aggregate",
+      "type": "source",
+      "description": "Read-only aggregation preview for the Data Explorer and MongoDB models: the first page of an allowlisted pipeline's result, Relaxed Extended JSON",
+      "method": "mongodb_aggregate",
+      "parameters": [
+        {
+          "name": "collection",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "pipeline",
+          "type": "array",
+          "required": true,
+          "description": "Aggregation pipeline: a list of single-key stages. Allowed stages: $match $project $addFields $set $unset $group $sort $limit $skip $unwind $count $lookup $unionWith $graphLookup $replaceRoot $replaceWith $sortByCount $bucket $bucketAuto $facet $sample $setWindowFields $densify $fill $redact. $out, $merge, $function, $accumulator and $where are refused at any depth. At most 50 stages, 128 KB"
+        },
+        {
+          "name": "database",
+          "type": "string",
+          "required": false,
+          "description": "Database to read (a connection without a database only)"
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 50,
+          "description": "Documents returned, max 500"
+        },
+        {
+          "name": "max_time_ms",
+          "type": "integer",
+          "required": false,
+          "default": 15000,
+          "description": "Server-side time limit in milliseconds, max 15000"
+        }
+      ]
+    },
+    {
+      "name": "materialize",
+      "type": "destination",
+      "description": "Run a MongoDB model: write an allowlisted pipeline's result to a target collection through $out, built aside and swapped in, never taking over a collection the model did not create",
+      "method": "mongodb_materialize",
+      "parameters": [
+        {
+          "name": "collection",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "pipeline",
+          "type": "array",
+          "required": true,
+          "description": "Aggregation pipeline: a list of single-key stages. Allowed stages: $match $project $addFields $set $unset $group $sort $limit $skip $unwind $count $lookup $unionWith $graphLookup $replaceRoot $replaceWith $sortByCount $bucket $bucketAuto $facet $sample $setWindowFields $densify $fill $redact. $out, $merge, $function, $accumulator and $where are refused at any depth. At most 50 stages, 128 KB"
+        },
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target collection, or database.collection; each part matches [A-Za-z_][A-Za-z0-9_]{0,51}"
+        },
+        {
+          "name": "database",
+          "type": "string",
+          "required": false,
+          "description": "Database to read (a connection without a database only)"
+        },
+        {
+          "name": "replace",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "True once this model owns the target: $out replaces it directly. False builds <target>__rsync_new and renames it onto the target without dropping an existing collection"
+        },
+        {
+          "name": "timeout_seconds",
+          "type": "integer",
+          "required": false,
+          "default": 1800,
+          "description": "Server-side time limit (maxTimeMS) in seconds"
+        }
+      ]
+    },
+    {
       "name": "import_data",
       "type": "destination",
       "description": "Insert documents into a collection (batch / CDC insert). upsert_data and delete_data are advertised at runtime via get_capabilities for the CDC update/delete paths.",

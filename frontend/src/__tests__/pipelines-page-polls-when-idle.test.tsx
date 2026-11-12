@@ -1,9 +1,11 @@
 /**
  * Prod retest 2026-09-18: a CDC pipeline read "Failed" on /pipelines and stayed
  * Failed after it recovered — the list polled only while some row was running, so
- * with the one stream failed nothing ever re-fetched; the stats cards fetched once
- * on mount and never again. The page now always polls (fast while a run is in
- * flight, slow otherwise) and refreshes the cards on every tick.
+ * with the one stream failed nothing ever re-fetched. The page now always polls
+ * (fast while a run is in flight, slow otherwise).
+ *
+ * The page's four count cards are gone: Home has the counts, and "Failed runs"
+ * here counted runs where Home's "failed" counts pipelines.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
@@ -42,7 +44,6 @@ function json(body: unknown): Response {
 }
 
 let listStatus = "failed"
-let failedCount = 1
 
 function calls(fragment: string): number {
   return mockAuthFetch.mock.calls.filter(([url]) => String(url).includes(fragment)).length
@@ -61,36 +62,41 @@ describe("/pipelines — a Failed row is not frozen", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     listStatus = "failed"
-    failedCount = 1
     mockAuthFetch.mockReset()
-    mockAuthFetch.mockImplementation(async (url) => {
-      if (String(url).includes("/pipelines/stats")) {
-        return json({ pipelines: { total: 1, active: 1 }, executions: { running: 0, completed: 0, failed: failedCount } })
-      }
-      return json({ pipelines: [row(listStatus)], total: 1 })
-    })
+    mockAuthFetch.mockImplementation(async () => json({ pipelines: [row(listStatus)], total: 1 }))
   })
   afterEach(() => {
     vi.useRealTimers()
   })
 
-  it("re-fetches the list and the stats cards with nothing running, so recovery shows", async () => {
+  it("re-fetches the list with nothing running, so recovery shows", async () => {
     render(<PipelinesPageClient />)
     const table = await screen.findByRole("table")
     expect(await within(table).findByText(/^failed$/i)).toBeInTheDocument()
     const listBefore = calls("/api/v1/pipelines?")
-    const statsBefore = calls("/pipelines/stats")
 
     // The stream recovers out of band (healer / Reload / another tab).
     listStatus = "running"
-    failedCount = 0
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000)
     })
 
     expect(calls("/api/v1/pipelines?")).toBeGreaterThan(listBefore)
-    expect(calls("/pipelines/stats")).toBeGreaterThan(statsBefore)
     expect(await within(table).findByText(/^running$/i)).toBeInTheDocument()
     expect(within(table).queryByText(/^failed$/i)).not.toBeInTheDocument()
+  })
+
+  it("shows no count cards and reads no stats; Home has the counts", async () => {
+    render(<PipelinesPageClient />)
+    await screen.findByRole("table")
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+
+    expect(calls("/api/v1/pipelines?")).toBeGreaterThan(0)
+    expect(calls("/pipelines/stats")).toBe(0)
+    for (const label of ["Running", "Successful runs", "Failed runs"]) {
+      expect(screen.queryByText(label)).not.toBeInTheDocument()
+    }
   })
 })

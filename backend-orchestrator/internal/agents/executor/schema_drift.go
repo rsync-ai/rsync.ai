@@ -46,7 +46,7 @@ func schemaDriftEnabled() bool {
 type SchemaDriftPolicy struct {
 	Enabled      bool // gates the whole detector for this pipeline
 	NotifyOnAdd  bool // emit additive drift (add_column / create_table)
-	NotifyOnDrop bool // emit drop drift (drop_column / drop_table)
+	NotifyOnDrop bool // emit dropped columns (drop_table is always emitted; see filterChangesByPolicy)
 }
 
 func defaultSchemaDriftPolicy() SchemaDriftPolicy {
@@ -106,8 +106,11 @@ func loadSchemaDriftPolicy(ctx context.Context, db *sql.DB, pipelineID string) S
 
 // filterChangesByPolicy drops deltas the pipeline's policy opted out of:
 // notify_on_add gates additive drift (add_column/create_table), notify_on_drop
-// gates drop drift (drop_column/drop_table). modify_column is always kept — a
-// type change can silently break the sink, so it is not opt-out-able. Pure.
+// gates dropped columns. modify_column is always kept — a type change can
+// silently break the sink, so it is not opt-out-able. drop_table is always kept
+// too: it is the one change that waits for a decision, and the run leaves the
+// table out until that decision is made, so opting out of it would drop a table
+// from every run with nobody ever asked. Pure.
 func filterChangesByPolicy(policy SchemaDriftPolicy, changes []healer.SchemaChange) []healer.SchemaChange {
 	if policy.NotifyOnAdd && policy.NotifyOnDrop {
 		return changes
@@ -119,7 +122,7 @@ func filterChangesByPolicy(policy SchemaDriftPolicy, changes []healer.SchemaChan
 			if !policy.NotifyOnAdd {
 				continue
 			}
-		case "drop_column", "drop_table":
+		case "drop_column":
 			if !policy.NotifyOnDrop {
 				continue
 			}
@@ -133,9 +136,27 @@ func filterChangesByPolicy(policy SchemaDriftPolicy, changes []healer.SchemaChan
 // discovery-success branch. `discovered` is the full source-DB schema; it is scoped
 // to the pipeline's selected tables before any baseline/diff so unrelated tables
 // never produce drift [RT-fix #3].
-func (a *Agent) detectAndEmitSchemaDrift(ctx context.Context, task ExecutorTask, executionID string, discovered []TableMetadata) {
+//
+// It returns the source keys of the selected tables that vanished from the source
+// and now wait for a drop decision. The caller leaves them out of this run: there is
+// nothing left to read, and failing the whole run over a table the user is being
+// asked about would stop the tables that are still there.
+//
+// totals.truncated() says the connector returned fewer tables than the source has.
+// A selected table missing from a partial list may simply be past the cap, so no
+// drop is reported on such a run: a decision whose Approve drops the destination
+// table must never rest on a list that was cut short.
+//
+// totals.NeedingSettings names the tables the connector left out only because the
+// connection is missing a setting they need. Such a table is still in the source:
+// it is diffed as unchanged and stays in the run, whose read of it then fails
+// asking for the setting by name (missing_config.go).
+//
+// A pending drop decision this discovery disproves is withdrawn: the table is in
+// the list again, or it was only missing a setting.
+func (a *Agent) detectAndEmitSchemaDrift(ctx context.Context, task ExecutorTask, executionID string, discovered []TableMetadata, totals discoveryTotals) []string {
 	if !schemaDriftEnabled() || a.db == nil || strings.TrimSpace(task.PipelineID) == "" {
-		return
+		return nil
 	}
 
 	// Per-pipeline policy (pipelines.config->'schema_drift_policy'). Read
@@ -145,41 +166,202 @@ func (a *Agent) detectAndEmitSchemaDrift(ctx context.Context, task ExecutorTask,
 	policy := loadSchemaDriftPolicy(ctx, a.db, task.PipelineID)
 	if !policy.Enabled {
 		log.Debugf("[schema-drift] pipeline %s: per-pipeline policy disabled; skipping", task.PipelineID)
-		return
+		return nil
 	}
 
 	selected := selectedTableSet(task.Params["tables"])
 	if len(selected) == 0 {
 		// No selected-table set reachable — never baseline an unscoped whole-DB snapshot.
 		log.Debugf("[schema-drift] pipeline %s: no selected tables in params; skipping", task.PipelineID)
-		return
+		return nil
+	}
+	if len(discovered) == 0 {
+		// An empty list says nothing about which tables exist (a source with no
+		// tables at all is the pre-flight's EMPTY_CATALOG), so it must not read as
+		// every selected table dropped.
+		return nil
 	}
 
 	current := filterDiscoveredToSelected(discovered, selected)
-	if len(current) == 0 {
-		return
-	}
 	currentMap := tableMapByKey(current)
 
+	var awaitingDrop, carried []string
 	prior := loadSchemaBaseline(ctx, a.db, task.PipelineID)
 	if len(prior) > 0 {
 		// Scope the prior baseline to the CURRENT selection so a table the user
 		// de-selected does not read back as a drop_table; only a still-selected
 		// table that vanished from the source counts as a drop.
 		priorScoped := scopeBaselineToSelected(prior, selected)
+		var diffed map[string]TableMetadata
+		diffed, carried = carryTablesNeedingSettings(priorScoped, currentMap, totals.NeedingSettings)
+		if len(carried) > 0 {
+			log.Warnf("[schema-drift] pipeline %s: %d selected table(s) are missing from discovery because the connection is missing a setting they need, not because they were dropped; the run asks for it: %v",
+				task.PipelineID, len(carried), carried)
+		}
 		// Resolved here, not inside the diff, so the (pure, unit-tested) differ stays
 		// DB-free. Empty = legacy pipeline; the DROP text then falls back to the bare
 		// table name, which is what resolves in the destination's default schema.
 		destNS := resolveDestinationNamespace(ctx, a.db, task)
-		if deltas := filterChangesByPolicy(policy, diffSchemas(priorScoped, currentMap, destNS)); len(deltas) > 0 {
+		var deltas []healer.SchemaChange
+		var unconfirmed []string
+		deltas, awaitingDrop, unconfirmed = planSchemaDrift(priorScoped, diffed, destNS, policy, totals.truncated())
+		if len(unconfirmed) > 0 {
+			log.Warnf("[schema-drift] pipeline %s: discovery was cut short, so %d selected table(s) missing from it are not reported as dropped: %v",
+				task.PipelineID, len(unconfirmed), unconfirmed)
+		}
+		if len(deltas) > 0 {
 			a.emitSchemaChanges(ctx, task.PipelineID, deltas)
 		}
-	} else {
+	} else if len(current) > 0 {
 		log.Infof("[schema-drift] pipeline %s: captured first baseline for %d table(s); no diff this run", task.PipelineID, len(current))
 	}
 
-	// Snapshot AFTER diffing so the next run compares against this run.
+	a.withdrawDisprovedTableDrops(ctx, task.PipelineID, currentMap, carried, totals.NeedingSettings)
+
+	// Snapshot AFTER diffing so the next run compares against this run. A vanished
+	// table keeps its old baseline row, so it reads as dropped again on every run
+	// until the decision takes it out of the selection. A carried table is not in
+	// `current`, so it keeps its baseline row too.
 	storeSchemaBaseline(ctx, a.db, task.PipelineID, executionID, sourceTypeOf(task), current)
+	return awaitingDrop
+}
+
+// planSchemaDrift is detectAndEmitSchemaDrift's decision without the DB or Kafka.
+// prior is the baseline already scoped to the current selection. It returns the
+// changes to report, the source keys of the tables that wait for a drop decision,
+// and — on a truncated discovery only — the tables that are missing from the list
+// but not reported as dropped, because the list was cut short. Pure.
+func planSchemaDrift(prior, current map[string]TableMetadata, destNS string, policy SchemaDriftPolicy, truncated bool) (deltas []healer.SchemaChange, awaitingDrop, unconfirmed []string) {
+	for _, ch := range filterChangesByPolicy(policy, diffSchemas(prior, current, destNS)) {
+		if ch.ChangeType == "drop_table" {
+			if truncated {
+				unconfirmed = append(unconfirmed, ch.Table)
+				continue
+			}
+			awaitingDrop = append(awaitingDrop, ch.Table)
+		}
+		deltas = append(deltas, ch)
+	}
+	return deltas, awaitingDrop, unconfirmed
+}
+
+// withdrawDisprovedTableDrops withdraws the pending drop decisions this discovery
+// disproves: a table in the list (current) is back in the source, and a carried
+// one was only missing a setting. Approve on either would drop a destination
+// table whose source table exists. Best-effort, like the rest of drift.
+func (a *Agent) withdrawDisprovedTableDrops(ctx context.Context, pipelineID string, current map[string]TableMetadata, carried []string, needing map[string][]string) {
+	withdrawn := healer.WithdrawPendingTableDrops(ctx, a.db, pipelineID, sortedTableKeys(current), healer.DroppedTableIsBackReason)
+	for _, key := range carried {
+		settings, _ := settingsNeededBy(needing, key)
+		withdrawn = append(withdrawn, healer.WithdrawPendingTableDrops(ctx, a.db, pipelineID, []string{key}, missingSettingReason(settings))...)
+	}
+	if len(withdrawn) > 0 {
+		log.Infof("[schema-drift] pipeline %s: withdrew the pending drop decision for %d table(s) that are still in the source: %v",
+			pipelineID, len(withdrawn), withdrawn)
+	}
+}
+
+// missingSettingReason is shown on a pending drop decision withdrawn because the
+// connector left the table out only for a setting the connection is missing.
+func missingSettingReason(settings []string) string {
+	what := "a setting"
+	switch len(settings) {
+	case 0:
+	case 1:
+		what = "the setting " + settings[0]
+	default:
+		what = "the settings " + strings.Join(settings, ", ")
+	}
+	return "The table is still in the source, so nothing was dropped. The connection is missing " + what +
+		" it needs to read the table: set it on the connection and the next run reads the table."
+}
+
+// carryTablesNeedingSettings returns current plus the baseline metadata of each
+// prior table the connector left out only because the connection is missing a
+// setting it needs, so the diff sees it unchanged instead of dropped. It also
+// returns the baseline keys it carried. A table the connector did list keeps this
+// run's metadata. current is not modified, so a carried table never enters the
+// stored baseline as if it had been read. Pure.
+func carryTablesNeedingSettings(prior, current map[string]TableMetadata, needing map[string][]string) (map[string]TableMetadata, []string) {
+	if len(needing) == 0 {
+		return current, nil
+	}
+	merged := make(map[string]TableMetadata, len(current)+len(needing))
+	for k, t := range current {
+		merged[k] = t
+	}
+	var carried []string
+	for _, key := range sortedTableKeys(prior) {
+		if _, listed := current[key]; listed {
+			continue
+		}
+		if _, needs := settingsNeededBy(needing, key); needs {
+			merged[key] = prior[key]
+			carried = append(carried, key)
+		}
+	}
+	return merged, carried
+}
+
+// settingsNeededBy looks up a baseline key in a connector's tables_needing_settings:
+// exactly, or by bare name when one side carries no schema (the same rule as
+// withoutTablesAwaitingDrop). Pure.
+func settingsNeededBy(needing map[string][]string, key string) ([]string, bool) {
+	key = strings.TrimSpace(key)
+	if s, ok := needing[key]; ok {
+		return s, true
+	}
+	for name, s := range needing {
+		if !strings.Contains(name, ".") && name == bareTableName(key) {
+			return s, true
+		}
+		if !strings.Contains(key, ".") && bareTableName(name) == key {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// withoutTablesAwaitingDrop removes the selected tables that wait for a drop
+// decision from a run's table list. A selection entry matches a vanished source
+// key exactly, or by bare name when one side carries no schema. Pure.
+func withoutTablesAwaitingDrop(tables []interface{}, awaitingDrop []string) (kept []interface{}, removed []string) {
+	if len(awaitingDrop) == 0 {
+		return tables, nil
+	}
+	matches := func(entry string) bool {
+		for _, key := range awaitingDrop {
+			key = strings.TrimSpace(key)
+			if entry == key {
+				return true
+			}
+			if !strings.Contains(entry, ".") && entry == bareTableName(key) {
+				return true
+			}
+			if !strings.Contains(key, ".") && bareTableName(entry) == key {
+				return true
+			}
+		}
+		return false
+	}
+	kept = make([]interface{}, 0, len(tables))
+	for _, t := range tables {
+		if s, ok := t.(string); ok && matches(strings.TrimSpace(s)) {
+			removed = append(removed, strings.TrimSpace(s))
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept, removed
+}
+
+// bareTableName strips a leading schema qualifier: "public.orders" -> "orders".
+func bareTableName(name string) string {
+	n := strings.TrimSpace(name)
+	if i := strings.LastIndex(n, "."); i >= 0 {
+		return strings.TrimSpace(n[i+1:])
+	}
+	return n
 }
 
 // --- pure helpers (unit-tested, no DB/Kafka) ---------------------------------
@@ -325,20 +507,38 @@ func nativeTypeDrifted(prev, cur string) bool {
 	return pq != cq
 }
 
+// sameCanonicalType reports whether two discovered canonical types are the same.
+// A bare "numeric" is PostgreSQL's NUMERIC with no precision or scale, which
+// discovery reported as "decimal" until it got its own token
+// (shared/unconstrained_numeric_golden.json). The two name one source column, so
+// the switch is not drift; a destination column created either way stays as it is.
+func sameCanonicalType(prev, cur string) bool {
+	fold := func(t string) string {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "numeric" {
+			return "decimal"
+		}
+		return t
+	}
+	return fold(prev) == fold(cur)
+}
+
 // diffSchemas compares the prior baseline against the freshly discovered schema
 // (both already scoped to the pipeline's selected tables) and returns one
 // SchemaChange per drift. Pure + deterministic (sorted iteration, canonical DDL) so
 // the consumer's UNIQUE(pipeline_id, ddl) dedup is idempotent across re-runs.
 //
-// Routing follows the P0–P3 matrix: additive (add_column/create_table) is
-// informational; destructive (drop_column/drop_table/modify_column) is approve-only.
-// ChangeType uses the EXACT strings the healer fallbackAnalysis switch consumes.
+// Routing is the healer's (routeSchemaChange), one policy for batch and CDC: only
+// drop_table waits for a decision; a new or retyped column is applied, and a dropped
+// column or a new table is recorded. ChangeType uses the EXACT strings the healer
+// consumes.
 //
-// destNamespace is the pipeline's destination namespace, and it is used for exactly one
-// thing: qualifying the DROP statements, which we never execute and the user runs by hand
-// on the DESTINATION. See healer.DestinationQualifiedTable for why the source key is the
-// wrong — and actively dangerous — name to print there. Everything else keeps the source
-// key: Table/SchemaName are the source's identity, and the appliable ALTERs are rewritten
+// destNamespace is the pipeline's destination namespace, and it is used for exactly
+// one thing: naming the destination table in the drop_table statement and the
+// dropped-column note, both of which the user reads as being about the DESTINATION.
+// See healer.DestinationQualifiedTable for why the source key is the wrong — and
+// actively dangerous — name to print there. Everything else keeps the source key:
+// Table/SchemaName are the source's identity, and the appliable ALTERs are rewritten
 // against the destination at apply time by the healer.
 func diffSchemas(prior, current map[string]TableMetadata, destNamespace string) []healer.SchemaChange {
 	var changes []healer.SchemaChange
@@ -370,7 +570,7 @@ func diffSchemas(prior, current map[string]TableMetadata, destNamespace string) 
 				})
 				continue
 			}
-			if !strings.EqualFold(pcol.canonical, ccol.canonical) {
+			if !sameCanonicalType(pcol.canonical, ccol.canonical) {
 				changes = append(changes, healer.SchemaChange{
 					ChangeType: "modify_column", Table: key, SchemaName: strings.TrimSpace(cur.Schema),
 					ColumnName: col, ColumnType: ccol.canonical,
@@ -401,34 +601,28 @@ func diffSchemas(prior, current map[string]TableMetadata, destNamespace string) 
 				})
 			}
 		}
+		// A dropped column is a note, never a statement: the destination keeps the
+		// column and its history, and rsync.ai stops writing to it. The note names the
+		// destination table exactly as the CDC sink's report does, so one dropped
+		// column is one schema_change_approvals row whichever path saw it.
 		for _, col := range sortedStrKeys(prevCols) {
 			if _, still := curCols[col]; !still {
 				changes = append(changes, healer.SchemaChange{
 					ChangeType: "drop_column", Table: key, SchemaName: strings.TrimSpace(cur.Schema),
 					ColumnName: col, ColumnType: prevCols[col].canonical,
-					DDL:       fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", healer.DestinationQualifiedTable(destNamespace, key), col),
-					RiskLevel: "high",
+					DDL:       healer.DroppedColumnNote(healer.DestinationQualifiedTable(destNamespace, key), col),
+					RiskLevel: "low",
 				})
 			}
 		}
 	}
 
-	// Still-selected tables that vanished from the source = drop_table (approve-only).
-	//
-	// D1: this branch is REACHABLE, but only on the runs where the pre-flight lets
-	// the pipeline get this far. When assessor.RequiresTablePrimaryKeys() is true
-	// (CDC, or any destination that upserts) the per-table check in
-	// assessor/mysql.go oneMySQLTablePKCheck / assessor/postgresql.go raises
-	// CDC_TABLE_NOT_FOUND_IN_SOURCE at SeverityError for the missing table and the
-	// run never starts — the user is told about the drop by the pre-flight instead,
-	// which is the better surface anyway (it blocks before any data moves). What is
-	// left for this branch is the append-only case: a batch load into a file/SaaS
-	// destination, where RequiresTablePrimaryKeys() is false and nothing else
-	// notices the table is gone.
-	//
-	// So: do not delete this as dead code, and do not "fix" it by weakening the
-	// pre-flight. Two surfaces reporting the same fact is fine here because only
-	// one of them can fire on any given run.
+	// Still-selected tables that vanished from the source = drop_table, the one change
+	// that waits for a decision: Approve drops the destination table, Reject keeps it,
+	// and either way the table leaves the pipeline. Until then the run leaves the table
+	// out (detectAndEmitSchemaDrift returns it) and the pre-flight reports it as a
+	// warning rather than blocking the run, which is what lets this branch fire for
+	// upsert and CDC destinations as well as append-only ones.
 	for _, key := range sortedTableKeys(prior) {
 		if _, still := current[key]; !still {
 			changes = append(changes, healer.SchemaChange{
@@ -471,8 +665,8 @@ func sourceTypeOf(task ExecutorTask) string {
 // --- impure helpers (DB + Kafka; mirror loadNominatedKeys / ProduceWithContext) ---
 
 // emitSchemaChanges publishes one SchemaChangeEvent per delta to healer.HealerTopic,
-// keyed by pipeline_id. Best-effort per message. auto_apply stays false for P0–P3
-// (propose -> approve only).
+// keyed by pipeline_id. Best-effort per message. What happens to each change is the
+// healer's routing, not this event's: only a dropped table waits for a decision.
 func (a *Agent) emitSchemaChanges(ctx context.Context, pipelineID string, changes []healer.SchemaChange) {
 	// The produce itself is gated too, not only detectAndEmitSchemaDrift: with the
 	// flag off healer.HealerTopic is not provisioned, and a produce would auto-create it.
@@ -487,11 +681,8 @@ func (a *Agent) emitSchemaChanges(ctx context.Context, pipelineID string, change
 			PipelineID:   pipelineID,
 			Timestamp:    now,
 			SchemaChange: ch,
-			Context: map[string]interface{}{
-				"auto_apply_enabled":       false,
-				"skip_destructive_enabled": true,
-			},
-			ActionNeeded: true,
+			Context:      map[string]interface{}{"source": "batch_executor", "mode": "batch"},
+			ActionNeeded: ch.ChangeType == "drop_table",
 		}
 		b, err := json.Marshal(event)
 		if err != nil {
@@ -574,6 +765,39 @@ func loadSchemaBaseline(ctx context.Context, db *sql.DB, pipelineID string) map[
 			tm.Schema = schema
 		}
 		out[baselineKey(schema, table)] = tm
+	}
+	return out
+}
+
+// TablesAwaitingDropDecision reports which of the given tables the next batch
+// run will treat as dropped: tables this pipeline has a stored baseline for.
+// That run leaves them out and files a drop_table decision (see
+// planSchemaDrift), so the pre-flight can warn about them instead of blocking
+// the run that would file it. Empty when drift detection is off or the
+// pipeline's policy disables it — nothing would then leave the table out, and
+// the pre-flight must keep blocking.
+func TablesAwaitingDropDecision(ctx context.Context, db *sql.DB, pipelineID string, tables []string) map[string]bool {
+	out := map[string]bool{}
+	if len(tables) == 0 || !schemaDriftEnabled() || !loadSchemaDriftPolicy(ctx, db, pipelineID).Enabled {
+		return out
+	}
+	return tablesWithBaseline(loadSchemaBaseline(ctx, db, pipelineID), tables)
+}
+
+// tablesWithBaseline matches tables against baseline keys: exactly, or by bare
+// name, which only a row stored without a schema is keyed by (baselineKey). Pure.
+func tablesWithBaseline(baseline map[string]TableMetadata, tables []string) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range tables {
+		name := strings.TrimSpace(t)
+		if name == "" {
+			continue
+		}
+		_, exact := baseline[name]
+		_, bare := baseline[bareTableName(name)]
+		if exact || bare {
+			out[name] = true
+		}
 	}
 	return out
 }

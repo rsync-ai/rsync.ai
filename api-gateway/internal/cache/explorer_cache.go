@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/rsync-ai/shared/sqlexec/schemaindex"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -30,36 +31,13 @@ type ExplorerSchemaIndex struct {
 	ForeignKeys     []ExplorerForeignKeyIndex `json:"foreign_keys,omitempty"`
 }
 
-// ExplorerForeignKeyIndex represents a foreign key relationship in the schema index.
-type ExplorerForeignKeyIndex struct {
-	FromSchema string  `json:"from_schema,omitempty"`
-	FromTable  string  `json:"from_table"`
-	FromColumn string  `json:"from_column"`
-	ToSchema   string  `json:"to_schema,omitempty"`
-	ToTable    string  `json:"to_table"`
-	ToColumn   string  `json:"to_column"`
-	// Confidence is 1.0 for explicit FK constraints; <1.0 for inferred relationships (Phase 3.5).
-	Confidence float64 `json:"confidence,omitempty"`
-}
-
-// ExplorerTableIndex represents a table in the schema index
-type ExplorerTableIndex struct {
-	Name       string                  `json:"name"`
-	Schema     string                  `json:"schema,omitempty"`
-	RowCount   int64                   `json:"row_count,omitempty"`
-	Columns    []ExplorerColumnIndex   `json:"columns"`
-	PrimaryKey []string                `json:"primary_key,omitempty"`
-	// Compact searchable tokens for retrieval
-	SearchTokens string `json:"search_tokens"`
-}
-
-// ExplorerColumnIndex represents a column in the table index
-type ExplorerColumnIndex struct {
-	Name         string `json:"name"`
-	Type         string `json:"type"`
-	IsPrimaryKey bool   `json:"is_primary_key,omitempty"`
-	IsNullable   bool   `json:"is_nullable,omitempty"`
-}
+// The index's table, column and foreign-key shapes live with the schema readers, in
+// shared/go/sqlexec/schemaindex; these names keep the cache's callers unchanged.
+type (
+	ExplorerForeignKeyIndex = schemaindex.ForeignKey
+	ExplorerTableIndex      = schemaindex.Table
+	ExplorerColumnIndex     = schemaindex.Column
+)
 
 // =============================================================================
 // PHASE 3.5: INFERRED RELATIONSHIPS (Heuristics)
@@ -441,189 +419,7 @@ func ComputeSchemaHash(tables []ExplorerTableIndex, foreignKeys []ExplorerForeig
 }
 
 // BuildSearchTokens creates searchable tokens for a table (for retrieval)
-func BuildSearchTokens(table ExplorerTableIndex) string {
-	var tokens []string
-
-	// Table name tokens
-	tokens = append(tokens, strings.ToLower(table.Name))
-	// Split by underscore and camelCase
-	tokens = append(tokens, splitToTokens(table.Name)...)
-
-	// Column name tokens
-	for _, col := range table.Columns {
-		tokens = append(tokens, strings.ToLower(col.Name))
-		tokens = append(tokens, splitToTokens(col.Name)...)
-	}
-
-	// Deduplicate
-	seen := make(map[string]bool)
-	var unique []string
-	for _, t := range tokens {
-		t = strings.TrimSpace(t)
-		if t != "" && !seen[t] {
-			seen[t] = true
-			unique = append(unique, t)
-		}
-	}
-
-	return strings.Join(unique, " ")
-}
-
-// splitToTokens splits a name into searchable tokens
-func splitToTokens(name string) []string {
-	var tokens []string
-
-	// Split by underscore
-	parts := strings.Split(strings.ToLower(name), "_")
-	tokens = append(tokens, parts...)
-
-	// Only snake_case is split. Identifiers reaching this cache are snake_case by
-	// convention across the warehouses it serves, so camelCase splitting has never
-	// been needed; add it here if a source ever ships camelCase identifiers.
-
-	return tokens
-}
-
-// =============================================================================
-// CONVERSATION CONTEXT CACHE (Multi-turn)
-// =============================================================================
-
-// ExplorerConversation stores multi-turn conversation state
-type ExplorerConversation struct {
-	ID                string               `json:"id"`
-	ConnectionID      string               `json:"connection_id"`
-	SchemaHash        string               `json:"schema_hash"`
-	SelectedTables    []string             `json:"selected_tables,omitempty"`
-	SelectedColumns   []string             `json:"selected_columns,omitempty"`
-	JoinPlan          []string             `json:"join_plan,omitempty"`
-	LastSQL           string               `json:"last_sql,omitempty"`
-	LastExplanation   string               `json:"last_explanation,omitempty"`
-	ResultProfile     *ResultProfile       `json:"result_profile,omitempty"`
-	HITLConfirmations []HITLConfirmation   `json:"hitl_confirmations,omitempty"`
-	Messages          []ConversationMessage `json:"messages,omitempty"`
-	CreatedAt         time.Time            `json:"created_at"`
-	UpdatedAt         time.Time            `json:"updated_at"`
-}
-
-// ResultProfile contains lightweight result summary for context
-type ResultProfile struct {
-	RowCount     int       `json:"row_count"`
-	Columns      []string  `json:"columns"`
-	MinTimestamp *string   `json:"min_timestamp,omitempty"`
-	MaxTimestamp *string   `json:"max_timestamp,omitempty"`
-}
-
-// HITLConfirmation records a user's HITL decision
-type HITLConfirmation struct {
-	StepType string   `json:"step_type"` // table_link, column_link
-	Question string   `json:"question"`
-	Response []string `json:"response"` // selected options
-	At       time.Time `json:"at"`
-}
-
-// ConversationMessage represents a message in the conversation
-type ConversationMessage struct {
-	Role      string    `json:"role"` // user, assistant, system
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// GetConversation retrieves a conversation by ID
-func (c *ExplorerCache) GetConversation(ctx context.Context, conversationID string) (*ExplorerConversation, error) {
-	key := fmt.Sprintf("explorer:conversation:%s", conversationID)
-
-	val, err := c.client.Get(ctx, key).Bytes()
-	if err == redis.Nil {
-		return nil, nil // Not found
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var conv ExplorerConversation
-	if err := json.Unmarshal(val, &conv); err != nil {
-		return nil, err
-	}
-
-	return &conv, nil
-}
-
-// SetConversation stores a conversation
-func (c *ExplorerCache) SetConversation(ctx context.Context, conv *ExplorerConversation) error {
-	key := fmt.Sprintf("explorer:conversation:%s", conv.ID)
-	conv.UpdatedAt = time.Now()
-
-	data, err := json.Marshal(conv)
-	if err != nil {
-		return err
-	}
-
-	// Conversations have shorter TTL (30 minutes default)
-	convTTL := 30 * time.Minute
-	return c.client.Set(ctx, key, data, convTTL).Err()
-}
-
-// =============================================================================
-// QUERY RESULT CACHE
-// =============================================================================
-
-// CachedQueryResult represents a cached query result
-type CachedQueryResult struct {
-	CacheKey        string                   `json:"cache_key"`
-	ConnectionID    string                   `json:"connection_id"`
-	SchemaHash      string                   `json:"schema_hash"`
-	SQL             string                   `json:"sql"`
-	NormalizedSQL   string                   `json:"normalized_sql"`
-	Limit           int                      `json:"limit"`
-	Columns         []string                 `json:"columns"`
-	Rows            []map[string]interface{} `json:"rows"`
-	RowCount        int                      `json:"row_count"`
-	ExecutionTimeMs int64                    `json:"execution_time_ms"`
-	Truncated       bool                     `json:"truncated"`
-	CachedAt        time.Time                `json:"cached_at"`
-}
-
-// QueryResultCacheKey builds a cache key for query results
-func QueryResultCacheKey(userID, connectionID, schemaHash, normalizedSQL string, limit int) string {
-	keyPart := fmt.Sprintf("%s:%s:%s:%s:%d", userID, connectionID, schemaHash, normalizedSQL, limit)
-	hash := sha256.Sum256([]byte(keyPart))
-	return hex.EncodeToString(hash[:16]) // Use first 16 bytes
-}
-
-// GetQueryResult retrieves a cached query result
-func (c *ExplorerCache) GetQueryResult(ctx context.Context, cacheKey string) (*CachedQueryResult, error) {
-	key := fmt.Sprintf("explorer:query_result:%s", cacheKey)
-
-	val, err := c.client.Get(ctx, key).Bytes()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var result CachedQueryResult
-	if err := json.Unmarshal(val, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
-}
-
-// SetQueryResult caches a query result
-func (c *ExplorerCache) SetQueryResult(ctx context.Context, result *CachedQueryResult) error {
-	key := fmt.Sprintf("explorer:query_result:%s", result.CacheKey)
-	result.CachedAt = time.Now()
-
-	data, err := json.Marshal(result)
-	if err != nil {
-		return err
-	}
-
-	// Query results have shorter TTL (60s default)
-	resultTTL := 60 * time.Second
-	return c.client.Set(ctx, key, data, resultTTL).Err()
-}
+var BuildSearchTokens = schemaindex.SearchTokens
 
 // =============================================================================
 // TABLE RETRIEVAL METHODS (for large schema handling)

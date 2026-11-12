@@ -259,6 +259,11 @@ export interface MCPConnector {
   logo_path?: string
   logo_local?: boolean
   logo_url?: string  // Logo URL from API: /api/v1/connectors/{name}/logo
+  // Set when an AI agent or Ask rsync.ai generated the connector (single-connector
+  // read only). `by` names the agent token, or "Ask rsync.ai", and only for the
+  // workspace whose run it was. The connection form says so before anyone
+  // gives the connector credentials.
+  generated_by?: { generated_by_agent: boolean; generated_at: string; by?: string }
   // Docker deployment status
   docker_deployed: boolean
   docker_status?: DockerStatus
@@ -484,24 +489,6 @@ export function getConnectorConfidenceReasons(connector?: {
   if (Array.isArray(connector.qa_warnings)) reasons.push(...connector.qa_warnings)
 
   return reasons
-}
-
-/**
- * Get Lucide icon component name for a connector icon string
- */
-export function getConnectorIconName(icon: string): string {
-  const iconMap: Record<string, string> = {
-    database: "Database",
-    cloud: "Cloud",
-    api: "Zap",
-    analytics: "BarChart3",
-    messaging: "MessageSquare",
-    storage: "HardDrive",
-    streaming: "Activity",
-    file: "FileText",
-    plug: "Plug",
-  }
-  return iconMap[icon] || "Puzzle"
 }
 
 /**

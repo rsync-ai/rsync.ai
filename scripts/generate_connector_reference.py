@@ -91,16 +91,6 @@ def _normalise(name: str) -> str:
     return str(name).strip().lower().replace(" ", "_").replace("-", "_")
 
 
-def cdc_policy_source() -> Path:
-    """Which of the two copies of the CDC allowlist this tree actually has.
-
-    Callers that compare the two against each other must consult this first: on
-    the public tree there is only one, and comparing it with itself passes while
-    checking nothing.
-    """
-    return CAPABILITY_RULES if CAPABILITY_RULES.is_file() else GO_POLICY
-
-
 def _allowlist_from_yaml() -> set[str]:
     import yaml
     rules = yaml.safe_load(CAPABILITY_RULES.read_text())

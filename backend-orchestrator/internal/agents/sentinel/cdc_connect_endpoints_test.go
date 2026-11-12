@@ -80,25 +80,29 @@ func TestCDCSentinelDoesNotPollAKafkaConnectEndpointThatDoesNotExist(t *testing.
 	}
 }
 
-// A PostgreSQL connector heartbeats (#12) so its slot acknowledges filtered WAL, but its
-// position does not move on a database with no writes. checkSourceFreshness must never
-// read its offsets, or every quiet PostgreSQL pipeline would raise SOURCE_STALLED. A
-// MongoDB connector with the same heartbeat is still checked.
-func TestCheckSourceFreshnessReadsOffsetsOnlyForAHeartbeatThatAdvancesWhenIdle(t *testing.T) {
+// checkSourceFreshness reads a connector's offsets only when it heartbeats: without
+// heartbeats a frozen position just means a quiet source. A PostgreSQL heartbeat does not
+// move the position on a database with no writes, so a quiet PostgreSQL pipeline is kept
+// from alarming by its heartbeat topic (TestSourceFreshness_IdleOrSnapshottingPostgresNeverAlarms),
+// not by skipping its offsets.
+func TestCheckSourceFreshnessReadsOffsetsOnlyForAHeartbeatingSource(t *testing.T) {
 	for _, tc := range []struct {
+		name        string
 		class       string
+		heartbeatMs string
 		wantOffsets bool
 	}{
-		{"io.debezium.connector.postgresql.PostgresConnector", false},
-		{"io.debezium.connector.mongodb.MongoDbConnector", true},
+		{"postgres heartbeating", "io.debezium.connector.postgresql.PostgresConnector", "300000", true},
+		{"mongodb heartbeating", "io.debezium.connector.mongodb.MongoDbConnector", "300000", true},
+		{"postgres without heartbeats", "io.debezium.connector.postgresql.PostgresConnector", "0", false},
 	} {
-		t.Run(tc.class, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			rec := &recordingConnect{}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				rec.record(req.URL.Path)
 				if req.URL.Path == "/connectors/cdc-abcd1234/config" {
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"connector.class":"` + tc.class + `","heartbeat.interval.ms":"300000"}`))
+					_, _ = w.Write([]byte(`{"connector.class":"` + tc.class + `","heartbeat.interval.ms":"` + tc.heartbeatMs + `"}`))
 					return
 				}
 				w.WriteHeader(http.StatusNotFound)

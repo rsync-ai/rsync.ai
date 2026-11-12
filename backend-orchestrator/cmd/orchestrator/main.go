@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rsync-ai/shared/memlimit"
 	_ "github.com/rsync-ai/shared/pgdriver"
+	"github.com/rsync-ai/shared/transforms"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 
@@ -46,6 +47,13 @@ import (
 const (
 	Version = "1.0.0"
 )
+
+// cdcRestartBudget bounds one CDC restart, the connector restart and the sink-worker
+// restart together. It runs detached from the request (context.WithoutCancel), so a
+// caller that goes away — a closed tab, a gateway that stops waiting — cannot cancel the
+// sink restart between its stop and its start. The gateway's cdcRestartProxyTimeout still
+// outlasts it, so the caller hears how the restart ended.
+const cdcRestartBudget = 55 * time.Second
 
 // Global config reference
 var cfg *config.Config
@@ -446,6 +454,9 @@ func main() {
 	// Called here, not in init(), so `go test ./cmd/orchestrator/` never runs it,
 	// and before sql.Open/db.Ping, whose failures exit the process.
 	reportStartupSettingProblems(log.StandardLogger(), os.Getenv)
+	if !transforms.PIIHashKeyConfigured() {
+		log.Warn(startupCheckLogPrefix + transforms.PIIHashKeyUnsetWarning)
+	}
 
 	// Initialize PostgreSQL database connection using config
 	db, err := sql.Open("postgres", cfg.Database.ConnectionString())
@@ -517,7 +528,7 @@ func main() {
 		if err := ensurePlatformTopicsWithRetry(context.Background(),
 			topologyManager.EnsurePlatformTopics,
 			platformTopicAttempts, platformTopicBackoff, time.Sleep); err != nil {
-			log.WithError(err).Warn("⚠️  Failed to ensure platform topics")
+			logPlatformTopicsFailure(err)
 		} else {
 			log.Info("✅ Ensured platform topics")
 		}
@@ -839,6 +850,14 @@ func main() {
 		defer cdcStatsAgent.Stop()
 	}
 
+	// Topics of tables removed from a CDC connector's include list are deleted once
+	// the sink has applied them (nil without a Kafka admin: they stay). Deletions a
+	// previous run left unfinished resume here; Stop (before the stats agent's, as
+	// defers run in reverse) leaves the unfinished ones stored for the next start.
+	removedTopicReaper := handlers.NewRemovedTopicReaper(db, topologyManager, kafkaManager, cdcStatsAgent)
+	removedTopicReaper.Resume()
+	defer removedTopicReaper.Stop()
+
 	// Phase 4 HealWorker — diagnoses failed executions and applies fixes.
 	// Enabled by default; disable with ENABLE_HEAL_WORKER=false.
 	//
@@ -866,6 +885,9 @@ func main() {
 	// Heal reads as success.
 	if os.Getenv("ENABLE_HEAL_WORKER") != "false" {
 		healWorker := heal.NewHealWorker(db, "")
+		// A run the zombie sweep reaps never reached the temporal adapter's failure
+		// alert, so the sweep sends that PIPELINE_RUN_FAILED itself.
+		healWorker.NotifyRunFailuresVia(kafkaManager)
 		healCtx, healCancel := context.WithCancel(context.Background())
 		defer healCancel()
 		go healWorker.Start(healCtx)
@@ -894,9 +916,9 @@ func main() {
 	if batchSentinel != nil {
 		batchSentinel.SetMCPManager(mcpServerManager)
 	}
-	startSinkWorkerReaper(db, mcpServerManager) // KI-CDC-SINK-WORKER-NO-REAPER; off unless SINK_WORKER_REAPER_MODE is set
+	startSinkWorkerReaper(db, mcpServerManager, topologyManager) // KI-CDC-SINK-WORKER-NO-REAPER; SINK_WORKER_REAPER_MODE=off turns it off
 	// Start HTTP server
-	router := setupRouter(kafkaManager, topologyManager, executorAgent, consumerRegistry, retentionAgent, db, mcpServerManager, cdcStatsAgent)
+	router := setupRouter(kafkaManager, topologyManager, executorAgent, consumerRegistry, retentionAgent, db, mcpServerManager, cdcStatsAgent, removedTopicReaper)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Server.Port,
@@ -978,7 +1000,7 @@ func main() {
 // was the deleted /api/v1/mcp/connectors handler (see the tombstone on the
 // /api/v1 group below). Keeping a dead `toolsDir string` parameter would
 // re-advertise that this router serves connector metadata. It does not.
-func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyManager, executorAgent *executor.Agent, consumerRegistry *consumer.Registry, retentionAgent *retention.Agent, db *sql.DB, mcpServerManager *mcp.ServerManager, cdcStatsAgent *cdcstats.Agent) *gin.Engine {
+func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyManager, executorAgent *executor.Agent, consumerRegistry *consumer.Registry, retentionAgent *retention.Agent, db *sql.DB, mcpServerManager *mcp.ServerManager, cdcStatsAgent *cdcstats.Agent, removedTopicReaper *handlers.RemovedTopicReaper) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("DEBUG") != "true" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1267,19 +1289,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		// - This does NOT start workflows; it directly calls the MCP connector via the
 		//   executor agent (which is already wired to spawn MCP containers).
 		// - Keep response shape stable: must include { "tables": [...] } (extra fields allowed)
-		type discoverSchemaRequest struct {
-			Task          string                 `json:"task"`
-			ConnectionID  string                 `json:"connection_id"`
-			ConnectorType string                 `json:"connector_type"`
-			Config        map[string]interface{} `json:"config"`
-			UserID        string                 `json:"user_id"`
-			// Optional v2 flags (backward compatible; older callers can omit)
-			IncludeColumns       *bool `json:"include_columns,omitempty"`
-			IncludeRowCounts     *bool `json:"include_row_counts,omitempty"`
-			IncludeRelationships *bool `json:"include_relationships,omitempty"`
-			IncludeIndexes       *bool `json:"include_indexes,omitempty"`
-			MaxTables            *int  `json:"max_tables,omitempty"`
-		}
+		// Request body: discoverSchemaRequest (discover_schema_request.go).
 
 		// SECURITY: requirePrincipal — these agent endpoints accept an arbitrary
 		// connection `config` and reach out to it (schema discovery / test /
@@ -1315,24 +1325,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			}).Info("🔎 Agent: discover_schema (HTTP)")
 
 			// Merge optional flags into params
-			params := map[string]interface{}{}
-			if req.IncludeColumns != nil {
-				params["include_columns"] = *req.IncludeColumns
-			}
-			if req.IncludeRowCounts != nil {
-				params["include_row_counts"] = *req.IncludeRowCounts
-			}
-			if req.IncludeRelationships != nil {
-				params["include_relationships"] = *req.IncludeRelationships
-			}
-			if req.IncludeIndexes != nil {
-				params["include_indexes"] = *req.IncludeIndexes
-			}
-			if req.MaxTables != nil {
-				params["max_tables"] = *req.MaxTables
-			}
-
-			envelope, err := executorAgent.DiscoverSchemaEnvelope(c.Request.Context(), req.ConnectorType, req.Config, params)
+			envelope, err := executorAgent.DiscoverSchemaEnvelope(c.Request.Context(), req.ConnectorType, req.Config, req.params())
 			if err != nil {
 				c.JSON(discoverSchemaErrorResponse(err))
 				return
@@ -1427,7 +1420,35 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			})
 		})
 
-		// list-namespaces: the names one level above a connector's tables
+		// check-tables: reads one page of every table a connection lists and keeps
+		// no row (executor CheckTables), so a table the connector cannot read is
+		// found when the connection is saved. Used by the api-gateway after a
+		// passing pre-save test and by POST /connections/:id/check-tables.
+		api.POST("/agent/check-tables", requirePrincipal(db), func(c *gin.Context) {
+			var req struct {
+				ConnectorType string                 `json:"connector_type" binding:"required"`
+				Config        map[string]interface{} `json:"config"`
+				ConnectionID  string                 `json:"connection_id,omitempty"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "details": err.Error()})
+				return
+			}
+			log.WithFields(log.Fields{
+				"connector_type": req.ConnectorType,
+				"connection_id":  req.ConnectionID,
+				"config_keys":    len(req.Config),
+			}).Info("🧪 Agent: check_tables (HTTP)")
+
+			result, err := executorAgent.CheckTables(c.Request.Context(), req.ConnectorType, req.Config)
+			if err != nil {
+				c.JSON(http.StatusBadGateway, gin.H{"error": "check_tables failed", "details": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, result)
+		})
+
+		// list-namespaces:the names one level above a connector's tables
 		// (schemas, databases or datasets, per its metadata.json
 		// namespace_model), from the connector's list_namespaces operation.
 		// Used by the api-gateway's GET /connections/:id/namespaces.
@@ -1476,6 +1497,10 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				Limit         int                    `json:"limit"`
 				ConnectionID  string                 `json:"connection_id,omitempty"`
 				Write         bool                   `json:"write,omitempty"`
+				// ModelRun marks one statement of a model build: one attempt, no
+				// 30 s cap, bounded by TimeoutSeconds (see modelStatementContext).
+				ModelRun       bool `json:"model_run,omitempty"`
+				TimeoutSeconds int  `json:"timeout_seconds,omitempty"`
 			}
 			if err := c.ShouldBindJSON(&req); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "details": err.Error()})
@@ -1489,12 +1514,21 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				"connection_id":  req.ConnectionID,
 				"config_keys":    len(req.Config),
 				"write":          req.Write,
+				"model_run":      req.ModelRun,
 			}).Info("🔎 Agent: explorer_query (HTTP)")
 
 			// Write path: run the connector's MCP `execute` tool and return the
 			// affected-row count. Authorization already happened in the api-gateway.
 			if req.Write {
-				rowsAffected, err := executorAgent.ExplorerExecute(c.Request.Context(), req.ConnectorType, req.Config, req.Query)
+				var rowsAffected *int64
+				var err error
+				if req.ModelRun {
+					ctx, cancel, timeoutSeconds := modelStatementContext(c, req.TimeoutSeconds)
+					rowsAffected, err = executorAgent.ExplorerExecuteModel(ctx, req.ConnectorType, req.Config, req.Query, timeoutSeconds)
+					cancel()
+				} else {
+					rowsAffected, err = executorAgent.ExplorerExecute(c.Request.Context(), req.ConnectorType, req.Config, req.Query)
+				}
 				if err != nil {
 					c.JSON(http.StatusBadGateway, gin.H{
 						"error":   "explorer_execute failed",
@@ -1585,19 +1619,115 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 
 			result, err := executorAgent.ExplorerFind(c.Request.Context(), req.ConnectorType, req.Config, spec)
 			if err != nil {
-				code, path := "query_failed", ""
-				if fe, ok := err.(*executor.ExplorerFindError); ok {
-					code, path = fe.Code, fe.Path
-				}
-				c.JSON(explorerFindStatus(code), gin.H{
-					"error":      "explorer_find failed",
-					"error_code": code,
-					"path":       path,
-					"details":    err.Error(),
-				})
+				explorerDocumentError(c, "explorer_find", err)
 				return
 			}
 			c.JSON(http.StatusOK, result)
+		})
+
+		// Data Explorer document mode: a preview of an aggregation pipeline (the first
+		// page of its result) through the connector's MCP aggregate tool. The api-gateway
+		// validates the pipeline against the stage allowlist; the connector enforces it
+		// again and refuses $out/$merge at any depth. S2S-gated by requirePrincipal.
+		api.POST("/agent/explorer-aggregate", requirePrincipal(db), func(c *gin.Context) {
+			var req struct {
+				ConnectorType string                 `json:"connector_type" binding:"required"`
+				Config        map[string]interface{} `json:"config"`
+				ConnectionID  string                 `json:"connection_id,omitempty"`
+				Database      string                 `json:"database,omitempty"`
+				Collection    string                 `json:"collection" binding:"required"`
+				// Raw for the reason explorer-find's filter is.
+				Pipeline  json.RawMessage `json:"pipeline" binding:"required"`
+				Limit     int             `json:"limit,omitempty"`
+				MaxTimeMS int             `json:"max_time_ms,omitempty"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "error_code": "invalid_request", "details": err.Error()})
+				return
+			}
+
+			// SECURITY: never log the pipeline — only shape metadata.
+			log.WithFields(log.Fields{
+				"connector_type": req.ConnectorType,
+				"connection_id":  req.ConnectionID,
+				"config_keys":    len(req.Config),
+				"pipeline_bytes": len(req.Pipeline),
+				"limit":          req.Limit,
+			}).Info("📄 Agent: explorer_aggregate (HTTP)")
+
+			spec := map[string]interface{}{"collection": req.Collection, "pipeline": req.Pipeline}
+			if req.Database != "" {
+				spec["database"] = req.Database
+			}
+			if req.Limit > 0 {
+				spec["limit"] = req.Limit
+			}
+			if req.MaxTimeMS > 0 {
+				spec["max_time_ms"] = req.MaxTimeMS
+			}
+
+			result, err := executorAgent.ExplorerAggregate(c.Request.Context(), req.ConnectorType, req.Config, spec)
+			if err != nil {
+				explorerDocumentError(c, "explorer_aggregate", err)
+				return
+			}
+			c.JSON(http.StatusOK, result)
+		})
+
+		// One document-store model build (the api-gateway's runDocumentModel): the
+		// pipeline's result written to the target collection through the connector's MCP
+		// materialize tool. replace is true only for a target this model created, which
+		// the gateway records; otherwise the connector builds aside and refuses to
+		// overwrite an existing collection (target_exists, 409). Like a SQL model
+		// statement it runs under modelStatementContext. S2S-gated by requirePrincipal.
+		api.POST("/agent/explorer-materialize", requirePrincipal(db), func(c *gin.Context) {
+			var req struct {
+				ConnectorType  string                 `json:"connector_type" binding:"required"`
+				Config         map[string]interface{} `json:"config"`
+				ConnectionID   string                 `json:"connection_id,omitempty"`
+				Database       string                 `json:"database,omitempty"`
+				Collection     string                 `json:"collection" binding:"required"`
+				Pipeline       json.RawMessage        `json:"pipeline" binding:"required"`
+				Target         string                 `json:"target" binding:"required"`
+				Replace        bool                   `json:"replace,omitempty"`
+				TimeoutSeconds int                    `json:"timeout_seconds,omitempty"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "error_code": "invalid_request", "details": err.Error()})
+				return
+			}
+
+			// SECURITY: never log the pipeline — only shape metadata.
+			log.WithFields(log.Fields{
+				"connector_type": req.ConnectorType,
+				"connection_id":  req.ConnectionID,
+				"config_keys":    len(req.Config),
+				"pipeline_bytes": len(req.Pipeline),
+				"replace":        req.Replace,
+			}).Info("🧱 Agent: explorer_materialize (HTTP)")
+
+			spec := map[string]interface{}{
+				"collection": req.Collection,
+				"pipeline":   req.Pipeline,
+				"target":     req.Target,
+				"replace":    req.Replace,
+			}
+			if req.Database != "" {
+				spec["database"] = req.Database
+			}
+
+			ctx, cancel, timeoutSeconds := modelStatementContext(c, req.TimeoutSeconds)
+			defer cancel()
+			result, err := executorAgent.ExplorerMaterialize(ctx, req.ConnectorType, req.Config, spec, timeoutSeconds)
+			if err != nil {
+				explorerDocumentError(c, "explorer_materialize", err)
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"executed":      true,
+				"rows_affected": result["rows_affected"],
+				"target":        result["target"],
+			})
 		})
 
 		// ============================================================================
@@ -1923,7 +2053,9 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				}
 				connectorName := fmt.Sprintf("cdc-%s", safe8)
 
-				ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+				restartCtx, restartCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), cdcRestartBudget)
+				defer restartCancel()
+				ctx, cancel := context.WithTimeout(restartCtx, 5*time.Second)
 				defer cancel()
 
 				connectURL := strings.TrimSpace(os.Getenv("KAFKA_CONNECT_URL"))
@@ -1970,7 +2102,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				// because the sink could not be reached — but its outcome is reported, never
 				// swallowed.
 				if restartOK {
-					sinkCtx, sinkCancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+					sinkCtx, sinkCancel := context.WithTimeout(restartCtx, 45*time.Second)
 					if serr := handlers.RestartCDCSinkWorker(sinkCtx, db, mcpServerManager, pipelineID); serr != nil {
 						log.WithError(serr).WithFields(log.Fields{
 							"pipeline_id":    pipelineID,
@@ -2014,7 +2146,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				}
 				connectURL = strings.TrimRight(connectURL, "/")
 
-				ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
 				defer cancel()
 
 				u := fmt.Sprintf("%s/connectors/%s/pause", connectURL, connectorName)
@@ -2065,7 +2197,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				}
 				connectURL = strings.TrimRight(connectURL, "/")
 
-				ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
 				defer cancel()
 
 				u := fmt.Sprintf("%s/connectors/%s/resume", connectURL, connectorName)
@@ -2117,10 +2249,12 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			// groups. Must run AFTER the pipelines row is gone (see the handler
 			// doc) — api-gateway calls it once the delete transaction commits.
 			cdcGrp.POST("/cdc/kafka-teardown", handlers.TeardownPipelineKafka(db, mcpServerManager, topologyManager, cdcStatsAgent))
+			// A forced connection delete drops what deleted pipelines left on the
+			// source first, while the ledger and the credentials still exist.
+			cdcGrp.POST("/cdc/connections/:connection_id/release", handlers.ReleaseConnectionCDCResources(db))
 			// Topics of tables removed from the include list are deleted once the
-			// sink has applied them (nil without a Kafka admin: they stay).
-			cdcGrp.PUT("/cdc/tables", handlers.UpdateCDCTables(db,
-				handlers.NewRemovedTopicReaper(db, topologyManager, kafkaManager, cdcStatsAgent)))
+			// sink has applied them (built and resumed in main).
+			cdcGrp.PUT("/cdc/tables", handlers.UpdateCDCTables(db, removedTopicReaper))
 		}
 
 		// Transform Preview (for UI)

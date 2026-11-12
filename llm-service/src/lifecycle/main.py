@@ -44,6 +44,7 @@ from fastapi import FastAPI
 # Moat-free routers only. Neither import may transitively reach
 # tool_generator.agents.orchestrator or tool_generator.config.
 from src.agents.tool_generator.deployment.routes import lifecycle_router
+from src.agents.tool_generator.deployment.service import connector_catalog_is_shared
 from src.lifecycle.scaffold_routes import scaffold_router
 
 logging.basicConfig(
@@ -69,6 +70,11 @@ async def health():
         "status": "ok",
         "service": "connector-lifecycle",
         "edition": os.getenv("RSYNC_EDITION", "community"),
+        # Probed by the api-gateway before an agent or Ask rsync.ai may generate
+        # (connector_generations.go probeGenerator). This image generates from an
+        # uploaded OpenAPI document only; it never fetches one by URL.
+        "generate_from_url": False,
+        "catalog_shared": connector_catalog_is_shared(),
     }
 
 

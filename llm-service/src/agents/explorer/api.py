@@ -6,7 +6,7 @@ import os
 import re
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.utils.prompt_registry import PromptRegistry
 from src.utils.openai_client import (
@@ -22,10 +22,15 @@ from src.utils.openai_client import (
     with_reasoning_headroom,
 )
 from src.utils.llm_gate import require_explorer_llm
+from src.egress import EgressRefused, guarded_acall
+from src.utils.rate_limit_waits import RateLimitWaits, wait_out
 
 logger = logging.getLogger("llm-explorer")
 
 router = APIRouter(tags=["Explorer"])
+
+
+_REFUSED_DETAIL = "The LLM request was refused: it did not fit what may be sent to a model."
 
 
 def _extract_json_text(raw: str) -> str:
@@ -43,6 +48,62 @@ def _extract_json_text(raw: str) -> str:
     if start >= 0 and end > start:
         return text[start : end + 1].strip()
     return text
+
+
+# The model's reply is the one input to these endpoints that neither the user nor
+# this code controls: it can be empty (seen after a provider 503 retry), a refusal
+# in prose, cut off mid-object, or valid JSON of the wrong shape. None of that is a
+# server fault and none of it stops the user from answering by hand, so each
+# endpoint degrades instead of answering 500: tables and columns to "nothing
+# matched, pick it yourself", next steps to the rule-based list.
+
+
+def _parse_model_reply(raw: str | None, step: str) -> dict | None:
+    """The model's reply as a JSON object, or None when it is not one."""
+    text = (raw or "").strip()
+    if not text:
+        logger.warning("%s: the model's reply was empty", step)
+        return None
+    try:
+        parsed = json.loads(_extract_json_text(text))
+    except ValueError as e:
+        # Length and error only: the reply itself stays out of the log.
+        logger.warning("%s: the model's reply is not JSON (%s, %d chars)", step, type(e).__name__, len(text))
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("%s: the model's reply is JSON but not an object (%s)", step, type(parsed).__name__)
+        return None
+    return parsed
+
+
+def _reply_list(result: dict, *keys: str) -> list:
+    """The first of `keys` holding a list, else []."""
+    for key in keys:
+        value = result.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _str_list(value) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _opt_str(value) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _confidence(value, default: float) -> float:
+    """A 0..1 score from the model, or `default` when it did not send a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        score = float(value)
+    except ValueError:  # "high"
+        return default
+    if score != score:  # NaN
+        return default
+    return min(max(score, 0.0), 1.0)
 
 
 # ------------------------------------------------------------------------------
@@ -181,7 +242,7 @@ class ColumnLinkResponse(BaseModel):
 class NextStepSuggestion(BaseModel):
     """A suggested next action"""
 
-    action_type: str  # metabase, download_csv, slack, email
+    action_type: str  # download_csv, slack, email
     title: str
     description: str
     confidence: float = 0.8
@@ -212,8 +273,12 @@ class NextStepsRequest(BaseModel):
 
     question: str
     sql: str
+    # The SQL's dialect. The guard finds the query's literals with it and sends
+    # placeholders in their place; with none, or one it does not know, it
+    # withholds the query rather than guess where the literals are.
+    dialect: str | None = None
     result_profile: ResultProfile
-    available_actions: list[str] = ["metabase", "download_csv", "slack", "email"]
+    available_actions: list[str] = ["download_csv", "slack", "email"]
 
 
 class NextStepsResponse(BaseModel):
@@ -244,42 +309,72 @@ async def resolve_tables(request: TableLinkRequest):
         variables = {
             "question": request.question,
             "tables": (request.tables or [])[:30],
-            "previous_context": request.previous_context,
         }
-        messages = registry.render_messages(prompt_name, variables)
         cfg = registry.get_config(prompt_name)
 
-        response = await explorer_client.chat.completions.create(
-            model=EXPLORER_TABLE_LINK_MODEL,
-            messages=messages,
-            temperature=cfg["parameters"].get("temperature", 0.1),
-            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
+        # A 429 is tried again, at most 15 seconds asleep: api-gateway gives the
+        # table match 30 (handlers/explorer.go ResolveExplorerTables).
+        response = await wait_out(
+            lambda: guarded_acall(
+                explorer_client,
+                component="explorer.table_link",
+                model=EXPLORER_TABLE_LINK_MODEL,
+                prompt=prompt_name,
+                variables=variables,
+                temperature=cfg["parameters"].get("temperature", 0.1),
+                max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
+            ),
+            RateLimitWaits(most=15.0),
+            "explorer.table_link",
         )
 
-        result_text = (response.choices[0].message.content or "").strip()
-        result = json.loads(_extract_json_text(result_text))
+        result = _parse_model_reply(response.text, "table link")
+        if result is None:
+            return _pick_tables_yourself("The table match could not be read")
 
-        # Accept both 'schema' and 'schema_name' from models.
+        # Accept both 'schema' and 'schema_name' from models. An entry of the wrong
+        # shape is dropped on its own; the rest of the reply still counts.
         parsed_candidates = []
-        for c in (result.get("candidates", []) or []):
+        for c in _reply_list(result, "candidates"):
             if not isinstance(c, dict):
                 continue
             if "schema_name" not in c and "schema" in c:
                 c = {**c, "schema_name": c.get("schema")}
-            parsed_candidates.append(TableCandidate(**c))
+            try:
+                parsed_candidates.append(TableCandidate(**c))
+            except ValidationError as e:
+                logger.warning("table link: dropped a candidate of the wrong shape (%d errors)", e.error_count())
+
+        if not parsed_candidates:
+            return _pick_tables_yourself(_opt_str(result.get("hitl_reason")) or "No table matched the question")
 
         return TableLinkResponse(
             candidates=parsed_candidates,
-            confidence_overall=float(result.get("confidence_overall", 0.5) or 0.5),
+            confidence_overall=_confidence(result.get("confidence_overall"), 0.5),
             needs_hitl=bool(result.get("needs_hitl", False)),
-            hitl_reason=result.get("hitl_reason"),
-            suggested_join_keys=result.get("suggested_join_keys"),
+            hitl_reason=_opt_str(result.get("hitl_reason")),
+            suggested_join_keys=_str_list(result.get("suggested_join_keys")) or None,
         )
     except HTTPException:
         raise
+    except EgressRefused as e:
+        logger.warning("Table link refused by the LLM egress guard: %s", e.reason)
+        raise HTTPException(status_code=503, detail=_REFUSED_DETAIL)
     except Exception as e:
+        # The exception text can quote a provider reply; the log keeps it.
         logger.exception("Table link failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Table link failed. See the llm-service log.")
+
+
+def _pick_tables_yourself(reason: str) -> TableLinkResponse:
+    """No usable match from the model: the user picks the tables."""
+    return TableLinkResponse(
+        candidates=[],
+        confidence_overall=0.0,
+        needs_hitl=True,
+        hitl_reason=f"{reason} — pick the tables to query.",
+        suggested_join_keys=None,
+    )
 
 
 def _mock_table_link(request: TableLinkRequest) -> TableLinkResponse:
@@ -323,48 +418,82 @@ async def resolve_columns(request: ColumnLinkRequest):
         variables = {
             "question": request.question,
             "selected_tables": request.selected_tables,
-            "previous_context": request.previous_context,
         }
-        messages = registry.render_messages(prompt_name, variables)
         cfg = registry.get_config(prompt_name)
 
-        response = await explorer_client.chat.completions.create(
+        response = await guarded_acall(
+            explorer_client,
+            component="explorer.column_link",
             model=EXPLORER_COLUMN_LINK_MODEL,
-            messages=messages,
+            prompt=prompt_name,
+            variables=variables,
             temperature=cfg["parameters"].get("temperature", 0.1),
             max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
 
-        result_text = (response.choices[0].message.content or "").strip()
-        result = json.loads(_extract_json_text(result_text))
+        result = _parse_model_reply(response.text, "column link")
+        if result is None:
+            return _pick_columns_yourself("The column match could not be read")
 
-        cols = result.get("columns", {})
-        return ColumnLinkResponse(
-            columns=ColumnMapping(
-                select_cols=cols.get("select_cols", cols.get("select", [])),
-                where_cols=cols.get("where_cols", cols.get("where", [])),
-                group_by_cols=cols.get("group_by_cols", cols.get("group_by", [])),
-                order_by_cols=cols.get("order_by_cols", cols.get("order_by", [])),
-            ),
-            join_plan=[
-                JoinPlan(
-                    join_type=j.get("join_type", j.get("type", "INNER")),
-                    left_table=j.get("left_table", j.get("left", "")),
-                    right_table=j.get("right_table", j.get("right", "")),
-                    condition=j.get("condition", ""),
+        cols = result.get("columns")
+        if not isinstance(cols, dict):
+            cols = {}
+        mapping = ColumnMapping(
+            select_cols=_str_list(cols.get("select_cols", cols.get("select"))),
+            where_cols=_str_list(cols.get("where_cols", cols.get("where"))),
+            group_by_cols=_str_list(cols.get("group_by_cols", cols.get("group_by"))),
+            order_by_cols=_str_list(cols.get("order_by_cols", cols.get("order_by"))),
+        )
+        join_plan = []
+        for j in _reply_list(result, "join_plan"):
+            if not isinstance(j, dict):
+                continue
+            try:
+                join_plan.append(
+                    JoinPlan(
+                        join_type=j.get("join_type", j.get("type", "INNER")),
+                        left_table=j.get("left_table", j.get("left", "")),
+                        right_table=j.get("right_table", j.get("right", "")),
+                        condition=j.get("condition", ""),
+                    )
                 )
-                for j in result.get("join_plan", [])
-            ],
-            confidence=result.get("confidence", 0.5),
-            needs_hitl=result.get("needs_hitl", False),
-            hitl_reason=result.get("hitl_reason"),
-            ambiguous_columns=result.get("ambiguous_columns"),
+            except ValidationError as e:
+                logger.warning("column link: dropped a join of the wrong shape (%d errors)", e.error_count())
+
+        if not join_plan and not any(
+            (mapping.select_cols, mapping.where_cols, mapping.group_by_cols, mapping.order_by_cols)
+        ):
+            return _pick_columns_yourself(_opt_str(result.get("hitl_reason")) or "No column matched the question")
+
+        return ColumnLinkResponse(
+            columns=mapping,
+            join_plan=join_plan,
+            confidence=_confidence(result.get("confidence"), 0.5),
+            needs_hitl=bool(result.get("needs_hitl", False)),
+            hitl_reason=_opt_str(result.get("hitl_reason")),
+            ambiguous_columns=_str_list(result.get("ambiguous_columns")) or None,
         )
     except HTTPException:
         raise
+    except EgressRefused as e:
+        logger.warning("Column link refused by the LLM egress guard: %s", e.reason)
+        raise HTTPException(status_code=503, detail=_REFUSED_DETAIL)
     except Exception as e:
+        # The exception text can quote a provider reply; the log keeps it.
         logger.exception("Column link failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Column link failed. See the llm-service log.")
+
+
+def _pick_columns_yourself(reason: str) -> ColumnLinkResponse:
+    """No usable match from the model: the user picks the columns."""
+    return ColumnLinkResponse(
+        columns=ColumnMapping(),
+        join_plan=[],
+        confidence=0.0,
+        needs_hitl=True,
+        hitl_reason=f"{reason} — pick the columns to use.",
+        ambiguous_columns=None,
+    )
 
 
 def _mock_column_link(request: ColumnLinkRequest) -> ColumnLinkResponse:
@@ -410,54 +539,60 @@ async def get_next_steps(request: NextStepsRequest):
         variables = {
             "question": request.question,
             "sql": request.sql,
-            "result_profile": request.result_profile.model_dump(),
+            # Column names only. The row count and time range describe the
+            # customer's data.
+            "columns": list(request.result_profile.columns or []),
         }
-        messages = registry.render_messages(prompt_name, variables)
         cfg = registry.get_config(prompt_name)
 
-        response = await explorer_client.chat.completions.create(
+        response = await guarded_acall(
+            explorer_client,
+            component="explorer.next_steps",
             model=EXPLORER_NEXT_STEPS_MODEL,
-            messages=messages,
+            prompt=prompt_name,
+            variables=variables,
+            dialect=request.dialect,
             temperature=cfg["parameters"].get("temperature", 0.3),
             max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 512)),
         )
 
-        result_text = (response.choices[0].message.content or "").strip()
-        result = json.loads(_extract_json_text(result_text))
+        result = _parse_model_reply(response.text, "next steps")
+        if result is None:
+            return _mock_next_steps(request)
 
+        offered = _reply_list(result, "suggestions")
         suggestions = []
-        for s in (result.get("suggestions", []) or []):
+        for s in offered:
             if not isinstance(s, dict):
                 continue
             # Accept both 'type' (prompt spec) and 'action_type' (API model).
             if "action_type" not in s and "type" in s:
                 s = {**s, "action_type": s.get("type")}
-            suggestions.append(NextStepSuggestion(**s))
+            try:
+                suggestions.append(NextStepSuggestion(**s))
+            except ValidationError as e:
+                logger.warning("next steps: dropped a suggestion of the wrong shape (%d errors)", e.error_count())
 
+        # The model offered suggestions and none could be used: serve the
+        # rule-based list rather than an empty one. An empty list it chose stays.
+        if offered and not suggestions:
+            return _mock_next_steps(request)
         return NextStepsResponse(suggestions=suggestions)
     except HTTPException:
         raise
+    except EgressRefused as e:
+        logger.warning("Next steps refused by the LLM egress guard: %s", e.reason)
+        raise HTTPException(status_code=503, detail=_REFUSED_DETAIL)
     except Exception as e:
+        # The exception text can quote a provider reply; the log keeps it.
         logger.exception("Next steps failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Next steps failed. See the llm-service log.")
 
 
 def _mock_next_steps(request: NextStepsRequest) -> NextStepsResponse:
     """Rule-based next steps: mock mode, and installs without an LLM."""
     suggestions = []
     row_count = request.result_profile.row_count
-
-    # Always suggest Metabase for visualization
-    suggestions.append(
-        NextStepSuggestion(
-            action_type="metabase",
-            title="Create Dashboard",
-            description="Visualize these results in Metabase",
-            confidence=0.9,
-            required_inputs=["dashboard_name"],
-            cta="Create Dashboard",
-        )
-    )
 
     # Suggest download for larger results
     if row_count > 10:

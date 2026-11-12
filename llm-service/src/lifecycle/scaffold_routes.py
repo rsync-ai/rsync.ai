@@ -61,6 +61,7 @@ from src.agents.tool_generator.scaffold.openapi_to_spec import (
     OpenAPIConversionError,
     openapi_to_connector_spec,
 )
+from src.utils.spec_limits import SpecRefusedError, parse_spec, refuse_yaml_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,9 @@ def _parse_document(raw: str) -> Dict[str, Any]:
     try:
         parsed: Any = json.loads(raw)
     except ValueError as json_error:
+        # A large spec is read as JSON or not at all: YAML of that size would
+        # not fit in memory (spec_limits).
+        refuse_yaml_fallback(raw, json_error)
         try:
             import yaml
         except ImportError:
@@ -218,6 +222,17 @@ async def generate_connector_deterministic(request: GenerateRequestV1):
     connector_name = _canonicalize_connector_id(request.api_name)
     logger.info("🧱 /v1/generate (deterministic) request for: %s", connector_name)
 
+    # Generator-trust P4a: this service always saves a new version (DeploymentService
+    # .deploy), so an overwrite is refused rather than saved as something else.
+    if request.overwrite:
+        return _refusal(
+            connector_name,
+            "This service always saves a regenerated connector as a new version; it "
+            "cannot overwrite the current one in place.",
+            stage="overwrite",
+            suggestions=["Turn overwrite off to save the result as a new version"],
+        )
+
     refusal = _unsupported_input(request)
     if refusal is not None:
         message, suggestions = refusal
@@ -235,13 +250,17 @@ async def generate_connector_deterministic(request: GenerateRequestV1):
             f"category '{request.category}' is not one this service renders; used '{category}'"
         )
     try:
-        document = _parse_document(request.openapi_spec or "")
+        # Off the event loop. A spec over its limit, or one whose parse would
+        # not fit in memory, is refused with its size and the limit.
+        document = await parse_spec(request.openapi_spec or "", _parse_document)
         report: ConversionReport = openapi_to_connector_spec(
             document,
             name=connector_name,
             category=category,
             base_url=request.base_url,
         )
+    except SpecRefusedError as exc:
+        return _refusal(connector_name, exc.message, stage="spec_size", status_code=exc.status_code)
     except OpenAPIConversionError as exc:
         return _refusal(connector_name, str(exc), stage="spec_conversion")
     stages.append(_stage("convert", stage_began))
@@ -338,7 +357,8 @@ async def generate_connector_deterministic(request: GenerateRequestV1):
                 version="latest",
             ),
             build_docker=managed,
-            start_container=managed,
+            # Built, not started: the infra preflight starts it on first use.
+            start_container=False,
             verify=True,
             validation_passed=True,
         )

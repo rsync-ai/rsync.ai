@@ -112,3 +112,22 @@ describe("describeCron", () => {
     expect(describeCron("  0   3 *\t* *  ")).toBe("Every day at 03:00")
   })
 })
+
+// A workflow's view says its trigger with the server's words (definition.go
+// describeCron), while its edit form says the cron with these. They read
+// "every hour at :00" against "Every hour on the hour" for one schedule.
+// Both sides pin the same sentences for the hourly shapes: workflow_test.go
+// TestDescribeTrigger_ReadsLikeASentence.
+describe("the hourly shapes the server says the same way", () => {
+  it.each([
+    ["0 * * * *", "every hour on the hour"],
+    ["1 * * * *", "every hour at 1 minute past"],
+    ["15 * * * *", "every hour at 15 minutes past"],
+    ["0 */6 * * *", "every 6 hours from 00:00"],
+    ["30 */5 * * *", "every 5 hours from 00:30 to 20:30"],
+    ["0 */12 * * *", "every day at 00:00 and 12:00"],
+    ["0 */1 * * *", "every hour on the hour"],
+  ])("%s", (cron, server) => {
+    expect(describeCron(cron)?.toLowerCase()).toBe(server)
+  })
+})

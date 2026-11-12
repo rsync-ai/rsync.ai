@@ -479,6 +479,49 @@ services:
       rsync-network:
         aliases:
           - rsync-ai-notion-rest-mcp
+  nse-india-v1-0-0-mcp:
+    build:
+      context: ./shared/mcp-connectors/public/nse-india/versions/v1.0.0
+      dockerfile: Dockerfile
+      additional_contexts:
+        shared: ./shared/mcp-connectors/public
+    image: mcp-nse-india:v1.0.0
+    container_name: rsync-ai-nse-india-v1-0-0-mcp
+    labels:
+      - rsync-ai.mcp=true
+      - rsync-ai.connector=nse-india
+      - rsync-ai.connector_version=v1.0.0
+    environment:
+      - PORT=8000
+      - MCP_PORT=8000
+      - MCP_HTTP_MODE=true
+      - DOCKER_CONTAINER=true
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=docker
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${MCP_MEMORY_LIMIT:-512m}
+    pids_limit: ${MCP_PIDS_LIMIT:-512}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${MCP_LOG_MAX_SIZE:-10m}
+        max-file: "${MCP_LOG_MAX_FILE:-3}"
+    networks:
+      rsync-network:
+        aliases:
+          - rsync-ai-nse-india-mcp
   oracle-v1-0-0-mcp:
     build:
       context: ./shared/mcp-connectors/public/database/oracle/versions/v1.0.0

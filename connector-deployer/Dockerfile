@@ -21,7 +21,7 @@ FROM moby/buildkit:${BUILDKIT_VERSION} AS buildkit
 # ---- build ----
 # Compiles natively on $BUILDPLATFORM; the GOARCH=${TARGETARCH} below already made
 # this a cross-compile, so a multi-arch publish need not run it under QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 # Cache modules first.
@@ -51,6 +51,10 @@ RUN cd /usr/local/bin && sha256sum -c /tmp/deployer.sha256 && rm /tmp/deployer.s
 # buildctl for the rootless build path — version-locked to the buildkitd sidecar via
 # the BUILDKIT_VERSION-parameterized `buildkit` stage above.
 COPY --from=buildkit /usr/bin/buildctl /usr/local/bin/buildctl
+
+# The licence attributions for what this image ships. A repo-root file this build's
+# context cannot reach, so it comes through the `legal` named context (the repo root).
+COPY --from=legal THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 ENV PORT=5011
 EXPOSE 5011

@@ -114,6 +114,14 @@ secrets:
   #   --set secrets.internalServiceSecret=$(openssl rand -hex 24)
   internalServiceSecret: ""
 
+  # Key for PII mask rules that hash with hmac_sha256; also salts sha256/md5
+  # hashes. Empty is allowed: hmac_sha256 rules then refuse to save and to run.
+  # NEVER change it once hash rules have written data -- new hashes of the same
+  # input stop matching the ones already in the destination, and there is no
+  # rotation. install-k8s.sh generates one on a fresh install only; by hand:
+  #   --set secrets.piiHashKey=$(openssl rand -hex 32)
+  piiHashKey: ""
+
   # RESTRICTED ALPHABET -- these three, plus demoWarehousePassword below, must
   # avoid whitespace and  "  '  \  @  :  /  ?  #  [  ]  %
   #
@@ -151,6 +159,14 @@ secrets:
   # without these when mode is "minio".
   minioAccessKey: ""
   minioSecretKey: ""
+  # MinIO's KMS key, so the claim-check objects minio-mcp writes are encrypted at
+  # rest (SSE-S3). Format `<name>:<base64 of 32 bytes>` -- validate.yaml refuses
+  # anything else, because MinIO exits at start on it. Generate once with
+  #   echo "rsync-ai-kms:$(openssl rand -base64 32)"
+  # and NEVER change or remove it after: objects and IAM entries encrypted under
+  # it become unreadable. install-k8s.sh generates it and keeps it. Empty, MinIO
+  # stores those objects unencrypted. With existingSecret, add MINIO_KMS_SECRET_KEY.
+  minioKmsSecretKey: ""
   # The blob-staging store's login (objectStorage.blobStaging). Connectors are
   # handed it, so give it its own; empty falls back to the MinIO pair above,
   # which connectors then hold but -- with networkPolicy.enabled -- cannot use
@@ -586,6 +602,11 @@ apiGateway:
   # stays the cloud behaviour and only this deployment artifact opts out, the
   # same way docker-compose.quickstart.yml does.
   billingEnforced: false
+  # One workspace per install: the first sign-up owns it, later users join it,
+  # and the gateway refuses a second one. Unset in the code means any number
+  # (cloud), so removing this value keeps it on; only false turns it off. See
+  # docs/architecture/multi-tenancy.md "Single-workspace mode".
+  singleWorkspace: true
   # Absolute URL connector OAuth flows redirect back to, e.g.
   # https://api.example.com/api/v1/oauth/callback. Empty disables OAuth
   # connectors; a WRONG value fails at the provider, not here.
@@ -734,6 +755,12 @@ generation:
     # Air-gapped / on-prem: pins ONLY the Data Explorer to Ollama so schema
     # metadata never leaves the deployment.
     explorerOfflineOnly: false
+    # Ask rsync.ai's sample rows: up to 5 rows of a table sent to a model, once
+    # a platform admin approves the model and a workspace owner turns them on.
+    # Self-host keeps them off, so no row value reaches a model whatever those
+    # two pick. Cloud leaves the variable unset (allowed). Both api-gateway and
+    # llm-service read this one value; unset here also means off.
+    sampleRowsAllowed: false
   llmService:
     replicaCount: 1
     resources:
@@ -754,7 +781,7 @@ generation:
     # container itself. With DEPLOYER_URL unset — which this chart guarantees,
     # see the note beside it in templates/apps/generation.yaml — DockerBuilder
     # takes the legacy in-process path and calls docker.from_env()
-    # (deployment/docker_builder.py:154), so it needs /var/run/docker.sock in
+    # (deployment/docker_builder.py:144), so it needs /var/run/docker.sock in
     # THIS pod. No template in this chart mounts one, for the same reason
     # connectorDeployer is absent: a pod holding the node's Docker socket holds
     # the node.
@@ -765,7 +792,7 @@ generation:
     # building:true before anything has been attempted; the orchestrator extends
     # its poll on that flag (mcp/server_manager.go:827-836) and waits out the
     # full pre-flight timeout while docker.from_env() has already failed with a
-    # WARNING and returned False (docker_builder.py:158). The operator gets a
+    # WARNING and returned False (docker_builder.py:148). The operator gets a
     # slow "not reachable — check `docker compose logs`" on a cluster with no
     # compose in it, and the real cause sits in a tool-generator log line.
     #
@@ -841,6 +868,9 @@ connectors:
   minio:
     enabled: true
     image: { repository: mcp-minio, tag: "" }
+    # Gzip each claim-check object (~10x smaller for typical batches). false
+    # writes plain JSON. Safe to flip either way: the reader autodetects both.
+    claimCheckGzip: true
     resources:
       requests: { cpu: 50m, memory: 128Mi }
       limits: { memory: 512Mi }
@@ -892,6 +922,11 @@ connectors:
       # "/docker-entrypoint.sh start" is treated as empty.
       entrypoint: ""
       heapOpts: "-Xms256M -Xmx768M"
+      # Producer-side compression for every CDC topic (rsync.cdc-*). lz4 is fast
+      # and both CDC consumers (kafka-mcp-sink, the orchestrator's cdcstats) read
+      # it. none | gzip | snappy | lz4 | zstd. Applies to batches written after a
+      # restart; records already on the topic stay as they were written.
+      compressionType: lz4
       # Where debezium-mcp writes each source database's credentials for
       # Connect's FileConfigProvider. It MUST survive a pod restart: the
       # connector configs live in Kafka and reference these files, so with an

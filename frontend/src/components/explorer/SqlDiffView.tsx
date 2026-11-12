@@ -115,7 +115,7 @@ function HunkRows({
         <tr>
           <td
             colSpan={4}
-            className="border-y bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400 dark:bg-zinc-800"
+            className="border-y bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-600 dark:text-zinc-400 dark:bg-zinc-800"
           >
             @@ −{hunk.baseStart},{hunk.baseCount} +{hunk.nextStart},{hunk.nextCount} @@
           </td>

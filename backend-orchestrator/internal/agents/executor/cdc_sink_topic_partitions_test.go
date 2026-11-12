@@ -198,7 +198,7 @@ func TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount(t *testing.T) {
 	t.Run("unresolved count falls back to one partition", func(t *testing.T) {
 		ev := &sinkTopicEvents{}
 		km := newFakeSinkTopicManager(ev)
-		got := prepareSinkTopics(km, mongoSinkInputs("shop.customers", "shop.orders", "shop.products"))
+		got, _ := prepareSinkTopics(km, mongoSinkInputs("shop.customers", "shop.orders", "shop.products"))
 
 		subscribed, ok := got.([]string)
 		if !ok {
@@ -222,7 +222,7 @@ func TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount(t *testing.T) {
 		ev := &sinkTopicEvents{}
 		km := newFakeSinkTopicManager(ev)
 		in := mongoSinkInputs()
-		got := prepareSinkTopics(km, in)
+		got, _ := prepareSinkTopics(km, in)
 
 		if s, ok := got.(string); !ok || s != partitionsLiveTopic {
 			t.Fatalf("topics = %#v, want the provider topic %q", got, partitionsLiveTopic)
@@ -241,7 +241,7 @@ func TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount(t *testing.T) {
 		km := newFakeSinkTopicManager(ev)
 		in := mongoSinkInputs("shop.customers", "shop.orders")
 		in.partitions = 3
-		got := prepareSinkTopics(km, in)
+		got, _ := prepareSinkTopics(km, in)
 
 		if len(km.created) != 2 {
 			t.Fatalf("pre-created %d topics %v, want 2", len(km.created), km.created)
@@ -295,7 +295,7 @@ func TestSinkTopicBackstopRunsBeforePreCreate(t *testing.T) {
 		km := newFakeSinkTopicManager(ev)
 
 		// These tables do not rebuild to the live topic, so the backstop must fire.
-		got := prepareSinkTopics(km, mongoSinkInputs("inventory.items", "inventory.stock"))
+		got, _ := prepareSinkTopics(km, mongoSinkInputs("inventory.items", "inventory.stock"))
 
 		events := ev.snapshot()
 		backstop := indexOf(events, "backstop")
@@ -436,7 +436,7 @@ func TestBatchBackfillSinkTopicIsNotPreCreated(t *testing.T) {
 
 	ev := &sinkTopicEvents{}
 	km := newFakeSinkTopicManager(ev)
-	got := prepareSinkTopics(km, in)
+	got, _ := prepareSinkTopics(km, in)
 	if s, ok := got.(string); !ok || s != in.kafkaTopic {
 		t.Fatalf("topics = %#v, want the batch topic unchanged", got)
 	}
@@ -453,7 +453,7 @@ func TestBatchBackfillSinkTopicIsNotPreCreated(t *testing.T) {
 			"empty result above proves nothing")
 	}
 
-	if got := prepareSinkTopics(nil, mongoSinkInputs("shop.customers")); got == nil {
+	if got, _ := prepareSinkTopics(nil, mongoSinkInputs("shop.customers")); got == nil {
 		t.Fatal("nil manager: topics must still be returned")
 	}
 }
@@ -517,7 +517,7 @@ func TestSinkTopicsForUnifiedTopicMode(t *testing.T) {
 			Params:     map[string]interface{}{"cdc_unified_topic": " " + unified + " "},
 		}
 
-		got := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
+		got, _ := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
 
 		assertTopicList(t, got, []string{unified, orders})
 		if events := ev.snapshot(); indexOf(events, "backstop") >= 0 {
@@ -537,7 +537,7 @@ func TestSinkTopicsForUnifiedTopicMode(t *testing.T) {
 		km := newFakeSinkTopicManager(ev)
 		task := ExecutorTask{PipelineID: "p1", Source: &ConnectorConfig{Type: "mongodb"}}
 
-		got := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
+		got, _ := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
 
 		assertTopicList(t, got, []string{live, orders})
 		if events := ev.snapshot(); indexOf(events, "backstop") >= 0 {
@@ -563,7 +563,7 @@ func TestSinkTopicsForSQLServerKeepTheDatabaseSegment(t *testing.T) {
 	km := newFakeSinkTopicManager(ev)
 	task := ExecutorTask{PipelineID: "p1", Source: &ConnectorConfig{Type: "sqlserver"}}
 
-	got := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
+	got, _ := prepareSinkTopics(km, sinkTopicInputsFor(task, live, "cdc", tables, false))
 
 	assertTopicList(t, got, want)
 	if events := ev.snapshot(); indexOf(events, "backstop") >= 0 {
@@ -579,7 +579,7 @@ func TestSinkTopicsForSQLServerKeepTheDatabaseSegment(t *testing.T) {
 	}
 
 	ctask := ExecutorTask{PipelineID: "p1", Source: &ConnectorConfig{Type: "postgresql"}}
-	cgot := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}),
+	cgot, _ := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}),
 		sinkTopicInputsFor(ctask, live, "cdc", tables, false))
 	if list, ok := cgot.([]string); !ok || strings.Join(list, ",") == strings.Join(want, ",") {
 		t.Fatalf("control: a postgresql source gave %#v, the same as SQL Server, so the source type "+
@@ -601,7 +601,7 @@ func TestNonCDCSyncModeKeepsTheProviderTopic(t *testing.T) {
 			in := mongoSinkInputs(tables...)
 			in.syncMode = mode
 
-			got := prepareSinkTopics(km, in)
+			got, _ := prepareSinkTopics(km, in)
 
 			if s, ok := got.(string); !ok || s != partitionsLiveTopic {
 				t.Fatalf("topics = %#v, want only the provider topic %q", got, partitionsLiveTopic)
@@ -612,7 +612,7 @@ func TestNonCDCSyncModeKeepsTheProviderTopic(t *testing.T) {
 		})
 	}
 
-	got := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}), mongoSinkInputs(tables...))
+	got, _ := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}), mongoSinkInputs(tables...))
 	assertTopicList(t, got, []string{partitionsLiveTopic, "rsync.cdc-ec6d3a3b.shop.orders"})
 }
 
@@ -629,7 +629,7 @@ func TestProviderTopicWithoutTableSegmentIsNotRebuilt(t *testing.T) {
 	in := mongoSinkInputs("shop.customers", "shop.orders")
 	in.kafkaTopic = bare
 
-	got := prepareSinkTopics(km, in)
+	got, _ := prepareSinkTopics(km, in)
 
 	if s, ok := got.(string); !ok || s != bare {
 		t.Fatalf("topics = %#v, want only %q", got, bare)
@@ -638,7 +638,7 @@ func TestProviderTopicWithoutTableSegmentIsNotRebuilt(t *testing.T) {
 		t.Fatalf("pre-created %v, want only %q (no topic without a prefix)", km.created, bare)
 	}
 
-	cgot := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}), mongoSinkInputs("shop.customers", "shop.orders"))
+	cgot, _ := prepareSinkTopics(newFakeSinkTopicManager(&sinkTopicEvents{}), mongoSinkInputs("shop.customers", "shop.orders"))
 	assertTopicList(t, cgot, []string{partitionsLiveTopic, "rsync.cdc-ec6d3a3b.shop.orders"})
 }
 
@@ -673,7 +673,7 @@ func TestBlankSinkTopicNamesAreNeverCreated(t *testing.T) {
 	t.Run("all table names blank keep the provider topic", func(t *testing.T) {
 		km := newFakeSinkTopicManager(&sinkTopicEvents{})
 
-		got := prepareSinkTopics(km, mongoSinkInputs("", "  "))
+		got, _ := prepareSinkTopics(km, mongoSinkInputs("", "  "))
 
 		if s, ok := got.(string); !ok || s != partitionsLiveTopic {
 			t.Fatalf("topics = %#v, want the provider topic %q, not an empty list", got, partitionsLiveTopic)
@@ -784,16 +784,21 @@ func sinkTopicWiringProblems(file *ast.File) []string {
 	var prepares []*ast.CallExpr
 	var topicsValues []string // values given to the sink's "topics" config key
 	direct, topicsParamAssigns := 0, 0
-	assignedFromPrepare := false
+	assignedFromPrepare, errDiscarded := false, false
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.AssignStmt:
 			for _, lhs := range x.Lhs {
 				if id, ok := lhs.(*ast.Ident); ok && id.Name == "topicsParam" {
 					topicsParamAssigns++
-					if len(x.Lhs) == 1 && len(x.Rhs) == 1 {
+					// topicsParam, err := prepareSinkTopics(...): the error is the ACL
+					// refusal that stops the sink start.
+					if len(x.Rhs) == 1 && x.Lhs[0] == lhs {
 						if c, ok := x.Rhs[0].(*ast.CallExpr); ok && exprText(c.Fun) == "prepareSinkTopics" {
 							assignedFromPrepare = true
+							if len(x.Lhs) != 2 || exprText(x.Lhs[1]) == "_" {
+								errDiscarded = true
+							}
 						}
 					}
 				}
@@ -827,6 +832,10 @@ func sinkTopicWiringProblems(file *ast.File) []string {
 	if !assignedFromPrepare || topicsParamAssigns != 1 {
 		problems = append(problems, fmt.Sprintf("topicsParam is assigned %d time(s) (from prepareSinkTopics: %v), "+
 			"want once, from prepareSinkTopics", topicsParamAssigns, assignedFromPrepare))
+	}
+	if errDiscarded {
+		problems = append(problems, "startKafkaMCPSink discards the error from prepareSinkTopics; "+
+			"it is the broker's ACL refusal and the sink must not start on a topic that can never exist")
 	}
 	if len(topicsValues) != 1 || topicsValues[0] != "topicsParam" {
 		problems = append(problems, fmt.Sprintf("the sink's \"topics\" config is %v, want [topicsParam]", topicsValues))
@@ -888,7 +897,7 @@ func TestStartKafkaMCPSinkPreCreatesOnlyThroughPrepareSinkTopics(t *testing.T) {
 	const (
 		inputs  = "sinkTopicInputsFor(task, kafkaTopic, syncMode, tablesList, isBatchBackfillTopic)"
 		manager = "prepareSinkTopics(sinkTopicCreatorFor(a.kafkaManager),"
-		assign  = "\ttopicsParam := prepareSinkTopics("
+		assign  = "\ttopicsParam, err := prepareSinkTopics("
 	)
 	controls := []struct{ name, old, new string }{
 		{"no tables", inputs, "sinkTopicInputsFor(task, kafkaTopic, syncMode, nil, isBatchBackfillTopic)"},
@@ -899,6 +908,7 @@ func TestStartKafkaMCPSinkPreCreatesOnlyThroughPrepareSinkTopics(t *testing.T) {
 		{"empty task", inputs, "sinkTopicInputsFor(ExecutorTask{}, kafkaTopic, syncMode, tablesList, isBatchBackfillTopic)"},
 		{"arguments swapped", inputs, "sinkTopicInputsFor(task, syncMode, kafkaTopic, tablesList, isBatchBackfillTopic)"},
 		{"nil manager", manager, "prepareSinkTopics(sinkTopicCreatorFor(nil),"},
+		{"refusal discarded", assign, "\ttopicsParam, _ := prepareSinkTopics("},
 		{"direct create added", assign, "\t_ = a.kafkaManager.EnsureTopicExists(kafkaTopic, 3)\n" + assign},
 		{"sink given the provider topic", "\"topics\":                  topicsParam,", "\"topics\":                  kafkaTopic,"},
 		{"result replaced after the call", "\n\tsinkReq := mcp.ExecuteRequest{", "\n\ttopicsParam = kafkaTopic\n\tsinkReq := mcp.ExecuteRequest{"},

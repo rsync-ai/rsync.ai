@@ -26,6 +26,26 @@
   --input: 240 5.9% 90%;
   --ring: 262.1 83.3% 57.8%;
   --radius: 0.75rem;
+  /* Chart colours (components/charts/chart-theme.ts reads them, so chart
+     settings never name a colour). One per run outcome, kept for outcomes; seven
+     series colours in the order series take them (Blue, Orange, Sky, Ochre, Pink,
+     Violet, Green), validated for colour-blind separation on this surface
+     (dashboards-design.md § 2); and Other, for everything past the seventh. */
+  --chart-succeeded: 142 76% 36%;
+  --chart-failed: 0 72% 51%;
+  --chart-error: 25 95% 53%;
+  --chart-waiting: 38 92% 50%;
+  --chart-running: 221 83% 53%;
+  --chart-cancelled: 240 5% 65%;
+  --chart-skipped: 240 5% 84%;
+  --chart-series-1: 226.1 68.3% 59.2%;
+  --chart-series-2: 27 73.2% 51.8%;
+  --chart-series-3: 195.2 97.2% 42.2%;
+  --chart-series-4: 48.8 98.9% 34.9%;
+  --chart-series-5: 343.9 90.5% 66.9%;
+  --chart-series-6: 259.5 34.7% 53.1%;
+  --chart-series-7: 162.7 71.3% 38.2%;
+  --chart-other: 240 4.6% 57.6%;
 }
 
 .dark {
@@ -48,6 +68,21 @@
   --border: 240 3.7% 15.9%;
   --input: 240 3.7% 15.9%;
   --ring: 262.1 83.3% 57.8%;
+  --chart-succeeded: 142 69% 58%;
+  --chart-failed: 0 91% 71%;
+  --chart-error: 27 96% 61%;
+  --chart-waiting: 43 96% 56%;
+  --chart-running: 213 94% 68%;
+  --chart-cancelled: 240 5% 46%;
+  --chart-skipped: 240 5% 34%;
+  --chart-series-1: 226.1 68.3% 59.2%;
+  --chart-series-2: 27.4 72.2% 49.4%;
+  --chart-series-3: 195.5 91.9% 43.7%;
+  --chart-series-4: 48.8 98.9% 34.9%;
+  --chart-series-5: 343.4 81.7% 63.5%;
+  --chart-series-6: 259.5 34.7% 53.1%;
+  --chart-series-7: 162.2 64.6% 41%;
+  --chart-other: 240 3.8% 46.1%;
 }
 
 * {
@@ -67,6 +102,11 @@ body {
 }
 
 ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Where a box's two bars meet: unstyled, the browser paints it white, in either theme. */
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 

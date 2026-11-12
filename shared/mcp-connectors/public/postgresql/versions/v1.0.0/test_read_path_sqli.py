@@ -8,8 +8,8 @@ table name directly into SQL. These tests pin the fix:
     (returns None) and re-quotes each segment of a legit qualified name.
   * export() returns a fail-closed error dict for an injection table (the
     connection seam is mocked so the guard is exercised offline).
-  * _get_primary_key_column() (MySQL branch) never issues a raw
-    ``SHOW KEYS FROM <payload>`` — it validates + backtick-quotes first.
+  * export paging's MySQL key read (``sql_paging._mysql_key``) never issues
+    a raw ``SHOW KEYS FROM <payload>`` — it validates + backtick-quotes first.
 
 Run standalone (no pytest needed):  python3 test_read_path_sqli.py
 """
@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from connector import PostgresqlMCPServer as _Server  # noqa: E402
+from connector import sql_paging  # noqa: E402  (the module export pages with)
 
 # Driver identifier quote char used by export() for this connector.
 _QUOTE = '"'
@@ -81,17 +82,29 @@ def test_export_rejects_injection_table_failclosed():
     assert "Unsafe table identifier" in res.get("error", ""), res
 
 
-def test_get_primary_key_column_rejects_injection_no_raw_show_keys():
-    s = _Server()
-    s.driver_pattern = {"module": "mysql.connector"}
-    cur = _FakeCursor(rows=[{"Column_name": "id", "Seq_in_index": 1}])
-    # Injection payload -> validation fails, no SQL issued, returns None.
-    assert s._get_primary_key_column(cur, "users; DROP TABLE x") is None
-    assert cur.executed == [], cur.executed
+class _KeyCatalogCursor(_FakeCursor):
+    """SHOW KEYS answers a PRIMARY key on `id`; the column read answers none."""
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        # Table, Non_unique, Key_name, Seq_in_index, Column_name, Collation,
+        # Cardinality, Sub_part, Packed, Null
+        self._rows = ([("tbl", 0, "PRIMARY", 1, "id", "A", 0, None, None, "")]
+                      if sql.startswith("SHOW KEYS") else [])
+
+
+def test_paging_key_read_rejects_injection_no_raw_show_keys():
+    # Export pages by the key sql_paging reads (KI-DB-BATCH-PAGING-CAN-SKIP-ROWS).
+    # Injection payload -> no SHOW KEYS; only the bound-parameter column read runs.
+    cur = _KeyCatalogCursor()
+    plan = sql_paging.paging_plan(None, cur, sql_paging.MYSQL, "users; DROP TABLE x", "`x`")
+    assert plan == sql_paging.offset_plan(), plan
+    assert cur.executed == [sql_paging.MYSQL_COLUMNS_SQL], cur.executed
     # Legit qualified name -> backtick-quoted SHOW KEYS, PK resolved.
-    cur2 = _FakeCursor(rows=[{"Column_name": "id", "Seq_in_index": 1}])
-    assert s._get_primary_key_column(cur2, "db.tbl") == "id"
-    assert cur2.executed == ["SHOW KEYS FROM `db`.`tbl` WHERE Key_name = 'PRIMARY'"], cur2.executed
+    cur2 = _KeyCatalogCursor()
+    plan = sql_paging.paging_plan(None, cur2, sql_paging.MYSQL, "db.tbl", "`db`.`tbl`")
+    assert plan == sql_paging.key_plan(["id"]), plan
+    assert cur2.executed == [sql_paging.MYSQL_COLUMNS_SQL, "SHOW KEYS FROM `db`.`tbl`"], cur2.executed
 
 
 # ---------------------------------------------------------------------------

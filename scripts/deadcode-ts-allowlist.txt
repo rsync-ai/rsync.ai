@@ -1,0 +1,22 @@
+# Frontend code the production build never uses, kept on purpose. Read by
+# scripts/check-deadcode-ts.mjs, which fails on any knip finding not listed here
+# AND on any line here that is no longer a finding.
+#
+# "<path>" alone is a whole file nothing imports; "<path> <name>" is one export,
+# type, member or dependency nothing in the production build uses. Paths are
+# from the repo root. Full-line comments and blank lines are ignored. Every group
+# says why it is kept and what would retire it -- a line without a reason is a
+# deletion nobody made.
+
+# Test seam: resets auth-fetch's module-level session-probe and logout latches
+# between the cases of auth-fetch-401-is-not-always-a-logout.test.ts. Retired by
+# that test re-importing the module after vi.resetModules() instead.
+frontend/src/lib/api/auth-fetch.ts __resetAuthFetchSessionState
+
+# Go-parity seam: healerActivity.test.ts reads the orchestrator's diagnose.go and
+# auto_executors.go and fails when the healer gains an Action or Category these
+# token lists (the label maps' keys) do not cover, so the Self-healing panel
+# never falls back to showing a new token with its underscores as spaces.
+# Retired by generating the label maps from the Go enums.
+frontend/src/components/pipeline/SelfHealingPanel.tsx ACTION_TOKENS
+frontend/src/components/pipeline/SelfHealingPanel.tsx CATEGORY_TOKENS

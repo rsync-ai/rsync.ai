@@ -23,7 +23,7 @@ RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync.ai}"
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
 # takes both halves from the same commit. Pass RSYNC_REF=main to track the branch.
-RSYNC_REF="${RSYNC_REF:-v0.1.8}"
+RSYNC_REF="${RSYNC_REF:-v0.2.0}"
 # The image tag that pairs with RSYNC_REF. Both halves of an install have to name
 # the same code: the compose file is fetched from RSYNC_REF, and the images that
 # compose file starts are pulled at this tag. Left independent they drift, and did
@@ -347,6 +347,28 @@ generate_secret() {
     exit 1
   fi
   printf '%s' "${raw:0:32}"
+}
+
+# MinIO's KMS key, `rsync-ai-kms:<base64 of 32 random bytes>`: what lets MinIO do
+# the SSE-S3 that minio-mcp asks for on every claim-check put. MinIO checks the
+# format at start and exits on anything else ("invalid secret key format"), and
+# everything that waits on its health then never starts -- so the shape is
+# checked HERE, where the failure can still say what it is. `head -c 32` bounds
+# the INPUT, as in generate_secret: base64 drains it, so no SIGPIPE.
+generate_kms_key() {
+  local b64=""
+  if command -v openssl &>/dev/null; then
+    b64=$(openssl rand -base64 32)
+  else
+    b64=$(head -c 32 /dev/urandom | base64)
+  fi
+  b64=$(printf '%s' "$b64" | LC_ALL=C tr -d '\n\r ')
+  if [[ ! "$b64" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    error "Could not generate MinIO's KMS key (got ${#b64} base64 characters, need 44)."
+    echo "  Install openssl, or report this with your OS and shell version." >&2
+    exit 1
+  fi
+  printf 'rsync-ai-kms:%s' "$b64"
 }
 
 # The provider menu: OpenAI or any OpenAI-compatible endpoint, Ollama, or none.
@@ -753,6 +775,11 @@ prompt_env() {
   # Shared service-to-service secret. Its absence makes the api-gateway internal
   # route 503 (internal_service_not_configured), breaking OAuth token refresh.
   INTERNAL_SERVICE_SECRET=$(generate_secret)
+  # Key for PII mask rules that hash with hmac_sha256 (unset, they refuse to run).
+  # Fresh installs only: on a stack whose hash rules already wrote data, a new
+  # value changes every hash from then on, so it is never backfilled (see
+  # ENV_BACKFILLABLE_SECRETS) and an upgrade never adds it.
+  RSYNC_PII_HASH_SALT=$(generate_secret)
   # Generated HERE, not inline in write_env's heredoc. `KEY=$(generate_secret)`
   # written inside `cat <<EOF` puts the call in a command substitution whose
   # `exit 1` exits only that subshell, and a heredoc's expansions do not set the
@@ -766,6 +793,9 @@ prompt_env() {
   # blob run is handed it, so it is deliberately not MinIO's.
   BLOB_STAGING_ACCESS_KEY=$(generate_secret)
   BLOB_STAGING_SECRET_KEY=$(generate_secret)
+  # MinIO's KMS key, so claim-check objects are encrypted at rest. A plain
+  # assignment for the reason above: its format check must be able to abort.
+  MINIO_KMS_SECRET_KEY=$(generate_kms_key)
 
   info "Secrets generated"
 }
@@ -795,6 +825,8 @@ REDIS_PASSWORD=${REDIS_PASSWORD}
 JWT_SECRET=${JWT_SECRET}
 ENCRYPTION_KEY=${ENCRYPTION_KEY}
 INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET}
+# PII hash key. Never change it: hashes already written stop matching new ones.
+RSYNC_PII_HASH_SALT=${RSYNC_PII_HASH_SALT}
 
 # ── URLs ──────────────────────────────────────────────────────────────────────
 PUBLIC_URL=${PUBLIC_URL}
@@ -842,6 +874,9 @@ AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
 # ── Object Storage (internal MinIO) ───────────────────────────────────────────
 MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
 MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+# MinIO's KMS key (SSE-S3 for claim-check objects). NEVER change or remove it:
+# whatever MinIO encrypted under it becomes unreadable. Back it up with this file.
+MINIO_KMS_SECRET_KEY=${MINIO_KMS_SECRET_KEY}
 # Blob-passthrough staging store (blob-staging), a separate MinIO the connectors reach
 BLOB_STAGING_ACCESS_KEY=${BLOB_STAGING_ACCESS_KEY}
 BLOB_STAGING_SECRET_KEY=${BLOB_STAGING_SECRET_KEY}
@@ -1221,13 +1256,23 @@ build_compose_args() {
 #                            by every client from this same .env
 #   BLOB_STAGING_ACCESS_KEY/SECRET_KEY  the same, for blob-staging; it holds only
 #                            staged blobs that expire in 7 days
+#   MINIO_KMS_SECRET_KEY     added by the version that gave MinIO a KMS key. A
+#                            MinIO that never had one has nothing encrypted under
+#                            one, so a first key strands nothing. (A key that was
+#                            set and then deleted from the .env has already lost
+#                            what it encrypted; a new one loses nothing more, and
+#                            claim-check objects expire in 7 days.) An existing
+#                            value is never replaced -- that WOULD strand data.
 # Deliberately NOT in the list, and reported instead:
 #   POSTGRES_PASSWORD  the database volume was created with the old one; a new
 #                      value locks every service out of the existing data (and
 #                      for bring-your-own Postgres it is someone else's password)
 #   ENCRYPTION_KEY     every saved connection credential is encrypted under the
 #                      old one; a new value makes all of them unreadable
-ENV_BACKFILLABLE_SECRETS="INTERNAL_SERVICE_SECRET JWT_SECRET REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY BLOB_STAGING_ACCESS_KEY BLOB_STAGING_SECRET_KEY"
+#   RSYNC_PII_HASH_SALT  (optional, so never `:?` either) every hash a mask rule
+#                      already wrote was made without it or under the old one;
+#                      a new value makes new hashes of the same input differ
+ENV_BACKFILLABLE_SECRETS="INTERNAL_SERVICE_SECRET JWT_SECRET REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY BLOB_STAGING_ACCESS_KEY BLOB_STAGING_SECRET_KEY MINIO_KMS_SECRET_KEY"
 
 # Every ${VAR:?} in the -f files this install runs with, one per line. The same
 # extraction as scripts/check-env-templates.sh required_vars(). A static grep is
@@ -1318,7 +1363,10 @@ check_env_required() {
     # Into a variable first, for the reason the INTERNAL_SERVICE_SECRET backfill
     # in main spells out: inside a command substitution, generate_secret's
     # `exit 1` would leave an empty value behind instead of stopping the run.
-    secret=$(generate_secret)
+    case "$v" in
+      MINIO_KMS_SECRET_KEY) secret=$(generate_kms_key) ;;
+      *)                    secret=$(generate_secret) ;;
+    esac
     set_env_value "$v" "$secret"
     warn "Added a generated ${v} to ${envf}: this version requires it and the file had no value."
   done

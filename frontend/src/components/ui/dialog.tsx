@@ -7,6 +7,13 @@ import { cn } from "@/lib/utils"
 interface DialogProps {
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  /**
+   * Close on a click outside the panel. Default on. A dialog where the user
+   * types or picks something turns it off, since a stray click would throw the
+   * input away; Escape and X still close it. So does a dialog whose close is an
+   * action (the Transforms step's close is Skip).
+   */
+  closeOnOutsideClick?: boolean
   children: React.ReactNode
 }
 
@@ -62,35 +69,75 @@ function focusableWithin(panel: HTMLElement): HTMLElement[] {
   ).filter((el) => !el.closest("[hidden]") && el.getAttribute("aria-hidden") !== "true")
 }
 
-const Dialog = ({ open, onOpenChange, children }: DialogProps) => {
+/**
+ * The dialogs open right now, oldest first. Every one listens for Escape on the
+ * document, so without this a dialog opened over another (a preview over the
+ * pipeline Transforms step) closed both on one key press.
+ */
+const openDialogs: object[] = []
+
+const Dialog = ({ open, onOpenChange, closeOnOutsideClick = true, children }: DialogProps) => {
   // Hooks run unconditionally (gated on `open`) to satisfy the rules of hooks.
   const close = React.useCallback(() => onOpenChange?.(false), [onOpenChange])
+  // Read at key time, so the effect below runs once per opening: most call sites
+  // pass an inline handler, and re-running on each new one moved this dialog
+  // back to the top of `openDialogs` over a dialog opened after it.
+  const closeRef = React.useRef(close)
+  React.useEffect(() => {
+    closeRef.current = close
+  }, [close])
 
   // Close on Escape and lock background scroll while the dialog is open.
   React.useEffect(() => {
     if (!open) return
+    const self = {}
+    openDialogs.push(self)
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close()
+      // An Escape belongs to the layer on top. Radix layers inside this panel (a
+      // Select's dropdown, a menu, an alert dialog) close themselves in a capture
+      // listener and mark the event handled, and a dialog opened later sits
+      // above this one. Closing can be an action (the Transforms step's close
+      // is Skip), so it must not ride along on a key meant for something else.
+      if (e.key !== "Escape" || e.defaultPrevented) return
+      if (openDialogs[openDialogs.length - 1] !== self) return
+      closeRef.current()
     }
     document.addEventListener("keydown", onKeyDown)
     const prevOverflow = document.body.style.overflow
     document.body.style.overflow = "hidden"
     return () => {
+      openDialogs.splice(openDialogs.indexOf(self), 1)
       document.removeEventListener("keydown", onKeyDown)
       document.body.style.overflow = prevOverflow
     }
-  }, [open, close])
+  }, [open])
+
+  // Whether the press began on the empty area around the panel. A text selection
+  // dragged out of the panel ends there too, and the browser fires that click on
+  // the area, so a click alone would close the dialog mid-select.
+  const pressedOutside = React.useRef(false)
 
   if (!open) return null
 
   return (
     <DialogCloseContext.Provider value={close}>
       <div className="fixed inset-0 z-50">
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50" />
+        {/* This layer covers the whole screen above the dim backdrop (same z,
+            later in the document), so it is the one that gets an outside click:
+            a handler on the backdrop could never fire. `target` is the layer
+            itself only on its empty area, not on the panel or anything in it. */}
         <div
-          className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50"
-          onClick={close}
-        />
-        <div className="fixed inset-0 flex items-center justify-center p-4 z-50">
+          className="fixed inset-0 flex items-center justify-center p-4 z-50"
+          onMouseDown={(e) => {
+            pressedOutside.current = e.target === e.currentTarget
+          }}
+          onClick={(e) => {
+            const outside = pressedOutside.current && e.target === e.currentTarget
+            pressedOutside.current = false
+            if (outside && closeOnOutsideClick) close()
+          }}
+        >
           {children}
         </div>
       </div>
@@ -202,8 +249,11 @@ const DialogContent = React.forwardRef<
         descriptionIds.length > 0 ? descriptionIds.join(" ") : undefined
       }
       tabIndex={-1}
+      // Stops at the window, less the wrapper's p-4, and scrolls: the open
+      // dialog locks the page's own scroll, so a taller panel was cut off.
+      // A call site's own max-h-* or overflow-* wins (twMerge).
       className={cn(
-        "relative z-[60] w-full max-w-lg rounded-lg bg-white p-6 shadow-xl outline-none dark:bg-zinc-900",
+        "relative z-[60] max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-lg bg-white p-6 shadow-xl outline-none dark:bg-zinc-900",
         className
       )}
       {...props}

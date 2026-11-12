@@ -257,7 +257,3 @@ def has_errors(issues: List[ValidationIssue]) -> bool:
 
 def errors_only(issues: List[ValidationIssue]) -> List[ValidationIssue]:
     return [i for i in issues if i.severity == "error"]
-
-
-def warnings_only(issues: List[ValidationIssue]) -> List[ValidationIssue]:
-    return [i for i in issues if i.severity == "warning"]

@@ -13,6 +13,10 @@ import { maskedColumnsNotScanned, type PIIMaskedColumn } from "@/lib/pii/masked-
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+vi.mock("@/components/charts/EChartNoSSR", () => ({ EChartNoSSR: () => <div data-testid="chart" /> }))
+
+// The number on a KPI card: the first paragraph of the card the title names.
+const statValue = (title: string) => screen.getByRole("region", { name: title }).querySelector("p")
 
 beforeAll(() => {
   window.ResizeObserver ||= class {
@@ -100,7 +104,7 @@ describe("PII page: masked by pipelines", () => {
     render(<PIIDashboardPage />)
 
     await screen.findByText("Masked by pipelines")
-    expect(screen.getByTestId("pii-columns-detected")).toHaveTextContent("1")
+    expect(statValue("Columns found")).toHaveTextContent("1")
     expect(screen.getByText("0 from scans · 1 masked by pipelines")).toBeInTheDocument()
 
     const table = screen.getByRole("table", { name: "Columns masked by pipelines" })
@@ -119,7 +123,7 @@ describe("PII page: masked by pipelines", () => {
     render(<PIIDashboardPage />)
 
     await screen.findByRole("table", { name: "Columns masked by pipelines" })
-    expect(screen.getByTestId("pii-columns-detected")).toHaveTextContent("1")
+    expect(statValue("Columns found")).toHaveTextContent("1")
     expect(screen.getByText("1 from scans · 0 masked by pipelines")).toBeInTheDocument()
   })
 
@@ -129,7 +133,7 @@ describe("PII page: masked by pipelines", () => {
     render(<PIIDashboardPage />)
 
     expect(await screen.findByText("No pipeline in this workspace masks or hashes a column.")).toBeInTheDocument()
-    expect(screen.getByTestId("pii-columns-detected")).toHaveTextContent("0")
+    expect(statValue("Columns found")).toHaveTextContent("0")
   })
 
   it("reports a failed read instead of showing nothing masked as fact", async () => {
@@ -168,5 +172,35 @@ describe("maskedColumnsNotScanned", () => {
     ["a blank column is ignored", [masked({ column: "  " })], 0],
   ])("%s", (_name, rules, want) => {
     expect(maskedColumnsNotScanned(scan, rules)).toBe(want)
+  })
+})
+
+// Launch review, PR1: the type card was blank when no scan had run, and an "Audit
+// Log" tab said only "Audit log will be displayed here". Nothing feeds that tab yet,
+// so it is gone until something does, and the card says why it is empty.
+describe("PII page: nothing that reads as unfinished", () => {
+  it("says the type card is empty because no scan has results", async () => {
+    installPageFetch({})
+    render(<PIIDashboardPage />)
+    // "Masked by pipelines" draws before the reads land; the type card only after.
+    expect(await screen.findByText("No scan results yet")).toBeInTheDocument()
+    expect(screen.getByText("Columns a PII scan flags are counted here by type.")).toBeInTheDocument()
+  })
+
+  it("draws the types, not the empty message, once a scan has results", async () => {
+    installPageFetch({ scan: [scanRow("public.users", "email")] })
+    render(<PIIDashboardPage />)
+    await screen.findByText(/1 column found by scans/)
+    expect(screen.queryByText("No scan results yet")).not.toBeInTheDocument()
+  })
+
+  it("has no Audit Log tab", async () => {
+    installPageFetch({})
+    render(<PIIDashboardPage />)
+    await screen.findByText("Masked by pipelines")
+    const tabs = screen.getAllByRole("tab").map((t) => t.textContent)
+    expect(tabs).toEqual(["Overview", "Approvals", "Policies", "Hash functions"])
+    expect(screen.queryByText("Audit log will be displayed here")).not.toBeInTheDocument()
+    expect(screen.getByRole("tablist")).toHaveClass("grid-cols-4")
   })
 })

@@ -19,6 +19,10 @@ _spec = importlib.util.spec_from_file_location("base_connector_scrub", _BC_PATH)
 _bc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_bc)
 
+_SYNC_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "scripts", "mcp-connectors", "sync_log_scrubber.py"
+)
+
 
 # --- scrub_sensitive ---------------------------------------------------------
 
@@ -84,3 +88,23 @@ def test_filter_never_raises_on_bad_record():
     # A non-string msg must not break logging.
     rec = logging.LogRecord("mcp.test", logging.ERROR, __file__, 1, {"obj": 1}, None, None)
     assert _bc.SensitiveDataScrubbingFilter().filter(rec) is True
+
+
+# --- every versioned copy runs this scrubber ---------------------------------
+
+def test_every_versioned_copy_carries_the_canonical_scrubber():
+    # A connector runs its versions/<v>/base_connector.py, not this file.
+    # sync_log_scrubber.py copies the marked block into each one, and nothing
+    # ran its --check, so a fix made here could ship to no connector at all.
+    spec = importlib.util.spec_from_file_location("sync_log_scrubber", _SYNC_PATH)
+    sync = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sync)
+    block = sync.canonical_block()
+    copies = sync.versioned_copies()
+    # A glob that found nothing would pass every copy it did not see.
+    assert any(p.parts[-4:-2] == ("stripe", "versions") for p in copies), copies
+    stale = [str(p) for p in copies if sync.patch(p.read_text(), block) != p.read_text()]
+    assert not stale, (
+        "versioned base_connector.py copies differ from the canonical scrubber block; "
+        f"run python3 scripts/mcp-connectors/sync_log_scrubber.py: {stale}"
+    )

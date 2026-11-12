@@ -69,6 +69,46 @@ describe("layoutGraph", () => {
     expect(bounds.width).toBe(220)
     expect(bounds.height).toBe(40)
   })
+
+  // The Lineage page's layer columns: a model stays in its layer's column whatever it reads.
+  describe("with column bands", () => {
+    it("lines bands up across unconnected parts of the picture", async () => {
+      const layoutGraph = await freshLayout()
+      const bands = new Map([["p1", 0], ["t1", 1], ["p2", 0], ["t2", 1], ["m2", 2], ["lone", 2]])
+      const { positions } = await layoutGraph(
+        [box("p1"), box("t1"), box("p2"), box("t2"), box("m2"), box("lone")],
+        [
+          { from: "p1", to: "t1" },
+          { from: "p2", to: "t2" },
+          { from: "t2", to: "m2" },
+        ],
+        { partitions: bands },
+      )
+      const x = (id: string) => positions.get(id)!.x
+      expect(x("p1")).toBe(x("p2"))
+      expect(x("t1")).toBe(x("t2"))
+      // Linked to nothing, but still in band 2, not stacked in the first column.
+      expect(x("lone")).toBe(x("m2"))
+      expect(x("t1")).toBeGreaterThan(x("p1"))
+      expect(x("m2")).toBeGreaterThan(x("t1"))
+    })
+
+    it("keeps a box in its band when a link points back to an earlier one", async () => {
+      const layoutGraph = await freshLayout()
+      // gold reads late, which sits in a band after it: without bands, gold would move right.
+      const { positions } = await layoutGraph(
+        [box("silver"), box("gold"), box("late")],
+        [
+          { from: "silver", to: "gold" },
+          { from: "late", to: "gold" },
+        ],
+        { partitions: new Map([["silver", 0], ["gold", 1], ["late", 2]]) },
+      )
+      const x = (id: string) => positions.get(id)!.x
+      expect(x("silver")).toBeLessThan(x("gold"))
+      expect(x("gold")).toBeLessThan(x("late"))
+    })
+  })
 })
 
 /** A stand-in Web Worker that answers the way elk-worker does, or fails the way a broken one does. */

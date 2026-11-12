@@ -19,6 +19,31 @@ export interface FeatureFlags {
   // cloud behaviour and is turned off by the API for a deployment that does
   // not enforce plan quotas -- see api-gateway/internal/config/features.go.
   usagePanel: boolean
+
+  // The agent gateway (the MCP server at /api/agent/v1/mcp and its tokens). On
+  // in every edition unless an install sets RSYNC_AGENT_GATEWAY_ENABLED=false
+  // (api-gateway/internal/config/features.go); shown only once /features says so.
+  agentGateway: boolean
+
+  // The in-app assistant ("Ask rsync.ai" in the header). On in every edition
+  // unless an install sets RSYNC_ASSISTANT_ENABLED=false
+  // (api-gateway/internal/config/features.go); shown only once /features says so.
+  assistant: boolean
+
+  // Whether this install allows Ask rsync.ai sample rows at all. Cloud does; the
+  // self-host compose and Helm chart set RSYNC_LLM_SAMPLE_ROWS_ALLOWED=false, and
+  // the gateway then refuses both switches. Hides those switches, nothing more.
+  llmSampleRows: boolean
+
+  // Whether this install has an LLM set up (llm-service's /health, relayed by
+  // /api/v1/features). Gates what only an LLM can back, such as editing a
+  // workflow. Not a rollout flag: off on an install without an LLM.
+  llmConfigured: boolean
+
+  // Whether this install has one workspace (RSYNC_SINGLE_WORKSPACE, the self-host
+  // compose and Helm chart). The gateway refuses a second one; this only stops
+  // the header offering it.
+  singleWorkspace: boolean
 }
 
 /**
@@ -53,6 +78,23 @@ export const DEFAULT_FEATURES: FeatureFlags = {
   // panel off on a self-host; /api/v1/features does that at runtime. The
   // variable exists for a deployment that builds its own image.
   usagePanel: parseBool(process.env.NEXT_PUBLIC_FEATURE_USAGE_PANEL, true),
+
+  // Connect your AI app - OFF until /api/v1/features says the gateway serves it.
+  // No build-time override: the card is useless without the gateway's routes.
+  agentGateway: false,
+
+  // The assistant - OFF until /api/v1/features says the gateway serves it.
+  assistant: false,
+
+  // Sample rows - the cloud behaviour, as usagePanel: /api/v1/features turns it
+  // off on a self-host. Callers wait for that answer (useFlagState).
+  llmSampleRows: true,
+
+  // OFF until /api/v1/features says llm-service has an LLM set up.
+  llmConfigured: false,
+
+  // Cloud: any number of workspaces, until /api/v1/features says otherwise.
+  singleWorkspace: false,
 }
 
 /**
@@ -206,6 +248,11 @@ export async function fetchFeatureFlags(apiUrl: string): Promise<void> {
         monitoringInfra: data.monitoring_infra ?? DEFAULT_FEATURES.monitoringInfra,
         monitoringTraces: data.monitoring_traces ?? DEFAULT_FEATURES.monitoringTraces,
         usagePanel: data.usage_panel ?? DEFAULT_FEATURES.usagePanel,
+        agentGateway: data.agent_gateway === true,
+        assistant: data.assistant === true,
+        llmConfigured: data.llm_configured === true,
+        llmSampleRows: data.llm_sample_rows ?? DEFAULT_FEATURES.llmSampleRows,
+        singleWorkspace: data.single_workspace === true,
       })
     }
   } catch (error) {
@@ -218,21 +265,19 @@ export async function fetchFeatureFlags(apiUrl: string): Promise<void> {
 }
 
 /**
- * Resolution state of the usage panel.
- *
- * 'loading' until the runtime flags arrive. Callers must treat it as NOT
- * visible: the panel reports plan limits, and a deployment that enforces none
- * would otherwise flash a plan meter full of numbers that mean nothing before
- * withdrawing it.
+ * Resolution state of a flag whose surface must not appear on the wrong
+ * deployment: 'loading' until the runtime flags arrive, then 'on' or 'off'.
+ * Callers must treat 'loading' as NOT visible, or a self-host would flash a
+ * cloud surface before withdrawing it.
  */
-export type UsagePanelState = 'loading' | 'on' | 'off'
+export type FlagState = 'loading' | 'on' | 'off'
 
 /**
- * React hook for the usage panel's visibility.
- * Usage: const state = useUsagePanelState()
+ * React hook for one flag's resolution state.
+ * Usage: const state = useFlagState('llmSampleRows')
  */
-export function useUsagePanelState(): UsagePanelState {
-  const [state, setState] = React.useState<UsagePanelState>('loading')
+export function useFlagState(flag: keyof FeatureFlags): FlagState {
+  const [state, setState] = React.useState<FlagState>('loading')
 
   React.useEffect(() => {
     const read = () => {
@@ -240,19 +285,26 @@ export function useUsagePanelState(): UsagePanelState {
         setState('loading')
         return
       }
-      setState(featureFlagsManager.getFlags().usagePanel ? 'on' : 'off')
+      setState(featureFlagsManager.getFlags()[flag] ? 'on' : 'off')
     }
     read()
     return featureFlagsManager.subscribe(read)
-  }, [])
+  }, [flag])
 
   return state
 }
 
 /**
- * Helper to check if monitoring is available
+ * Resolution state of the usage panel. The panel reports plan limits, and a
+ * deployment that enforces none would otherwise flash a plan meter full of
+ * numbers that mean nothing before withdrawing it.
  */
-export function isMonitoringAvailable(): boolean {
-  return featureFlagsManager.isMonitoringEnabled()
-}
+export type UsagePanelState = FlagState
 
+/**
+ * React hook for the usage panel's visibility.
+ * Usage: const state = useUsagePanelState()
+ */
+export function useUsagePanelState(): UsagePanelState {
+  return useFlagState('usagePanel')
+}

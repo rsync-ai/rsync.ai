@@ -79,9 +79,11 @@ place**, so a user who already pulled the connector gets the fix at the version 
 run. A new version by hand is only for a change the maintainers decide is major: bump
 `versions/<v>/`, `latest.json` and `docker-compose.mcp.yml` together.
 
-Regeneration is the exception. The tool generator (REST and GraphQL only) always
-writes a **new** version (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...) and
-moves `latest.json` to it, so regenerating never overwrites a version you fixed by hand.
+Regeneration is the exception. The tool generator (REST and GraphQL only) writes a
+**new** version by default (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...) and
+moves `latest.json` to it, so a default regeneration never overwrites a version you fixed
+by hand. Only the user's explicit overwrite rewrites the current version in place and
+removes its container.
 
 ### 2. Implement Core Methods
 

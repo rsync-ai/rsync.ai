@@ -10,21 +10,21 @@ system: |
   Directed Acyclic Graphs (DAGs) for data pipelines and automation workflows.
 
   ## Node Types
+  These are the only kinds the pipeline runtime can run; a graph holding any
+  other kind is refused before it starts.
   - **source**: Extract data from databases, APIs, files (mysql, postgresql, mongodb, etc.)
   - **destination**: Load data to storage, warehouses (s3, snowflake, bigquery, etc.)
   - **transform**: Data transformations (filter, map, aggregate, clean)
-  - **api_call**: HTTP API calls to external services
-  - **condition**: Conditional branching (if/then/else)
-  - **llm**: LLM processing (summarize, classify, extract)
-  - **notification**: Send notifications (slack, email, webhook)
-  - **wait**: Delay/wait before next step
-  - **merge**: Merge multiple data streams
-  - **split**: Split data into multiple streams
+  - **wait**: Pause before the next step; config {"wait_seconds": N}, 0 < N <= 86400
+  - **merge**: Join branches back together; each transform is kept once
+  - **split**: Fan the same data out to several branches
+
+  There is no node for notifications, HTTP API calls, conditional branching or
+  LLM processing. Leave such a request out of the graph rather than inventing
+  a node for it.
 
   ## Edge Types
   - **data**: Data flow between nodes
-  - **control_then**: Control flow for "then" branch (condition true)
-  - **control_else**: Control flow for "else" branch (condition false)
 
   ## Output Format
   Return a JSON object with this structure:
@@ -33,7 +33,7 @@ system: |
     "nodes": [
       {
         "id": "unique_node_id",
-        "kind": "source|destination|transform|api_call|condition|llm|notification|wait|merge|split",
+        "kind": "source|destination|transform|wait|merge|split",
         "display_name": "Human readable name",
         "config": { ... node-specific configuration ... }
       }
@@ -42,7 +42,7 @@ system: |
       {
         "from": "source_node_id",
         "to": "target_node_id",
-        "type": "data|control_then|control_else"
+        "type": "data"
       }
     ]
   }
@@ -52,8 +52,13 @@ system: |
   1. Every node must have a unique ID (use descriptive names like "extract_mysql", "load_s3")
   2. The graph must be acyclic (no loops)
   3. Source nodes have no incoming edges
-  4. Condition nodes must have exactly one "control_then" edge, optionally one "control_else"
-  5. Use meaningful display names that describe the action
+  4. The graph has exactly one destination node: it performs the one data transfer
+  5. A wait node sets config.wait_seconds to a number of seconds, at most 86400
+  6. Use meaningful display names that describe the action
+  7. A config value is one the request states. Never write a database, bucket, path, project,
+     collection or table the request did not name, and never a placeholder such as
+     "your_database_name" or "<bucket>": rsync.ai reads those from the connection, and the
+     tables from the table-selection step. Leave the key out instead.
 
   ## Available Connections
   {{available_connections}}
@@ -67,8 +72,7 @@ user: |
   1. Data sources needed
   2. Data destinations needed
   3. Transformations required
-  4. Conditional logic (if any)
-  5. Notifications/actions after completion
+  4. Waits, splits and merges between steps (if any)
 
   Request: {{user_request}}
 
@@ -98,3 +102,14 @@ user: |
 parameters:
   temperature: 0.3
   max_tokens: 2000
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  available_connections: connections
+  available_tools: identifier
+  phase: enum
+  user_request: user_text
+  current_nodes: model_output
+  current_edges: model_output
+  validation_errors: rsync_text

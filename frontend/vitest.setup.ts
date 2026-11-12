@@ -13,8 +13,10 @@ configure({ asyncUtilTimeout: 10_000 })
 
 // jsdom does not implement scrollIntoView; components that auto-scroll (e.g.
 // PipelineAccordionView's cardRef.current?.scrollIntoView) would throw an
-// unhandled error under the test environment. Stub it globally.
-if (!Element.prototype.scrollIntoView) {
+// unhandled error under the test environment. Stub it globally. (A test that runs in
+// the node environment — the dashboard PDF, whose font reader rejects jsdom's
+// Uint8Array — has no Element at all.)
+if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = vi.fn()
 }
 
@@ -23,7 +25,7 @@ if (!Element.prototype.scrollIntoView) {
 // without these a click on a <SelectTrigger> throws instead of opening the listbox —
 // which reads in a test as "the option does not exist" rather than as a missing DOM
 // feature. Guarded, so a jsdom that grows a real implementation keeps it.
-if (!Element.prototype.hasPointerCapture) {
+if (typeof Element !== "undefined" && !Element.prototype.hasPointerCapture) {
   Element.prototype.hasPointerCapture = vi.fn(() => false)
   Element.prototype.setPointerCapture = vi.fn()
   Element.prototype.releasePointerCapture = vi.fn()

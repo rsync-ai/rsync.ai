@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { cn } from "@/lib/utils"
 import { ChevronDown, ChevronRight } from "lucide-react"
-import { formatCount, formatDuration } from "@/lib/transform-format"
+import { formatCount } from "@/lib/transform-format"
+import { formatDuration } from "@/lib/duration"
 
 export type TransformExecutionLog = {
   id: string

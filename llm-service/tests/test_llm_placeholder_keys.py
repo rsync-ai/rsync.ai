@@ -459,6 +459,18 @@ class TestRealKeysStillCount:
         assert client_egress_host(make_sync_client()) == "api.openai.com"
         assert client_egress_host(make_async_client()) == "api.openai.com"
 
+    @pytest.mark.parametrize("base_url", ["", "  "], ids=["empty", "blank"])
+    def test_an_empty_base_url_still_goes_to_openai(self, monkeypatch, base_url):
+        """Compose passes OPENAI_BASE_URL through as "" when it is unset. The
+        factories skipped base_url for an empty value, so the SDK read the same
+        variable itself, took the "" as the address, and every call went to a
+        client with no host."""
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", REAL_OPENAI_PROJECT_KEY)
+        monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+        assert client_egress_host(make_sync_client()) == "api.openai.com"
+        assert client_egress_host(make_async_client()) == "api.openai.com"
+
     def test_azure_key(self, monkeypatch):
         monkeypatch.setenv("LLM_PROVIDER", "azure")
         monkeypatch.setenv("AZURE_OPENAI_API_KEY", REAL_AZURE_KEY)

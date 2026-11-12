@@ -80,10 +80,14 @@ func DiagnosePipeline(c *gin.Context) {
 	if err != nil {
 		// Even if the LLM call fails we still return the evidence — that's
 		// useful by itself for on-call.
-		log.Warnf("diagnose: LLM call failed for %s: %v", pipelineID, err)
+		// The error quotes the llm-service body: it goes to the log, scrubbed,
+		// and the browser gets fixed text plus the trace id to find it by.
+		traceID := c.GetString("trace_id")
+		log.WithField("trace_id", traceID).Warnf("diagnose: LLM call failed for %s: %s", pipelineID, llmscrub.Scrub(err.Error()))
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error":    "diagnose_unavailable",
-			"message":  err.Error(),
+			"message":  "The diagnosis model call failed; the evidence below is still accurate. The api-gateway log has the cause under this trace id.",
+			"trace_id": traceID,
 			"evidence": evidence,
 		})
 		return
@@ -176,7 +180,11 @@ func gatherDiagnosisEvidence(database *sql.DB, pipelineID string) (map[string]in
 	// LastError and Details carry free-form probe/recovery error text (arbitrary
 	// %v errors, raw Docker output) — scrub before LLM exposure like every other
 	// free-text field in this evidence map.
-	deps, depAggregate := loadRuntimeDeps(database, pipelineID)
+	// A paused or stopped pipeline's rows are not probed, so a healthy one is not a current
+	// check (markUnprobedDeps); the aggregate is refolded from the marked rows.
+	deps, _ := loadRuntimeDeps(database, pipelineID)
+	markUnprobedDeps(deps, status.String)
+	depAggregate := aggregateDepHealth(deps)
 	for i := range deps {
 		deps[i].LastError = llmscrub.Scrub(deps[i].LastError)
 		for k, v := range deps[i].Details {
@@ -308,6 +316,7 @@ func callDiagnoseLLM(ctx context.Context, pipelineID string, evidence map[string
 		return nil, http.StatusInternalServerError, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(httpReq)
 	for k, v := range telemetry.InjectTraceToHeaders(ctx) {
 		httpReq.Header.Set(k, v)
 	}

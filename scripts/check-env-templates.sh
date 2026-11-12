@@ -59,7 +59,7 @@ anchor_kafka_vars() {
 }
 
 # Four BYO variables live outside the anchor because they are not client
-# security: the broker ADDRESS is declared per-service (docker-compose.yml:1001,
+# security: the broker ADDRESS is declared per-service (docker-compose.yml:1002,
 # :1180), and the topic-shape knobs are read only by the topic bootstrapper and
 # the orchestrator (:255-256, :1022-1023). They are named literally, and the
 # self-test below proves each one is really in a shipped compose file — a

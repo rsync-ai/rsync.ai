@@ -92,7 +92,7 @@ describe("workspace roles — can(role, action)", () => {
 
 // Regression: the saved-query and schedule controls shipped ungated. On prod a real
 // viewer saw enabled Schedule / Edit / Delete buttons on both the Explorer panel and
-// /explorer/schedules; every one of them 403'd server-side ("insufficient workspace
+// /models; every one of them 403'd server-side ("insufficient workspace
 // role"), so the boundary held — but the UI invited a dead end. These pin the two
 // gates the controls now use.
 describe("workspace roles — saved queries & schedules", () => {

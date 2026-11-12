@@ -15,7 +15,6 @@ VERSION: 2.0.0
 
 import os
 import json
-import asyncio
 import shutil
 import logging
 from typing import Dict, Any, Optional, List
@@ -161,6 +160,8 @@ COPY . .
 # never bundled per-connector (anti-drift). Required for database/data_warehouse
 # connectors to import it at runtime; harmless otherwise.
 COPY --from=shared warehouse_adapters.py /app/warehouse_adapters.py
+# Stable batch paging for SQL sources; the SQL export fails without it.
+COPY --from=shared sql_paging.py /app/sql_paging.py
 
 # Expose MCP port
 EXPOSE 8000
@@ -214,9 +215,6 @@ class DeploymentService:
         self._docker_builder = None
         self._version_manager = None
         
-        # Status callback
-        self._status_callback = None
-        
         logger.info(f"DeploymentService initialized with connectors_path: {self.connectors_path}")
     
     @property
@@ -234,16 +232,10 @@ class DeploymentService:
             ConnectorVersionManager, _ = _get_version_manager()
             self._version_manager = ConnectorVersionManager(str(self.connectors_path))
         return self._version_manager
-    
-    def set_status_callback(self, callback):
-        """Set callback for status updates"""
-        self._status_callback = callback
-    
+
     def _update_status(self, status: DeploymentStatus, details: Dict = None):
         """Update deployment status"""
         logger.info(f"Deployment status: {status.value}")
-        if self._status_callback:
-            self._status_callback(status, details or {})
     
     async def deploy(
         self,
@@ -553,14 +545,11 @@ class DeploymentService:
             # CAPABILITIES-ARCHIVE.md. base_connector.py still bundles (above): it
             # uses a different runtime-dedupe pattern, out of scope here.
 
-            # Copy oauth helpers into the build context (required for OAuth2 connectors)
-            oauth_dir = self.connectors_path / "oauth"
-            if not oauth_dir.exists():
-                oauth_dir = self.connectors_path.parent / "oauth"
-            if oauth_dir.exists() and oauth_dir.is_dir():
-                for p in oauth_dir.glob("*.py"):
-                    artifacts_dict[f"oauth/{p.name}"] = p.read_text()
-            
+            # No oauth/ helpers: the gateway injects the OAuth token into the
+            # connection config and the orchestrator refreshes it, so a
+            # connector never imports the token store
+            # (test_dead_connector_layers_stay_deleted forbids a copy).
+
             # Save to versioned path
             version_path = self.version_manager.save_to_versioned_path(
                 connector_name,
@@ -591,9 +580,8 @@ class DeploymentService:
 
             # Register OAuth provider in shared/mcp-connectors/oauth/providers.json.
             # The agentic /v1/generate path runs through DeploymentService and
-            # previously skipped this — the upsert lived only in
-            # ConnectorArtifacts.save_to_directory (orchestrator) and the session
-            # fast-path, neither of which this path invokes. Result: OAuth-capable
+            # previously skipped this — the upsert lived only in the session
+            # fast-path, which this path does not invoke. Result: OAuth-capable
             # connectors got metadata.json oauth fields but were never added to
             # providers.json, so api-gateway's "Connect with <provider>" stayed
             # unavailable. Read from metadata.json (already on disk) and upsert.
@@ -673,16 +661,6 @@ class DeploymentService:
                 shutil.copy2(str(base_connector_src), str(base_connector_dest))
                 logger.debug(f"Copied base_connector.py to build context")
 
-            # Copy oauth helpers into the build context (required for OAuth2 connectors)
-            oauth_dir = self.connectors_path / "oauth"
-            if oauth_dir.exists() and oauth_dir.is_dir():
-                try:
-                    import shutil
-                    shutil.copytree(str(oauth_dir), str(output_dir / "oauth"), dirs_exist_ok=True)
-                    logger.debug("Copied oauth/ to build context")
-                except Exception as e:
-                    logger.warning(f"Failed to copy oauth/ to build context: {e}")
-            
             # Download logo for the connector
             await self._download_logo_to_path(artifacts.name, output_dir)
             
@@ -880,68 +858,3 @@ class DeploymentService:
                 success = False
         
         return success
-    
-    async def list_deployed(self) -> List[Dict[str, Any]]:
-        """List all deployed connectors.
-
-        Connectors use the versioned layout (``latest.json`` at root +
-        ``versions/<current_version>/...``); there are no root copies of
-        connector.py/metadata.json. Resolve each connector's current versioned
-        dir via the shared resolver rather than reading root-level files —
-        otherwise JIT-generated connectors (versioned-only) are silently
-        under-reported. iter_connector_dirs also finds nested connectors
-        (e.g. database/mysql, storage/aws-s3) the old top-level iterdir missed.
-        """
-        connectors: List[Dict[str, Any]] = []
-
-        try:
-            if not self.connectors_path.exists():
-                return connectors
-            from src.utils.connector_paths import (
-                iter_connector_dirs,
-                resolve_current_dir,
-                resolve_current_version,
-            )
-            for d in iter_connector_dirs(self.connectors_path):
-                cur = resolve_current_dir(d)
-                if not (cur / "connector.py").exists():
-                    continue
-                info: Dict[str, Any] = {
-                    "name": d.name,
-                    "path": str(d),
-                    "has_dockerfile": (cur / "Dockerfile").exists(),
-                    "has_metadata": (cur / "metadata.json").exists(),
-                }
-
-                # Load metadata if available
-                meta_path = cur / "metadata.json"
-                if meta_path.exists():
-                    try:
-                        metadata = json.loads(meta_path.read_text())
-                        info["display_name"] = metadata.get("name", d.name)
-                        info["version"] = metadata.get(
-                            "version", resolve_current_version(d) or "unknown"
-                        )
-                        info["category"] = metadata.get("category", "unknown")
-                    except Exception:
-                        pass
-
-                connectors.append(info)
-
-        except Exception as e:
-            logger.error(f"Failed to list connectors: {e}")
-
-        return connectors
-    
-    def deploy_sync(
-        self,
-        artifacts: ConnectorArtifacts,
-        build_docker: bool = True,
-        start_container: bool = True,
-    ) -> DeploymentResult:
-        """Synchronous wrapper for deploy"""
-        return asyncio.run(self.deploy(
-            artifacts,
-            build_docker=build_docker,
-            start_container=start_container
-        ))

@@ -16,7 +16,7 @@ not a doc:
     a schema that was never created. In Kubernetes it then wedges rather than
     crashes: readiness is /ready, which pings the pool and asserts SchemaReady
     (main.go:646), so the replica never goes Ready -- while liveness is
-    deliberately the static /health (api-gateway.yaml:212-218), so nothing
+    deliberately the static /health (api-gateway.yaml:212-216), so nothing
     restarts it either. The pod sits at 0/1 indefinitely, the Deployment never
     reports Available, and `helm install --wait` times out with no error naming
     the database. Quiet, not loud: the operator gets a timeout, not a cause.

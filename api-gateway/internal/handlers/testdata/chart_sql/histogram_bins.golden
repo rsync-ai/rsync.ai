@@ -1,0 +1,123 @@
+# settings: {"version":2,"type":"histogram","roles":{"x":[{"column":"amount","bins":10}]}}
+
+-- postgres
+SELECT b."rsync_lo" + b."rsync_bin" * b."rsync_w" AS "amount", b."rsync_w" AS "rsync_bin_width", COUNT(*) AS "count"
+FROM (
+SELECT CASE WHEN s."rsync_w" = 0 THEN 0 WHEN FLOOR((s."rsync_v" - s."rsync_lo") / NULLIF(s."rsync_w", 0)) >= 10 THEN 9 ELSE FLOOR((s."rsync_v" - s."rsync_lo") / NULLIF(s."rsync_w", 0)) END AS "rsync_bin", s."rsync_lo", s."rsync_w"
+FROM (
+SELECT src."amount" AS "rsync_v", MIN(src."amount") OVER () AS "rsync_lo", (MAX(src."amount") OVER () - MIN(src."amount") OVER ()) * 1.0 / 10 AS "rsync_w"
+FROM "gold"."orders" src
+WHERE src."amount" IS NOT NULL AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+) s
+) b
+GROUP BY b."rsync_bin", b."rsync_lo", b."rsync_w"
+ORDER BY b."rsync_bin" ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT b.`rsync_lo` + b.`rsync_bin` * b.`rsync_w` AS `amount`, b.`rsync_w` AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM (
+SELECT CASE WHEN s.`rsync_w` = 0 THEN 0 WHEN FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) >= 10 THEN 9 ELSE FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) END AS `rsync_bin`, s.`rsync_lo`, s.`rsync_w`
+FROM (
+SELECT src.`amount` AS `rsync_v`, MIN(src.`amount`) OVER () AS `rsync_lo`, (MAX(src.`amount`) OVER () - MIN(src.`amount`) OVER ()) * 1.0 / 10 AS `rsync_w`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+) s
+) b
+GROUP BY b.`rsync_bin`, b.`rsync_lo`, b.`rsync_w`
+ORDER BY b.`rsync_bin` ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) b.[rsync_lo] + b.[rsync_bin] * b.[rsync_w] AS [amount], b.[rsync_w] AS [rsync_bin_width], COUNT_BIG(*) AS [count]
+FROM (
+SELECT CASE WHEN s.[rsync_w] = 0 THEN 0 WHEN FLOOR((s.[rsync_v] - s.[rsync_lo]) / NULLIF(s.[rsync_w], 0)) >= 10 THEN 9 ELSE FLOOR((s.[rsync_v] - s.[rsync_lo]) / NULLIF(s.[rsync_w], 0)) END AS [rsync_bin], s.[rsync_lo], s.[rsync_w]
+FROM (
+SELECT src.[amount] AS [rsync_v], MIN(src.[amount]) OVER () AS [rsync_lo], (MAX(src.[amount]) OVER () - MIN(src.[amount]) OVER ()) * 1.0 / 10 AS [rsync_w]
+FROM [gold].[orders] src
+WHERE src.[amount] IS NOT NULL AND src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+) s
+) b
+GROUP BY b.[rsync_bin], b.[rsync_lo], b.[rsync_w]
+ORDER BY b.[rsync_bin] ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT b.`rsync_lo` + b.`rsync_bin` * b.`rsync_w` AS `amount`, b.`rsync_w` AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM (
+SELECT CASE WHEN s.`rsync_w` = 0 THEN 0 WHEN FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) >= 10 THEN 9 ELSE FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) END AS `rsync_bin`, s.`rsync_lo`, s.`rsync_w`
+FROM (
+SELECT src.`amount` AS `rsync_v`, MIN(src.`amount`) OVER () AS `rsync_lo`, (MAX(src.`amount`) OVER () - MIN(src.`amount`) OVER ()) * 1.0 / 10 AS `rsync_w`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+) s
+) b
+GROUP BY b.`rsync_bin`, b.`rsync_lo`, b.`rsync_w`
+ORDER BY b.`rsync_bin` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT b."RSYNC_LO" + b."RSYNC_BIN" * b."RSYNC_W" AS "AMOUNT", b."RSYNC_W" AS "RSYNC_BIN_WIDTH", COUNT(*) AS "COUNT"
+FROM (
+SELECT CASE WHEN s."RSYNC_W" = 0 THEN 0 WHEN FLOOR((s."RSYNC_V" - s."RSYNC_LO") / NULLIF(s."RSYNC_W", 0)) >= 10 THEN 9 ELSE FLOOR((s."RSYNC_V" - s."RSYNC_LO") / NULLIF(s."RSYNC_W", 0)) END AS "RSYNC_BIN", s."RSYNC_LO", s."RSYNC_W"
+FROM (
+SELECT src."AMOUNT" AS "RSYNC_V", MIN(src."AMOUNT") OVER () AS "RSYNC_LO", (MAX(src."AMOUNT") OVER () - MIN(src."AMOUNT") OVER ()) * 1.0 / 10 AS "RSYNC_W"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+) s
+) b
+GROUP BY b."RSYNC_BIN", b."RSYNC_LO", b."RSYNC_W"
+ORDER BY b."RSYNC_BIN" ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT b.`rsync_lo` + b.`rsync_bin` * b.`rsync_w` AS `amount`, b.`rsync_w` AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM (
+SELECT CASE WHEN s.`rsync_w` = 0 THEN 0 WHEN FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) >= 10 THEN 9 ELSE FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) END AS `rsync_bin`, s.`rsync_lo`, s.`rsync_w`
+FROM (
+SELECT src.`amount` AS `rsync_v`, MIN(src.`amount`) OVER () AS `rsync_lo`, (MAX(src.`amount`) OVER () - MIN(src.`amount`) OVER ()) * 1.0 / 10 AS `rsync_w`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+) s
+) b
+GROUP BY b.`rsync_bin`, b.`rsync_lo`, b.`rsync_w`
+ORDER BY b.`rsync_bin` ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT b.`rsync_lo` + b.`rsync_bin` * b.`rsync_w` AS `amount`, b.`rsync_w` AS `rsync_bin_width`, COUNT(*) AS `count`
+FROM (
+SELECT CASE WHEN s.`rsync_w` = 0 THEN 0 WHEN FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) >= 10 THEN 9 ELSE FLOOR((s.`rsync_v` - s.`rsync_lo`) / NULLIF(s.`rsync_w`, 0)) END AS `rsync_bin`, s.`rsync_lo`, s.`rsync_w`
+FROM (
+SELECT src.`amount` AS `rsync_v`, MIN(src.`amount`) OVER () AS `rsync_lo`, (MAX(src.`amount`) OVER () - MIN(src.`amount`) OVER ()) * 1.0 / 10 AS `rsync_w`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL
+) s
+) b
+GROUP BY b.`rsync_bin`, b.`rsync_lo`, b.`rsync_w`
+ORDER BY b.`rsync_bin` ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT b."RSYNC_LO" + b."RSYNC_BIN" * b."RSYNC_W" AS "AMOUNT", b."RSYNC_W" AS "RSYNC_BIN_WIDTH", COUNT(*) AS "COUNT"
+FROM (
+SELECT CASE WHEN s."RSYNC_W" = 0 THEN 0 WHEN FLOOR((s."RSYNC_V" - s."RSYNC_LO") / NULLIF(s."RSYNC_W", 0)) >= 10 THEN 9 ELSE FLOOR((s."RSYNC_V" - s."RSYNC_LO") / NULLIF(s."RSYNC_W", 0)) END AS "RSYNC_BIN", s."RSYNC_LO", s."RSYNC_W"
+FROM (
+SELECT src."AMOUNT" AS "RSYNC_V", MIN(src."AMOUNT") OVER () AS "RSYNC_LO", (MAX(src."AMOUNT") OVER () - MIN(src."AMOUNT") OVER ()) * 1.0 / 10 AS "RSYNC_W"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL
+) s
+) b
+GROUP BY b."RSYNC_BIN", b."RSYNC_LO", b."RSYNC_W"
+ORDER BY b."RSYNC_BIN" ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

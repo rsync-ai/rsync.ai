@@ -28,6 +28,15 @@ const adapterRunFailedPath = "/api/v1/internal/explorer/models/:id/run-failed"
 
 const runFailedHandler = "RecordSavedQueryModelRunFailureInternal"
 
+// The adapter lists the models below a finished run by posting to this path
+// (backend-temporal-adapter/internal/workflows/model_next_hop.go,
+// ListDownstreamModelsActivity), for the same reason and with the same failure if it
+// drifts: every hop is a 404 the adapter retries for its horizon and then gives up on,
+// and no model below a run rebuilds from it.
+const adapterDownstreamPath = "/api/v1/internal/explorer/models/:id/downstream"
+
+const downstreamHandler = "ListSavedQueryModelDownstreamInternal"
+
 // TestRunFailedRouteIsRegisteredBehindTheInternalSecret reads the route out of main.go,
 // where the router is built inline and cannot be called from a test, then serves that
 // exact registration with the real middleware and handler. The syntax check is what
@@ -35,11 +44,24 @@ const runFailedHandler = "RecordSavedQueryModelRunFailureInternal"
 // the group's chain at registration, so a later Use never reaches it); the served
 // requests prove what the adapter's URL gets back.
 func TestRunFailedRouteIsRegisteredBehindTheInternalSecret(t *testing.T) {
+	serveInternalRoute(t, runFailedHandler, adapterRunFailedPath, handlers.RecordSavedQueryModelRunFailureInternal,
+		`{"schedule_id":"dddddddd-0000-4000-8000-000000000002","error":"x","started_at":"2026-09-16T10:00:00Z"}`)
+}
+
+// TestDownstreamRouteIsRegisteredBehindTheInternalSecret is the same check for the next
+// hop's route.
+func TestDownstreamRouteIsRegisteredBehindTheInternalSecret(t *testing.T) {
+	serveInternalRoute(t, downstreamHandler, adapterDownstreamPath, handlers.ListSavedQueryModelDownstreamInternal,
+		`{"run_id":"dddddddd-0000-4000-8000-000000000003","execution_id":"","depth":0}`)
+}
+
+func serveInternalRoute(t *testing.T, handler, adapterPath string, h gin.HandlerFunc, body string) {
+	t.Helper()
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
 	}
-	prefix, rel, problem := runFailedRouteWiring(string(src))
+	prefix, rel, problem := internalRouteWiring(string(src), handler, adapterPath)
 	if problem != "" {
 		t.Fatal(problem)
 	}
@@ -48,15 +70,14 @@ func TestRunFailedRouteIsRegisteredBehindTheInternalSecret(t *testing.T) {
 	r := gin.New()
 	group := r.Group(prefix)
 	group.Use(handlers.InternalServiceMiddleware())
-	group.POST(rel, handlers.RecordSavedQueryModelRunFailureInternal)
+	group.POST(rel, h)
 
 	prevDB := db.DB
 	db.DB = nil
 	t.Cleanup(func() { db.DB = prevDB })
 
 	const modelID = "dddddddd-0000-4000-8000-000000000001"
-	adapterURL := strings.Replace(adapterRunFailedPath, ":id", modelID, 1)
-	body := `{"schedule_id":"dddddddd-0000-4000-8000-000000000002","error":"x","started_at":"2026-09-16T10:00:00Z"}`
+	adapterURL := strings.Replace(adapterPath, ":id", modelID, 1)
 	cases := []struct {
 		name, configured, header, path string
 		want                           int
@@ -70,7 +91,7 @@ func TestRunFailedRouteIsRegisteredBehindTheInternalSecret(t *testing.T) {
 		{"right header reaches the handler", "run-failed-route-secret", "run-failed-route-secret", adapterURL, http.StatusServiceUnavailable, "database not available"},
 		// Control: the same engine answers 404 for a path it does not have, so the
 		// refusals above come from a route that matched, not from a missing one.
-		{"an unregistered path is 404", "run-failed-route-secret", "", strings.TrimSuffix(adapterURL, "-failed") + "-failure", http.StatusNotFound, ""},
+		{"an unregistered path is 404", "run-failed-route-secret", "", adapterURL + "-x", http.StatusNotFound, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,8 +119,8 @@ func TestRunFailedRouteIsRegisteredBehindTheInternalSecret(t *testing.T) {
 	}
 }
 
-// The reader has to reject each wrong wiring, or the check above proves nothing.
-func TestRunFailedRouteWiringReaderRejectsWrongWiring(t *testing.T) {
+// The reader has to reject each wrong wiring, or the checks above prove nothing.
+func TestInternalRouteWiringReaderRejectsWrongWiring(t *testing.T) {
 	const ok = `package main
 func main() {
 	r := gin.Default()
@@ -126,28 +147,28 @@ func main() {
 		"in a function literal":  strings.Replace(ok, route, "func() { "+route+" }()", 1),
 		"registered as GET":      strings.Replace(ok, route, strings.Replace(route, "internal.POST", "internal.GET", 1), 1),
 	}
-	if prefix, rel, problem := runFailedRouteWiring(ok); problem != "" || prefix+rel != adapterRunFailedPath {
+	if prefix, rel, problem := internalRouteWiring(ok, runFailedHandler, adapterRunFailedPath); problem != "" || prefix+rel != adapterRunFailedPath {
 		t.Fatalf("reader rejects correct wiring: %q (%s%s)", problem, prefix, rel)
 	}
 	for name, src := range controls {
 		if src == ok {
 			t.Fatalf("control %q did not change the source", name)
 		}
-		if _, _, problem := runFailedRouteWiring(src); problem == "" {
+		if _, _, problem := internalRouteWiring(src, runFailedHandler, adapterRunFailedPath); problem == "" {
 			t.Errorf("reader accepts wrong wiring %q", name)
 		}
 	}
 }
 
-// runFailedRouteWiring finds, in func main of src, the one unconditional
-// X.POST("<path>", handlers.RecordSavedQueryModelRunFailureInternal) and returns the
-// group prefix X was created with and the path it registers. problem is non-empty when
-// the route is missing, registered more than once, not under adapterRunFailedPath, or
-// not preceded by X.Use(handlers.InternalServiceMiddleware()).
+// internalRouteWiring finds, in func main of src, the one unconditional
+// X.POST("<path>", handlers.<handler>) and returns the group prefix X was created with
+// and the path it registers. problem is non-empty when the route is missing, registered
+// more than once, not under adapterPath, or not preceded by
+// X.Use(handlers.InternalServiceMiddleware()).
 //
 // Only statements that always run are read: main's own statements and plain { } blocks.
 // A registration inside an if, a loop or a function literal is treated as absent.
-func runFailedRouteWiring(src string) (prefix, rel, problem string) {
+func internalRouteWiring(src, handler, adapterPath string) (prefix, rel, problem string) {
 	file, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
 	if err != nil {
 		return "", "", "parse main.go: " + err.Error()
@@ -203,23 +224,23 @@ func runFailedRouteWiring(src string) (prefix, rel, problem string) {
 				switch {
 				case sel.Sel.Name == "Use" && len(call.Args) == 1 && isHandlersCall(call.Args[0], "InternalServiceMiddleware"):
 					secured[recv.Name] = true
-				case len(call.Args) == 2 && isHandlersRef(call.Args[1], runFailedHandler):
+				case len(call.Args) == 2 && isHandlersRef(call.Args[1], handler):
 					registrations++
 					if sel.Sel.Name != http.MethodPost {
-						problem = "main.go registers " + runFailedHandler + " with " + sel.Sel.Name + ", want POST"
+						problem = "main.go registers " + handler + " with " + sel.Sel.Name + ", want POST"
 						return
 					}
 					path, ok := stringLit(call.Args[0])
 					if !ok {
-						problem = "main.go registers " + runFailedHandler + " on a path that is not a string literal"
+						problem = "main.go registers " + handler + " on a path that is not a string literal"
 						return
 					}
 					if _, known := groups[recv.Name]; !known {
-						problem = "main.go registers " + runFailedHandler + " on " + recv.Name + ", which is not a route group created in main"
+						problem = "main.go registers " + handler + " on " + recv.Name + ", which is not a route group created in main"
 						return
 					}
 					if !secured[recv.Name] {
-						problem = "main.go registers " + runFailedHandler + " on group " + recv.Name + " before (or without) " + recv.Name + ".Use(handlers.InternalServiceMiddleware())"
+						problem = "main.go registers " + handler + " on group " + recv.Name + " before (or without) " + recv.Name + ".Use(handlers.InternalServiceMiddleware())"
 						return
 					}
 					routeGroup, routePath = recv.Name, path
@@ -232,13 +253,13 @@ func runFailedRouteWiring(src string) (prefix, rel, problem string) {
 	case problem != "":
 		return "", "", problem
 	case registrations == 0:
-		return "", "", "main.go never registers " + runFailedHandler + " unconditionally in func main"
+		return "", "", "main.go never registers " + handler + " unconditionally in func main"
 	case registrations > 1:
-		return "", "", "main.go registers " + runFailedHandler + " " + strconv.Itoa(registrations) + " times"
+		return "", "", "main.go registers " + handler + " " + strconv.Itoa(registrations) + " times"
 	}
 	prefix = groups[routeGroup]
-	if prefix+routePath != adapterRunFailedPath {
-		return "", "", "main.go serves " + runFailedHandler + " at " + prefix + routePath + ", but the adapter posts to " + adapterRunFailedPath
+	if prefix+routePath != adapterPath {
+		return "", "", "main.go serves " + handler + " at " + prefix + routePath + ", but the adapter posts to " + adapterPath
 	}
 	return prefix, routePath, ""
 }

@@ -4,12 +4,12 @@ The async scan (``pii.scan.request``) is handed column names and declared types
 and nothing else: no row value leaves the source for it. So the question it can
 answer is what a column is *meant* to hold, read from its name.
 
-The vocabulary is the API gateway's ``isPIIColumnName``
-(api-gateway/internal/handlers/connections.go), which preview redaction already
-uses, so a column the preview hides is the column the scan reports. Its tests
-(pii_column_name_test.go) pin the false positives that shaped it; the same
-cases are pinned here in test_pii_scan_names_only.py. Adding a keyword to one
-without the other makes the two screens disagree about the same column.
+The vocabulary is ``mask.IsPIIColumnName`` (shared/go/sqlexec/mask/mask.go),
+which preview redaction already uses, so a column the preview hides is the
+column the scan reports. Its tests (mask_test.go) pin the false positives that
+shaped it; the same cases are pinned here in test_pii_scan_names_only.py.
+Adding a keyword to one without the other makes the two screens disagree about
+the same column.
 """
 
 import re

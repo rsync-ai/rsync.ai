@@ -1,0 +1,40 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M23.1 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 232.5L560 232.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 198.5L560 198.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 164.5L560 164.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 130.5L560 130.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 96.5L560 96.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 62.5L560 62.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M23.1 28.5L560 28.5" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:Inter;" y="-3.0250000000000004" transform="translate(23.1 13)" fill="#71717a">Count</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(291.55 288.95)" fill="#71717a">rate</text>
+<path d="M23.1 266.5L560 266.5" fill="none" pointer-events="visible" stroke="#e4e4e7" stroke-linecap="round" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 265.95)" fill="#71717a">0</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 231.9571)" fill="#71717a">3</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 197.9643)" fill="#71717a">6</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 163.9714)" fill="#71717a">9</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 129.9786)" fill="#71717a">12</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 95.9857)" fill="#71717a">15</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 61.9929)" fill="#71717a">18</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:Inter;" transform="translate(15.1 28)" fill="#71717a">21</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(112.5833 273.95)" fill="#71717a">0.1–0.2</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(291.55 273.95)" fill="#71717a">0.2–0.3</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(470.5167 273.95)" fill="#71717a">0.3–0.4</text>
+<path d="M23.6 265.5l178 0l0 -78.3l-178 0Z" fill="#5071de" stroke="#ffffff" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M202.6 265.5l178 0l0 -214.3l-178 0Z" fill="#5071de" stroke="#ffffff" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M381.5 265.5l178 0l0 -123.6l-178 0Z" fill="#5071de" stroke="#ffffff" ecmeta_series_index="0" ecmeta_data_index="2" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+
+]]>
+
+</style>
+</svg>

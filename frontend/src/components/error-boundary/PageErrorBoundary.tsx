@@ -30,8 +30,10 @@ export function PageErrorBoundary({
     console.error("[PageErrorBoundary]", { message: error.message, digest: error.digest, error })
   }, [error])
 
+  // Its own `@container`: app/error.tsx renders this outside DashboardShell's
+  // page frame, where a container variant would otherwise never match.
   return (
-    <div className="min-h-[60vh] flex items-center justify-center p-8">
+    <div className="@container min-h-[60vh] flex items-center justify-center p-8">
       <Card className="w-full max-w-xl p-8 border-zinc-200 dark:border-zinc-800">
         <div className="text-center">
           <div className="text-6xl">⚠️</div>
@@ -42,7 +44,7 @@ export function PageErrorBoundary({
             {error.message || "Unknown error"}
           </div>
 
-          <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-center">
+          <div className="mt-6 flex flex-col gap-3 @md:flex-row @md:justify-center">
             <Button onClick={reset} className="bg-gradient-to-r from-violet-600 to-indigo-600">
               Try Again
             </Button>

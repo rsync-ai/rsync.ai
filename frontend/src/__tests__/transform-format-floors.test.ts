@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { formatAge, formatDuration } from "@/lib/transform-format"
+import { formatRelativeTime as formatAge } from "@/lib/utils"
+import { formatDuration } from "@/lib/duration"
 
 // #56: the transform panel's freshness rounded ("16h ago") while the pipeline
 // and execution pages floored the same moment ("15h ago"). #37's class too:
 // a rounded remainder printed "2m 60s".
-describe("transform-format floors like the rest of the app", () => {
+describe("ages and durations floor, on every panel", () => {
   const NOW = Date.parse("2026-09-18T12:00:00Z")
   beforeEach(() => {
     vi.useFakeTimers()

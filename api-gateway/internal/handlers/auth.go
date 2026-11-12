@@ -19,6 +19,7 @@ import (
 
 	sharedcrypto "github.com/rsync-ai/shared/crypto"
 
+	"api-gateway/internal/config"
 	"api-gateway/internal/db"
 	"api-gateway/internal/email"
 	"api-gateway/internal/identity"
@@ -185,6 +186,9 @@ type AuthResponse struct {
 	Token         string `json:"token"`
 	ExpiresAt     int64  `json:"expires_at"`
 	EmailVerified bool   `json:"email_verified"`
+	// JoinedWorkspaceID is the team workspace sign-up joined: the install
+	// workspace in single-workspace mode, or the one a team invite named.
+	JoinedWorkspaceID string `json:"joined_workspace_id,omitempty"`
 }
 
 // stampLastLogin records that this user just authenticated.
@@ -414,13 +418,7 @@ func acceptWorkspaceInviteAtSignup(database *sql.DB, token, userID, userEmail st
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	var workspaceID, role string
-	err = tx.QueryRow(
-		`UPDATE workspace_invites SET status = 'accepted', accepted_at = NOW(), accepted_by = $1
-		WHERE token = $2 AND status = 'pending' AND expires_at > NOW() AND lower(email) = lower($3)
-		RETURNING workspace_id, role`,
-		userID, token, userEmail,
-	).Scan(&workspaceID, &role)
+	workspaceID, role, err := claimWorkspaceInvite(tx, token, userID, userEmail)
 	if err == sql.ErrNoRows {
 		return "", "", nil
 	}
@@ -428,16 +426,27 @@ func acceptWorkspaceInviteAtSignup(database *sql.DB, token, userID, userEmail st
 		return "", "", err
 	}
 
-	if _, err := tx.Exec(
-		`INSERT INTO workspace_members (workspace_id, user_id, role)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (workspace_id, user_id) DO NOTHING`,
-		workspaceID, userID, role,
-	); err != nil {
+	if err := tx.Commit(); err != nil {
 		return "", "", err
 	}
+	return workspaceID, role, nil
+}
 
-	if err := tx.Commit(); err != nil {
+// claimWorkspaceInvite consumes a pending team invite addressed to userEmail and
+// joins userID to its workspace with its role, on the caller's transaction.
+// sql.ErrNoRows means the claim matched nothing: consumed, expired or addressed
+// to someone else since validation.
+func claimWorkspaceInvite(tx *sql.Tx, token, userID, userEmail string) (string, string, error) {
+	var workspaceID, role string
+	if err := tx.QueryRow(
+		`UPDATE workspace_invites SET status = 'accepted', accepted_at = NOW(), accepted_by = $1
+		WHERE token = $2 AND status = 'pending' AND expires_at > NOW() AND lower(email) = lower($3)
+		RETURNING workspace_id, role`,
+		userID, token, userEmail,
+	).Scan(&workspaceID, &role); err != nil {
+		return "", "", err
+	}
+	if err := joinWorkspace(tx, workspaceID, userID, role); err != nil {
 		return "", "", err
 	}
 	return workspaceID, role, nil
@@ -467,7 +476,8 @@ func (h *AuthHandler) Register(c *gin.Context) {
 
 	// Check registration mode
 	inviteToken := strings.TrimSpace(c.Query("invite"))
-	registrationMode, err := getInstanceSetting(h.db, "registration_mode", "open")
+	workspaceInviteToken := strings.TrimSpace(c.Query("workspace_invite"))
+	registrationMode, err := effectiveRegistrationMode(h.db)
 	if err != nil {
 		// We could not read the policy, so we do not know whether this instance
 		// accepts self-service signups. Refuse rather than assume "open": the
@@ -482,11 +492,8 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 
-	if registrationMode == "invite_only" && inviteToken == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":   "invite_required",
-			"message": "Registration is invite-only. Please use an invite link.",
-		})
+	if registrationMode == "invite_only" && !holdsSignupInvite(inviteToken, workspaceInviteToken) {
+		respondInviteRequired(c)
 		return
 	}
 
@@ -533,7 +540,6 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	// the instance-level `invitations` gate above. A bad/foreign/expired invite
 	// rejects registration here so no half-provisioned account is created; the join
 	// itself runs after the user + personal workspace exist.
-	workspaceInviteToken := strings.TrimSpace(c.Query("workspace_invite"))
 	if problem, vErr := validateWorkspaceInviteForSignup(h.db, workspaceInviteToken, req.Email); vErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
@@ -570,80 +576,23 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 
-	// Determine role.
-	//
-	// Default for self-service signup is "user" (the regular writer role),
-	// not "viewer". Viewer is intended for read-only audit access — but
-	// the create/run endpoints don't enforce that today, so labelling
-	// every self-signup as "viewer" was a misleading lie about what the
-	// account can actually do. Until RBAC is added on writes, default
-	// signups should be tagged as the role that matches their effective
-	// permissions. Invitations can still downgrade to "viewer" explicitly.
-	role := "user"
+	if config.SingleWorkspace() {
+		h.registerIntoInstallWorkspace(c, req, hashedPassword, inviteToken, inviteID, inviteRole, workspaceInviteToken)
+		return
+	}
 
-	// First-user-is-admin: if no users exist, assign admin role
+	// First-user-is-admin: if no users exist, assign admin role. A failed count
+	// leaves userCount 0, which withholds admin but auto-verifies, as it always has.
 	var userCount int64
-	if err := h.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount); err == nil && userCount == 0 {
-		role = "admin"
-	}
-
-	// Invite role overrides default (but not first-user-admin)
-	if inviteRole != "" && role != "admin" {
-		role = inviteRole
-	}
-
-	// Email verification: generate a 32-byte (64 hex-char) cryptographically-random token.
-	// Skip if RESEND_API_KEY is not set (self-hosted / air-gapped) or first admin.
-	emailVerified := false
-	var verifyToken sql.NullString
-	var verifyExpires sql.NullTime
-	resendConfigured := emailClient.IsConfigured()
-	if !resendConfigured || userCount == 0 {
-		// Auto-verify: no email service configured, or this is the first admin
-		// (bootstrap: without verified email the admin can't log in to configure anything).
-		emailVerified = true
-	} else {
-		rawToken, tokenErr := generateVerifyToken()
-		if tokenErr == nil {
-			verifyToken = sql.NullString{String: rawToken, Valid: true}
-			verifyExpires = sql.NullTime{Time: time.Now().Add(24 * time.Hour), Valid: true}
-		} else {
-			// If we can't generate a token, auto-verify rather than blocking signup.
-			log.Errorf("auth: failed to generate email verify token for %s: %v", req.Email, tokenErr)
-			emailVerified = true
-		}
-	}
-
-	// Assign subscription plan. Admins (incl. the first-user bootstrap) get the
-	// unlimited 'pro' plan with no expiry so operators are never trial-capped.
-	// Regular signups start directly on 'free' with an expiry of free.duration_days
-	// from now (read from the plans table so it's configurable). The 'free' plan
-	// grants 2 pipelines for 30 days and has no downgrade target, so access is
-	// blocked on expiry until the user upgrades. See migration 060_user_plans.sql.
-	userPlan := "free"
-	var planExpires sql.NullTime
-	if role == "admin" {
-		userPlan = "pro"
-	} else {
-		freeDays := 30
-		if err := h.db.QueryRow(`SELECT duration_days FROM plans WHERE name = 'free'`).Scan(&freeDays); err != nil || freeDays <= 0 {
-			freeDays = 30
-		}
-		planExpires = sql.NullTime{Time: time.Now().Add(time.Duration(freeDays) * 24 * time.Hour), Valid: true}
-	}
+	countErr := h.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount)
+	role := signupRole(countErr == nil && userCount == 0, inviteRole)
+	emailVerified, verifyToken, verifyExpires := signupVerification(userCount == 0, req.Email)
+	userPlan, planExpires := signupPlan(h.db, role)
 
 	// Create user
 	userID := uuid.New().String()
-	_, err = h.db.Exec(`
-		INSERT INTO users (id, email, password_hash, role, name, company, phone, country, employee_range, status,
-		                   email_verified, email_verify_token, email_verify_expires_at,
-		                   plan, plan_expires_at,
-		                   created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13, $14, NOW(), NOW())
-	`, userID, req.Email, string(hashedPassword), role, req.Name, req.Company, req.Phone, req.Country, req.EmployeeRange,
-		emailVerified, verifyToken, verifyExpires, userPlan, planExpires)
-
-	if err != nil {
+	if err := insertSignupUser(h.db, userID, req, hashedPassword, role,
+		emailVerified, verifyToken, verifyExpires, userPlan, planExpires); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 		return
 	}
@@ -675,16 +624,251 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	// race that consumed the invite first leaves the account valid with just its
 	// personal workspace. The up-front validation already rejected bad/foreign
 	// invites, so a no-join here is a rare concurrent-consume, not user error.
+	var joinedWS string
 	if workspaceInviteToken != "" {
-		if joinedWS, joinedRole, jErr := acceptWorkspaceInviteAtSignup(h.db, workspaceInviteToken, userID, req.Email); jErr != nil {
+		ws, joinedRole, jErr := acceptWorkspaceInviteAtSignup(h.db, workspaceInviteToken, userID, req.Email)
+		if jErr != nil {
 			log.Errorf("auth: failed to join workspace from invite for %s: %v", req.Email, jErr)
-		} else if joinedWS != "" {
-			log.Infof("auth: user %s joined workspace %s as %s via team invite", req.Email, joinedWS, joinedRole)
+		} else if ws != "" {
+			log.Infof("auth: user %s joined workspace %s as %s via team invite", req.Email, ws, joinedRole)
+			joinedWS = ws
 		}
 	}
 
+	h.completeRegistration(c, newSignup{
+		req:               req,
+		userID:            userID,
+		role:              role,
+		firstUser:         userCount == 0,
+		inviteUsed:        inviteToken != "",
+		emailVerified:     emailVerified,
+		verifyToken:       verifyToken,
+		joinedWorkspaceID: joinedWS,
+	})
+}
+
+// registerIntoInstallWorkspace is Register's single-workspace path: no personal
+// workspace; the new user joins the install workspace. One transaction takes the
+// install-workspace lock and then reads the gate again, because the reads
+// Register made before bcrypt can be stale: two first sign-ups both saw zero
+// users, or an admin closed registration meanwhile. Under the lock exactly one
+// of them is first. The user row, the install workspace, the membership and the
+// invite claims commit together, so a refusal at any step leaves no account.
+func (h *AuthHandler) registerIntoInstallWorkspace(c *gin.Context, req RegisterRequest, hashedPassword []byte,
+	inviteToken, inviteID, inviteRole, workspaceInviteToken string) {
+	failed := func(step string, err error) {
+		log.Errorf("auth: register %s into the install workspace: %s: %v", req.Email, step, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		failed("begin", err)
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op once committed
+
+	if err := lockInstallWorkspace(tx); err != nil {
+		failed("lock", err)
+		return
+	}
+	registrationMode, userCount, err := registrationGate(tx)
+	if err != nil {
+		log.Printf("register: cannot read registration_mode: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "registration_unavailable",
+			"message": "Registration is temporarily unavailable. Please try again shortly.",
+		})
+		return
+	}
+	if registrationMode == "invite_only" && !holdsSignupInvite(inviteToken, workspaceInviteToken) {
+		respondInviteRequired(c)
+		return
+	}
+
+	firstUser := userCount == 0
+	role := signupRole(firstUser, inviteRole)
+	emailVerified, verifyToken, verifyExpires := signupVerification(firstUser, req.Email)
+	userPlan, planExpires := signupPlan(tx, role)
+
+	userID := uuid.New().String()
+	if err := insertSignupUser(tx, userID, req, hashedPassword, role,
+		emailVerified, verifyToken, verifyExpires, userPlan, planExpires); err != nil {
+		failed("insert user", err)
+		return
+	}
+	installWS, err := ensureInstallWorkspaceLocked(tx)
+	if err != nil {
+		failed("install workspace", err)
+		return
+	}
+
+	// A team invite names the workspace and role; an upgraded install can hold
+	// team workspaces besides the install one, and the inviter offered only
+	// theirs. Without one, the user joins the install workspace.
+	joinedWS := installWS
+	if workspaceInviteToken != "" {
+		ws, _, err := claimWorkspaceInvite(tx, workspaceInviteToken, userID, req.Email)
+		if err == sql.ErrNoRows {
+			// Consumed or expired since validation. It may have been this
+			// sign-up's only way past invite_only, so refuse rather than guess.
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   wsInviteProblemUnusable,
+				"message": "This workspace invite is no longer valid.",
+			})
+			return
+		}
+		if err != nil {
+			failed("claim workspace invite", err)
+			return
+		}
+		joinedWS = ws
+	} else if err := joinWorkspace(tx, installWS, userID, installWorkspaceRole(firstUser, inviteRole)); err != nil {
+		failed("join install workspace", err)
+		return
+	}
+
+	// The instance invite is single-use: AND used_at IS NULL makes a sign-up
+	// racing on the same token touch no row, and that one is refused.
+	if inviteID != "" {
+		res, err := tx.Exec(`UPDATE invitations SET used_at = NOW(), used_by = $1 WHERE id = $2 AND used_at IS NULL`,
+			userID, inviteID)
+		if err != nil {
+			failed("mark invite used", err)
+			return
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			failed("mark invite used", err)
+			return
+		}
+		if n == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "invite_used",
+				"message": "This invitation has already been used",
+			})
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		failed("commit", err)
+		return
+	}
+
+	h.completeRegistration(c, newSignup{
+		req:               req,
+		userID:            userID,
+		role:              role,
+		firstUser:         firstUser,
+		inviteUsed:        inviteToken != "",
+		emailVerified:     emailVerified,
+		verifyToken:       verifyToken,
+		joinedWorkspaceID: joinedWS,
+	})
+}
+
+// newSignup is what both Register paths hand completeRegistration once the
+// account exists.
+type newSignup struct {
+	req               RegisterRequest
+	userID            string
+	role              string
+	firstUser         bool
+	inviteUsed        bool
+	emailVerified     bool
+	verifyToken       sql.NullString
+	joinedWorkspaceID string
+}
+
+// respondInviteRequired is Register's refusal for a sign-up with no invite on
+// an invite-only instance.
+func respondInviteRequired(c *gin.Context) {
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":   "invite_required",
+		"message": "Registration is invite-only. Please use an invite link.",
+	})
+}
+
+// signupRole is a new account's users.role.
+//
+// Default for self-service signup is "user" (the regular writer role),
+// not "viewer". Viewer is intended for read-only audit access — but
+// the create/run endpoints don't enforce that today, so labelling
+// every self-signup as "viewer" was a misleading lie about what the
+// account can actually do. Until RBAC is added on writes, default
+// signups should be tagged as the role that matches their effective
+// permissions. Invitations can still downgrade to "viewer" explicitly.
+//
+// The first user is admin, and an invite's role does not override that.
+func signupRole(firstUser bool, inviteRole string) string {
+	if firstUser {
+		return "admin"
+	}
+	if inviteRole != "" {
+		return inviteRole
+	}
+	return "user"
+}
+
+// signupVerification decides whether a new account starts verified, and if not
+// mints its verification token: 32 cryptographically-random bytes (64 hex chars).
+// Skipped if RESEND_API_KEY is not set (self-hosted / air-gapped) or for the first
+// admin (bootstrap: without verified email the admin can't log in to configure
+// anything).
+func signupVerification(firstUser bool, email string) (bool, sql.NullString, sql.NullTime) {
+	if !emailClient.IsConfigured() || firstUser {
+		return true, sql.NullString{}, sql.NullTime{}
+	}
+	rawToken, err := generateVerifyToken()
+	if err != nil {
+		// If we can't generate a token, auto-verify rather than blocking signup.
+		log.Errorf("auth: failed to generate email verify token for %s: %v", email, err)
+		return true, sql.NullString{}, sql.NullTime{}
+	}
+	return false, sql.NullString{String: rawToken, Valid: true},
+		sql.NullTime{Time: time.Now().Add(24 * time.Hour), Valid: true}
+}
+
+// signupPlan assigns a new account's subscription plan. Admins (incl. the
+// first-user bootstrap) get the unlimited 'pro' plan with no expiry so operators
+// are never trial-capped. Regular signups start directly on 'free' with an expiry
+// of free.duration_days from now (read from the plans table so it's
+// configurable). The 'free' plan grants 2 pipelines for 30 days and has no
+// downgrade target, so access is blocked on expiry until the user upgrades. See
+// migration 060_user_plans.sql.
+func signupPlan(q rowQueryer, role string) (string, sql.NullTime) {
+	if role == "admin" {
+		return "pro", sql.NullTime{}
+	}
+	freeDays := 30
+	if err := q.QueryRow(`SELECT duration_days FROM plans WHERE name = 'free'`).Scan(&freeDays); err != nil || freeDays <= 0 {
+		freeDays = 30
+	}
+	return "free", sql.NullTime{Time: time.Now().Add(time.Duration(freeDays) * 24 * time.Hour), Valid: true}
+}
+
+func insertSignupUser(e execer, userID string, req RegisterRequest, hashedPassword []byte, role string,
+	emailVerified bool, verifyToken sql.NullString, verifyExpires sql.NullTime, userPlan string, planExpires sql.NullTime) error {
+	_, err := e.Exec(`
+		INSERT INTO users (id, email, password_hash, role, name, company, phone, country, employee_range, status,
+		                   email_verified, email_verify_token, email_verify_expires_at,
+		                   plan, plan_expires_at,
+		                   created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13, $14, NOW(), NOW())
+	`, userID, req.Email, string(hashedPassword), role, req.Name, req.Company, req.Phone, req.Country, req.EmployeeRange,
+		emailVerified, verifyToken, verifyExpires, userPlan, planExpires)
+	return err
+}
+
+// completeRegistration sends the sign-up emails, signs the new user in and
+// answers 201.
+func (h *AuthHandler) completeRegistration(c *gin.Context, s newSignup) {
+	req, userID := s.req, s.userID
+
 	// Send verification email asynchronously (don't fail registration if email delivery fails).
-	if verifyToken.Valid {
+	if s.verifyToken.Valid {
+		verifyToken := s.verifyToken
 		go func() {
 			appURL := strings.TrimSpace(os.Getenv("APP_BASE_URL"))
 			if appURL == "" {
@@ -740,7 +924,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	token := uuid.New().String()
 	expiresAt := time.Now().Add(24 * time.Hour).Unix()
 
-	_, err = h.db.Exec(`
+	_, err := h.db.Exec(`
 		INSERT INTO sessions (id, user_id, token, expires_at, created_at)
 		VALUES ($1, $2, $3, $4, NOW())
 	`, uuid.New().String(), userID, sharedcrypto.HashSessionToken(token), time.Unix(expiresAt, 0))
@@ -758,11 +942,11 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	// Audit: user registered
 	logAudit(c, "register", "auth", userID, map[string]interface{}{
 		"email":             req.Email,
-		"role":              role,
-		"invite_used":       inviteToken != "",
-		"first_user":        userCount == 0,
-		"email_verified":    emailVerified,
-		"verification_sent": verifyToken.Valid,
+		"role":              s.role,
+		"invite_used":       s.inviteUsed,
+		"first_user":        s.firstUser,
+		"email_verified":    s.emailVerified,
+		"verification_sent": s.verifyToken.Valid,
 	})
 
 	// Set HttpOnly auth cookie (preferred)
@@ -770,14 +954,15 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	ensureCSRFCookie(c)
 
 	c.JSON(http.StatusCreated, AuthResponse{
-		UserID:        userID,
-		Email:         req.Email,
-		Name:          req.Name,
-		Role:          role,
-		Status:        "active",
-		Token:         token,
-		ExpiresAt:     expiresAt,
-		EmailVerified: emailVerified,
+		UserID:            userID,
+		Email:             req.Email,
+		Name:              req.Name,
+		Role:              s.role,
+		Status:            "active",
+		Token:             token,
+		ExpiresAt:         expiresAt,
+		EmailVerified:     s.emailVerified,
+		JoinedWorkspaceID: s.joinedWorkspaceID,
 	})
 }
 
@@ -1079,9 +1264,9 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 // and defaultVal is then correct. Any other error means we do not know what the
 // setting says — returning defaultVal there is a guess, and for
 // registration_mode the guess is "anyone may create an account".
-func getInstanceSetting(database *sql.DB, key, defaultVal string) (string, error) {
+func getInstanceSetting(q rowQueryer, key, defaultVal string) (string, error) {
 	var value string
-	err := database.QueryRow("SELECT value FROM instance_settings WHERE key = $1", key).Scan(&value)
+	err := q.QueryRow("SELECT value FROM instance_settings WHERE key = $1", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return defaultVal, nil
 	}

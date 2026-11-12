@@ -981,7 +981,6 @@ UNGATED_TESTS=(
   test_mongodb_cdc_to_gcs.py                   # provisions its own mongod replica set + fake-gcs-server fixtures
   test_pg_bulk_copy_parity.py                  # needs the copytest-pg fixture + a mounted edited connector.py
   test_pg_bulk_copy_merge.py                   # needs the copytest-pg fixture + RSYNC_PG_BULK_COPY overlay
-  test_claim_check_gzip.py                     # needs the RSYNC_CLAIM_CHECK_GZIP opt-in overlay
   test_mysql_load_strategy.py                  # connector-source contract check; needs the mounted connector tree
 
   # -- non-deterministic: asserts on LLM output or wall-clock timing --

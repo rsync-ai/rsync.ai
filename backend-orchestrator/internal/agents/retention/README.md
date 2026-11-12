@@ -9,7 +9,7 @@ The Retention Manager Agent manages the lifecycle of bulk data in Kafka topics. 
 - **Bulk Load Detection**: Automatically detect and track large data loads
 - **Consumer Progress Tracking**: Monitor consumer offset progress per topic
 - **Safety Checks**: Comprehensive safety checks before cleanup
-- **Intelligent Cleanup**: Reduce retention, delete records, or archive to S3
+- **Intelligent Cleanup**: Reduce retention or compact (delete records falls back to reducing retention; archive to S3 is not implemented and refuses)
 - **Automatic Restoration**: Restore original retention after cleanup
 
 ## Architecture
@@ -93,8 +93,8 @@ Performs safety checks before cleanup:
 
 Executes cleanup operations:
 - Reduce retention (default)
-- Delete records (if supported)
-- Archive to S3 (if enabled)
+- Delete records (not implemented: falls back to reducing retention)
+- Archive to S3 (not implemented: refuses, retention is left as it is)
 - Compact topic
 - Restore original retention
 
@@ -187,9 +187,13 @@ RETENTION_S3_PREFIX=kafka-archive
 RETENTION_CHECK_INTERVAL=60
 RETENTION_CLEANUP_CHECK_INTERVAL=300
 
-# Agent
-ENABLE_RETENTION_AGENT=true
+# Agent (off by default: no stack ships the Kafka REST proxy it calls, so every call fails)
+ENABLE_RETENTION_AGENT=false
 ```
+
+Every Kafka call goes through a REST proxy at `localhost:8082`. A call that fails is
+an error: the safety checks fail closed, and no retention is changed on a value that
+was not read from the broker.
 
 ## Usage Examples
 
@@ -242,8 +246,8 @@ Before any cleanup, the following checks are performed:
 | Action | Description | Use Case |
 |--------|-------------|----------|
 | `reduce_retention` | Reduce retention to 1 hour | Default, safe |
-| `delete_records` | Delete records up to offset | Fast cleanup |
-| `archive_to_s3` | Archive then cleanup | Compliance |
+| `delete_records` | Delete records up to offset — not implemented, reduces retention instead | Fast cleanup |
+| `archive_to_s3` | Archive then cleanup — not implemented, refuses | Compliance |
 | `compact` | Enable log compaction | Key-based data |
 
 ## Testing

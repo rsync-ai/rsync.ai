@@ -43,7 +43,10 @@ func TestCategoryFor(t *testing.T) {
 		{"RSYNC_BUG_SILENT_DROP", "", CategoryDataLoss},
 		{"PIPELINE_RUN_FAILED", "cdc_wal_pressure", CategoryRunStatus}, // code wins
 		{"", "CDC_WAL_PRESSURE", CategoryDataLoss},                     // type is case-insensitive
+		{"", "cdc_position_retention", CategoryDataLoss},
 		{" SCHEMA_DRIFT_DETECTED ", "", CategorySchemaDrift},
+		{"SCHEMA_DRIFT_HANDLED", "", CategorySchemaDrift},
+		{"SCHEMA_DRIFT_APPLY_FAILED", "", CategorySchemaDrift},
 		{codeSchemaChangeApplied, "", CategorySchemaDrift},
 		{"NOT_A_CODE", "not_a_type", CategoryOther},
 		{"", "", CategoryOther},

@@ -34,7 +34,6 @@ It:
 - **Redis**: V2 correlation store
 
 ### Scaling / HA Notes
-- Runs as a Temporal worker for a task queue (default: `pipeline-workflows`).
 - Scaling requires understanding Temporal worker concurrency and idempotency of activities.
 
 ### Observability

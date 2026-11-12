@@ -46,10 +46,12 @@ import (
 // makes it run.
 //
 // destination_qualified_name is NULL for object-storage destinations and any sink older
-// than 089, so those pipelines cannot be suggested. That is a miss, and a miss is the
-// right way to be wrong here: the dialog falls back to the manual picker the user
-// already has, whereas a confident wrong answer gets a schedule hung off an unrelated
-// pipeline.
+// than 089, so those rows cannot be suggested. That is a miss, and a miss is the right
+// way to be wrong here: the dialog falls back to the manual picker the user already
+// has, whereas a confident wrong answer gets a schedule hung off an unrelated pipeline.
+// A lake pipeline is still offered when the warehouse reads its files through an
+// external table: the warehouse names the folder it reads, and the folder names the
+// pipeline (lake_external_tables.go). That is the asset graph's rule too.
 
 // upstreamCandidate is one producer — a pipeline observed writing a table, or a model
 // declared to build one — of a table this model reads.
@@ -120,11 +122,12 @@ func SuggestSavedQueryUpstreams(c *gin.Context) {
 	}
 
 	resp, err := resolveUpstreams(c.Request.Context(), database, upstreamLookup{
-		SavedQueryID: id,
-		SQLText:      q.SQLText,
-		ConnectionID: q.ConnectionID,
-		WorkspaceID:  q.WorkspaceID,
-		UserID:       userID,
+		SavedQueryID:  id,
+		SQLText:       q.SQLText,
+		ConnectionID:  q.ConnectionID,
+		ConnectorType: q.ConnectorType,
+		WorkspaceID:   q.WorkspaceID,
+		UserID:        userID,
 	})
 	if err != nil {
 		log.WithError(err).Error("upstream suggestion: could not resolve table references")
@@ -139,7 +142,11 @@ type upstreamLookup struct {
 	SavedQueryID string
 	SQLText      string
 	ConnectionID string
-	WorkspaceID  string
+	// ConnectorType is the connection's, and decides what SQLText holds: SQL, or a
+	// document store's stored pipeline. Every model the loader reads is on the same
+	// connection, so it holds the same kind.
+	ConnectorType string
+	WorkspaceID   string
 	// UserID decides which private models are visible as producers.
 	UserID string
 }
@@ -153,7 +160,7 @@ func resolveUpstreams(
 	database *sql.DB,
 	in upstreamLookup,
 ) (upstreamSuggestionResponse, error) {
-	refs := validators.ExtractTableReferences(in.SQLText)
+	refs := modelReadReferences(in.ConnectorType, in.SQLText)
 	if len(refs) == 0 {
 		return buildUpstreamSuggestion(nil, nil, in.SavedQueryID), nil
 	}
@@ -252,7 +259,7 @@ func resolveUpstreams(
 		if err := modelRows.Scan(&id, &name, &materialization, &target, &sqlText); err != nil {
 			return upstreamSuggestionResponse{}, err
 		}
-		for _, table := range modelProducedTables(id, name, materialization, target, sqlText) {
+		for _, table := range modelProducedTables(in.ConnectorType, id, name, materialization, target, sqlText) {
 			producers = append(producers, tableProducer{
 				ConnectionID: in.ConnectionID, Kind: assetKindModel, Table: table,
 			})
@@ -260,6 +267,16 @@ func resolveUpstreams(
 	}
 	if err := modelRows.Err(); err != nil {
 		return upstreamSuggestionResponse{}, err
+	}
+
+	// Lake pipelines feeding this warehouse's external tables. A failure costs these
+	// candidates, not the suggestion.
+	if warehouseKeepsExternalTables(in.ConnectorType) {
+		lake, err := loadLakeTableLinks(ctx, database, in.WorkspaceID, in.ConnectionID)
+		if err != nil {
+			log.WithError(err).Warn("upstream suggestion: could not load lake links")
+		}
+		producers = append(producers, lakeLinkProducers(lake.Links, in.ConnectionID)...)
 	}
 
 	return buildUpstreamSuggestion(refs, producers, in.SavedQueryID), nil

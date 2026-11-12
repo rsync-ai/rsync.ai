@@ -75,16 +75,18 @@ func TestClassifySchemaChange_ProdDropTable(t *testing.T) {
 	}
 }
 
-func TestClassifySchemaChange_ProdDropColumn(t *testing.T) {
-	got := classifySchemaChange(parseRecord(t, prodDropColumnRecord), "rsync_pipeline_test_a1b2c3d4")
-	if len(got) != 1 {
-		t.Fatalf("expected 1 change, got %d: %+v", len(got), got)
-	}
-	if got[0].changeType != "drop_column" || got[0].column != "note" {
-		t.Errorf("got %+v, want drop_column on column note", got[0])
-	}
-	if got[0].ddl != "ALTER TABLE rsync_pipeline_test_a1b2c3d4.cdc_drift DROP COLUMN note" {
-		t.Errorf("ddl = %q, want the DESTINATION-qualified ALTER … DROP COLUMN note", got[0].ddl)
+// The sink reports a dropped column itself, from the row shape, for every source
+// (kafka-mcp-sink reportDroppedColumns), and the destination keeps it. Filing it from
+// the DDL topic too would file one drop twice, under the source's table name and the
+// destination's, which the UNIQUE (pipeline_id, ddl) key cannot collapse.
+func TestClassifySchemaChange_DropColumnIsLeftToTheSink(t *testing.T) {
+	multi := `{"payload":{"source":{"snapshot":"false","db":"pipeline_test"},
+	  "databaseName":"pipeline_test","ddl":"ALTER TABLE pipeline_test.cdc_drift DROP COLUMN note, DROP COLUMN amount",
+	  "tableChanges":[{"type":"ALTER","id":"\"pipeline_test\".\"cdc_drift\""}]}}`
+	for name, raw := range map[string]string{"prod record": prodDropColumnRecord, "two columns in one statement": multi} {
+		if got := classifySchemaChange(parseRecord(t, raw), "rsync_pipeline_test_a1b2c3d4"); len(got) != 0 {
+			t.Errorf("%s: a dropped column must be left to the sink, got %+v", name, got)
+		}
 	}
 }
 
@@ -93,11 +95,11 @@ func TestClassifySchemaChange_ProdDropColumn(t *testing.T) {
 // destination session — and the source qualifier must never be the fallback.
 func TestClassifySchemaChange_NoNamespaceFallsBackToBareTable(t *testing.T) {
 	for _, ns := range []string{"", "  ", "default"} {
-		got := classifySchemaChange(parseRecord(t, prodDropColumnRecord), ns)
+		got := classifySchemaChange(parseRecord(t, prodDropTableRecord), ns)
 		if len(got) != 1 {
 			t.Fatalf("ns=%q: expected 1 change, got %d", ns, len(got))
 		}
-		if got[0].ddl != "ALTER TABLE cdc_drift DROP COLUMN note" {
+		if got[0].ddl != "DROP TABLE cdc_drift" {
 			t.Errorf("ns=%q: ddl = %q, want the bare-table form", ns, got[0].ddl)
 		}
 		if got[0].table != "pipeline_test.cdc_drift" {
@@ -141,8 +143,8 @@ func TestClassifySchemaChange_SnapshotDDLIsIgnored(t *testing.T) {
 	}
 }
 
-// Not every DROP removes user data from the destination. Filing these would invite the
-// user to run destructive DDL by hand for a constraint that was never mirrored.
+// Not every DROP in an ALTER is a dropped table. Filing one of these as drop_table would
+// put a destination table up for a drop decision because a constraint went away.
 func TestClassifySchemaChange_NonColumnDropsIgnored(t *testing.T) {
 	for _, ddl := range []string{
 		"ALTER TABLE pipeline_test.cdc_drift DROP FOREIGN KEY fk_owner",
@@ -158,21 +160,6 @@ func TestClassifySchemaChange_NonColumnDropsIgnored(t *testing.T) {
 		if got := classifySchemaChange(parseRecord(t, raw), ""); len(got) != 0 {
 			t.Errorf("%q must not be reported, got %+v", ddl, got)
 		}
-	}
-}
-
-func TestClassifySchemaChange_MultipleDropColumnsInOneStatement(t *testing.T) {
-	raw := `{"payload":{"source":{"snapshot":"false","db":"pipeline_test"},
-	  "databaseName":"pipeline_test","ddl":"ALTER TABLE pipeline_test.cdc_drift DROP COLUMN note, DROP COLUMN amount",
-	  "tableChanges":[{"type":"ALTER","id":"\"pipeline_test\".\"cdc_drift\""}]}}`
-	got := classifySchemaChange(parseRecord(t, raw), "")
-	if len(got) != 2 {
-		t.Fatalf("expected 2 drop_column changes, got %d: %+v", len(got), got)
-	}
-	// Distinct DDL per column, so each files its own approval row rather than one
-	// combined statement the user can only accept or reject wholesale.
-	if got[0].column != "note" || got[1].column != "amount" {
-		t.Errorf("columns = %q,%q; want note,amount", got[0].column, got[1].column)
 	}
 }
 
@@ -328,9 +315,8 @@ func TestTrackSelectedTableDrops(t *testing.T) {
 
 	t.Run("CREATE closes the row", func(t *testing.T) {
 		a, w, mock := dropTrackAgent(t, []string{"cdc_drift"})
-		mock.ExpectExec(`UPDATE cdc_source_table_drops`).
-			WithArgs(dropTrackPipelineID, "cdc_drift").
-			WillReturnResult(sqlmock.NewResult(0, 1))
+		expectRecreateClears(mock, "cdc_drift", nil)
+		mock.ExpectCommit()
 
 		a.trackSelectedTableDrops(context.Background(), w,
 			parseRecord(t, dropRecord("CREATE", "false", `"pipeline_test"."cdc_drift"`)))
@@ -349,9 +335,9 @@ func TestTrackSelectedTableDrops(t *testing.T) {
 		// proof the table exists now, whatever phase the connector is in.
 		for _, snap := range []string{"true", "first", "last", "incremental"} {
 			a, w, mock := dropTrackAgent(t, []string{"cdc_drift"})
-			mock.ExpectExec(`UPDATE cdc_source_table_drops`).
-				WithArgs(dropTrackPipelineID, "cdc_drift").
-				WillReturnResult(sqlmock.NewResult(0, 1))
+			expectRecreateClears(mock, "cdc_drift", []string{"pipeline_test.cdc_drift"})
+			expectDropDecisionWithdrawn(mock, "pipeline_test.cdc_drift")
+			mock.ExpectCommit()
 
 			a.trackSelectedTableDrops(context.Background(), w,
 				parseRecord(t, dropRecord("CREATE", snap, `"pipeline_test"."cdc_drift"`)))
@@ -378,6 +364,120 @@ func TestTrackSelectedTableDrops(t *testing.T) {
 			t.Errorf("unmet expectations: %v", err)
 		}
 	})
+}
+
+// expectRecreateClears is the first half of a selected table's CREATE: one
+// transaction that closes the open drop and reads the pipeline's pending
+// dropped-table decisions, by the source spelling the healer filed them under.
+func expectRecreateClears(mock sqlmock.Sqlmock, selected string, pending []string) {
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE cdc_source_table_drops`).
+		WithArgs(dropTrackPipelineID, selected).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	rows := sqlmock.NewRows([]string{"table_name"})
+	for _, name := range pending {
+		rows.AddRow(name)
+	}
+	mock.ExpectQuery(`SELECT table_name FROM schema_change_approvals`).
+		WithArgs(dropTrackPipelineID).
+		WillReturnRows(rows)
+}
+
+func expectDropDecisionWithdrawn(mock sqlmock.Sqlmock, tables ...string) *sqlmock.ExpectedQuery {
+	list, _ := json.Marshal(tables)
+	returned := sqlmock.NewRows([]string{"table_name"})
+	for _, name := range tables {
+		returned.AddRow(name)
+	}
+	return mock.ExpectQuery(`UPDATE schema_change_approvals\s+SET status = 'withdrawn'`).
+		WithArgs(dropTrackPipelineID, string(list), "system:schema-drift",
+			"The table is back in the source, so nothing was dropped and it stays in this pipeline.").
+		WillReturnRows(returned)
+}
+
+// A CDC pipeline's dropped selected table files a pending drop_table decision
+// (healer storePendingApproval). When the table is created again, the CREATE closed
+// only the health fact in cdc_source_table_drops and left the decision pending: the
+// schema changes page, the badge and Slack kept offering "Approve — drop destination
+// table", and Approve unselected a table that exists and dropped its destination
+// table. Batch pipelines withdraw the same row on rediscovery
+// (withdrawDisprovedTableDrops); steady-state CDC never runs that path.
+//
+// The class: no pending drop decision outlives the proof that its table exists. The
+// code that learns the table is back withdraws the decision, in the same
+// transaction as the health fact, so the page never shows a healthy stream with a
+// drop still waiting, or the reverse.
+func TestRecreatedTableWithdrawsItsPendingDropDecision(t *testing.T) {
+	t.Run("the pending decision is withdrawn with the drop", func(t *testing.T) {
+		a, w, mock := dropTrackAgent(t, []string{"cdc_drift"})
+		expectRecreateClears(mock, "cdc_drift", []string{"pipeline_test.cdc_drift"})
+		expectDropDecisionWithdrawn(mock, "pipeline_test.cdc_drift")
+		mock.ExpectCommit()
+
+		a.trackSelectedTableDrops(context.Background(), w,
+			parseRecord(t, dropRecord("CREATE", "false", `"pipeline_test"."cdc_drift"`)))
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("a recreated table must withdraw its pending drop decision: %v", err)
+		}
+	})
+
+	t.Run("a same-named table in another schema keeps its decision", func(t *testing.T) {
+		// Both spellings are qualified and differ: a different table. Withdrawing
+		// its decision would hide a real drop.
+		a, w, mock := dropTrackAgent(t, []string{"cdc_drift"})
+		expectRecreateClears(mock, "cdc_drift", []string{"archive.cdc_drift", "pipeline_test.cdc_drift"})
+		expectDropDecisionWithdrawn(mock, "pipeline_test.cdc_drift")
+		mock.ExpectCommit()
+
+		a.trackSelectedTableDrops(context.Background(), w,
+			parseRecord(t, dropRecord("CREATE", "false", `"pipeline_test"."cdc_drift"`)))
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("only the recreated table's decision may be withdrawn: %v", err)
+		}
+	})
+
+	t.Run("a failed withdraw leaves the drop open too", func(t *testing.T) {
+		// One transaction: the stream stays degraded and the decision pending, and
+		// the next CREATE (a connector restart re-snapshots it) tries again.
+		a, w, mock := dropTrackAgent(t, []string{"cdc_drift"})
+		expectRecreateClears(mock, "cdc_drift", []string{"pipeline_test.cdc_drift"})
+		expectDropDecisionWithdrawn(mock, "pipeline_test.cdc_drift").
+			WillReturnError(errors.New("pq: canceling statement due to statement timeout"))
+		mock.ExpectRollback()
+
+		a.trackSelectedTableDrops(context.Background(), w,
+			parseRecord(t, dropRecord("CREATE", "false", `"pipeline_test"."cdc_drift"`)))
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("a failed withdraw must roll the clear back: %v", err)
+		}
+	})
+}
+
+// TestSameSourceTable: a withdraw keys on the table the CREATE reported, so it is
+// form-insensitive (quoted, case, bare against qualified) but never matches across
+// schemas, unlike matchSelectedTable, whose job is to find a selection at all.
+func TestSameSourceTable(t *testing.T) {
+	cases := []struct {
+		filed, reported string
+		want            bool
+	}{
+		{"pipeline_test.cdc_drift", `"pipeline_test"."cdc_drift"`, true},
+		{"PIPELINE_TEST.CDC_DRIFT", "pipeline_test.cdc_drift", true},
+		{"cdc_drift", `"pipeline_test"."cdc_drift"`, true},
+		{"pipeline_test.cdc_drift", "cdc_drift", true},
+		{"archive.cdc_drift", "pipeline_test.cdc_drift", false},
+		{"pipeline_test.orders", "pipeline_test.cdc_drift", false},
+		{"", "cdc_drift", false},
+		{"cdc_drift", "", false},
+	}
+	for _, tc := range cases {
+		if got := sameSourceTable(tc.filed, tc.reported); got != tc.want {
+			t.Errorf("sameSourceTable(%q, %q) = %v, want %v", tc.filed, tc.reported, got, tc.want)
+		}
+	}
 }
 
 // TestMatchSelectedTable is the asymmetry guard. The row the DROP opens and the row

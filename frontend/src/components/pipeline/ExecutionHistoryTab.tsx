@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useId, useMemo, useRef } from "react"
 import { useRouter } from "next/navigation"
 import {
   Table,
@@ -25,19 +25,37 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Loader2, Clock, RefreshCw, Eye, RotateCcw } from "lucide-react"
+import { ChartColumn, History, RefreshCw, Eye, RotateCcw } from "lucide-react"
+import { EChartNoSSR } from "@/components/charts/EChartNoSSR"
+import { ChartCard, WindowToggle } from "@/components/kit/ChartCard"
+import { EmptyState } from "@/components/kit/EmptyState"
+import { ChartCardsSkeleton, RowsSkeleton } from "@/components/kit/PageSkeleton"
+import { pipelineRunMetrics } from "@/components/pipeline/pipeline-run-metrics"
+import {
+  PIPELINE_OUTCOMES,
+  countChart,
+  countRows,
+  dayLabel,
+  rowsWrittenChart,
+  rowsWrittenRows,
+  runTimeChart,
+  runTimeRows,
+} from "@/components/runs/run-chart-specs"
+import { METRICS_WINDOWS, type MetricsWindow } from "@/lib/api/activity-metrics"
 import { formatRelativeTime } from "@/lib/utils"
 // Was a local copy that floored to whole seconds, so this tab and the pipeline
 // list disagreed about the same execution ("0s" vs "500ms").
 import { formatDurationBetween as formatDuration } from "@/lib/duration"
 import { LocalDateTime } from "@/components/ui/local-date-time"
-import { listExecutionsResponse } from "@/lib/api/executions"
+import { listExecutionsResponse, type ExecutionListResponse } from "@/lib/api/executions"
+import { ACTIVITY_STATUS_LABELS } from "@/lib/api/activity"
 import {
   executePipelineWithRunMode,
   AssessmentRequiredError,
   type AssessmentReport,
 } from "@/lib/api/pipelines"
 import { PreMigrationAssessmentModal } from "@/components/pipeline/PreMigrationAssessmentModal"
+import { usePipelineReloadSupported } from "@/lib/hooks/usePipelineReloadSupported"
 import {
   ExecutionDetailDialog,
   statusPresentation,
@@ -49,15 +67,84 @@ interface ExecutionHistoryTabProps {
   pipelineId: string
 }
 
+const LIMIT = 250
+
+/**
+ * The stored statuses one filter option reads. The gateway matches one status
+ * exactly (`pipelines.go:4285`), and a succeeded run is stored as "success" or
+ * "completed", so "Succeeded" asks for both.
+ */
+function filterStatuses(filter: string): (string | undefined)[] {
+  if (filter === "all") return [undefined]
+  if (filter === "succeeded") return ["success", "completed"]
+  return [filter]
+}
+
+/**
+ * Several newest-first lists as one, newest first, each run once, at most
+ * `limit` long. One list is kept in the order the server sent it.
+ */
+export function mergeNewestFirst<T extends { id: string; start_time: string }>(lists: T[][], limit: number): T[] {
+  if (lists.length === 1) return lists[0].slice(0, limit)
+  const seen = new Set<string>()
+  return lists
+    .flat()
+    .sort((a, b) => (Date.parse(b.start_time) || 0) - (Date.parse(a.start_time) || 0))
+    .filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)))
+    .slice(0, limit)
+}
+
+/**
+ * The tab's three charts, counted from the runs it loaded (no other request):
+ * runs per day by outcome, run time, and rows written, over the last `days` days.
+ */
+function pipelineRunCharts(runs: readonly Execution[], days: number) {
+  const m = pipelineRunMetrics(runs, days, { truncated: runs.length >= LIMIT })
+  return {
+    since: m.since,
+    list: [
+      {
+        title: "Runs",
+        caption: "Per day, by outcome",
+        settings: countChart("This pipeline's runs per day, by outcome", m.days, PIPELINE_OUTCOMES),
+        rows: countRows(m.pipeline_runs, PIPELINE_OUTCOMES),
+        empty: m.pipeline_runs.length > 0 ? undefined : "No runs in this window.",
+      },
+      {
+        title: "Run time",
+        caption: "Median and 95th percentile, in seconds",
+        settings: runTimeChart("Median and 95th-percentile run time per day of this pipeline, in seconds", m.days),
+        rows: runTimeRows(m.days, m.pipeline_run_time),
+        empty: m.pipeline_run_time.length > 0 ? undefined : "No run succeeded or failed in this window.",
+      },
+      {
+        title: "Rows written",
+        caption: "Per day",
+        settings: rowsWrittenChart("Rows this pipeline's runs wrote per day", m.days),
+        rows: rowsWrittenRows(m.rows_written),
+        empty: m.rows_written.length > 0 ? undefined : "No runs in this window.",
+      },
+    ],
+  }
+}
+
 export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
   const router = useRouter()
+  const chartsHeadingId = useId()
   const [executions, setExecutions] = useState<Execution[]>([])
+  // The charts count every run, so they read the unfiltered list: a status filter
+  // narrows the table, not the charts. Null until the first unfiltered list lands.
+  const [allRuns, setAllRuns] = useState<Execution[] | null>(null)
+  const allRunsLoaded = useRef(false)
+  const [chartDays, setChartDays] = useState<MetricsWindow>(METRICS_WINDOWS[0])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState("all")
   const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
   const perPage = 25
+  // No "Reload everything" when the destination is an app's API (reverse ETL).
+  const reloadSupported = usePipelineReloadSupported(pipelineId)
 
   // Pre-migration assessment modal state. The first POST /run returns
   // 422 with an assessment payload when warnings need acking. We hold
@@ -94,20 +181,30 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
     [pipelineId, router],
   )
 
+  // Succeeded asks twice, so an older filter's answer can land after a newer
+  // one; only the latest request may write the list.
+  const listSeq = useRef(0)
+
   const fetchExecutions = useCallback(async () => {
+    const seq = ++listSeq.current
     setLoading(true)
     setError(null)
 
     try {
-      const resp = await listExecutionsResponse({
-        pipelineId,
-        status: statusFilter !== "all" ? statusFilter : undefined,
-        // Keep a wide window for accurate pagination/search within the tab.
-        limit: 250,
-      })
+      // A filter picked before the unfiltered list came, or after it failed,
+      // loads that list as well, for the charts; if only it fails, they stay away.
+      const withAll = statusFilter !== "all" && !allRunsLoaded.current
+      const [resps, everyResp] = await Promise.all([
+        Promise.all(
+          filterStatuses(statusFilter).map((status) =>
+            // Keep a wide window for accurate pagination/search within the tab.
+            listExecutionsResponse({ pipelineId, status, limit: LIMIT }),
+          ),
+        ),
+        withAll ? listExecutionsResponse({ pipelineId, limit: LIMIT }).catch(() => null) : null,
+      ])
 
-      const raw = (resp.executions || []) as any[]
-      const normalized: Execution[] = raw.map((e) => ({
+      const toRow = (e: any): Execution => ({
         id: String(e.id || ""),
         pipeline_id: String(e.pipeline_id || e.pipelineId || pipelineId),
         status: String(e.status || "pending"),
@@ -122,13 +219,23 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
         schedule_id: e.schedule_id ?? null,
         scheduled_time: e.scheduled_time ?? null,
         pipeline_name: e.pipeline_name ?? null,
-      }))
+      })
+      const rowsOf = (r: ExecutionListResponse) => (r.executions || []).map(toRow).filter((e) => Boolean(e.id))
+      const lists = resps.map(rowsOf)
 
-      setExecutions(normalized.filter((e) => Boolean(e.id)))
+      if (seq !== listSeq.current) return
+      const merged = mergeNewestFirst(lists, LIMIT)
+      setExecutions(merged)
+      const every = statusFilter === "all" ? merged : everyResp ? rowsOf(everyResp).slice(0, LIMIT) : null
+      if (every) {
+        setAllRuns(every)
+        allRunsLoaded.current = true
+      }
     } catch (err: any) {
+      if (seq !== listSeq.current) return
       setError(err?.message || "Failed to load execution history")
     } finally {
-      setLoading(false)
+      if (seq === listSeq.current) setLoading(false)
     }
   }, [pipelineId, statusFilter])
 
@@ -149,8 +256,44 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
   const previousExecution =
     selectedIndex >= 0 ? executions[selectedIndex + 1] ?? null : null
 
+  const charts = useMemo(() => (allRuns ? pipelineRunCharts(allRuns, chartDays) : null), [allRuns, chartDays])
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      {/* Hidden only while no unfiltered list has loaded: when it failed, the run list below says so, with Retry. */}
+      {(charts || loading) && (
+        <section aria-labelledby={chartsHeadingId} className="space-y-4">
+          <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+            <div className="min-w-0 space-y-0.5">
+              <h3 id={chartsHeadingId} className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                Runs per day
+              </h3>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400" data-testid="run-charts-caption">
+                Days are UTC days, by when each run started.
+                {charts?.since &&
+                  ` Counted from the ${LIMIT} most recent runs, which go back to ${dayLabel(charts.since)}.`}
+              </p>
+            </div>
+            <WindowToggle value={chartDays} options={METRICS_WINDOWS} onChange={setChartDays} />
+          </div>
+          {charts ? (
+            <div className="grid gap-4 @3xl:grid-cols-2 @4xl:grid-cols-3">
+              {charts.list.map((c) => (
+                <ChartCard key={c.title} title={c.title} description={c.caption} empty={c.empty} emptyIcon={ChartColumn}>
+                  <EChartNoSSR settings={c.settings} rows={c.rows} />
+                </ChartCard>
+              ))}
+            </div>
+          ) : (
+            <ChartCardsSkeleton count={3} label="Loading run charts…" className="@4xl:grid-cols-3" />
+          )}
+        </section>
+      )}
+
+      <section
+        aria-label="Run list"
+        className="space-y-4 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-950"
+      >
       {/* Filters */}
       <div className="flex items-center gap-4">
         {/*
@@ -167,16 +310,15 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
             setCurrentPage(1)
           }}
         >
-          <SelectTrigger className="w-[180px]">
+          <SelectTrigger className="w-[180px]" aria-label="Status">
             <SelectValue placeholder="All Statuses" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All Statuses</SelectItem>
-            <SelectItem value="success">Success</SelectItem>
-            <SelectItem value="completed">Completed</SelectItem>
-            <SelectItem value="failed">Failed</SelectItem>
-            <SelectItem value="running">Running</SelectItem>
-            <SelectItem value="cancelled">Cancelled</SelectItem>
+            <SelectItem value="succeeded">{ACTIVITY_STATUS_LABELS.succeeded}</SelectItem>
+            <SelectItem value="failed">{ACTIVITY_STATUS_LABELS.failed}</SelectItem>
+            <SelectItem value="running">{ACTIVITY_STATUS_LABELS.running}</SelectItem>
+            <SelectItem value="cancelled">{ACTIVITY_STATUS_LABELS.cancelled}</SelectItem>
           </SelectContent>
         </Select>
 
@@ -188,24 +330,22 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
 
       {/* Table */}
       {loading ? (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-8 w-8 animate-spin text-violet-600" />
-        </div>
+        <RowsSkeleton rows={5} label="Loading runs…" />
       ) : error ? (
         <div className="flex flex-col items-center justify-center py-12">
           <div className="text-red-600 mb-4">{error}</div>
           <Button onClick={fetchExecutions}>Retry</Button>
         </div>
       ) : filteredExecutions.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-12 text-center">
-          <Clock className="h-12 w-12 text-zinc-400 mb-4" />
-          <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-            No execution history yet
-          </p>
-          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-            Run this pipeline to see execution results
-          </p>
-        </div>
+        statusFilter === "all" ? (
+          <EmptyState icon={History} title="No runs yet" description="Run this pipeline and its runs appear here." />
+        ) : (
+          <EmptyState
+            icon={History}
+            title="No runs with this status"
+            description="Pick All Statuses to see every run."
+          />
+        )
       ) : (
         <>
           <Table>
@@ -295,11 +435,13 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
                               >
                                 Resume from the pipeline&apos;s checkpoints
                               </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onClick={() => void tryRun("reload", false)}
-                              >
-                                Reload everything from scratch
-                              </DropdownMenuItem>
+                              {reloadSupported && (
+                                <DropdownMenuItem
+                                  onClick={() => void tryRun("reload", false)}
+                                >
+                                  Reload everything from scratch
+                                </DropdownMenuItem>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -339,6 +481,7 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
           )}
         </>
       )}
+      </section>
 
       {/*
         The detail dialog is its own component because it now asks the API

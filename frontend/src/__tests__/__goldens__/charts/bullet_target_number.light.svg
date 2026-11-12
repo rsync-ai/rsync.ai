@@ -1,0 +1,33 @@
+<svg width="568" height="300" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 568 300">
+<rect width="568" height="300" x="0" y="0" fill="none"></rect>
+<path d="M6.5 10L6.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M115.5 10L115.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M223.5 10L223.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M332.5 10L332.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M441.5 10L441.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<path d="M550.5 10L550.5 286" fill="none" pointer-events="visible" stroke="#e4e4e7" class="zr-cls-0"></path>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(6.025 293.95)" fill="#71717a">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(114.795 293.95)" fill="#71717a">200</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(223.565 293.95)" fill="#71717a">400</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(332.335 293.95)" fill="#71717a">600</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(441.105 293.95)" fill="#71717a">800</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:Inter;" y="3.0250000000000004" transform="translate(549.875 293.95)" fill="#71717a">1,000</text>
+<path d="M6 138L438.1 138A3 3 0 0 1 441.1 141L441.1 155A3 3 0 0 1 438.1 158L6 158L6 138Z" fill="#5071de" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-1"></path>
+<path d="M-1 -1l2 0l0 2l-2 0Z" transform="matrix(1.5,0,0,18,549.875,147.975)" fill="#09090b" fill-opacity="0.8" ecmeta_series_index="1" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr-cls-2"></path>
+<style ><![CDATA[
+.zr-cls-0:hover {
+pointer-events:none;
+}
+.zr-cls-1:hover {
+cursor:pointer;
+fill:rgba(88,124,244,1);
+}
+.zr-cls-2:hover {
+cursor:pointer;
+fill:rgba(9,9,12,1);
+}
+
+]]>
+
+</style>
+</svg>

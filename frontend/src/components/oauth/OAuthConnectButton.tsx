@@ -314,5 +314,3 @@ export function OAuthConnectButton({
     </div>
   );
 }
-
-export default OAuthConnectButton;

@@ -24,11 +24,22 @@ class NodeKind(str, Enum):
     SPLIT = "split"
 
 
-class EdgeType(str, Enum):
-    """Edge types in a workflow graph"""
-    DATA = "data"
-    CONTROL_THEN = "control_then"
-    CONTROL_ELSE = "control_else"
+# The kinds the pipeline runtime can run. The temporal adapter refuses a graph
+# holding any other kind before a node starts, so the planner must not emit
+# one: api_call, condition, llm and notification are declared but have no
+# runtime yet. Pinned by shared/workflow_node_kinds_golden.json.
+RUNNABLE_NODE_KINDS = (
+    NodeKind.SOURCE.value,
+    NodeKind.TRANSFORM.value,
+    NodeKind.WAIT.value,
+    NodeKind.SPLIT.value,
+    NodeKind.MERGE.value,
+    NodeKind.DESTINATION.value,
+)
+
+# A wait node's one setting, and its cap (one day); same golden.
+WAIT_SECONDS_KEY = "wait_seconds"
+MAX_WAIT_SECONDS = 86400
 
 
 @dataclass
@@ -72,7 +83,7 @@ class EdgeSpec:
     """Specification for an edge in the workflow graph"""
     from_node: str
     to_node: str
-    edge_type: str = "data"  # EdgeType value
+    edge_type: str = "data"  # "data", "control_then" or "control_else"
     from_port: Optional[str] = None
     to_port: Optional[str] = None
     label: Optional[str] = None
@@ -164,17 +175,6 @@ class ToolDefinition:
     name: str
     description: str
     parameters: Dict[str, Any]
-    
-    def to_langchain_tool(self) -> Dict[str, Any]:
-        """Convert to LangChain tool format"""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            }
-        }
 
 
 # Predefined tools for the DAG planner
@@ -250,7 +250,7 @@ DAG_PLANNER_TOOLS = [
             "properties": {
                 "node_kind": {
                     "type": "string",
-                    "enum": ["source", "destination", "transform", "api_call", "condition", "llm", "notification", "wait", "merge", "split"],
+                    "enum": list(RUNNABLE_NODE_KINDS),
                     "description": "Type of node to get template for"
                 },
                 "connector_type": {

@@ -3,9 +3,9 @@
  *
  * Bug class: the same fact rendered from two sources. The health header, above
  * every tab, printed runtime.progress ("78% · step 7/8"), whose total is a count
- * the executor hard-codes, while the Overview timeline and the Monitoring header
- * both count the run's own stages (stepInfoFromEvents → deriveStepInfo, pinned
- * by monitoring-header-matches-overview): "7/8" above "7/7" on one screen. The
+ * the executor hard-codes, while the Overview timeline counts the run's own
+ * stages (buildAgenticStagesFromEvents → deriveStepInfo, pinned by
+ * monitoring-header-matches-overview): "7/8" above "7/7" on one screen. The
  * header now keeps the percentage and leaves the step to the timeline.
  *
  * Controls: the percentage stays, and a completed run still reads 100 %.

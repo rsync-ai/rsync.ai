@@ -35,4 +35,27 @@ messages:
 
   - role: user
     content: |
-      {prompt}
+      Generate a Debezium Kafka Connect connector configuration for a {{ source_type }} database.
+
+      - Database: {{ database }}
+      - Tables to capture: {{ tables | join(', ') }}
+      - Snapshot mode: {{ snapshot_mode }}
+      - Use "topic.prefix": "{{ topic_prefix }}"
+
+      Write the connection properties (host, port, user, password) with the value "${CONNECTION}":
+      rsync.ai fills them in from the saved connection.
+
+      Requirements:
+      1. Return ONLY valid JSON (no markdown, no explanation)
+      2. Include the correct "connector.class" for {{ source_type }}
+      3. Include all necessary connection and CDC properties
+      4. Include schema history configuration if needed
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  source_type: enum
+  database: identifier
+  tables: identifier
+  snapshot_mode: enum
+  topic_prefix: identifier

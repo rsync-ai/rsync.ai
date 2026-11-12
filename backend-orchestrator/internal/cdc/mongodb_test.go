@@ -8,12 +8,9 @@ import (
 // MongoDB must self-register via init() and dispatch like the relational
 // families, even though it provisions nothing.
 func TestMongoDBProviderRegistered(t *testing.T) {
-	if !IsSupportedDBType("mongodb") {
-		t.Fatalf("expected mongodb to have a registered CDC provider")
-	}
 	mgr, ok := NewProvider("mongodb", nil)
 	if !ok {
-		t.Fatalf("NewProvider(mongodb) not ok")
+		t.Fatalf("expected mongodb to have a registered CDC provider")
 	}
 	if mgr.Family() != "mongodb" {
 		t.Errorf("mongodb Family()=%q, want mongodb", mgr.Family())

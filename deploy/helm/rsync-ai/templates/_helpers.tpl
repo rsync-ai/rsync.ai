@@ -799,6 +799,21 @@ failure the alias was added to end. Documented as this name too
       name: {{ include "rsync-ai.secretName" . }}
       key: INTERNAL_SERVICE_SECRET
       optional: true
+{{ include "rsync-ai.piiHashKeyEnv" . }}
+{{- end -}}
+
+{{/*
+The key for PII mask rules that hash with hmac_sha256. api-gateway (preview),
+orchestrator (batch) and kafka-mcp-sink (CDC) must read the SAME value, so all
+three take it from here. Optional: without it those rules refuse to run.
+*/}}
+{{- define "rsync-ai.piiHashKeyEnv" -}}
+- name: RSYNC_PII_HASH_SALT
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rsync-ai.secretName" . }}
+      key: RSYNC_PII_HASH_SALT
+      optional: true
 {{- end -}}
 
 {{/*

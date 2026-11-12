@@ -1,15 +1,12 @@
 "use client"
 
 import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties } from "react"
-import { PageHeader } from "@/components/layout/PageHeader"
 import { isNameResolutionFailure } from "@/lib/errors/name-resolution"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Textarea } from "@/components/ui/textarea"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -48,7 +45,7 @@ import {
   Bookmark,
   Code,
   Loader2,
-  Sparkles,
+  Plus,
   AlertCircle,
   CheckCircle2,
   RefreshCw,
@@ -56,24 +53,26 @@ import {
   Copy,
   Download,
   X,
-  BarChart3,
-  ExternalLink,
-  GitBranch,
   Server,
   PanelLeftClose,
   PanelLeftOpen,
   Table2,
   EyeOff,
   GripHorizontal,
+  ChartColumn,
+  BellRing,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { toast } from "sonner"
 import { copyTextToClipboard } from "@/lib/clipboard"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { cn } from "@/lib/utils"
 import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
-import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
+import { useCurrentUser } from "@/contexts/CurrentUserContext"
+import { captureWorkspace, getActiveWorkspaceId, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
 import {
   canRunExplorerStatement,
   classifyExplorerStatement,
@@ -81,41 +80,43 @@ import {
   firstSqlVerb,
   minRoleForStmtClass,
 } from "@/lib/explorer/statementClass"
+import { resolveRunTarget, type RunTarget } from "@/lib/explorer/sqlStatements"
 import {
-  resolveRunTarget,
-  spliceRunTarget,
-  type RunTarget,
-} from "@/lib/explorer/sqlStatements"
-import {
-  ExplorerStepTimeline,
-  ExplorerRun,
-  ExplorerStep,
-  createInitialExplorerSteps,
-  updateExplorerStep,
-  HITLTablePicker,
-  TableCandidate as HITLTableCandidate,
-  HITLMetricPicker,
-  type MetricChoice,
   SqlEditor,
   type SqlEditorHandle,
-  NlExamplePrompts,
   SchemaBrowser,
   SavedQueries,
 } from "@/components/explorer"
-import { groupTablesByDatabase } from "@/lib/explorer/schemaTree"
-import { fetchNextStepSuggestions } from "@/lib/explorer/nextSteps"
-import {
-  describeColumnLink,
-  flattenResolvedColumns,
-  resolveExplorerColumns,
-} from "@/lib/explorer/resolveColumns"
+import { DEFAULT_DATABASE, groupTablesByDatabase } from "@/lib/explorer/schemaTree"
+import { explorerSqlDialect, SQL_DIALECT_LABELS, type ExplorerSqlDialect } from "@/lib/explorer/sqlDialect"
 import { handleExplorerRunShortcut } from "@/lib/explorer/runShortcut"
-import { ShareToSlackDialog } from "@/components/explorer/ShareToSlackDialog"
-import { DocumentExplorer } from "@/components/explorer/DocumentExplorer"
-import { SuggestTablesCard } from "@/components/explorer/SuggestTablesCard"
+import {
+  EXPLORER_OPEN_SQL_EVENT,
+  MAX_QUERY_TABS,
+  addTab,
+  appendHistory,
+  closeTab,
+  initialTabsState,
+  loadTabs,
+  queryTabsKey,
+  readHistory,
+  renameTab,
+  saveTabs,
+  stashWorkflowQuery,
+  takeExplorerSql,
+  updateTab,
+  WORKFLOW_FROM_EXPLORER_HREF,
+  type QueryHistoryEntry,
+  type QueryTabsState,
+} from "@/lib/explorer/queryTabs"
+import { DocumentExplorer, type DocumentMode } from "@/components/explorer/DocumentExplorer"
+import { buildDocumentQueryText, parseDocumentQueryText } from "@/lib/explorer/documentSpec"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
-import { llmNotConfiguredError } from "@/lib/explorer/llmNotConfigured"
+import { extractRawMessage } from "@/lib/explorer/errorMessage"
 import { maskedColumns } from "@/lib/explorer/redactedColumns"
+import { textFilters } from "@/lib/explorer/textFilters"
+import { ExplorerStartHere } from "@/components/explorer/ExplorerStartHere"
+import { useModKey } from "@/lib/hooks/useModKey"
 
 // Types
 interface Connection {
@@ -163,7 +164,7 @@ interface ForeignKeyMetadata {
 }
 
 interface ExplorerError {
-  code: string   // "auth" | "llm_offline" | "llm_not_configured" | "db_error" | "table_resolve_failed" | "sql_gen_failed" | "network" | "validation" | "schema_failed" | "unknown"
+  code: string   // "auth" | "service_unavailable" | "db_error" | "network" | "validation" | "schema_failed" | "unknown"
   title: string  // shown as the error heading
   message: string // raw server message or fallback
   hint?: string  // actionable suggestion shown below
@@ -192,21 +193,26 @@ interface QueryResult {
   statement_type?: string
 }
 
-interface QueryHistory {
-  id: string
-  question?: string
-  sql: string
-  timestamp: Date
-  executionTimeMs?: number
-  rowCount?: number
-}
-
-// The four panes of the workspace's results half. "results" is the run output
-// and the default — it used to be a card stacked below the editor, so a run's
-// outcome was off-screen on a laptop. "history" is the automatic, per-browser
+// What the centre column shows: the active query tab's editor and results, or
+// the Saved or History list in their place. Saved and History are tabs at the
+// top (dashboards-design.md § 7.5): "history" is the automatic, per-browser
 // localStorage scratchpad; "saved" is the workspace-scoped server resource
 // (migration 084). Those two coexist on purpose — one is disposable, one shared.
-type ExplorerPanelTab = "results" | "steps" | "history" | "saved"
+type ExplorerView = "query" | "saved" | "history"
+
+// One tab's last run. Held in memory only, by tab id: a result is a copy of
+// customer data and is never written to the browser's storage.
+interface TabRun {
+  result: QueryResult | null
+  // The SQL the result came from, for the 0-row state's text matches.
+  sql: string | null
+  error: ExplorerError | null
+  running: boolean
+}
+
+const EMPTY_RUN: TabRun = { result: null, sql: null, error: null, running: false }
+
+const TAB_LIMIT_MESSAGE = `${MAX_QUERY_TABS} query tabs are open. Close one to open another.`
 
 type ExportFormat = "csv" | "tsv" | "json" | "xlsx"
 
@@ -222,16 +228,6 @@ const MAX_COMPOSE_RATIO = 0.75
 function clampComposeRatio(v: number): number {
   if (!Number.isFinite(v)) return DEFAULT_COMPOSE_RATIO
   return Math.min(MAX_COMPOSE_RATIO, Math.max(MIN_COMPOSE_RATIO, v))
-}
-
-// Human name for the dialect the editor highlights against and the AI writes
-// for. Resolved from the connector on every generate and never shown until now.
-const SQL_DIALECT_LABELS: Record<string, string> = {
-  postgresql: "PostgreSQL",
-  mysql: "MySQL",
-  redshift: "Redshift",
-  databricks: "Databricks",
-  generic: "ANSI SQL",
 }
 
 // The one database discovery is pinned to. A connector whose tables live in
@@ -255,25 +251,6 @@ function pluralizeRows(n: number): string {
   return `${count} ${n === 1 ? "row" : "rows"}`
 }
 
-type VisualizationTool = "metabase" | "superset" | "looker" | "powerbi" | "tableau"
-
-interface VisualizationToolDef {
-  id: VisualizationTool
-  name: string
-  description: string
-  implemented: boolean
-  accentClass: string
-}
-
-const VISUALIZATION_TOOLS: VisualizationToolDef[] = [
-  { id: "metabase", name: "Metabase",  description: "Open-source BI",         implemented: true,  accentClass: "border-blue-400 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300" },
-  // Superset export is not wired: the client posts to /proxy/explorer/superset/dashboard, which does not exist (only metabase does). Marked unimplemented until a real proxy route ships.
-  { id: "superset", name: "Superset",  description: "Apache data exploration", implemented: false, accentClass: "border-cyan-400 bg-cyan-50 dark:bg-cyan-950 text-cyan-700 dark:text-cyan-300" },
-  { id: "looker",   name: "Looker",    description: "Google BI platform",      implemented: false, accentClass: "border-indigo-400 bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300" },
-  { id: "powerbi",  name: "Power BI",  description: "Microsoft analytics",     implemented: false, accentClass: "border-yellow-400 bg-yellow-50 dark:bg-yellow-950 text-yellow-700 dark:text-yellow-300" },
-  { id: "tableau",  name: "Tableau",   description: "Visual analytics",        implemented: false, accentClass: "border-orange-400 bg-orange-50 dark:bg-orange-950 text-orange-700 dark:text-orange-300" },
-]
-
 function normalizeTableName(input: unknown): string {
   const raw = String(input ?? "").trim()
   if (!raw) return ""
@@ -281,16 +258,6 @@ function normalizeTableName(input: unknown): string {
   const last = raw.split(".").pop() || ""
   // Strip common quoting.
   return last.replace(/^["'`]+/, "").replace(/["'`]+$/, "").trim()
-}
-
-function parseQualifiedTable(input: unknown): { schema: string; table: string } {
-  const raw = String(input ?? "").trim()
-  if (!raw) return { schema: "", table: "" }
-  const parts = raw.split(".").map((p) => p.trim()).filter(Boolean)
-  if (parts.length <= 1) return { schema: "", table: normalizeTableName(raw) }
-  const table = normalizeTableName(parts[parts.length - 1])
-  const schema = parts.slice(0, -1).join(".").replace(/^["'`]+/, "").replace(/["'`]+$/, "").trim()
-  return { schema, table }
 }
 
 // True when the connection is a MySQL/MariaDB family source. These are
@@ -308,55 +275,57 @@ function tableKeyFromMeta(t: { name: string; schema?: string }): string {
   return schema ? `${schema}.${table}` : table
 }
 
-function normalizeTableKey(input: unknown): string {
-  const { schema, table } = parseQualifiedTable(input)
-  if (!table) return ""
-  return schema ? `${schema}.${table}` : table
-}
-
-function qualifyTableKeyIfPossible(input: unknown, allTables: TableMetadata[]): string {
-  const key = normalizeTableKey(input)
-  if (!key) return ""
-  const parsed = parseQualifiedTable(key)
-  if (parsed.schema) return `${parsed.schema}.${parsed.table}`
-
-  // No schema: if the table name is unique in this connection's schema index,
-  // we can safely upgrade it to schema.table.
-  const matches = (allTables || []).filter((t) => normalizeTableName(t.name) === parsed.table)
-  if (matches.length === 1) return tableKeyFromMeta(matches[0])
-  return parsed.table
-}
-
-function formatTableKeyForDisplay(key: string): string {
-  const { schema, table } = parseQualifiedTable(key)
-  return schema ? `${schema}.${table}` : table
-}
-
-function qualifySqlUsingSelectedTables(sql: string, selectedTableKeys: string[]): string {
-  const mappings = (selectedTableKeys || [])
-    .map((k) => parseQualifiedTable(k))
-    .filter((p) => p.schema && p.table)
-
-  if (mappings.length === 0) return sql
-
-  // Best-effort qualification for common SELECT patterns.
-  // We only rewrite unqualified identifiers in FROM/JOIN positions.
-  const re = /\b(from|join)\s+([a-zA-Z0-9_]+)\b/gi
-  return sql.replace(re, (full, kw: string, ident: string) => {
-    const m = mappings.find((x) => x.table.toLowerCase() === String(ident).toLowerCase())
-    if (!m) return full
-    return `${kw} ${m.schema}.${m.table}`
-  })
-}
-
 export default function ExplorerPage() {
+  const modKey = useModKey()
   const DEFAULT_ROW_LIMIT = 100
   const MAX_ROW_LIMIT = 1000
   const SCHEMA_CACHE_TTL_MS = 15 * 60 * 1000
 
   // Connection state
   const [connections, setConnections] = useState<Connection[]>([])
-  const [selectedConnection, setSelectedConnection] = useState<string>("")
+
+  // ── Query tabs (dashboards-design.md § 7.5) ──
+  // Up to 10, each with its own connection and SQL, kept in this browser per
+  // person and workspace (lib/explorer/queryTabs). Until the person is known
+  // there is no key and the tabs live in memory; the stored ones replace them
+  // the moment it is. A person with no workspace picked uses the default one.
+  const { user, isLoading: userLoading } = useCurrentUser()
+  const [workspaceId, setWorkspaceId] = useState<string | null>(() => getActiveWorkspaceId())
+  const tabsKey = queryTabsKey(user?.id, workspaceId || "default")
+  // The tabs carry the key they were loaded under, so a workspace switch can
+  // never save one workspace's tabs under the other's key.
+  const [tabsBox, setTabsBox] = useState<{ key: string | null; state: QueryTabsState }>(() => ({
+    key: null,
+    state: initialTabsState(),
+  }))
+  const tabsState = tabsBox.state
+  const setTabsState = useCallback((update: (s: QueryTabsState) => QueryTabsState) => {
+    setTabsBox((box) => {
+      const next = update(box.state)
+      return next === box.state ? box : { ...box, state: next }
+    })
+  }, [])
+  useEffect(() => {
+    if (!tabsKey) return
+    const stored = loadTabs(tabsKey)
+    // Storage is only readable on the client and the key needs the signed-in
+    // person, so this cannot be a useState initializer; it runs once per key.
+    // With nothing stored, the first load keeps the tab already on screen and
+    // a switch to another workspace starts that one fresh.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTabsBox((box) => ({ key: tabsKey, state: stored ?? (box.key === null ? box.state : initialTabsState()) }))
+  }, [tabsKey])
+  useEffect(() => {
+    if (tabsBox.key && tabsBox.key === tabsKey) saveTabs(tabsBox.key, tabsBox.state)
+  }, [tabsBox, tabsKey])
+  const activeTab = tabsState.tabs.find((t) => t.id === tabsState.active) ?? tabsState.tabs[0]
+  const activeTabId = activeTab.id
+  // A tab whose connection is gone (deleted, or not in this workspace) reads the
+  // first usable one until it is pointed at another. Derived, not stored, so it
+  // can never disagree with the connection list it was picked from.
+  const selectedConnection = connections.some((c) => c.id === activeTab.connectionId)
+    ? activeTab.connectionId
+    : (connections[0]?.id ?? "")
   // Document connections (explorer_mode "document") browse one collection at a time.
   const [documentCollection, setDocumentCollection] = useState<string>("")
   // The picked collection's database: a server-level connection lists several.
@@ -365,6 +334,23 @@ export default function ExplorerPage() {
     setDocumentCollection(name)
     setDocumentDatabase(database)
   }, [])
+  // Find or Pipeline, and the pipeline as typed. Held here because a pipeline is what a
+  // MongoDB saved query (and so a MongoDB model) stores.
+  const [documentMode, setDocumentMode] = useState<DocumentMode>("find")
+  const [documentPipeline, setDocumentPipeline] = useState("")
+  const loadSavedPipeline = useCallback(
+    (text: string) => {
+      const saved = parseDocumentQueryText(text)
+      if (!saved) {
+        toast.error("This saved query is not a pipeline the Document Browser can open")
+        return
+      }
+      pickDocumentCollection(saved.collection, saved.database)
+      setDocumentPipeline(saved.pipeline)
+      setDocumentMode("pipeline")
+    },
+    [pickDocumentCollection],
+  )
   const [loadingConnections, setLoadingConnections] = useState(true)
 
   // Schema state
@@ -404,7 +390,6 @@ export default function ExplorerPage() {
     const mins = Math.floor((Date.now() - schemaCachedAt) / 60_000)
     return mins < 1 ? "" : `${mins}m`
   }, [schemaCachedAt, schemaCacheAgeTick])
-  const [selectedTables, setSelectedTables] = useState<string[]>([])
   // allDatabases (MySQL only) switches the schema-index fetch to server scope
   // (every database, not just the configured one). Tree expansion + search now
   // live inside <SchemaBrowser>.
@@ -421,15 +406,38 @@ export default function ExplorerPage() {
       }
     >()
   )
-  const tableIndexCacheRef = useRef(new Map<string, { tablesRef: TableMetadata[]; index: TableIndex }>())
 
-  // Query state
-  const [nlInput, setNlInput] = useState("")
-  const [sqlQuery, setSqlQuery] = useState("")
-  const [generatingSql, setGeneratingSql] = useState(false)
-  const [executingQuery, setExecutingQuery] = useState(false)
-  const [queryResult, setQueryResult] = useState<QueryResult | null>(null)
-  const [queryError, setQueryError] = useState<ExplorerError | null>(null)
+  // Query state: the active tab's SQL, and its last run.
+  const sqlQuery = activeTab.sql
+  // The saved query last opened from Saved, while the editor still holds its SQL: Create
+  // chart charts that query (a chart's source is a model or a saved query, § 7.2).
+  const [openedSaved, setOpenedSaved] = useState<{ id: string; sql: string } | null>(null)
+  const chartHref =
+    openedSaved && openedSaved.sql === sqlQuery ? `/charts/new?source=${encodeURIComponent(openedSaved.id)}` : "/charts/new"
+  const setSqlQuery = useCallback(
+    (v: string | ((prev: string) => string)) =>
+      setTabsState((s) => {
+        const t = s.tabs.find((x) => x.id === s.active)
+        if (!t) return s
+        return updateTab(s, t.id, { sql: typeof v === "function" ? v(t.sql) : v })
+      }),
+    [setTabsState],
+  )
+  const [runs, setRuns] = useState<Record<string, TabRun>>({})
+  const patchRun = useCallback((tabId: string, patch: Partial<TabRun>) => {
+    setRuns((prev) => ({ ...prev, [tabId]: { ...(prev[tabId] ?? EMPTY_RUN), ...patch } }))
+  }, [])
+  const activeRun = runs[activeTabId] ?? EMPTY_RUN
+  const queryResult = activeRun.result
+  // A query that matched nothing names its text matches: a value it guessed
+  // ('DECLINED' for a stored 'declined') is the usual reason.
+  const zeroRowFilters = queryResult?.rows.length === 0 ? textFilters(activeRun.sql) : []
+  const queryError = activeRun.error
+  const executingQuery = activeRun.running
+  const setQueryError = useCallback(
+    (e: ExplorerError | null) => patchRun(activeTabId, { error: e }),
+    [patchRun, activeTabId],
+  )
   // Destructive statements (DROP/TRUNCATE) require an owner AND a typed confirmation.
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
   const [destructiveConfirmText, setDestructiveConfirmText] = useState("")
@@ -454,7 +462,11 @@ export default function ExplorerPage() {
   )
   // The caller's workspace role gates which statement classes can run (advisory; the
   // api-gateway independently enforces via validators.ValidateExplorerStatement).
-  const { role: workspaceRole } = useWorkspaceRole()
+  const { role: workspaceRole, meets: meetsRole } = useWorkspaceRole()
+  const canMakeCharts = meetsRole("admin")
+  // Building a workflow is an owner's or admin's, as on /workflows/new; the server checks it again.
+  const canBuildWorkflows = meetsRole("admin")
+  const router = useRouter()
   const currentStmtClass = classifyExplorerStatement(runTarget.sql)
   const canRunCurrentStatement = canRunExplorerStatement(workspaceRole, runTarget.sql)
   // Stable identity: SqlEditor holds this in a memoized extension array, so a new
@@ -477,65 +489,43 @@ export default function ExplorerPage() {
     }
     return currentStmtClass === "destructive" ? "Run Query…" : "Run Query"
   }, [runTarget.multi, runTarget.source, runTarget.total, runTarget.index, currentStmtClass])
-  const [executionLimit, setExecutionLimit] = useState<number>(DEFAULT_ROW_LIMIT)
   const [exportingFormat, setExportingFormat] = useState<ExportFormat | null>(null)
 
-  // History state
-  const [queryHistory, setQueryHistory] = useState<QueryHistory[]>([])
+  // History: the last 20 successful runs per connection in this browser, read
+  // from storage and re-read after each run (a run in a background tab can add
+  // to a connection that is not on screen).
+  const [historyVersion, setHistoryVersion] = useState(0)
+  const queryHistory = useMemo(() => {
+    void historyVersion
+    return readHistory(selectedConnection)
+  }, [selectedConnection, historyVersion])
 
   // Cell viewer (for long values so UI truncation isn't confused with masking)
   const [cellViewerOpen, setCellViewerOpen] = useState(false)
   const [cellViewerTitle, setCellViewerTitle] = useState<string>("")
   const [cellViewerValue, setCellViewerValue] = useState<string>("")
 
-  // BI dashboard creation state
-  const [creatingDashboard, setCreatingDashboard] = useState(false)
-  const [showDashboardDialog, setShowDashboardDialog] = useState(false)
-  const [dashboardName, setDashboardName] = useState("")
-  const [dashboardDescription, setDashboardDescription] = useState("")
-  const [selectedBiTool, setSelectedBiTool] = useState<VisualizationTool>("metabase")
-
-  // Exploration run state (for step DAG/timeline)
-  const [currentRun, setCurrentRun] = useState<ExplorerRun | null>(null)
-  const [rightPanelTab, setRightPanelTab] = useState<ExplorerPanelTab>("results")
+  const [view, setView] = useState<ExplorerView>("query")
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
 
   // Height split between the compose pane and the results pane below it.
   const [composeRatio, setComposeRatio] = useState(DEFAULT_COMPOSE_RATIO)
   const splitColumnRef = useRef<HTMLDivElement>(null)
 
-  // "ask" shows the natural-language box above the SQL editor; "sql" hides it so
-  // the editor owns the whole compose pane. The editor stays mounted in both.
-  const [composeMode, setComposeMode] = useState<"ask" | "sql">("ask")
-
   // The schema browser (left rail) collapses to a thin strip so power users
   // writing raw SQL can reclaim the full editor width. Open by default.
   const [leftRailOpen, setLeftRailOpen] = useState(true)
 
-  // HITL (Tables)
-  const [tableHITLOpen, setTableHITLOpen] = useState(false)
-  const [tableHITLCandidates, setTableHITLCandidates] = useState<HITLTableCandidate[]>([])
-
-  // HITL (Metric)
-  const [metricHITLOpen, setMetricHITLOpen] = useState(false)
-  const [metricChoice, setMetricChoice] = useState<MetricChoice | null>(null)
-  const [metricHitlOptions, setMetricHitlOptions] = useState<
-    Array<{ id: MetricChoice; title: string; description: string; default?: boolean }>
-  >([])
-  const pendingGenerateRef = useRef<{ tablesOverride?: string[] } | null>(null)
-  const metricChoiceRef = useRef<MetricChoice | null>(null)
-  const lastMetricQuestionRef = useRef<string>("")
-
-  const nlTextareaRef = useRef<HTMLTextAreaElement>(null)
   // Imperative handle on the CodeMirror SQL editor — used by the
   // sidebar's "insert table/column at cursor" buttons. Without this
   // the click-to-insert flow would require replicating CodeMirror's
   // selection API at the page level.
   const sqlEditorRef = useRef<SqlEditorHandle>(null)
-  // AbortController for the currently-running query. Replaced on each
-  // Run Query press; .abort() cancels both the fetch AND the
-  // server-side query via the request context (the Go driver honors
-  // ctx.Done() on connections).
-  const executeAbortRef = useRef<AbortController | null>(null)
+  // One AbortController per tab with a run in flight. .abort() cancels both the
+  // fetch AND the server-side query via the request context (the Go driver
+  // honors ctx.Done() on connections). Per tab, so a run started in one tab
+  // never cancels another's.
+  const abortsRef = useRef(new Map<string, AbortController>())
 
   // Persist the dragged split so a chosen layout survives a reload.
   const persistComposeRatio = useCallback((next: number) => {
@@ -615,8 +605,6 @@ export default function ExplorerPage() {
     [composeRatio, persistComposeRatio]
   )
 
-  const HISTORY_KEY_PREFIX = "rsync_explorer_history_v1"
-
   const loadConnections = useCallback(async () => {
     // A switch mid-flight makes this response the previous workspace's list.
     const isStale = captureWorkspace()
@@ -648,16 +636,13 @@ export default function ExplorerPage() {
         return String(a.name || "").localeCompare(String(b.name || ""))
       })
 
+      // No auto-select: a tab with no usable connection reads the first one
+      // (selectedConnection above).
       setConnections(usable)
 
-      // Auto-select a default connection. Read the selection through the updater, not a
-      // closure: depending on it made every pick in the menu fetch this list again.
-      if (usable.length > 0) {
-        setSelectedConnection((current) => current || usable[0].id)
-      }
       if (usable.length === 0) {
         toast.message("No queryable connections found", {
-          description: "Create a PostgreSQL, MySQL, SQL Server, Databricks, or Redshift connection (source or destination) to use Explorer.",
+          description: "Create a PostgreSQL, MySQL, SQL Server, Redshift, Databricks, BigQuery, Snowflake, ClickHouse, Oracle, or MongoDB connection (source or destination) to use Explorer.",
         })
       }
     } catch (err) {
@@ -671,52 +656,6 @@ export default function ExplorerPage() {
       setLoadingConnections(false)
     }
   }, [])
-
-  // Load per-connection query history from localStorage
-  useEffect(() => {
-    if (!selectedConnection) return
-    const key = `${HISTORY_KEY_PREFIX}:${selectedConnection}`
-    try {
-      const raw = localStorage.getItem(key)
-      if (!raw) {
-        setQueryHistory([])
-        return
-      }
-      const parsed = JSON.parse(raw)
-      if (!Array.isArray(parsed)) {
-        setQueryHistory([])
-        return
-      }
-      const hydrated: QueryHistory[] = parsed
-        .map((e: any) => ({
-          id: String(e.id || ""),
-          question: e.question ? String(e.question) : undefined,
-          sql: String(e.sql || ""),
-          timestamp: new Date(e.timestamp || Date.now()),
-          executionTimeMs: typeof e.executionTimeMs === "number" ? e.executionTimeMs : undefined,
-          rowCount: typeof e.rowCount === "number" ? e.rowCount : undefined,
-        }))
-        .filter((e) => e.id && e.sql)
-      setQueryHistory(hydrated)
-    } catch {
-      setQueryHistory([])
-    }
-  }, [selectedConnection])
-
-  // Persist query history to localStorage
-  useEffect(() => {
-    if (!selectedConnection) return
-    const key = `${HISTORY_KEY_PREFIX}:${selectedConnection}`
-    try {
-      const serializable = queryHistory.map((e) => ({
-        ...e,
-        timestamp: e.timestamp instanceof Date ? e.timestamp.toISOString() : new Date().toISOString(),
-      }))
-      localStorage.setItem(key, JSON.stringify(serializable))
-    } catch {
-      // ignore
-    }
-  }, [selectedConnection, queryHistory])
 
   const loadSchema = useCallback(
     async (opts?: { force?: boolean }) => {
@@ -792,19 +731,31 @@ export default function ExplorerPage() {
     [selectedConnection, allDatabases]
   )
 
+  // A run can finish after its tab, or its connection, has left the screen.
+  const selectedConnectionRef = useRef(selectedConnection)
+  const loadSchemaRef = useRef(loadSchema)
+  useEffect(() => {
+    selectedConnectionRef.current = selectedConnection
+    loadSchemaRef.current = loadSchema
+  }, [selectedConnection, loadSchema])
+
   // Load connections on mount
   useEffect(() => {
     loadConnections()
   }, [loadConnections])
 
   // Reload connections when the active workspace changes (header switcher). This is a
-  // client page, so router.refresh() won't re-run the fetch. We also drop the selected
-  // connection — it belongs to the previous workspace and would 404 on query — so the
-  // effects keyed on selectedConnection clear the schema and the reload re-defaults to
-  // the new workspace's first queryable connection.
+  // client page, so router.refresh() won't re-run the fetch. The tabs move to the new
+  // workspace's key, and the old list goes at once so the effects keyed on
+  // selectedConnection clear the schema. Runs in flight belong to the previous
+  // workspace: they are cancelled and every result is dropped.
   useEffect(() => {
     return onActiveWorkspaceChange(() => {
-      setSelectedConnection("")
+      setWorkspaceId(getActiveWorkspaceId())
+      setConnections([])
+      for (const ctl of abortsRef.current.values()) ctl.abort()
+      abortsRef.current.clear()
+      setRuns({})
       void loadConnections()
     })
   }, [loadConnections])
@@ -816,7 +767,6 @@ export default function ExplorerPage() {
     } else {
       setTables([])
       setForeignKeys([])
-      setSelectedTables([])
       setSchemaFromCache(false)
       setSchemaError(null)
     }
@@ -827,97 +777,17 @@ export default function ExplorerPage() {
   useEffect(() => {
     setAllDatabases(false)
     pickDocumentCollection("")
+    setDocumentMode("find")
+    setDocumentPipeline("")
   }, [selectedConnection, pickDocumentCollection])
-
-  // When the user focuses NL/SQL inputs, pause step updates and flush them on blur.
-  const editorInteractingRef = useRef(false)
-  const pendingRunStepUpdatesRef = useRef<Array<{ stepId: string; updates: Partial<ExplorerStep> }>>([])
-
-  const flushPendingRunStepUpdates = useCallback(() => {
-    const queued = pendingRunStepUpdatesRef.current
-    if (queued.length === 0) return
-    pendingRunStepUpdatesRef.current = []
-
-    setCurrentRun((prev) => {
-      if (!prev) return prev
-      let next = prev
-      for (const u of queued) {
-        next = updateExplorerStep(next, u.stepId, u.updates)
-      }
-      return next
-    })
-  }, [])
-
-  // The parked updates ARE what the timeline is meant to be showing, so land
-  // them the moment the timeline comes into view. Until this existed the queue
-  // was flushed from exactly two places — the two editor blur handlers — so a
-  // run started with Cmd/Ctrl+Enter from inside a focused editor never flushed
-  // at all: the Steps tab showed "Completed · 0ms total" with every step blank
-  // while the rows sat in the grid next to it.
-  useEffect(() => {
-    if (rightPanelTab === "steps") flushPendingRunStepUpdates()
-  }, [rightPanelTab, flushPendingRunStepUpdates])
-
-  // Helper to update a step in the current run
-  const updateRunStep = useCallback(
-    (stepId: string, updates: Partial<ExplorerStep>) => {
-      // Avoid re-rendering the entire explorer while the user is actively editing NL/SQL.
-      // This prevents focus/caret jitter and makes automated UI interactions less flaky.
-      if (editorInteractingRef.current) {
-        pendingRunStepUpdatesRef.current.push({ stepId, updates })
-        // Keep only the most recent ~50 updates to avoid unbounded growth in worst-case loops.
-        if (pendingRunStepUpdatesRef.current.length > 50) {
-          pendingRunStepUpdatesRef.current = pendingRunStepUpdatesRef.current.slice(-50)
-        }
-        return
-      }
-      setCurrentRun((prev) => {
-        if (!prev) return prev
-        return updateExplorerStep(prev, stepId, updates)
-      })
-    },
-    []
-  )
-
-  // Start a new exploration run
-  const startExplorationRun = useCallback((question: string): ExplorerRun => {
-    const runId = `run-${Date.now()}`
-    const run: ExplorerRun = {
-      id: runId,
-      question,
-      steps: createInitialExplorerSteps(),
-      startedAt: new Date(),
-      status: "running",
-    }
-    // Drop whatever the last run parked while an editor held focus. The queue
-    // addresses steps by id, so without this a stale update from the previous
-    // run lands on this one the next time a flush fires.
-    pendingRunStepUpdatesRef.current = []
-    setCurrentRun(run)
-    setRightPanelTab("steps")
-    return run
-  }, [])
-
-  const tableIndex = useMemo(() => {
-    if (!selectedConnection) return buildTableIndex([])
-    const cached = tableIndexCacheRef.current.get(selectedConnection)
-    if (cached && cached.tablesRef === tables) return cached.index
-    const idx = buildTableIndex(tables)
-    tableIndexCacheRef.current.set(selectedConnection, { tablesRef: tables, index: idx })
-    return idx
-  }, [selectedConnection, tables])
 
   // Map the selected connection's connector_type onto a CodeMirror SQL
   // dialect so the editor highlights and autocompletes against the
   // right keyword set + identifier rules.
-  const sqlDialect: "postgresql" | "mysql" | "redshift" | "databricks" | "generic" = useMemo(() => {
-    const ct = (connections.find((c) => c.id === selectedConnection)?.connector_type || "").toLowerCase()
-    if (ct.includes("mysql") || ct.includes("mariadb")) return "mysql"
-    if (ct.includes("redshift")) return "redshift"
-    if (ct.includes("databricks")) return "databricks"
-    if (ct.includes("postgres")) return "postgresql"
-    return "generic"
-  }, [connections, selectedConnection])
+  const sqlDialect: ExplorerSqlDialect = useMemo(
+    () => explorerSqlDialect(connections.find((c) => c.id === selectedConnection)?.connector_type),
+    [connections, selectedConnection],
+  )
 
   // Columns the server masked before sending this preview, detected from the
   // values rather than by re-implementing the Go naming rules (which would
@@ -928,554 +798,14 @@ export default function ExplorerPage() {
     [queryResult]
   )
 
-  const generateSQL = async (opts?: { tablesOverride?: string[]; metricChoiceOverride?: MetricChoice }) => {
-    if (!nlInput.trim()) {
-      toast.error("Please enter a question")
-      return
-    }
-
-    try {
-      // Metric choice is per-question. If the prompt changed, clear prior choice.
-      if (lastMetricQuestionRef.current !== nlInput) {
-        lastMetricQuestionRef.current = nlInput
-        metricChoiceRef.current = null
-        setMetricChoice(null)
-        setMetricHitlOptions([])
-      }
-
-      setGeneratingSql(true)
-      setQueryError(null)
-
-      const requestedLimitFromNL = extractRequestedRowLimit(nlInput)
-      const desiredLimit = clampInt(
-        requestedLimitFromNL ?? DEFAULT_ROW_LIMIT,
-        1,
-        MAX_ROW_LIMIT
-      )
-
-      // Start exploration run with step tracking
-      startExplorationRun(nlInput)
-
-      // Step 1: Schema Fetch (already loaded, mark as success)
-      const schemaFetchStart = Date.now()
-      updateRunStep("schema_fetch", {
-        status: "success",
-        startedAt: new Date(schemaFetchStart),
-        durationMs: Date.now() - schemaFetchStart,
-        completedAt: new Date(),
-        inputs: [{ key: "connection_id", value: selectedConnection }],
-        outputs: [
-          { key: "tables_loaded", value: tables.length },
-          { key: "selected_tables_pre", value: selectedTables },
-          { key: "requested_row_limit", value: requestedLimitFromNL ?? DEFAULT_ROW_LIMIT },
-        ],
-      })
-
-      // Step 2: Table Link (LLM-assisted when user didn't preselect tables)
-      const tableLinkStart = Date.now()
-      updateRunStep("table_link", {
-        status: "running",
-        startedAt: new Date(),
-        inputs: [
-          { key: "question", value: nlInput },
-          { key: "available_tables", value: tables.map((t) => tableKeyFromMeta(t)) },
-        ],
-      })
-
-      const overrideTables = Array.isArray(opts?.tablesOverride) ? opts?.tablesOverride : undefined
-      const hasOverride = Boolean(overrideTables && overrideTables.length > 0)
-      const normalizedSelectedTables = selectedTables.map((t) => qualifyTableKeyIfPossible(t, tables)).filter(Boolean)
-      // Upgrade any legacy unqualified selection to schema-qualified keys when we can.
-      if (!hasOverride && selectedTables.length > 0 && !sameTableSet(selectedTables, normalizedSelectedTables)) {
-        setSelectedTables(normalizedSelectedTables)
-      }
-
-      // Keep selected tables schema-aware so generated SQL and execution use the correct database.
-      let linkedTables: string[] = (hasOverride ? (overrideTables as string[]) : normalizedSelectedTables)
-        .map((t) => qualifyTableKeyIfPossible(t, tables))
-        .filter(Boolean)
-      let tableLinkConfidence = linkedTables.length > 0 ? 1.0 : 0.0
-      let tableLinkReason = hasOverride
-        ? "User-confirmed tables"
-        : selectedTables.length > 0
-          ? "User-selected tables"
-          : "LLM table link"
-
-      // Always attempt table linking from the question unless the user already confirmed tables via HITL.
-      // This prevents the UI from getting "stuck" on a previously-selected table when the question changes.
-      if (!hasOverride) {
-        const resp = await authFetch("/api/v1/explorer/nl/resolve-tables", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({
-            connection_id: selectedConnection,
-            question: nlInput,
-            tables: tables.slice(0, 30).map((t) => ({
-              name: t.name,
-              schema: t.schema || "public",
-              row_count: t.row_count,
-              columns: (t.columns || []).map((c) => ({
-                name: c.name,
-                type: c.type,
-                is_primary_key: c.is_primary_key ?? false,
-              })),
-            })),
-          }),
-        })
-
-        const data = await resp.json()
-        if (!resp.ok) {
-          throw new ExplorerApiError(classifyApiError(resp.status, data, "table_resolve"))
-        }
-
-        const candidates = Array.isArray(data?.candidates) ? data.candidates : []
-
-        // Local schema-aware ranking (generic): use table + column names to detect when
-        // the LLM's linked tables conflict with strong keyword matches (e.g. question says "invoices"
-        // but a suggested table looks like "payments").
-        const localRanked = rankTablesForQuestion(nlInput, tableIndex)
-        const localTop = localRanked.slice(0, 5)
-
-        const needsHitlFromServer = Boolean(data?.needs_hitl) || candidates.length === 0
-        const suggestedTables = candidates
-          .slice(0, 3)
-          .map((c: any) => {
-            const raw = String(c.table || "")
-            const parsed = parseQualifiedTable(raw)
-            const tableName = parsed.table || normalizeTableName(raw)
-            const schemaName = String(c.schema_name || c.schema || "").trim() || parsed.schema || ""
-            const key = schemaName ? `${schemaName}.${tableName}` : tableName
-            return qualifyTableKeyIfPossible(key, tables)
-          })
-          .filter((t: unknown): t is string => typeof t === "string" && t.trim().length > 0)
-        const suggestedConfidence = typeof data?.confidence_overall === "number" ? data.confidence_overall : 0.7
-
-        // Enrich candidates with column previews from already-loaded metadata
-        const enriched: HITLTableCandidate[] = candidates.map((c: any) => {
-          const rawTable = String(c.table || "")
-          const parsed = parseQualifiedTable(rawTable)
-          const tableName = parsed.table
-          // Prefer explicit schema fields, otherwise infer from the qualified table if present.
-          let schemaName = String(c.schema_name || c.schema || "").trim()
-          if (!schemaName || schemaName.toLowerCase() === "public") {
-            if (parsed.schema) schemaName = parsed.schema
-          }
-
-          const tableMeta = tables.find((t) => {
-            if (t.name !== tableName) return false
-            if (!t.schema || !schemaName) return true
-            return String(t.schema).trim() === schemaName
-          })
-          schemaName = schemaName || String(tableMeta?.schema || "").trim() || parsed.schema || ""
-          schemaName = schemaName || "public"
-          return {
-            table: tableName,
-            schema_name: schemaName,
-            confidence: typeof c.confidence === "number" ? c.confidence : 0.5,
-            reason: String(c.reason || ""),
-            row_count: typeof tableMeta?.row_count === "number" ? tableMeta?.row_count : undefined,
-            columns: (tableMeta?.columns || []).map((col) => ({
-              name: col.name,
-              type: col.type,
-              is_primary_key: col.is_primary_key,
-            })),
-          }
-        })
-
-        const mergedCandidates = mergeTableCandidates({
-          serverCandidates: enriched,
-          localTop,
-          tables: tableIndex.tables,
-        })
-
-        const suggestedSet = new Set<string>(suggestedTables.map((t: string) => normalizeTableKey(t)))
-        const userSelectedSet = new Set<string>(normalizedSelectedTables.map((t: string) => normalizeTableKey(t)))
-
-        // Decide whether to ask the user to confirm tables:
-        // - Server says HITL, OR
-        // - Local ranking is uncertain (close top-2) OR
-        // - User-selected tables conflict with strong local top table(s), OR
-        // - Suggested tables don't include the strongest local match but the match is strong.
-        const tableAsk = decideTableHitl({
-          question: nlInput,
-          userSelected: Array.from(userSelectedSet),
-          suggested: Array.from(suggestedSet),
-          localTop,
-          serverConfidence: suggestedConfidence,
-          serverNeedsHitl: needsHitlFromServer,
-        })
-
-        if (tableAsk.shouldAsk) {
-          setTableHITLCandidates(mergedCandidates)
-          setTableHITLOpen(true)
-          updateRunStep("table_link", {
-            status: "waiting_hitl",
-            durationMs: Date.now() - tableLinkStart,
-            completedAt: new Date(),
-            confidence: suggestedConfidence,
-            reason: tableAsk.reason || String(data?.hitl_reason || "Need confirmation on tables"),
-            outputs: [
-              { key: "current_selected_tables", value: selectedTables },
-              { key: "candidates", value: mergedCandidates.map((e) => `${e.schema_name}.${e.table}`) },
-            ],
-          })
-          setCurrentRun((prev) => (prev ? { ...prev, status: "waiting" } : prev))
-          return
-        }
-
-        // If user selected tables but the linker suggests different ones, either auto-switch (high confidence)
-        // or ask for confirmation (lower confidence).
-        if (normalizedSelectedTables.length > 0 && !sameTableSet(normalizedSelectedTables, suggestedTables) && suggestedTables.length > 0) {
-          if (suggestedConfidence >= 0.85) {
-            linkedTables = suggestedTables
-            tableLinkConfidence = suggestedConfidence
-            tableLinkReason = "Auto-selected tables (high confidence)"
-            setSelectedTables(suggestedTables)
-            toast.message("Updated tables for your question", {
-              description: `Using: ${suggestedTables.join(", ")}`,
-            })
-          } else {
-            setTableHITLCandidates(mergedCandidates)
-            setTableHITLOpen(true)
-            updateRunStep("table_link", {
-              status: "waiting_hitl",
-              durationMs: Date.now() - tableLinkStart,
-              completedAt: new Date(),
-              confidence: suggestedConfidence,
-              reason: "Your selected tables may not match the question — confirm tables to use",
-              outputs: [
-                { key: "current_selected_tables", value: selectedTables },
-                { key: "suggested_tables", value: suggestedTables },
-              ],
-            })
-            setCurrentRun((prev) => (prev ? { ...prev, status: "waiting" } : prev))
-            return
-          }
-        } else if (selectedTables.length === 0) {
-          // No user selection: accept suggested tables.
-          linkedTables = suggestedTables
-          tableLinkConfidence = suggestedConfidence
-          tableLinkReason = "LLM-selected tables"
-          setSelectedTables(linkedTables)
-        }
-      }
-
-      updateRunStep("table_link", {
-        status: "success",
-        durationMs: Date.now() - tableLinkStart,
-        completedAt: new Date(),
-        confidence: tableLinkConfidence,
-        reason: tableLinkReason,
-        outputs: [{ key: "selected_tables", value: linkedTables }],
-      })
-
-      // Build schema context from linked tables (fallback to first few tables if needed)
-      const linkedKeys = new Set(linkedTables.map((t) => normalizeTableKey(t)).filter(Boolean))
-      const tablesToUse =
-        linkedKeys.size > 0
-          ? tables.filter((t) => linkedKeys.has(tableKeyFromMeta(t))).slice(0, 20)
-          : tables.slice(0, 10)
-
-      if (tablesToUse.length === 0) {
-        throw new ExplorerApiError({
-          code: "no_tables",
-          title: "No tables available",
-          message: "Could not find any tables to generate SQL from.",
-          hint: "Refresh the schema using the button in the sidebar, or select specific tables manually.",
-        })
-      }
-
-      const schemaContext = tablesToUse
-        .map((t) => {
-          const cols = (t.columns || []).map((c) => c.name).join(", ")
-          return `${tableKeyFromMeta(t)}(${cols})`
-        })
-        .join("; ")
-
-      // Typed schema payload (preferred by backend when present).
-      // Keep this minimal to avoid leaking large fields (e.g. search_tokens).
-      const tablesTyped = tablesToUse.map((t) => ({
-        name: t.name,
-        schema: (t.schema || "public") as string,
-        row_count: typeof (t as unknown as Record<string, unknown>)["row_count"] === "number" ? (t as unknown as Record<string, unknown>)["row_count"] as number : undefined,
-        primary_key: Array.isArray((t as unknown as Record<string, unknown>)["primary_key"]) ? (t as unknown as Record<string, unknown>)["primary_key"] as string[] : undefined,
-        columns: (t.columns || []).map((c) => ({
-          name: c.name,
-          type: c.type,
-          is_primary_key: c.is_primary_key,
-          nullable: c.nullable,
-        })),
-      }))
-
-      const fkKey = (schema: unknown, table: unknown) => {
-        const s = String(schema || "").trim()
-        const t = normalizeTableName(table)
-        return s ? `${s}.${t}` : t
-      }
-      const tableKeySet = new Set(tablesToUse.map((t) => tableKeyFromMeta(t)))
-      const foreignKeysForSelection = (foreignKeys || []).filter((fk) => {
-        return tableKeySet.has(fkKey(fk.from_schema, fk.from_table)) && tableKeySet.has(fkKey(fk.to_schema, fk.to_table))
-      })
-
-      // Step 3: Column Link.
-      //
-      // This used to list every column of every linked table and report a
-      // hard-coded confidence of 0.85 — a step that could not fail and measured
-      // nothing. POST /explorer/nl/resolve-columns has been implemented the
-      // whole time with no caller; it is what actually decides which columns the
-      // question needs, and it is the only step that can say "I am not sure
-      // which column you meant" (needs_hitl / ambiguous_columns).
-      //
-      // It is NOT fatal. Nothing downstream consumes this step's output — SQL
-      // generation is handed `schemaContext` directly — so a failure degrades
-      // the timeline entry to the local list rather than killing the run.
-      const colLinkStart = Date.now()
-      updateRunStep("column_link", {
-        status: "running",
-        startedAt: new Date(),
-        inputs: [{ key: "tables", value: linkedTables }],
-      })
-
-      const localColumns = tablesToUse.flatMap((t) => (t.columns || []).map((c) => `${tableKeyFromMeta(t)}.${c.name}`))
-      let linkedColumns = localColumns
-
-      try {
-        const resolved = await resolveExplorerColumns({
-          connectionId: selectedConnection,
-          question: nlInput,
-          tables: tablesTyped,
-        })
-        const chosen = flattenResolvedColumns(resolved.columns)
-        if (chosen.length > 0) linkedColumns = chosen
-
-        const joins = (resolved.join_plan || [])
-          .map((j) => `${j.left_table} ${j.join_type || "JOIN"} ${j.right_table} ON ${j.condition}`)
-          .filter(Boolean)
-
-        updateRunStep("column_link", {
-          status: "success",
-          durationMs: Date.now() - colLinkStart,
-          completedAt: new Date(),
-          // The server's number, not a constant.
-          confidence: resolved.confidence,
-          reason: describeColumnLink(resolved),
-          outputs: [
-            { key: "columns", value: linkedColumns.slice(0, 10) },
-            ...(joins.length > 0 ? [{ key: "joins", value: joins }] : []),
-            ...(resolved.ambiguous_columns?.length
-              ? [{ key: "ambiguous", value: resolved.ambiguous_columns }]
-              : []),
-          ],
-        })
-      } catch (colErr) {
-        // "skipped", not "failed": the run is unaffected, and marking it failed
-        // would make a working query look like it went wrong.
-        updateRunStep("column_link", {
-          status: "skipped",
-          durationMs: Date.now() - colLinkStart,
-          completedAt: new Date(),
-          reason: `Column linking unavailable (${colErr instanceof Error ? colErr.message : "request failed"}) — every column of the linked tables was passed to SQL generation instead.`,
-          outputs: [{ key: "columns", value: linkedColumns.slice(0, 10) }],
-        })
-      }
-
-      // Step 4: SQL Generation
-      const sqlGenStart = Date.now()
-      updateRunStep("sql_generate", {
-        status: "running",
-        startedAt: new Date(),
-        inputs: [
-          { key: "question", value: nlInput },
-          { key: "schema", value: schemaContext.slice(0, 100) + "..." },
-        ],
-      })
-
-      // Generic metric disambiguation using question + schema:
-      // e.g. "total ... per month" could mean COUNT(rows) or SUM(amount-like column).
-      const metricToUse = opts?.metricChoiceOverride ?? metricChoiceRef.current ?? metricChoice
-      const metricDecision = decideMetricHitl({
-        question: nlInput,
-        selectedTables: linkedTables,
-        tableIndex,
-        currentChoice: metricToUse,
-      })
-      if (metricDecision.shouldAsk && !metricHITLOpen) {
-        pendingGenerateRef.current = { tablesOverride: linkedTables }
-        setMetricHitlOptions(metricDecision.options)
-        setMetricHITLOpen(true)
-        updateRunStep("sql_generate", {
-          status: "waiting_hitl",
-          durationMs: Date.now() - sqlGenStart,
-          completedAt: new Date(),
-          confidence: metricDecision.confidence,
-          reason: metricDecision.reason,
-          outputs: [
-            { key: "selected_tables", value: linkedTables },
-            { key: "metric_candidates", value: metricDecision.options.map((o) => o.id) },
-          ],
-        })
-        setCurrentRun((prev) => (prev ? { ...prev, status: "waiting" } : prev))
-        return
-      }
-
-      const conn = connections.find((c) => c.id === selectedConnection)
-      const dialect =
-        (conn?.connector_type || "").toLowerCase().includes("mysql") ||
-        (conn?.connector_type || "").toLowerCase().includes("mariadb")
-          ? "mysql"
-          : "postgresql"
-
-      const questionForGen = applyMetricHintToQuestion(nlInput, metricToUse, {
-        selectedTables: linkedTables,
-        tableIndex,
-      })
-
-      const res = await authFetch("/api/v1/sql/generate", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          question: questionForGen,
-          dialect,
-          schema: schemaContext,
-          tables: linkedTables.join(","),
-          tables_typed: tablesTyped,
-          foreign_keys: foreignKeysForSelection,
-        }),
-      })
-
-      const raw = await res.text()
-      const data = safeJsonParse(raw) ?? (raw ? { error: raw } : {})
-
-      if (res.ok && data.sql) {
-        const sqlWithDesiredLimit =
-          requestedLimitFromNL !== null ? setOrReplaceLimit(data.sql, desiredLimit) : data.sql
-
-        updateRunStep("sql_generate", {
-          status: "success",
-          durationMs: Date.now() - sqlGenStart,
-          completedAt: new Date(),
-          confidence: data.confidence || 0.8,
-          outputs: [
-            {
-              key: "sql",
-              value:
-                sqlWithDesiredLimit.slice(0, 100) +
-                (sqlWithDesiredLimit.length > 100 ? "..." : ""),
-            },
-            { key: "explanation", value: data.explanation || "SQL query generated" },
-            { key: "requested_row_limit", value: requestedLimitFromNL ?? DEFAULT_ROW_LIMIT },
-          ],
-        })
-
-        setSqlQuery(sqlWithDesiredLimit)
-        setExecutionLimit(desiredLimit)
-
-        // Step 5: Safety Check
-        const safetyStart = Date.now()
-        updateRunStep("safety_check", {
-          status: "running",
-          startedAt: new Date(),
-          inputs: [{ key: "sql", value: sqlWithDesiredLimit.slice(0, 50) + "..." }],
-        })
-
-        // Simulate safety check (actual check happens server-side during execution)
-        const isSafe = isSelectOnlySql(sqlWithDesiredLimit)
-
-        updateRunStep("safety_check", {
-          status: isSafe ? "success" : "failed",
-          durationMs: Date.now() - safetyStart,
-          completedAt: new Date(),
-          confidence: 1.0,
-          outputs: [
-            { key: "is_select_only", value: isSafe },
-            { key: "has_limit", value: sqlWithDesiredLimit.toUpperCase().includes("LIMIT") },
-            { key: "execution_row_cap", value: desiredLimit },
-          ],
-          ...(isSafe ? {} : { error: "Query must be SELECT-only" }),
-        })
-
-        if (isSafe) {
-          // Mark remaining steps as pending
-          updateRunStep("execute", { status: "pending" })
-          updateRunStep("next_steps", { status: "pending" })
-
-          // Update run status
-          setCurrentRun(prev => prev ? { ...prev, status: "completed", completedAt: new Date() } : prev)
-          toast.success("SQL generated successfully")
-        } else {
-          updateRunStep("execute", { status: "skipped" })
-          updateRunStep("next_steps", { status: "skipped" })
-          setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-          toast.error("Generated SQL was rejected: only SELECT queries are allowed")
-        }
-      } else if (data.error || !res.ok) {
-        const e = classifyApiError(res.status, data, "generate")
-        updateRunStep("sql_generate", {
-          status: "failed",
-          durationMs: Date.now() - sqlGenStart,
-          completedAt: new Date(),
-          error: e.message,
-        })
-        updateRunStep("safety_check", { status: "skipped" })
-        updateRunStep("execute", { status: "skipped" })
-        updateRunStep("next_steps", { status: "skipped" })
-        setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-        setQueryError(e)
-        toast.error(e.title, { description: e.hint ?? e.message })
-      } else {
-        // 200 but no SQL field — unexpected shape.
-        const e: ExplorerError = {
-          code: "sql_gen_failed",
-          title: "No SQL returned",
-          message: "The generator returned a successful response but did not include a SQL query.",
-          hint: "Try rephrasing your question.",
-        }
-        updateRunStep("sql_generate", {
-          status: "failed",
-          durationMs: Date.now() - sqlGenStart,
-          completedAt: new Date(),
-          error: e.message,
-        })
-        updateRunStep("safety_check", { status: "skipped" })
-        updateRunStep("execute", { status: "skipped" })
-        updateRunStep("next_steps", { status: "skipped" })
-        setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-        setQueryError(e)
-        toast.error(e.title, { description: e.hint ?? e.message })
-      }
-    } catch (err) {
-      console.error("Failed to generate SQL:", err)
-      const e: ExplorerError =
-        err instanceof ExplorerApiError
-          ? err.explorerError
-          : classifyApiError(undefined, { error: err instanceof Error ? err.message : String(err) }, "generate")
-      updateRunStep("sql_generate", {
-        status: "failed",
-        error: e.message,
-        completedAt: new Date(),
-      })
-      setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-      setQueryError(e)
-      toast.error(e.title, { description: e.hint ?? e.message })
-    } finally {
-      setGeneratingSql(false)
-      flushPendingRunStepUpdates()
-    }
-  }
-
-  // Cancel an in-flight Run Query. Triggered by the explicit "Cancel"
-  // button on the Run Query row and by Cmd/Ctrl+. inside the editor.
+  // Cancel the active tab's in-flight Run Query. Triggered by the explicit
+  // "Cancel" button on the Run Query row and by Cmd/Ctrl+. inside the editor.
   // The AbortController.signal we pass to fetch propagates to the
-  // server-side request context, which cancels the running DB query.
+  // server-side request context, which cancels the running DB query. The
+  // run's own `finally` clears the controller and the spinner.
   const cancelQuery = useCallback(() => {
-    const ctl = executeAbortRef.current
-    if (!ctl) return
-    ctl.abort()
-    executeAbortRef.current = null
-  }, [])
+    abortsRef.current.get(activeTabId)?.abort()
+  }, [activeTabId])
 
   // DX-ClickToInsert: insert a snippet at the SQL editor's cursor.
   // Used by the sidebar's per-table and per-column quick-insert
@@ -1493,7 +823,7 @@ export default function ExplorerPage() {
     }
     handle.insertAtCursor(toInsert)
     if (queryError) setQueryError(null)
-  }, [sqlQuery, queryError])
+  }, [sqlQuery, queryError, setQueryError])
 
   // attemptRunQuery routes the Run action: destructive statements (DROP/TRUNCATE) open a
   // typed-confirmation dialog first; everything else runs immediately. executeQuery still
@@ -1552,81 +882,19 @@ export default function ExplorerPage() {
       return
     }
 
-    // If a previous query was somehow still tracked (shouldn't happen
-    // under normal use, but is cheap insurance), abort it before we
-    // start a new one so we don't leak.
-    if (executeAbortRef.current) {
-      executeAbortRef.current.abort()
-    }
+    // The run belongs to the tab it started in, whichever tab is on screen when
+    // it finishes: its result, error and spinner are written under this id.
+    const tabId = activeTabId
+    const connId = selectedConnection
+    // Re-running a tab replaces its run; other tabs' runs carry on.
+    abortsRef.current.get(tabId)?.abort()
     const abortController = new AbortController()
-    executeAbortRef.current = abortController
+    abortsRef.current.set(tabId, abortController)
 
     try {
-      setExecutingQuery(true)
-      setQueryError(null)
-      setQueryResult(null)
-      // Ensure manual SQL runs still show a step timeline.
-      // (Without NL "Generate SQL", `currentRun` can be null and the UI misleadingly says
-      // "No exploration run yet" even though the query executed.)
-      if (!currentRun) {
-        startExplorationRun(nlInput.trim() || "Manual SQL query")
-        const t = Date.now()
-        updateRunStep("schema_fetch", {
-          status: "success",
-          startedAt: new Date(t),
-          completedAt: new Date(t),
-          durationMs: 0,
-        })
-        updateRunStep("sql_generate", { status: "skipped" })
-        // A hand-written query identifies no tables and maps no columns, so
-        // these two stayed `pending` — a clock icon reading "still to come" on
-        // a run that had already finished. Skipped is what actually happened.
-        updateRunStep("table_link", { status: "skipped" })
-        updateRunStep("column_link", { status: "skipped" })
-        updateRunStep("safety_check", {
-          status: "success",
-          startedAt: new Date(t),
-          completedAt: new Date(t),
-          durationMs: 0,
-        })
-      }
+      patchRun(tabId, { running: true, error: null, result: null, sql: null })
 
-      // A run's output belongs in front of the operator. (This used to switch to
-      // the step timeline, which meant the grid arrived in a pane nobody was
-      // looking at; Steps is one click away on the same pane.) This has to run
-      // AFTER the block above, not before it: `startExplorationRun` selects
-      // Steps itself — right for the NL path, where you watch the SQL being
-      // generated — so selecting Results first just got overwritten, and every
-      // manual run finished on the timeline with its grid out of sight.
-      setRightPanelTab("results")
-
-      const sqlLimit = extractLimitFromSQL(targetSql)
-      const nlLimit = extractRequestedRowLimit(nlInput)
-      const effectiveLimit = clampInt(
-        sqlLimit ?? nlLimit ?? executionLimit ?? DEFAULT_ROW_LIMIT,
-        1,
-        MAX_ROW_LIMIT
-      )
-
-      const sqlToRun = qualifySqlUsingSelectedTables(targetSql, selectedTables)
-      if (sqlToRun !== targetSql) {
-        // Keep the editor aligned with what we actually execute (prevents confusing "wrong DB"
-        // errors). Splice the rewritten statement back over its own range — overwriting the
-        // whole buffer here would destroy the user's other queries.
-        setSqlQuery((prev) => spliceRunTarget(prev, target, sqlToRun))
-      }
-
-      // Update execute step in current run
-      const executeStart = Date.now()
-      updateRunStep("execute", {
-        status: "running",
-        startedAt: new Date(),
-        inputs: [
-          { key: "connection_id", value: selectedConnection },
-          { key: "sql", value: sqlToRun.slice(0, 100) + (sqlToRun.length > 100 ? "..." : "") },
-          { key: "limit", value: effectiveLimit },
-        ],
-      })
+      const effectiveLimit = clampInt(extractLimitFromSQL(targetSql) ?? DEFAULT_ROW_LIMIT, 1, MAX_ROW_LIMIT)
 
       const res = await authFetch("/api/v1/explorer/query", {
         method: "POST",
@@ -1635,8 +903,8 @@ export default function ExplorerPage() {
           Accept: "application/json",
         },
         body: JSON.stringify({
-          connection_id: selectedConnection,
-          sql: sqlToRun,
+          connection_id: connId,
+          sql: targetSql,
           limit: effectiveLimit,
         }),
         signal: abortController.signal,
@@ -1657,16 +925,7 @@ export default function ExplorerPage() {
 
       if (data.error || !res.ok) {
         const e = classifyApiError(res.status, data, "execute")
-        updateRunStep("execute", {
-          status: "failed",
-          durationMs: Date.now() - executeStart,
-          completedAt: new Date(),
-          error: e.message,
-          recovery: e.hint ? { action: "Suggestion", description: e.hint } : undefined,
-        })
-        updateRunStep("next_steps", { status: "skipped" })
-        setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-        setQueryError(e)
+        patchRun(tabId, { error: e })
         toast.error(e.title, { description: e.hint ?? e.message })
       } else {
         const rowCount = typeof data.row_count === "number" ? data.row_count : 0
@@ -1677,81 +936,27 @@ export default function ExplorerPage() {
         const rowsAffected = typeof data.rows_affected === "number" ? data.rows_affected : undefined
         const statementType = typeof data.statement_type === "string" ? data.statement_type : undefined
 
-        updateRunStep("execute", {
-          status: "success",
-          durationMs: Date.now() - executeStart,
-          completedAt: new Date(),
-          outputs: [
-            { key: "row_count", value: rowCount },
-            { key: "columns", value: columns.slice(0, 5) },
-            { key: "execution_time_ms", value: executionTimeMs },
-            { key: "truncated", value: truncated },
-            { key: "limit", value: effectiveLimit },
-          ],
-        })
-
-        // Next steps: ask the server rather than print a fixed list. The three
-        // strings that used to be hard-coded here were identical for every run —
-        // a zero-row result, a DDL statement, a 40-column report all got
-        // "Create Metabase Dashboard / Download CSV / Share via Slack" — while
-        // POST /explorer/nl/next-steps had been shipped with no caller at all.
-        const nextStepsStart = Date.now()
-        updateRunStep("next_steps", { status: "running", startedAt: new Date(nextStepsStart) })
-
-        // The run is complete once the rows are in hand. Deliberately NOT
-        // awaiting the suggestion call: the gateway gives it up to 25 s, and
-        // nothing below depends on it. The step fills itself in when it lands.
-        setCurrentRun((prev) => (prev ? { ...prev, status: "completed", completedAt: new Date() } : prev))
-
-        void fetchNextStepSuggestions({
-          question: nlInput || "",
-          sql: sqlToRun,
-          rowCount,
-          columns: columns.map((c) => String(c)),
-          signal: abortController.signal,
-        })
-          .then((suggestions) => {
-            updateRunStep("next_steps", {
-              status: suggestions.length > 0 ? "success" : "skipped",
-              durationMs: Date.now() - nextStepsStart,
-              completedAt: new Date(),
-              outputs: suggestions.length > 0 ? [{ key: "suggestions", value: suggestions }] : undefined,
-            })
-          })
-          .catch((err) => {
-            // A cancelled run is not a failed suggestion call.
-            if (abortController.signal.aborted) return
-            updateRunStep("next_steps", {
-              status: "failed",
-              durationMs: Date.now() - nextStepsStart,
-              completedAt: new Date(),
-              error: err instanceof Error ? err.message : "Could not get suggestions",
-            })
-          })
-
         const nextResult: QueryResult = {
           columns,
-          rows: Array.isArray((data as Record<string, unknown>)?.["rows"]) ? ((data as Record<string, unknown>)["rows"] as Record<string, unknown>[]) : [],
+          rows: Array.isArray(data.rows) ? (data.rows as Record<string, unknown>[]) : [],
           row_count: rowCount,
           execution_time_ms: executionTimeMs,
           truncated,
           rows_affected: rowsAffected,
           statement_type: statementType,
         }
-        setQueryResult(nextResult)
-        // Add to history
-        const historyEntry: QueryHistory = {
+        patchRun(tabId, { result: nextResult, sql: targetSql })
+        appendHistory(connId, {
           id:
             (globalThis.crypto as unknown as { randomUUID?: () => string })?.randomUUID?.() ||
             `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          question: nlInput || undefined,
           // The statement that ran — not the whole editor buffer, which may hold several.
-          sql: sqlToRun,
+          sql: targetSql,
           timestamp: new Date(),
           executionTimeMs,
           rowCount,
-        }
-        setQueryHistory(prev => [historyEntry, ...prev.slice(0, 19)])
+        })
+        setHistoryVersion((n) => n + 1)
         // No success toast: the Results header already says the rows (or rows
         // affected) and the time, and the toast sat on top of it (#54).
         if (isWriteResult(statementType)) {
@@ -1759,28 +964,17 @@ export default function ExplorerPage() {
           // the table list itself after a CREATE/DROP, are both wrong now — the
           // sidebar kept a row count of 3 for a table that had grown to 8 and
           // then been dropped. Drop both scope entries (the write may have hit a
-          // table outside the current scope) and re-fetch past the server cache.
-          if (selectedConnection) {
-            schemaCacheRef.current.delete(`${selectedConnection}::db`)
-            schemaCacheRef.current.delete(`${selectedConnection}::server`)
-            tableIndexCacheRef.current.delete(selectedConnection)
-            void loadSchema({ force: true })
-          }
+          // table outside the current scope) and re-fetch past the server cache;
+          // a connection no longer on screen re-fetches when it is next shown.
+          schemaCacheRef.current.delete(`${connId}::db`)
+          schemaCacheRef.current.delete(`${connId}::server`)
+          if (connId === selectedConnectionRef.current) void loadSchemaRef.current({ force: true })
         }
       }
     } catch (err) {
       // Cancellation is a normal user action, not an error — show
       // a neutral status and don't push an ExplorerError into the UI.
       if (err instanceof DOMException && err.name === "AbortError") {
-        updateRunStep("execute", {
-          status: "failed",
-          error: "Cancelled by user",
-          completedAt: new Date(),
-        })
-        updateRunStep("next_steps", { status: "skipped" })
-        setCurrentRun((prev) =>
-          prev ? { ...prev, status: "failed", completedAt: new Date() } : prev,
-        )
         toast.info("Query cancelled")
         return
       }
@@ -1789,26 +983,15 @@ export default function ExplorerPage() {
         err instanceof ExplorerApiError
           ? err.explorerError
           : classifyApiError(undefined, { error: err instanceof Error ? err.message : String(err) }, "execute")
-      updateRunStep("execute", {
-        status: "failed",
-        error: e.message,
-        completedAt: new Date(),
-      })
-      updateRunStep("next_steps", { status: "skipped" })
-      setCurrentRun(prev => prev ? { ...prev, status: "failed", completedAt: new Date() } : prev)
-      setQueryError(e)
+      patchRun(tabId, { error: e })
       toast.error(e.title, { description: e.hint ?? e.message })
     } finally {
-      // Only clear our ref if this is still the active query — a new
-      // Run Query press will have already replaced it.
-      if (executeAbortRef.current === abortController) {
-        executeAbortRef.current = null
+      // Only if this is still the tab's run: a re-run has replaced it, and a
+      // closed tab or a workspace switch has already dropped it.
+      if (abortsRef.current.get(tabId) === abortController) {
+        abortsRef.current.delete(tabId)
+        patchRun(tabId, { running: false })
       }
-      setExecutingQuery(false)
-      // The run is over, so the anti-jitter reason for parking step updates is
-      // over with it. Without this the timeline stays blank after a Cmd-Enter
-      // run until the editor happens to lose focus.
-      flushPendingRunStepUpdates()
     }
   }
 
@@ -1817,12 +1000,12 @@ export default function ExplorerPage() {
   // lib/explorer/runShortcut so it can be tested, and so the deps type can withhold
   // executeQuery — see the defect write-up there.
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Document mode has no NL or SQL to run; DocumentExplorer handles its own shortcut.
+    // Document mode has no SQL to run; DocumentExplorer handles its own shortcut.
     if (connections.find((c) => c.id === selectedConnection)?.explorer_mode === "document") return
+    // Saved and History put no editor on screen, so there is nothing in view to run.
+    if (view !== "query") return
     handleExplorerRunShortcut(e, {
-      hasNlInput: Boolean(nlInput.trim()),
       hasSql: Boolean(sqlQuery.trim()),
-      generateSQL,
       attemptRunQuery,
     })
   }
@@ -1867,10 +1050,12 @@ export default function ExplorerPage() {
     try {
       setExportingFormat(format)
       // Re-run export server-side with a safe cap (keeps downloads consistent even if UI is truncated).
-      // /proxy/ prefix so Traefik doesn't intercept it (only routes /api/* to api-gateway)
-      const res = await fetch("/proxy/explorer/export", {
+      // /proxy/ prefix so Traefik doesn't intercept it (only routes /api/* to api-gateway).
+      // authFetch sends the CSRF header the route checks; an absolute same-origin URL
+      // keeps it off the gateway's base URL.
+      const res = await authFetch(new URL("/proxy/explorer/export", window.location.origin).href, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "*/*" },
+        headers: { Accept: "*/*" },
         body: JSON.stringify({
           connection_id: selectedConnection,
           sql: sqlQuery,
@@ -1902,70 +1087,104 @@ export default function ExplorerPage() {
     }
   }
 
-  const createVisualizationDashboard = async () => {
-    if (!sqlQuery.trim() || !dashboardName.trim()) {
-      toast.error("Please enter a dashboard name")
+  // Start here (a bar, or a recent query): the SQL goes in this tab when it is
+  // empty, else in a new one so nothing typed is lost. It is not run: a person runs it.
+  const startQuery = (sql: string) => {
+    if (!sqlQuery.trim() || sqlQuery === sql) {
+      setSqlQuery(sql)
       return
     }
-
-    const toolDef = VISUALIZATION_TOOLS.find((t) => t.id === selectedBiTool)
-    if (!toolDef?.implemented) {
-      toast.info(`${toolDef?.name ?? selectedBiTool} integration coming soon`, {
-        description: "Only Metabase is supported today. More tools are on the roadmap.",
-      })
+    const next = addTab(tabsState, { connectionId: selectedConnection, sql })
+    if (!next) {
+      toast.error(TAB_LIMIT_MESSAGE)
       return
     }
-
-    try {
-      setCreatingDashboard(true)
-
-      const res = await fetch(`/proxy/explorer/${selectedBiTool}/dashboard`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({
-          sql: sqlQuery,
-          name: dashboardName,
-          description: dashboardDescription || `Generated from Explorer: ${nlInput || "SQL query"}`,
-        }),
-      })
-
-      let data: Record<string, unknown> = {}
-      try {
-        const raw = await res.text()
-        data = raw ? JSON.parse(raw) : {}
-      } catch {
-        data = { error: `HTTP ${res.status}: unexpected response from server` }
-      }
-
-      if (!res.ok || !data.success) {
-        const e = classifyApiError(res.status, data, "bi_tool")
-        toast.error(e.title, { description: e.hint ?? e.message })
-        return
-      }
-
-      toast.success(`Dashboard created in ${toolDef.name}!`)
-      setShowDashboardDialog(false)
-      setDashboardName("")
-      setDashboardDescription("")
-      setSelectedBiTool("metabase")
-      if (data.dashboard_url) {
-        window.open(data.dashboard_url as string, "_blank")
-      }
-    } catch (err) {
-      const e = classifyApiError(undefined, { error: err instanceof Error ? err.message : String(err) }, "bi_tool")
-      toast.error(e.title, { description: e.hint ?? e.message })
-    } finally {
-      setCreatingDashboard(false)
-    }
+    setTabsState(() => next)
+    setEditorSelection({ from: 0, to: 0 })
   }
 
-  const loadFromHistory = (entry: QueryHistory) => {
+  const loadFromHistory = (entry: QueryHistoryEntry) => {
     setSqlQuery(entry.sql)
-    if (entry.question) {
-      setNlInput(entry.question)
-    }
+    setView("query")
     toast.info("Query loaded from history")
   }
+
+  // ── Query tab actions ──
+  const openNewTab = () => {
+    const next = addTab(tabsState, { connectionId: selectedConnection })
+    if (!next) {
+      toast.error(TAB_LIMIT_MESSAGE)
+      return
+    }
+    setTabsState(() => next)
+    setEditorSelection({ from: 0, to: 0 })
+    setView("query")
+  }
+
+  const selectTab = (id: string) => {
+    if (id !== activeTabId) {
+      setTabsState((s) => ({ ...s, active: id }))
+      // The caret belonged to the other tab's editor.
+      setEditorSelection({ from: 0, to: 0 })
+    }
+    setView("query")
+  }
+
+  // Closing a tab cancels its run and drops its result with it.
+  const closeQueryTab = (id: string) => {
+    const ctl = abortsRef.current.get(id)
+    if (ctl) {
+      abortsRef.current.delete(id)
+      ctl.abort()
+    }
+    setRuns((prev) => {
+      if (!(id in prev)) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    setTabsState((s) => closeTab(s, id))
+    if (id === activeTabId) setEditorSelection({ from: 0, to: 0 })
+    if (id === renamingTabId) setRenamingTabId(null)
+  }
+
+  const finishRename = (id: string, name: string) => {
+    setTabsState((s) => renameTab(s, id, name))
+    setRenamingTabId(null)
+  }
+
+  const atTabLimit = tabsState.tabs.length >= MAX_QUERY_TABS
+
+  // ── Open in Explorer (Ask rsync.ai's SQL) ──
+  // The draft waits until this person's stored tabs are on screen, so loading
+  // them can never replace the tab it opens. Signed out there is no key, and
+  // the tabs are the in-memory ones as soon as we know nobody is signed in.
+  const tabsReady = tabsKey ? tabsBox.key === tabsKey : !userLoading
+  const [draftSignal, setDraftSignal] = useState(0)
+  useEffect(() => {
+    const onDraft = () => setDraftSignal((n) => n + 1)
+    window.addEventListener(EXPLORER_OPEN_SQL_EVENT, onDraft)
+    return () => window.removeEventListener(EXPLORER_OPEN_SQL_EVENT, onDraft)
+  }, [])
+  useEffect(() => {
+    if (!tabsReady) return
+    const draft = takeExplorerSql()
+    if (!draft) return
+    const next = addTab(tabsState, {
+      sql: draft.sql,
+      name: draft.name,
+      connectionId: draft.connectionId || selectedConnection,
+    })
+    if (!next) {
+      toast.error(TAB_LIMIT_MESSAGE)
+      return
+    }
+    // The draft lives in sessionStorage until it is taken, so it can only be
+    // opened from an effect; takeExplorerSql removes it, so this runs once.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTabsState(() => next)
+    setView("query")
+  }, [tabsReady, draftSignal, tabsState, selectedConnection, setTabsState])
 
   // Engine-aware naming: MySQL exposes sibling databases, Postgres exposes
   // schemas under one database. The tier label and the "all databases" toggle
@@ -1973,6 +1192,19 @@ export default function ExplorerPage() {
   const selectedConn = connections.find((c) => c.id === selectedConnection)
   const isMySQLConn = isMySQLFamily(selectedConn)
   const isDocumentConn = selectedConn?.explorer_mode === "document"
+  // Alert on this query: the one statement Run would execute, if it reads, opens
+  // the workflow builder with it and this connection as the query; the person
+  // adds the condition and where to send. The builder's Save checks it as any draft.
+  const canAlertOnQuery =
+    !!selectedConnection && !!runTarget.sql.trim() && !runTarget.multi && currentStmtClass === "read"
+  const alertOnQuery = () => {
+    if (!canAlertOnQuery) return
+    stashWorkflowQuery({ sql: runTarget.sql.trim(), connectionId: selectedConnection })
+    router.push(WORKFLOW_FROM_EXPLORER_HREF)
+  }
+  const toolbarBlurb = isDocumentConn
+    ? "Browse and filter the documents in your MongoDB collections"
+    : "Query and explore your connected data sources using SQL"
   const namespaceLabel = isMySQLConn || isDocumentConn ? "databases" : "schemas"
   // Database/schema count for the panel header label. Counts the *visible*
   // tables (rsync-internal `_rsync_*` excluded) so the header total matches the
@@ -1981,6 +1213,17 @@ export default function ExplorerPage() {
   const databaseCount = groupTablesByDatabase(visibleTables).length
   const isDestinationConn = (selectedConn?.type || "").toLowerCase() === "destination"
   const pinnedDatabase = pinnedDatabaseOf(selectedConn?.config)
+  // A document destination is browsed through the database it names AND the
+  // databases this workspace's pipelines write to on it, which the gateway adds
+  // to its scope (KI-EXPLORER-PIPELINE-DEST-DB-UNREACHABLE). A database is
+  // listed once it holds data, so the tree is the only place to read them from.
+  const reachesPipelineDatabases = isDocumentConn && isDestinationConn
+  const pipelineDatabases =
+    isDocumentConn && pinnedDatabase
+      ? groupTablesByDatabase(visibleTables)
+          .map((g) => g.database)
+          .filter((d) => d !== pinnedDatabase && d !== DEFAULT_DATABASE)
+      : []
   const dialectLabel = SQL_DIALECT_LABELS[sqlDialect] ?? "SQL"
   const composePct = Math.round(composeRatio * 100)
 
@@ -1994,80 +1237,71 @@ export default function ExplorerPage() {
     if (!selectedConnection) return "Select a connection to browse tables"
     const items = isDocumentConn ? "collections" : "tables"
     if (!pinnedDatabase || (isMySQLConn && allDatabases)) return `No ${items} found`
+    if (reachesPipelineDatabases) {
+      return `No ${items} in "${pinnedDatabase}", the database this connection names, or in the databases this workspace's pipelines write to on it. A pipeline's database is listed here once it holds data.`
+    }
     const head = `No ${items} in "${pinnedDatabase}" — the one database this connection browses.`
     return isDestinationConn
       ? `${head} This is a destination: a pipeline writing to it targets its own database, which can be a different one, so an empty tree here does not mean the pipeline is not landing data.`
       : `${head} Point the connection at another database to browse that one instead.`
   })()
 
-  const toggleTableSelection = (tableKey: string) => {
-    setSelectedTables(prev =>
-      prev.includes(tableKey)
-        ? prev.filter(t => t !== tableKey)
-        : [...prev, tableKey]
-    )
-  }
-
   return (
     <div
       data-testid="explorer-shell"
-      className="flex flex-col gap-4 lg:h-[calc(100vh-8rem)] lg:min-h-0"
+      className="flex flex-col @2xl:min-h-0 @2xl:flex-1"
       onKeyDown={handleKeyDown}
     >
-      <PageHeader
-        className="shrink-0"
-        heading="Data Explorer"
-        description={
-          isDocumentConn
-            ? "Browse and filter the documents in your MongoDB collections"
-            : "Query and explore your connected data sources using natural language or SQL"
-        }
-      />
+      {/* A toolbar rather than a page header: the panes below are the page. */}
+      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-zinc-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
+        <h1 className="shrink-0 text-sm font-semibold text-zinc-900 dark:text-white">Explorer</h1>
+        <p className="hidden min-w-0 truncate text-xs text-zinc-500 @xl:block dark:text-zinc-400" title={toolbarBlurb}>
+          {toolbarBlurb}
+        </p>
+      </header>
 
-      {/* Workspace: collapsible schema rail · compose pane above results pane.
-          Flex (not grid) so the schema rail can collapse to a thin strip by
-          animating its width. From lg up the row IS the page's remaining height
-          and each pane scrolls inside it — that is what makes the schema tree
-          and the result grid as tall as the window allows instead of the 340px
-          and 400px boxes they used to be. Stacks and grows on mobile. */}
-      <div className="flex flex-col gap-3 lg:min-h-0 lg:flex-1 lg:flex-row lg:items-stretch">
+      {/* Workspace: collapsible schema rail · compose pane above results pane,
+          edge to edge and divided by borders. Flex (not grid) so the schema rail
+          can collapse to a thin strip by animating its width. From @2xl up the
+          row IS the window's remaining height and each pane scrolls inside it —
+          that is what makes the schema tree and the result grid as tall as the
+          window allows. @2xl is the page's own width, not the window's, so the
+          panes stay side by side with the assistant docked on a 1440px screen.
+          Narrower, they stack at their content height and the page scrolls. */}
+      <div className="flex flex-col @2xl:min-h-0 @2xl:flex-1 @2xl:flex-row @2xl:items-stretch">
         {/* ── Left rail: schema browser ── */}
         <aside
           className={cn(
-            "w-full shrink-0 transition-[width] duration-200 lg:min-h-0",
-            leftRailOpen ? "lg:w-[280px]" : "lg:w-[48px]"
+            "w-full shrink-0 border-b border-zinc-200 bg-white transition-[width] duration-200 dark:border-zinc-800 dark:bg-zinc-950",
+            "@2xl:min-h-0 @2xl:border-r @2xl:border-b-0",
+            leftRailOpen ? "@2xl:w-60 @5xl:w-[280px]" : "@2xl:w-12"
           )}
         >
         {leftRailOpen ? (
-        <Card className="flex flex-col lg:h-full lg:min-h-0">
-          <CardHeader className="px-3 pt-4 pb-3">
-            <div className="flex items-center justify-between gap-2">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Database className="h-4 w-4 text-violet-500" />
-                Schema
-              </CardTitle>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="hidden h-7 w-7 p-0 lg:inline-flex"
-                onClick={() => setLeftRailOpen(false)}
-                title="Collapse schema browser"
-                aria-label="Collapse schema browser"
-              >
-                <PanelLeftClose className="h-4 w-4" />
-              </Button>
-            </div>
-            <CardDescription className="text-xs">
-              Browse databases, schemas &amp; tables
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex min-h-0 flex-1 flex-col gap-3 px-3 pb-3">
+        <div className="flex flex-col @2xl:h-full @2xl:min-h-0">
+          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-zinc-200 px-3 dark:border-zinc-800">
+            <h2 className="flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-zinc-100">
+              <Database className="h-4 w-4 text-violet-500" />
+              Schema
+            </h2>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              onClick={() => setLeftRailOpen(false)}
+              title="Collapse schema browser"
+              aria-label="Collapse schema browser"
+            >
+              <PanelLeftClose className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col gap-3 p-3">
             {/* Connection Selector */}
             <div className="shrink-0 space-y-2">
               <Label className="text-xs">Connection</Label>
               <Select
                 value={selectedConnection}
-                onValueChange={setSelectedConnection}
+                onValueChange={(id) => setTabsState((s) => updateTab(s, s.active, { connectionId: id }))}
                 disabled={loadingConnections}
               >
                 <SelectTrigger className="h-9">
@@ -2097,9 +1331,13 @@ export default function ExplorerPage() {
               <div
                 className="flex shrink-0 flex-wrap items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400"
                 title={
-                  isDestinationConn
-                    ? `Browsing the database this connection names. It is a destination: a pipeline writing to it targets its own database, which may be a different one.`
-                    : `Browsing "${pinnedDatabase}". Discovery is pinned to this one database — other databases on the server are not listed.`
+                  reachesPipelineDatabases || pipelineDatabases.length > 0
+                    ? `Browsing "${pinnedDatabase}", the database this connection names, and the databases this workspace's pipelines write to on it${
+                        pipelineDatabases.length > 0 ? `: ${pipelineDatabases.join(", ")}` : ""
+                      }. A pipeline's database is listed once it holds data.`
+                    : isDestinationConn
+                      ? `Browsing the database this connection names. It is a destination: a pipeline writing to it targets its own database, which may be a different one.`
+                      : `Browsing "${pinnedDatabase}". Discovery is pinned to this one database — other databases on the server are not listed.`
                 }
               >
                 <Database className="h-3 w-3 shrink-0 text-violet-500" />
@@ -2107,6 +1345,12 @@ export default function ExplorerPage() {
                 <code className="rounded bg-zinc-100 px-1 py-px font-mono text-[10px] dark:bg-zinc-800">
                   {pinnedDatabase}
                 </code>
+                {pipelineDatabases.slice(0, 3).map((d) => (
+                  <code key={d} className="rounded bg-zinc-100 px-1 py-px font-mono text-[10px] dark:bg-zinc-800">
+                    {d}
+                  </code>
+                ))}
+                {pipelineDatabases.length > 3 && <span>+{pipelineDatabases.length - 3} more</span>}
                 {isDestinationConn && (
                   <Badge variant="outline" className="h-4 px-1 text-[9px] font-normal">
                     destination
@@ -2180,7 +1424,7 @@ export default function ExplorerPage() {
                 rather than by a hardcoded 340px box. */}
             <div
               data-testid="schema-tree-pane"
-              className="min-h-[240px] overflow-hidden rounded-md border lg:min-h-0 lg:flex-1"
+              className="min-h-[240px] overflow-hidden rounded-md border @2xl:min-h-0 @2xl:flex-1"
             >
               {loadingSchema ? (
                 <div className="flex h-full items-center justify-center py-8">
@@ -2207,15 +1451,10 @@ export default function ExplorerPage() {
               ) : (
                 <SchemaBrowser
                   tables={visibleTables}
-                  // Already fetched for SQL generation and never displayed.
-                  // Showing them is what makes the joins the AI writes — and the
-                  // ones it only guessed at — inspectable before you trust them.
+                  // Showing them makes a join inspectable before you write it.
                   foreignKeys={foreignKeys}
-                  selectedTables={selectedTables}
-                  selectionKey={(t) => tableKeyFromMeta(t)}
-                  // Document mode: no table picking for NL→SQL and no SQL editor to
-                  // insert into — clicking a collection opens it in the browser.
-                  onToggleTable={isDocumentConn ? undefined : toggleTableSelection}
+                  // Document mode: no SQL editor to insert into — clicking a
+                  // collection opens it in the browser.
                   onInsertTable={
                     isDocumentConn
                       ? (qualified) => {
@@ -2235,24 +1474,13 @@ export default function ExplorerPage() {
               )}
             </div>
 
-            {selectedTables.length > 0 && (
-              <div className="flex shrink-0 items-center gap-2 flex-wrap">
-                <span className="text-xs text-zinc-500 dark:text-zinc-400">Selected:</span>
-                {selectedTables.map(t => (
-                  <Badge key={t} variant="secondary" className="text-[10px] gap-1">
-                    {formatTableKeyForDisplay(t)}
-                    <X
-                      className="h-2.5 w-2.5 cursor-pointer hover:text-red-500"
-                      onClick={() => toggleTableSelection(t)}
-                    />
-                  </Badge>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
         ) : (
-          <div className="hidden flex-col items-center gap-3 rounded-lg border bg-card py-3 lg:flex lg:h-full">
+          // A strip above the editor when the panes stack, a vertical rail beside
+          // it when they sit side by side — never hidden, or a rail collapsed on
+          // a wide page could not be reopened once the page narrows.
+          <div className="flex items-center gap-2 px-3 py-1.5 @2xl:h-full @2xl:flex-col @2xl:gap-3 @2xl:px-0 @2xl:py-3">
             <Button
               variant="ghost"
               size="sm"
@@ -2263,7 +1491,7 @@ export default function ExplorerPage() {
             >
               <PanelLeftOpen className="h-4 w-4 text-violet-500" />
             </Button>
-            <span className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400 [writing-mode:vertical-rl]">
+            <span className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400 @2xl:[writing-mode:vertical-rl]">
               Schema
             </span>
           </div>
@@ -2273,10 +1501,112 @@ export default function ExplorerPage() {
         {/* ── Center: compose pane · draggable split · results pane ── */}
         <main
           ref={splitColumnRef}
-          className="flex w-full min-w-0 flex-col gap-3 lg:min-h-0 lg:flex-1"
+          className="flex w-full min-w-0 flex-col @2xl:min-h-0 @2xl:flex-1"
         >
+          {/* ── Query tabs · Saved · History (dashboards-design.md § 7.5) ── */}
+          <div
+            data-testid="query-tab-strip"
+            className="flex h-10 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 dark:border-zinc-800 dark:bg-zinc-900"
+          >
+            <div role="group" aria-label="Query tabs" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+              {tabsState.tabs.map((tab) => {
+                // A document connection has no Saved/History views: its one tab is always the page.
+                const isActive = tab.id === activeTab.id && (isDocumentConn || view === "query")
+                const running = Boolean(runs[tab.id]?.running)
+                return (
+                  <div
+                    key={tab.id}
+                    data-testid="query-tab"
+                    className={cn(
+                      "flex h-7 max-w-[12rem] shrink-0 items-center rounded-md border text-xs",
+                      isActive
+                        ? "border-zinc-300 bg-white text-zinc-900 shadow-sm dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
+                        : "border-transparent text-zinc-600 hover:bg-white/70 dark:text-zinc-400 dark:hover:bg-zinc-950/60",
+                    )}
+                  >
+                    {renamingTabId === tab.id ? (
+                      <input
+                        aria-label="Tab name"
+                        autoFocus
+                        defaultValue={tab.name}
+                        maxLength={60}
+                        className="h-6 w-28 rounded bg-transparent px-2 text-xs outline-none ring-1 ring-violet-500"
+                        onBlur={(e) => finishRename(tab.id, e.currentTarget.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") finishRename(tab.id, e.currentTarget.value)
+                          else if (e.key === "Escape") setRenamingTabId(null)
+                        }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        aria-current={isActive ? "true" : undefined}
+                        title={`${tab.name} — double-click to rename`}
+                        className="flex h-full min-w-0 items-center gap-1.5 pl-2 pr-1"
+                        onClick={() => selectTab(tab.id)}
+                        onDoubleClick={() => setRenamingTabId(tab.id)}
+                      >
+                        {running ? (
+                          <Loader2 aria-label="Running" className="h-3 w-3 shrink-0 animate-spin text-violet-500" />
+                        ) : (
+                          <Code className="h-3 w-3 shrink-0 text-zinc-400" />
+                        )}
+                        <span className="truncate">{tab.name}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      aria-label={`Close ${tab.name}`}
+                      title={`Close ${tab.name}`}
+                      className="mr-1 rounded p-0.5 text-zinc-400 hover:bg-zinc-200 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+                      onClick={() => closeQueryTab(tab.id)}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                )
+              })}
+              {/* Not `disabled` at the limit: a disabled button cannot be
+                  clicked, so it could never say why nothing opened. */}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 shrink-0 p-0"
+                aria-label="New query tab"
+                aria-disabled={atTabLimit || undefined}
+                title={atTabLimit ? TAB_LIMIT_MESSAGE : "New query tab"}
+                onClick={openNewTab}
+              >
+                <Plus className="h-4 w-4" />
+              </Button>
+            </div>
+            {!isDocumentConn && (
+              <div className="flex shrink-0 items-center gap-1">
+                <Button
+                  variant={view === "saved" ? "secondary" : "ghost"}
+                  size="sm"
+                  className="h-7 px-2.5 text-xs"
+                  aria-pressed={view === "saved"}
+                  onClick={() => setView((v) => (v === "saved" ? "query" : "saved"))}
+                >
+                  <Bookmark className="mr-1 h-3 w-3" />
+                  Saved
+                </Button>
+                <Button
+                  variant={view === "history" ? "secondary" : "ghost"}
+                  size="sm"
+                  className="h-7 px-2.5 text-xs"
+                  aria-pressed={view === "history"}
+                  onClick={() => setView((v) => (v === "history" ? "query" : "history"))}
+                >
+                  <History className="mr-1 h-3 w-3" />
+                  History
+                </Button>
+              </div>
+            )}
+          </div>
           {isDocumentConn ? (
-          <div className="lg:min-h-0 lg:flex-1 lg:overflow-auto">
+          <div className="space-y-6 p-3 @2xl:min-h-0 @2xl:flex-1 @2xl:overflow-auto">
             <DocumentExplorer
               connectionId={selectedConnection}
               collections={visibleTables}
@@ -2286,141 +1616,149 @@ export default function ExplorerPage() {
               loadingCollections={loadingSchema}
               collectionsError={schemaError}
               onRetryCollections={() => loadSchema({ force: true })}
+              mode={documentMode}
+              onModeChange={setDocumentMode}
+              pipeline={documentPipeline}
+              onPipelineChange={setDocumentPipeline}
             />
+            {/* A saved pipeline is a MongoDB model: Model on its row builds a collection
+                from it, on a schedule. */}
+            <section
+              aria-labelledby="saved-pipelines-heading"
+              className="space-y-2 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950"
+            >
+              <h2 id="saved-pipelines-heading" className="text-base font-semibold">
+                Saved pipelines
+              </h2>
+              <SavedQueries
+                connectionId={selectedConnection}
+                currentSql={
+                  documentMode === "pipeline"
+                    ? buildDocumentQueryText({
+                        database: documentDatabase,
+                        collection: documentCollection,
+                        pipeline: documentPipeline,
+                      })
+                    : ""
+                }
+                queryLanguage="document"
+                onLoad={loadSavedPipeline}
+              />
+            </section>
           </div>
+          ) : view === "saved" ? (
+            <section
+              data-testid="saved-pane"
+              aria-label="Saved queries"
+              className="bg-white p-3 dark:bg-zinc-950 @2xl:min-h-0 @2xl:flex-1 @2xl:overflow-auto"
+            >
+              <SavedQueries
+                connectionId={selectedConnection}
+                currentSql={sqlQuery}
+                onLoad={(sql, _question, id) => {
+                  setSqlQuery(sql)
+                  setOpenedSaved(id ? { id, sql } : null)
+                  setView("query")
+                }}
+              />
+            </section>
+          ) : view === "history" ? (
+            <section
+              data-testid="history-pane"
+              aria-label="History"
+              className="bg-white p-3 dark:bg-zinc-950 @2xl:min-h-0 @2xl:flex-1 @2xl:overflow-auto"
+            >
+              <div className="rounded-md border p-1">
+                  {queryHistory.length === 0 ? (
+                    <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
+                      No history yet. Run a query to populate this list.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {queryHistory.map((entry) => (
+                        <div
+                          key={entry.id}
+                          role="button"
+                          tabIndex={0}
+                          className="p-3 border rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-900 cursor-pointer transition-colors"
+                          onClick={() => loadFromHistory(entry)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault()
+                              loadFromHistory(entry)
+                            }
+                          }}
+                        >
+                          {/* Runs from before the Explorer stopped writing SQL from a
+                              question still carry it. */}
+                          {entry.question && (
+                            <div className="mb-1 text-xs text-zinc-700 dark:text-zinc-300">{entry.question}</div>
+                          )}
+                          <div className="font-mono text-xs text-zinc-600 dark:text-zinc-400 truncate">
+                            {entry.sql}
+                          </div>
+                          <div className="flex items-center gap-3 mt-2 text-[10px] text-zinc-400">
+                            <span className="flex items-center gap-1">
+                              <Clock className="h-3 w-3" />
+                              {entry.executionTimeMs}ms
+                            </span>
+                            <span>{typeof entry.rowCount === "number" ? pluralizeRows(entry.rowCount) : "—"}</span>
+                            <span>{entry.timestamp.toLocaleTimeString()}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            </section>
           ) : (
           <>
           {/* ── Compose pane ── */}
           {/* `basis` is the dragged split and `shrink-0` holds it there, so the
-              results pane below absorbs whatever is left. Below lg it is
+              results pane below absorbs whatever is left. Below @2xl it is
               content-height and the page scrolls as it always did. */}
-          <Card
+          <section
             data-testid="compose-pane"
+            aria-labelledby="explorer-compose-heading"
             className={cn(
-              "flex shrink-0 flex-col lg:basis-[var(--compose-basis)] lg:overflow-hidden",
-              // A percentage basis cannot promise the editor a single pixel. The
-              // question box, the labels and the Run row are all shrink-0 and
-              // take ~310px before the editor is measured, so at 45% of any
-              // window shorter than ~1050px the editor was squeezed to 0 and the
-              // pane showed a bare "SQL Query" label with no editor under it.
-              // These floors are the measured content minimum: 25rem yields a
-              // 94px editor with nothing clipped. The drag cannot go below them.
-              composeMode === "ask" ? "lg:min-h-[25rem]" : "lg:min-h-[17rem]",
+              "flex shrink-0 flex-col border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950",
+              "@2xl:basis-[var(--compose-basis)] @2xl:overflow-hidden @2xl:border-b-0",
+              // A percentage basis cannot promise the editor a single pixel: on
+              // a short window the editor was squeezed to 0 and the pane showed
+              // a bare "SQL Query" label. The floor is the measured content
+              // minimum, and the drag cannot go below it.
+              "@2xl:min-h-[17rem]",
             )}
             style={{ "--compose-basis": `${composePct}%` } as CSSProperties}
           >
-            <CardHeader className="shrink-0 px-4 pt-4 pb-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <CardTitle className="flex items-center gap-2 text-base">
-                    <Code className="h-4 w-4 text-violet-500" />
-                    Query Editor
-                  </CardTitle>
-                  {/* The dialect the editor highlights and completes against —
-                      and the one the AI is told to write. Resolved per connector
-                      server-side and used on every generate; never shown before. */}
-                  <Badge
-                    variant="outline"
-                    className="text-[10px] font-normal"
-                    title={`SQL is highlighted, completed and generated for ${dialectLabel}`}
-                  >
-                    {dialectLabel}
-                  </Badge>
-                </div>
-                {/* Ask AI / SQL. "SQL" drops the question box so the editor owns
-                    the whole pane; the editor stays mounted either way. */}
-                <div
-                  role="group"
-                  aria-label="Compose mode"
-                  className="flex shrink-0 items-center gap-0.5 rounded-md border p-0.5"
+            <div className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-3 py-1.5 dark:border-zinc-800">
+              <div className="flex min-w-0 items-center gap-2">
+                <h2
+                  id="explorer-compose-heading"
+                  className="flex items-center gap-2 text-sm font-medium text-zinc-900 dark:text-zinc-100"
                 >
-                  <Button
-                    variant={composeMode === "ask" ? "secondary" : "ghost"}
-                    size="sm"
-                    className="h-7 px-2.5 text-xs"
-                    aria-pressed={composeMode === "ask"}
-                    onClick={() => setComposeMode("ask")}
-                    title="Ask in English (Cmd+Enter) and let the AI write the SQL"
-                  >
-                    <Sparkles className="mr-1 h-3 w-3" />
-                    Ask AI
-                  </Button>
-                  <Button
-                    variant={composeMode === "sql" ? "secondary" : "ghost"}
-                    size="sm"
-                    className="h-7 px-2.5 text-xs"
-                    aria-pressed={composeMode === "sql"}
-                    onClick={() => setComposeMode("sql")}
-                    title="Hide the question box and give the SQL editor the whole pane"
-                  >
-                    <Code className="mr-1 h-3 w-3" />
-                    SQL
-                  </Button>
-                </div>
+                  <Code className="h-4 w-4 text-violet-500" />
+                  Query Editor
+                </h2>
+                {/* The dialect the editor highlights and completes against,
+                    resolved per connector server-side. */}
+                <Badge
+                  variant="outline"
+                  className="text-[10px] font-normal"
+                  title={`SQL is highlighted and completed for ${dialectLabel}`}
+                >
+                  {dialectLabel}
+                </Badge>
               </div>
-            </CardHeader>
-            <CardContent className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
-              {/* NL Input */}
-              {composeMode === "ask" && (
-              <div className="shrink-0 space-y-2">
-                <Label htmlFor="explorer-nl" className="text-xs flex items-center gap-2">
-                  <Sparkles className="h-3 w-3 text-violet-500" />
-                  Natural Language Query
-                </Label>
-                <div className="flex gap-2">
-                  <Textarea
-                    id="explorer-nl"
-                    ref={nlTextareaRef}
-                    placeholder={"e.g., Show me total revenue by month for 2024...\nYou can use multiple lines and bullet points."}
-                    value={nlInput}
-                    onChange={(e) => setNlInput(e.target.value)}
-                    onFocus={() => {
-                      editorInteractingRef.current = true
-                    }}
-                    onBlur={() => {
-                      editorInteractingRef.current = false
-                      flushPendingRunStepUpdates()
-                    }}
-                    onKeyDown={(e) => {
-                      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                        e.preventDefault()
-                        generateSQL()
-                      }
-                    }}
-                    rows={3}
-                    className="flex-1 text-sm resize-y"
-                  />
-                  <Button
-                    onClick={() => generateSQL()}
-                    disabled={generatingSql || !nlInput.trim()}
-                    className="bg-gradient-to-r from-violet-600 to-indigo-600"
-                  >
-                    {generatingSql ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <>
-                        <Sparkles className="h-4 w-4 mr-2" />
-                        Generate SQL
-                      </>
-                    )}
-                  </Button>
-                </div>
-                {/* Example NL prompts — teach users how to phrase questions.
-                    Tailored to the connected schema; click to fill the box. */}
-                <NlExamplePrompts
-                  tables={visibleTables}
-                  onSelect={(prompt) => {
-                    setNlInput(prompt)
-                    nlTextareaRef.current?.focus()
-                  }}
-                />
-              </div>
-              )}
-
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-2.5 p-3">
               {/* SQL Editor — the pane's only growing child */}
-              {/* `min-h-0` lets this shrink with the pane; the `lg` floor stops
-                  it at ~five editor lines instead of letting it reach 0. */}
-              <div data-testid="sql-editor-pane" className="flex min-h-0 flex-1 flex-col gap-2 lg:min-h-[7.5rem]">
+              {/* An explicit floor, not `min-h-0`: it still lets this shrink with
+                  the pane, but stops at ~five editor lines instead of reaching 0.
+                  It holds at every width — when the panes stack (a docked
+                  assistant on a 1280px window does it) the pane is content-
+                  height and the editor otherwise collapsed to one 26px line. */}
+              <div data-testid="sql-editor-pane" className="flex min-h-[7.5rem] flex-1 flex-col gap-2">
                 <div className="flex shrink-0 items-center justify-between">
                   <Label htmlFor="explorer-sql" className="text-xs">SQL Query</Label>
                   {sqlQuery && (
@@ -2435,7 +1773,10 @@ export default function ExplorerPage() {
                     </Button>
                   )}
                 </div>
+                {/* One editor per tab: a new key gives the next tab its own undo
+                    history and cursor instead of inheriting this one's. */}
                 <SqlEditor
+                  key={activeTab.id}
                   ref={sqlEditorRef}
                   value={sqlQuery}
                   onChange={(next) => {
@@ -2446,11 +1787,11 @@ export default function ExplorerPage() {
                   foreignKeys={foreignKeys}
                   dialect={sqlDialect}
                   placeholder="SELECT * FROM table_name LIMIT 100"
-                  // Fill the pane rather than a fixed ~200px box: on lg the
-                  // dragged split decides the height; below lg the explicit
+                  // Fill the pane rather than a fixed ~200px box: from @2xl the
+                  // dragged split decides the height; below it the explicit
                   // h-[220px] keeps CodeMirror's height:100% resolvable.
                   fill
-                  className="h-[220px] rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden lg:h-auto"
+                  className="h-[220px] rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden @2xl:h-auto"
                   onSubmit={() => {
                     // Gate on the resolved target, matching the Run button. `multi` still
                     // calls through so attemptRunQuery can explain why it won't run.
@@ -2466,13 +1807,6 @@ export default function ExplorerPage() {
                   onCancel={() => {
                     if (executingQuery) cancelQuery()
                   }}
-                  onFocus={() => {
-                    editorInteractingRef.current = true
-                  }}
-                  onBlur={() => {
-                    editorInteractingRef.current = false
-                    flushPendingRunStepUpdates()
-                  }}
                   onSelectionChange={handleEditorSelectionChange}
                 />
               </div>
@@ -2480,10 +1814,10 @@ export default function ExplorerPage() {
               {/* Actions */}
               <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-                  <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">⌘</kbd>
+                  <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">{modKey}</kbd>
                   <span>+</span>
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">Enter</kbd>
-                  <span>to generate or run</span>
+                  <span>to run</span>
                   {runTarget.total > 1 && (
                     <>
                       <span className="mx-1 text-zinc-300">·</span>
@@ -2497,37 +1831,69 @@ export default function ExplorerPage() {
                   {executingQuery && (
                     <>
                       <span className="mx-1 text-zinc-300">·</span>
-                      <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">⌘</kbd>
+                      <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">{modKey}</kbd>
                       <span>+</span>
                       <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">.</kbd>
                       <span>to cancel</span>
                     </>
                   )}
                 </div>
-                {executingQuery ? (
-                  <Button
-                    onClick={cancelQuery}
-                    variant="outline"
-                    className="border-red-300 text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-950/30"
-                  >
-                    <X className="h-4 w-4 mr-2" />
-                    Cancel
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={attemptRunQuery}
-                    disabled={
-                      !runTarget.sql.trim() ||
-                      !selectedConnection ||
-                      (!canRunCurrentStatement && !runTarget.multi)
-                    }
-                    className="bg-gradient-to-r from-emerald-600 to-teal-600"
-                    title={runTarget.total > 1 ? runTarget.sql : undefined}
-                  >
-                    <Play className="h-4 w-4 mr-2" />
-                    {runButtonLabel}
-                  </Button>
-                )}
+                <div className="flex items-center gap-2">
+                  {canMakeCharts && (
+                    <Button asChild variant="outline" size="sm">
+                      <Link
+                        href={chartHref}
+                        title={
+                          chartHref === "/charts/new"
+                            ? "Chart a model or a saved query: save this query first to chart it"
+                            : "Chart this saved query"
+                        }
+                      >
+                        <ChartColumn className="h-4 w-4 mr-2" />
+                        Create chart
+                      </Link>
+                    </Button>
+                  )}
+                  {canBuildWorkflows && !isDocumentConn && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!canAlertOnQuery}
+                      onClick={alertOnQuery}
+                      title={
+                        canAlertOnQuery
+                          ? "Build a workflow that runs this query on a schedule and sends a message when a condition holds"
+                          : "Alert on one SELECT: write one, or put the cursor in it"
+                      }
+                    >
+                      <BellRing className="h-4 w-4 mr-2" />
+                      Alert on this query
+                    </Button>
+                  )}
+                  {executingQuery ? (
+                    <Button
+                      onClick={cancelQuery}
+                      variant="outline"
+                      className="border-red-300 text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-950/30"
+                    >
+                      <X className="h-4 w-4 mr-2" />
+                      Cancel
+                    </Button>
+                  ) : (
+                    <Button
+                      onClick={attemptRunQuery}
+                      disabled={
+                        !runTarget.sql.trim() ||
+                        !selectedConnection ||
+                        (!canRunCurrentStatement && !runTarget.multi)
+                      }
+                      title={runTarget.total > 1 ? runTarget.sql : undefined}
+                    >
+                      <Play className="h-4 w-4 mr-2" />
+                      {runButtonLabel}
+                    </Button>
+                  )}
+                </div>
               </div>
               {runTarget.multi ? (
                 <div className="shrink-0 text-xs text-amber-700 dark:text-amber-300">
@@ -2556,8 +1922,8 @@ export default function ExplorerPage() {
                   is destructive and irreversible — you&apos;ll be asked to confirm.
                 </div>
               ) : null}
-            </CardContent>
-          </Card>
+            </div>
+          </section>
 
           {/* Drag to re-balance editor against results. Keyboard-operable and
               double-click-to-reset, because a handle that only works with a
@@ -2574,13 +1940,13 @@ export default function ExplorerPage() {
             onKeyDown={handleSplitKeyDown}
             onDoubleClick={() => persistComposeRatio(DEFAULT_COMPOSE_RATIO)}
             title="Drag to resize · double-click to reset"
-            className="group hidden shrink-0 cursor-row-resize items-center justify-center rounded py-1 outline-none focus-visible:ring-2 focus-visible:ring-violet-500 lg:flex"
+            className="group hidden h-3 shrink-0 cursor-row-resize items-center justify-center border-y border-zinc-200 bg-zinc-50 outline-none hover:bg-violet-50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-violet-500 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:bg-violet-950/30 @2xl:flex"
           >
             <GripHorizontal className="h-3 w-3 text-zinc-300 transition-colors group-hover:text-violet-500 dark:text-zinc-700" />
           </div>
 
           {/* ── Results pane ── */}
-          {/* An explicit floor rather than `lg:min-h-0`: the compose pane's
+          {/* An explicit floor rather than `min-h-0`: the compose pane's
               floor leaves this one 62px on a 706px-tall window, and 62px of
               results pane renders a 2px grid scroller. Measured on the deployed
               page at that height, with the masked-columns notice showing (the
@@ -2590,39 +1956,13 @@ export default function ExplorerPage() {
               20rem → 123px. 15rem cannot show the header at all, so 18rem: the
               header plus a 49px row. The floor only binds on a short window,
               where the page already scrolls, so the extra 48px costs scroll
-              rather than layout. Past it the pane grows with `lg:flex-1`. */}
-          <Card data-testid="results-pane" className="flex flex-col lg:min-h-[18rem] lg:flex-1 lg:overflow-hidden">
-            <CardHeader className="shrink-0 px-4 pt-4 pb-3">
-              <Tabs value={rightPanelTab} onValueChange={(v) => setRightPanelTab(v as ExplorerPanelTab)}>
-                <TabsList className="grid w-full grid-cols-4">
-                  <TabsTrigger value="results" className="text-xs">
-                    {/* An error raised by a guard that returns before the run
-                        starts is toasted, then lives here — the marker is what
-                        makes it findable after the toast is gone. */}
-                    {queryError ? (
-                      <AlertCircle className="h-3 w-3 mr-1 text-red-500" />
-                    ) : (
-                      <Table2 className="h-3 w-3 mr-1" />
-                    )}
-                    Results
-                  </TabsTrigger>
-                  <TabsTrigger value="steps" className="text-xs">
-                    <GitBranch className="h-3 w-3 mr-1" />
-                    Steps
-                  </TabsTrigger>
-                  <TabsTrigger value="history" className="text-xs">
-                    <History className="h-3 w-3 mr-1" />
-                    History
-                  </TabsTrigger>
-                  <TabsTrigger value="saved" className="text-xs">
-                    <Bookmark className="h-3 w-3 mr-1" />
-                    Saved
-                  </TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </CardHeader>
-            <CardContent className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4">
-              {rightPanelTab === "results" ? (
+              rather than layout. Past it the pane grows with `flex-1`. */}
+          <section
+            data-testid="results-pane"
+            aria-label="Results"
+            className="flex flex-col bg-white dark:bg-zinc-950 @2xl:min-h-[18rem] @2xl:flex-1 @2xl:overflow-hidden"
+          >
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-3">
                 <div className="flex min-h-0 flex-1 flex-col gap-3">
                   {/* Error Display */}
                   {queryError && (
@@ -2633,7 +1973,7 @@ export default function ExplorerPage() {
                             <div className="font-semibold text-sm text-red-700 dark:text-red-400">
                               {queryError.title}
                             </div>
-                            <div className="text-sm text-red-600 dark:text-red-300 font-mono break-words">
+                            <div className="text-sm text-red-700 dark:text-red-300 font-mono break-words">
                               {queryError.message}
                             </div>
                             {queryError.hint && (
@@ -2654,7 +1994,7 @@ export default function ExplorerPage() {
                       <Loader2 className="h-6 w-6 animate-spin text-violet-500" />
                       <div className="text-sm text-zinc-500 dark:text-zinc-400">Running your query…</div>
                       <div className="text-xs text-zinc-400 dark:text-zinc-500">
-                        Press ⌘ + . to cancel
+                        Press {modKey} + . to cancel
                       </div>
                     </div>
                   )}
@@ -2662,8 +2002,7 @@ export default function ExplorerPage() {
                   {/* Results */}
                   {queryResult && (
                     <>
-                      {/* Toolbar. The "Results" heading is the tab above it now, so the
-                          row is only what came back and what you can do with it. */}
+                      {/* Toolbar: only what came back and what you can do with it. */}
                       <div className="shrink-0">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex shrink-0 items-center gap-1.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
@@ -2730,7 +2069,7 @@ export default function ExplorerPage() {
                                   size="sm"
                                   disabled={!sqlQuery.trim()}
                                   onClick={() => {
-                                    setRightPanelTab("saved")
+                                    setView("saved")
                                     toast.info(
                                       "Save this query, then use Schedule on it to materialize the result as a table on a schedule."
                                     )
@@ -2740,33 +2079,21 @@ export default function ExplorerPage() {
                                   <Table2 className="h-4 w-4 mr-2" />
                                   Turn into a table
                                 </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => {
-                                    setSelectedBiTool("metabase")
-                                    setDashboardName(nlInput || "Query Results")
-                                    setShowDashboardDialog(true)
-                                  }}
-                                >
-                                  <BarChart3 className="h-4 w-4 mr-2" />
-                                  Send to BI Tool
-                                </Button>
-                                {/* POST /explorer/share/slack has been live since the
-                                    explorer shipped and had no control anywhere. The
-                                    webhook is typed per-send and never stored; the
-                                    email sibling is absent on purpose (it needs
-                                    operator SMTP, so it is not a frontend-only gap). */}
-                                <ShareToSlackDialog
-                                  question={nlInput}
-                                  sql={sqlQuery}
-                                  columns={queryResult.columns || []}
-                                  rows={queryResult.rows || []}
-                                  rowCount={queryResult.row_count}
-                                  executionMs={queryResult.execution_time_ms}
-                                  truncated={queryResult.truncated}
-                                  disabled={!sqlQuery.trim()}
-                                />
+                                {canMakeCharts && (
+                                  <Button asChild variant="outline" size="sm">
+                                    <Link
+                                      href={chartHref}
+                                      title={
+                                        chartHref === "/charts/new"
+                                          ? "Chart a model or a saved query: save this query first to chart it"
+                                          : "Chart this saved query"
+                                      }
+                                    >
+                                      <ChartColumn className="h-4 w-4 mr-2" />
+                                      Create chart
+                                    </Link>
+                                  </Button>
+                                )}
                               </>
                             )}
                           </div>
@@ -2821,16 +2148,32 @@ export default function ExplorerPage() {
                             <div className="mt-3 text-sm font-medium text-zinc-700 dark:text-zinc-200">
                               Query ran successfully — no rows matched
                             </div>
-                            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
-                              {queryResult.columns.length > 0
-                                ? `The result set has ${queryResult.columns.length} column${queryResult.columns.length === 1 ? "" : "s"} but zero rows. Loosen your WHERE clause, or pick a different time range, then run again.`
-                                : "The query returned zero rows. Loosen your WHERE clause or pick a different time range, then run again."}
-                            </div>
+                            {zeroRowFilters.length > 0 ? (
+                              <div data-testid="zero-row-text-filters" className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
+                                <p>A text value matches only when it is stored exactly as written, case included. This query matched on:</p>
+                                <ul className="mt-2 flex flex-wrap justify-center gap-1.5">
+                                  {zeroRowFilters.map((f) => (
+                                    <li key={f}>
+                                      <code className="rounded bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 font-mono text-[11px] text-zinc-700 dark:text-zinc-200">
+                                        {f}
+                                      </code>
+                                    </li>
+                                  ))}
+                                </ul>
+                                <p className="mt-2">Check the values these columns hold, then run again.</p>
+                              </div>
+                            ) : (
+                              <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
+                                {queryResult.columns.length > 0
+                                  ? `The result set has ${queryResult.columns.length} column${queryResult.columns.length === 1 ? "" : "s"} but zero rows. Loosen your WHERE clause, or pick a different time range, then run again.`
+                                  : "The query returned zero rows. Loosen your WHERE clause or pick a different time range, then run again."}
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <div
                             data-testid="results-grid-scroller"
-                            className="min-h-0 max-h-[70vh] flex-1 overflow-auto rounded-md border lg:max-h-none"
+                            className="min-h-0 max-h-[70vh] flex-1 overflow-auto rounded-md border @2xl:max-h-none"
                           >
                             <Table>
                               <TableHeader>
@@ -2845,32 +2188,33 @@ export default function ExplorerPage() {
                               <TableBody>
                                 {queryResult.rows.map((row, i) => (
                                   <TableRow key={i}>
-                                    {queryResult.columns.map((col) => (
-                                      <TableCell
-                                        key={col}
-                                        className={cn(
-                                          "text-xs font-mono max-w-[520px]",
-                                          typeof row[col] === "string" && String(row[col]).length > 200
-                                            ? "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                                            : ""
-                                        )}
-                                        title={
-                                          typeof row[col] === "string" && String(row[col]).length > 200
-                                            ? "Click to view full value"
-                                            : undefined
-                                        }
-                                        onClick={() => {
-                                          const full = formatCellValue(row[col], { truncate: false })
-                                          if (typeof full === "string" && full.length > 200) {
-                                            setCellViewerTitle(col)
-                                            setCellViewerValue(full)
-                                            setCellViewerOpen(true)
-                                          }
-                                        }}
-                                      >
-                                        {formatCellValue(row[col], { truncate: true })}
-                                      </TableCell>
-                                    ))}
+                                    {queryResult.columns.map((col) => {
+                                      const full = formatCellValue(row[col])
+                                      const long = full.length > CELL_PREVIEW_CHARS
+                                      // One line, cut at the cell's width: a JSON value has no
+                                      // space to wrap at and used to run across the next columns.
+                                      // A click opens any value the cell cut off.
+                                      return (
+                                        <TableCell
+                                          key={col}
+                                          className={cn(
+                                            "text-xs font-mono max-w-[520px] truncate",
+                                            long ? "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-900" : ""
+                                          )}
+                                          title={long ? "Click to view full value" : undefined}
+                                          onClick={(e) => {
+                                            const cell = e.currentTarget
+                                            if (long || cell.scrollWidth > cell.clientWidth) {
+                                              setCellViewerTitle(col)
+                                              setCellViewerValue(full)
+                                              setCellViewerOpen(true)
+                                            }
+                                          }}
+                                        >
+                                          {long ? full.slice(0, CELL_PREVIEW_CHARS) + "…" : full}
+                                        </TableCell>
+                                      )
+                                    })}
                                   </TableRow>
                                 ))}
                               </TableBody>
@@ -2888,191 +2232,21 @@ export default function ExplorerPage() {
                     </>
                   )}
 
-                  {/* Empty state: suggest where to start. Kept mounted (hidden) once the user has a
-                      query, so the suggestions are still there if they clear the editor; keyed by
-                      connection so switching connections starts over. */}
-                  {selectedConnection && (
-                    <div
-                      hidden={Boolean(queryResult || queryError || sqlQuery.trim() || executingQuery)}
-                      className="min-h-0 flex-1 overflow-auto"
-                    >
-                      <SuggestTablesCard
-                        embedded
-                        key={selectedConnection}
-                        connectionId={selectedConnection}
-                        selectedTables={selectedTables}
-                        tableKey={tableKeyFromMeta}
-                        onToggleTable={toggleTableSelection}
-                        onStartQuery={insertIntoEditor}
-                      />
-                    </div>
+                  {!queryResult && !queryError && !executingQuery && (
+                    <ExplorerStartHere
+                      tables={visibleTables}
+                      history={queryHistory}
+                      onQueryTable={(qualified) => startQuery(`SELECT * FROM ${qualified} LIMIT 100`)}
+                      onOpenQuery={(entry) => startQuery(entry.sql)}
+                    />
                   )}
                 </div>
-              ) : rightPanelTab === "steps" ? (
-                <div className="min-h-0 flex-1 overflow-auto">
-                  <ExplorerStepTimeline
-                    run={currentRun}
-                    onRetry={() => {
-                      if (nlInput.trim()) {
-                        generateSQL()
-                      }
-                    }}
-                  />
-                </div>
-              ) : rightPanelTab === "saved" ? (
-                <div className="min-h-0 flex-1 overflow-auto">
-                  <SavedQueries
-                    connectionId={selectedConnection}
-                    currentSql={sqlQuery}
-                    currentQuestion={nlInput}
-                    onLoad={(sql, question) => {
-                      setSqlQuery(sql)
-                      if (question) setNlInput(question)
-                    }}
-                  />
-                </div>
-              ) : (
-                <div className="min-h-0 flex-1 overflow-auto rounded-md border p-1">
-                  {queryHistory.length === 0 ? (
-                    <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
-                      No history yet. Run a query to populate this list.
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      {queryHistory.map((entry) => (
-                        <div
-                          key={entry.id}
-                          role="button"
-                          tabIndex={0}
-                          className="p-3 border rounded-lg hover:bg-zinc-50 dark:hover:bg-zinc-900 cursor-pointer transition-colors"
-                          onClick={() => loadFromHistory(entry)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault()
-                              loadFromHistory(entry)
-                            }
-                          }}
-                        >
-                          {entry.question && (
-                            <div className="text-xs text-violet-600 mb-1 flex items-center gap-1">
-                              <Sparkles className="h-3 w-3" />
-                              {entry.question}
-                            </div>
-                          )}
-                          <div className="font-mono text-xs text-zinc-600 dark:text-zinc-400 truncate">
-                            {entry.sql}
-                          </div>
-                          <div className="flex items-center gap-3 mt-2 text-[10px] text-zinc-400">
-                            <span className="flex items-center gap-1">
-                              <Clock className="h-3 w-3" />
-                              {entry.executionTimeMs}ms
-                            </span>
-                            <span>{typeof entry.rowCount === "number" ? pluralizeRows(entry.rowCount) : "—"}</span>
-                            <span>{entry.timestamp.toLocaleTimeString()}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
+            </div>
+          </section>
           </>
           )}
         </main>
       </div>
-
-      {/* Send to BI Tool Dialog */}
-      <Dialog open={showDashboardDialog} onOpenChange={setShowDashboardDialog}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <BarChart3 className="h-5 w-5 text-violet-500" />
-              Send to BI Tool
-            </DialogTitle>
-            <DialogDescription>
-              Export your SQL query as a saved dashboard in your visualization tool.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            {/* Tool selector */}
-            <div className="space-y-2">
-              <Label>Visualization Tool</Label>
-              <div className="grid grid-cols-3 gap-2">
-                {VISUALIZATION_TOOLS.map((tool) => (
-                  <button
-                    key={tool.id}
-                    type="button"
-                    onClick={() => setSelectedBiTool(tool.id)}
-                    className={cn(
-                      "relative flex flex-col items-start gap-0.5 rounded-lg border p-3 text-left transition-all",
-                      selectedBiTool === tool.id
-                        ? tool.accentClass + " border-2"
-                        : "border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600",
-                      !tool.implemented && "opacity-60"
-                    )}
-                  >
-                    <span className="text-sm font-medium leading-tight">{tool.name}</span>
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 leading-tight">{tool.description}</span>
-                    {!tool.implemented && (
-                      <span className="absolute top-1.5 right-1.5 text-[9px] font-medium text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1 rounded">
-                        soon
-                      </span>
-                    )}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="dashboard-name">Dashboard Name</Label>
-              <Input
-                id="dashboard-name"
-                placeholder="e.g., Monthly Revenue Report"
-                value={dashboardName}
-                onChange={(e) => setDashboardName(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="dashboard-description">Description (optional)</Label>
-              <Textarea
-                id="dashboard-description"
-                placeholder="What does this dashboard show?"
-                value={dashboardDescription}
-                onChange={(e) => setDashboardDescription(e.target.value)}
-                rows={2}
-              />
-            </div>
-            <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-lg">
-              <div className="text-xs text-zinc-500 dark:text-zinc-400 mb-1">SQL Query</div>
-              <div className="font-mono text-xs text-zinc-600 dark:text-zinc-400 truncate">
-                {sqlQuery.slice(0, 120)}{sqlQuery.length > 120 ? "…" : ""}
-              </div>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowDashboardDialog(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={createVisualizationDashboard}
-              disabled={creatingDashboard || !dashboardName.trim()}
-              className="bg-gradient-to-r from-violet-600 to-indigo-600"
-            >
-              {creatingDashboard ? (
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-              ) : (
-                <ExternalLink className="h-4 w-4 mr-2" />
-              )}
-              {(() => {
-                const tool = VISUALIZATION_TOOLS.find((t) => t.id === selectedBiTool)
-                return tool?.implemented ? `Create in ${tool.name}` : `${tool?.name ?? "Tool"} — Coming Soon`
-              })()}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {/* Cell Viewer Dialog (for long values) */}
       <Dialog open={cellViewerOpen} onOpenChange={setCellViewerOpen}>
@@ -3105,6 +2279,7 @@ export default function ExplorerPage() {
           this dialog is the UX guardrail against an accidental irreversible run. */}
       <Dialog
         open={showDestructiveConfirm}
+        closeOnOutsideClick={false}
         onOpenChange={(open) => {
           setShowDestructiveConfirm(open)
           if (!open) {
@@ -3182,90 +2357,19 @@ export default function ExplorerPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      {/* HITL: Table selection when table linking is ambiguous */}
-      <HITLTablePicker
-        open={tableHITLOpen}
-        onOpenChange={setTableHITLOpen}
-        candidates={tableHITLCandidates}
-        question={nlInput}
-        onConfirm={(selectedFullTables) => {
-          // Preserve schema-qualified tables so execution uses the right database.
-          const selected = (selectedFullTables || []).map((s) => normalizeTableKey(s)).filter(Boolean)
-          setSelectedTables(selected)
-          // Immediately retry using the confirmed tables (avoid stale state).
-          generateSQL({ tablesOverride: selected })
-        }}
-        onCancel={() => {
-          setTableHITLOpen(false)
-        }}
-      />
-
-      <HITLMetricPicker
-        open={metricHITLOpen}
-        onOpenChange={setMetricHITLOpen}
-        question={nlInput}
-        options={metricHitlOptions.length > 0 ? metricHitlOptions : undefined}
-        onConfirm={(choice) => {
-          setMetricChoice(choice)
-          metricChoiceRef.current = choice
-          setMetricHITLOpen(false)
-          const pending = pendingGenerateRef.current
-          pendingGenerateRef.current = null
-          // Retry with same tables; metricChoice is read from state when building question hint.
-          if (pending?.tablesOverride) {
-            generateSQL({ tablesOverride: pending.tablesOverride, metricChoiceOverride: choice })
-          } else {
-            generateSQL({ metricChoiceOverride: choice })
-          }
-        }}
-        onCancel={() => {
-          pendingGenerateRef.current = null
-          setMetricHITLOpen(false)
-        }}
-      />
     </div>
   )
 }
 
+// A result cell renders at most this many characters; a click shows the rest.
+const CELL_PREVIEW_CHARS = 200
+
 // Helper to format cell values for display
-function formatCellValue(value: unknown, opts?: { truncate?: boolean }): string {
+function formatCellValue(value: unknown): string {
   if (value === null || value === undefined) return "NULL"
   if (typeof value === "object") return JSON.stringify(value)
   if (typeof value === "boolean") return value ? "true" : "false"
-  const str = String(value)
-  if (opts?.truncate && str.length > 200) return str.slice(0, 200) + "…"
-  return str
-}
-
-function safeJsonParse(raw: string): any | null {
-  const s = String(raw ?? "").trim()
-  if (!s) return null
-  try {
-    return JSON.parse(s)
-  } catch {
-    return null
-  }
-}
-
-// Extract the human-readable message from any API response shape.
-function extractRawMessage(data: any): string {
-  if (typeof data === "string") return data.trim()
-  if (!data || typeof data !== "object") return ""
-  const direct = data.error || data.message || (typeof data.detail === "string" ? data.detail : "")
-  if (direct) return String(direct).trim()
-  if (Array.isArray(data.detail)) {
-    return data.detail
-      .map((d: any) => {
-        if (typeof d === "string") return d
-        const loc = Array.isArray(d.loc) ? d.loc.filter((x: any) => x !== "body").join(".") : ""
-        const msg = d.msg || d.message || ""
-        return loc ? `${loc}: ${msg}` : msg
-      })
-      .filter(Boolean)
-      .join("; ")
-  }
-  return ""
+  return String(value)
 }
 
 // Single classification function: HTTP status + response body + call context → ExplorerError.
@@ -3273,39 +2377,13 @@ function extractRawMessage(data: any): string {
 function classifyApiError(
   status: number | undefined,
   data: any,
-  context: "table_resolve" | "generate" | "execute" | "schema" | "connections" | "export" | "bi_tool" | "general"
+  context: "execute" | "schema" | "connections" | "export" | "general"
 ): ExplorerError {
   const raw = extractRawMessage(data)
   const lower = raw.toLowerCase()
   // Use hint from the response body when the server provided one
   const serverHint: string | undefined =
     data && typeof data === "object" && typeof data.hint === "string" ? data.hint.trim() : undefined
-
-  // Checked before the status branches: its body's "error" is a code, not a
-  // sentence, and the generic 503 hint would blame a service that is healthy.
-  const noLlm = llmNotConfiguredError(data)
-  if (noLlm) return noLlm
-
-  // Plan quota (Ship 3 Phase 2): a 402 from /sql/generate means the workspace is
-  // over its monthly NL→SQL allowance. Direct SQL stays unlimited, so point there too.
-  if (status === 402) {
-    const errorCode =
-      data && typeof data === "object" && typeof data.error === "string" ? data.error : undefined
-    if (errorCode === "query_limit_reached") {
-      return {
-        code: "quota",
-        title: "Query limit reached",
-        message: raw || "You've used all the NL→SQL queries included in your plan this month.",
-        hint: serverHint || "Upgrade your plan to generate more queries, or run direct SQL (unlimited).",
-      }
-    }
-    return {
-      code: "quota",
-      title: "Plan limit reached",
-      message: raw || "This action isn't available on your current plan.",
-      hint: serverHint || "Upgrade your plan to continue.",
-    }
-  }
 
   if (status === 401 || status === 403) {
     // Role/permission rejections from the Explorer statement gate are NOT session
@@ -3330,16 +2408,11 @@ function classifyApiError(
   }
 
   if (status === 503) {
-    const isLlmContext = context === "table_resolve" || context === "generate"
     return {
-      code: isLlmContext ? "llm_offline" : "service_unavailable",
-      title: isLlmContext ? "AI service unavailable" : "Service unavailable",
+      code: "service_unavailable",
+      title: "Service unavailable",
       message: raw || "The service could not be reached.",
-      hint: serverHint || (
-        isLlmContext
-          ? "The LLM service (Ollama) may not be running. Ask your admin to check the llm-service."
-          : "A backend service is temporarily unavailable. Try again shortly."
-      ),
+      hint: serverHint || "A backend service is temporarily unavailable. Try again shortly.",
     }
   }
 
@@ -3358,20 +2431,6 @@ function classifyApiError(
       title: "Connection failed",
       message: raw || "Could not reach the server.",
       hint: serverHint || "Check your network connection and try again.",
-    }
-  }
-
-  // A schema load never calls the AI service, and its error carries database host
-  // names, where "llm" is an ordinary substring (a host named smallmart.example.net).
-  if (
-    context !== "schema" &&
-    (lower.includes("llm") || lower.includes("ollama") || lower.includes("chat completion") || lower.includes("model not"))
-  ) {
-    return {
-      code: "llm_error",
-      title: "AI service error",
-      message: raw,
-      hint: "The LLM service may be unavailable or the model may not be loaded. Check the llm-service logs.",
     }
   }
 
@@ -3409,24 +2468,6 @@ function classifyApiError(
     return { code: "db_error", title: "Query failed", message: raw || "The database returned an error.", hint }
   }
 
-  if (context === "table_resolve") {
-    return {
-      code: "table_resolve_failed",
-      title: "Could not identify tables",
-      message: raw || "The AI could not determine which tables are relevant to your question.",
-      hint: "Select tables manually in the sidebar, or rephrase your question to mention specific table names.",
-    }
-  }
-
-  if (context === "generate") {
-    return {
-      code: "sql_gen_failed",
-      title: "SQL generation failed",
-      message: raw || "Could not generate SQL for this question.",
-      hint: "Try rephrasing your question or selecting specific tables first.",
-    }
-  }
-
   if (context === "schema") {
     // Every wording the resolver can produce, not just NXDOMAIN -- see the
     // module for why the one-marker test missed most real outages.
@@ -3446,7 +2487,7 @@ function classifyApiError(
       lower.includes("server selection") || lower.includes("i/o timeout") ||
       lower.includes("timeout:")
     const hint = isDnsFailure
-      ? "The database hostname could not be resolved. If running locally, check that the database Docker container is running (`docker compose up -d`)."
+      ? "The database hostname could not be resolved. Check the host saved on this connection, then retry. If you host rsync.ai yourself, check that its services and the database are running."
       : isConnRefused
       ? "The database server is unreachable. Check that it is running and the host/port are correct."
       : isAuthFailure
@@ -3473,21 +2514,6 @@ function classifyApiError(
     }
   }
 
-  if (context === "bi_tool") {
-    return {
-      code: "bi_tool_failed",
-      title: "Could not create dashboard",
-      message: raw || "The BI tool returned an unexpected error.",
-      hint: serverHint || (
-        lower.includes("connect") || lower.includes("refused")
-          ? "Check that the BI tool is running and its URL is configured correctly."
-          : lower.includes("token") || lower.includes("auth")
-          ? "API credentials may be invalid. Check the relevant API key in your environment."
-          : "Make sure the BI tool is accessible and your API key is valid."
-      ),
-    }
-  }
-
   return {
     code: "unknown",
     title: "Something went wrong",
@@ -3504,39 +2530,6 @@ function clampInt(n: number, min: number, max: number): number {
   return x
 }
 
-function sameTableSet(a: string[], b: string[]): boolean {
-  const norm = (s: string) => String(s || "").trim().toLowerCase()
-  const as = new Set((a || []).map(norm).filter(Boolean))
-  const bs = new Set((b || []).map(norm).filter(Boolean))
-  if (as.size !== bs.size) return false
-  for (const k of as) {
-    if (!bs.has(k)) return false
-  }
-  return true
-}
-
-// Extract "N rows" / "top N" / "limit N" style hints from NL prompts.
-function extractRequestedRowLimit(text: string): number | null {
-  const t = String(text || "").trim()
-  if (!t) return null
-
-  const patterns: RegExp[] = [
-    /\b(?:show|give)\s+me\s+(\d{1,6})\s+rows?\b/i,
-    /\b(?:top|first)\s+(\d{1,6})\b/i,
-    /\blimit\s+(\d{1,6})\b/i,
-    /\b(\d{1,6})\s+rows?\b/i,
-  ]
-
-  for (const re of patterns) {
-    const m = t.match(re)
-    if (m?.[1]) {
-      const n = Number(m[1])
-      if (Number.isFinite(n) && n > 0) return Math.trunc(n)
-    }
-  }
-  return null
-}
-
 function extractLimitFromSQL(sql: string): number | null {
   const s = String(sql || "")
   const m = s.match(/\bLIMIT\s+(\d+)\b/i)
@@ -3546,349 +2539,10 @@ function extractLimitFromSQL(sql: string): number | null {
   return Math.trunc(n)
 }
 
-function setOrReplaceLimit(sql: string, limit: number): string {
-  const n = clampInt(limit, 1, Number.MAX_SAFE_INTEGER)
-  const trimmed = String(sql || "").trim().replace(/;+\s*$/, "")
-  if (!trimmed) return `SELECT 1 LIMIT ${n}`
-
-  if (/\bLIMIT\s+\d+\b/i.test(trimmed)) {
-    return trimmed.replace(/\bLIMIT\s+\d+\b/i, `LIMIT ${n}`)
-  }
-  return `${trimmed} LIMIT ${n}`
-}
-
-function isSelectOnlySql(sql: string): boolean {
-  const s = String(sql || "").trim()
-  if (!s) return false
-  const upper = s.toUpperCase()
-  return upper.startsWith("SELECT") || upper.startsWith("WITH")
-}
-
 /** A result is a write outcome (render "N rows affected", hide export/BI) when its
  *  statement_type is anything other than a read. */
 function isWriteResult(statementType?: string): boolean {
   if (!statementType) return false
   const t = statementType.toUpperCase()
   return t !== "SELECT" && t !== "WITH"
-}
-
-// ==========================
-// Schema-aware disambiguation
-// ==========================
-
-type TableIndex = {
-  tables: TableMetadata[]
-  byKey: Map<string, TableMetadata>
-  tokensByKey: Map<string, { schemaTokens: Set<string>; tableTokens: Set<string>; columnTokens: Set<string> }>
-  displayByKey: Map<string, { schema: string; table: string }>
-}
-
-type RankedTable = {
-  key: string
-  schema_name: string
-  table: string
-  score: number
-  confidence: number
-  reason: string
-}
-
-function buildTableIndex(all: TableMetadata[]): TableIndex {
-  const byKey = new Map<string, TableMetadata>()
-  const tokensByKey = new Map<string, { schemaTokens: Set<string>; tableTokens: Set<string>; columnTokens: Set<string> }>()
-  const displayByKey = new Map<string, { schema: string; table: string }>()
-
-  for (const t of all || []) {
-    const key = tableKeyFromMeta(t)
-    byKey.set(key, t)
-    const schema = String(t.schema || "").trim() || "public"
-    const table = normalizeTableName(t.name)
-
-    const schemaTokens = new Set(tokenizeForMatch(schema))
-    const tableTokens = new Set(tokenizeForMatch(table))
-    const columnTokens = new Set(
-      (t.columns || [])
-        .flatMap((c) => tokenizeForMatch(c.name))
-        .filter(Boolean)
-    )
-
-    tokensByKey.set(key, { schemaTokens, tableTokens, columnTokens })
-    displayByKey.set(key, { schema, table })
-  }
-
-  return { tables: all || [], byKey, tokensByKey, displayByKey }
-}
-
-function tokenizeForMatch(s: string): string[] {
-  const raw = String(s || "")
-    .toLowerCase()
-    .replace(/[`"'()[\]{}]/g, " ")
-    .replace(/[^a-z0-9_]+/g, " ")
-    .trim()
-  if (!raw) return []
-  const parts = raw
-    .split(/\s+/)
-    .flatMap((p) => p.split("_"))
-    .map((x) => x.trim())
-    .filter(Boolean)
-
-  const stop = new Set([
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "by",
-    "for",
-    "from",
-    "in",
-    "is",
-    "it",
-    "me",
-    "of",
-    "on",
-    "or",
-    "per",
-    "show",
-    "the",
-    "to",
-    "with",
-    "what",
-    "when",
-    "where",
-    "who",
-    "how",
-    "total",
-  ])
-
-  return parts
-    .map((p) => (p.endsWith("s") && p.length > 3 ? p.slice(0, -1) : p))
-    .filter((p) => p.length >= 2 && !stop.has(p))
-}
-
-function rankTablesForQuestion(question: string, index: TableIndex): RankedTable[] {
-  const qTokens = tokenizeForMatch(question)
-  if (qTokens.length === 0) return []
-
-  const scored: RankedTable[] = []
-  for (const [key, toks] of index.tokensByKey.entries()) {
-    let score = 0
-    const matched: string[] = []
-
-    for (const tok of qTokens) {
-      let inc = 0
-      if (toks.tableTokens.has(tok)) inc = Math.max(inc, 4)
-      if (toks.schemaTokens.has(tok)) inc = Math.max(inc, 3)
-      if (toks.columnTokens.has(tok)) inc = Math.max(inc, 1)
-      if (inc > 0) matched.push(tok)
-      score += inc
-    }
-
-    if (score <= 0) continue
-    const disp = index.displayByKey.get(key) || { schema: "public", table: key }
-    scored.push({
-      key,
-      schema_name: disp.schema,
-      table: disp.table,
-      score,
-      confidence: 0,
-      reason: matched.length ? `Matched: ${Array.from(new Set(matched)).slice(0, 6).join(", ")}` : "Schema match",
-    })
-  }
-
-  scored.sort((a, b) => b.score - a.score)
-  const max = scored[0]?.score || 1
-  for (const s of scored) {
-    s.confidence = Math.max(0, Math.min(1, s.score / max))
-  }
-  return scored
-}
-
-function decideTableHitl(args: {
-  question: string
-  userSelected: string[]
-  suggested: string[]
-  localTop: RankedTable[]
-  serverConfidence: number
-  serverNeedsHitl: boolean
-}): { shouldAsk: boolean; reason?: string } {
-  if (args.serverNeedsHitl) return { shouldAsk: true, reason: "Need confirmation on which tables to use" }
-
-  const top = args.localTop[0]
-  const second = args.localTop[1]
-  const userSet = new Set((args.userSelected || []).map((t) => normalizeTableKey(t)))
-  const suggestedSet = new Set((args.suggested || []).map((t) => normalizeTableKey(t)))
-
-  // If question doesn't strongly match anything, don't pop extra UI.
-  if (!top || top.score < 4) return { shouldAsk: false }
-
-  // If the best match is not among suggested tables (and server isn't very confident), ask.
-  if (!suggestedSet.has(normalizeTableKey(`${top.schema_name}.${top.table}`)) && args.serverConfidence < 0.85) {
-    return { shouldAsk: true, reason: `Your question seems to match ${top.schema_name}.${top.table} more than the suggested tables` }
-  }
-
-  // If user selected tables but the best match differs, ask rather than silently switching domains.
-  if (userSet.size > 0 && !userSet.has(normalizeTableKey(`${top.schema_name}.${top.table}`))) {
-    return { shouldAsk: true, reason: `Your question matches ${top.schema_name}.${top.table} more than your current selection` }
-  }
-
-  // If top-2 are close, ask.
-  if (second && top.score - second.score <= 2 && second.score >= 3) {
-    return { shouldAsk: true, reason: "Multiple tables look relevant — confirm which ones to use" }
-  }
-
-  return { shouldAsk: false }
-}
-
-function mergeTableCandidates(args: {
-  serverCandidates: HITLTableCandidate[]
-  localTop: RankedTable[]
-  tables: TableMetadata[]
-}): HITLTableCandidate[] {
-  const out = new Map<string, HITLTableCandidate>()
-
-  for (const c of args.serverCandidates || []) {
-    const key = `${String(c.schema_name || "public")}.${String(c.table || "")}`
-    out.set(key, c)
-  }
-
-  for (const r of args.localTop || []) {
-    const key = `${r.schema_name}.${r.table}`
-    if (out.has(key)) continue
-    out.set(key, {
-      table: r.table,
-      schema_name: r.schema_name,
-      confidence: r.confidence,
-      reason: r.reason || "Schema match",
-    })
-  }
-
-  return Array.from(out.values()).sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-}
-
-function decideMetricHitl(args: {
-  question: string
-  selectedTables: string[]
-  tableIndex: TableIndex
-  currentChoice: MetricChoice | null
-}): {
-  shouldAsk: boolean
-  confidence: number
-  reason: string
-  options: Array<{ id: MetricChoice; title: string; description: string; default?: boolean }>
-} {
-  const q = String(args.question || "").toLowerCase()
-  const already = args.currentChoice
-  if (already) {
-    return { shouldAsk: false, confidence: 1, reason: "Metric already chosen", options: [] }
-  }
-
-  const wantsCount = /\b(count|how many|number of)\b/.test(q)
-  const wantsAmount = /\b(amount|revenue|gmv|value|sum|\$|cents|usd)\b/.test(q)
-  const mentionsTotal = /\btotal\b/.test(q)
-
-  // Detect if selected (linked) tables have any "amount-like" columns, making "total" ambiguous.
-  const amountLike = new Set(["amount", "revenue", "price", "total", "value", "cents", "usd"])
-  const linkedKeys = (args.selectedTables || []).map((t) => normalizeTableKey(t)).filter(Boolean)
-  const entityLabel = inferEntityLabel(linkedKeys, args.tableIndex)
-  const amountCol = findBestAmountLikeColumn(linkedKeys, args.tableIndex, amountLike)
-  const hasAmountColumn = Boolean(amountCol)
-
-  const countTitle = entityLabel ? `Count of ${entityLabel}` : "Count of rows"
-  const sumTitle = amountCol
-    ? `Sum of ${humanizeIdentifier(amountCol.column)}`
-    : "Sum of amount/value"
-  const sumDesc = amountCol
-    ? `Sum ${amountCol.column} from ${amountCol.tableDisplay} (SUM).`
-    : "Sum an amount/value-like column (SUM)."
-
-  const options = [
-    {
-      id: "count" as const,
-      title: countTitle,
-      description: entityLabel ? `How many ${entityLabel} (COUNT).` : "How many rows/records (COUNT).",
-      default: true,
-    },
-    { id: "sum_amount" as const, title: sumTitle, description: sumDesc },
-  ]
-
-  // If user explicitly asked for count or amount, don't ask.
-  if (wantsCount) return { shouldAsk: false, confidence: 0.9, reason: "Explicit count intent", options }
-  if (wantsAmount) return { shouldAsk: false, confidence: 0.9, reason: "Explicit amount intent", options }
-
-  // If "total" appears with no explicit amount words, and schema has amount-like fields, ask.
-  if (mentionsTotal && hasAmountColumn) {
-    return { shouldAsk: true, confidence: 0.55, reason: "“Total” can mean count or sum — please confirm", options }
-  }
-
-  return { shouldAsk: false, confidence: 0.8, reason: "Metric unambiguous", options }
-}
-
-function applyMetricHintToQuestion(
-  question: string,
-  choice: MetricChoice | null | undefined,
-  ctx?: { selectedTables: string[]; tableIndex: TableIndex }
-): string {
-  const q = String(question || "")
-  if (!choice) return q
-  const linked = (ctx?.selectedTables || []).map((t) => normalizeTableKey(t)).filter(Boolean)
-  const amountLike = new Set(["amount", "revenue", "price", "total", "value", "cents", "usd"])
-  const amountCol = ctx?.tableIndex ? findBestAmountLikeColumn(linked, ctx.tableIndex, amountLike) : null
-
-  const hint =
-    choice === "count"
-      ? "Metric: COUNT rows/records. Do NOT SUM any amount/value column."
-      : amountCol
-        ? `Metric: SUM(${amountCol.column}) from ${amountCol.tableDisplay}.`
-        : "Metric: SUM an amount/value-like column (e.g., amount, total, revenue)."
-  return `${q}\n\n${hint}`
-}
-
-function humanizeIdentifier(input: string): string {
-  const s = String(input || "").trim()
-  if (!s) return ""
-  return s
-    .replace(/[`"'()[\]{}]/g, "")
-    .replace(/_/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function inferEntityLabel(linkedTableKeys: string[], index: TableIndex): string {
-  const first = linkedTableKeys[0]
-  if (!first) return ""
-  const disp = index.displayByKey.get(first)
-  const table = disp?.table || parseQualifiedTable(first).table
-  const human = humanizeIdentifier(table)
-  if (!human) return ""
-  // Example: "order_items" -> "order items"
-  return human
-}
-
-function findBestAmountLikeColumn(
-  linkedTableKeys: string[],
-  index: TableIndex,
-  amountLike: Set<string>
-): { tableKey: string; tableDisplay: string; column: string; score: number } | null {
-  let best: { tableKey: string; tableDisplay: string; column: string; score: number } | null = null
-
-  for (const k of linkedTableKeys || []) {
-    const meta = index.byKey.get(k) || index.byKey.get(qualifyTableKeyIfPossible(k, index.tables))
-    if (!meta) continue
-    const disp = index.displayByKey.get(tableKeyFromMeta(meta)) || index.displayByKey.get(k)
-    const tableDisplay = disp ? `${disp.schema}.${disp.table}` : k
-
-    for (const c of meta.columns || []) {
-      const toks = tokenizeForMatch(c.name)
-      const hits = toks.filter((t) => amountLike.has(t))
-      if (hits.length === 0) continue
-      // Prefer more specific columns (e.g. amount_cents) over generic (e.g. total).
-      const score = hits.length + (String(c.name).toLowerCase().includes("amount") ? 2 : 0)
-      if (!best || score > best.score) {
-        best = { tableKey: k, tableDisplay, column: c.name, score }
-      }
-    }
-  }
-
-  return best
 }

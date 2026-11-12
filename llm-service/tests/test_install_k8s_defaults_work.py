@@ -59,6 +59,7 @@ SECRET_KEYS = (
     "BLOB_STAGING_ACCESS_KEY",
     "BLOB_STAGING_SECRET_KEY",
     "RSYNC_DEMO_WAREHOUSE_PASSWORD",
+    "RSYNC_PII_HASH_SALT",
 )
 
 
@@ -231,6 +232,8 @@ def test_the_generated_secret_reaches_the_chart_secret(tmp_path):
     # Without it the gateway cannot authenticate to the orchestrator: every
     # POST /pipelines/{id}/run is refused "authentication required".
     assert data.get("INTERNAL_SERVICE_SECRET") == env["INTERNAL_SERVICE_SECRET"]
+    # Without it a mask rule that hashes with HMAC-SHA256 refuses to save and to run.
+    assert data.get("RSYNC_PII_HASH_SALT") == env["RSYNC_PII_HASH_SALT"]
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
@@ -746,6 +749,72 @@ def test_an_existing_internal_secret_in_the_cluster_is_reused(tmp_path):
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert _dotenv(tmp_path)["INTERNAL_SERVICE_SECRET"] == "I" * 32
+
+
+# The PII hash key keys HMAC-SHA256 masks and salts every sha256/md5 mask hash.
+# Adding it to an install that already hashes data changes those digests from
+# then on, so the installer generates one on a first install only.
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_an_existing_pii_hash_key_in_the_cluster_is_reused(tmp_path):
+    env, _ = _fake_cluster(tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_RSYNC_PII_HASH_SALT="H" * 32)
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert _dotenv(tmp_path)["RSYNC_PII_HASH_SALT"] == "H" * 32
+    assert _values(tmp_path)["secrets"]["piiHashKey"] == "H" * 32
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_an_upgrade_never_gains_a_pii_hash_key_it_did_not_have(tmp_path):
+    """A lost .env against a cluster whose Secret has no key: that install may
+    already hold sha256 digests, and a new key would change every later one."""
+    env, _ = _fake_cluster(tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_ENCRYPTION_KEY="K" * 32)
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert not _dotenv(tmp_path).get("RSYNC_PII_HASH_SALT"), "an upgrade was given a hash key it never had"
+    assert "piiHashKey" not in _values(tmp_path)["secrets"]
+    # the control: the same run still generates the keys that are safe to add
+    assert re.fullmatch(r"[A-Za-z0-9]{32}", _dotenv(tmp_path)["JWT_SECRET"])
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_rerun_of_an_install_without_a_pii_hash_key_does_not_add_one(tmp_path):
+    """An .env written by an installer that predates the key."""
+    assert _run(tmp_path, "--render-only").returncode == 0
+    dotenv = tmp_path / "inst" / ".env"
+    dotenv.write_text("".join(l for l in dotenv.read_text().splitlines(True) if not l.startswith("RSYNC_PII_HASH_SALT=")))
+    cp = _run(tmp_path, "--render-only")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert not _dotenv(tmp_path).get("RSYNC_PII_HASH_SALT")
+    assert "piiHashKey" not in _values(tmp_path)["secrets"]
+
+
+# The bundled MinIO's KMS key. Unlike the hash key, adding one to a MinIO that
+# never had one strands nothing (it only lets SSE-S3 work from then on), so an
+# upgrade gains one -- but once set it must never change: a different key makes
+# MinIO fail to decrypt what it already encrypted.
+_KMS_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*:[A-Za-z0-9+/]{43}=")
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_an_upgrade_without_a_kms_key_gains_one(tmp_path):
+    env, _ = _fake_cluster(tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_ENCRYPTION_KEY="K" * 32)
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    key = _dotenv(tmp_path)["MINIO_KMS_SECRET_KEY"]
+    assert _KMS_KEY.fullmatch(key), "the generated key is not one MinIO accepts"
+    assert _values(tmp_path)["secrets"]["minioKmsSecretKey"] == key
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_an_existing_kms_key_in_the_cluster_is_reused(tmp_path):
+    kept = "rsync-ai-kms:" + "Q" * 43 + "="
+    env, _ = _fake_cluster(tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_MINIO_KMS_SECRET_KEY=kept)
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert _dotenv(tmp_path)["MINIO_KMS_SECRET_KEY"] == kept
+    assert _values(tmp_path)["secrets"]["minioKmsSecretKey"] == kept
 
 
 # ---------------------------------------------------------------------------

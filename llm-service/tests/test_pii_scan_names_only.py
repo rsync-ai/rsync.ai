@@ -49,8 +49,8 @@ def _names_only_service() -> PIIScannerService:
     return service
 
 
-# The cases api-gateway/internal/handlers/pii_column_name_test.go pins for
-# isPIIColumnName, which preview redaction uses. The two must agree, or the
+# The cases shared/go/sqlexec/mask/mask_test.go pins for
+# IsPIIColumnName, which preview redaction uses. The two must agree, or the
 # preview hides a column the scan calls clean.
 @pytest.mark.parametrize(
     "name,is_pii",

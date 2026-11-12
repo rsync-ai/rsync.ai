@@ -46,7 +46,7 @@ join ONLY the dedicated rsync-ai-mcp network and never the internal
 rsync-ai_default, so they cannot reach postgres, redis, kafka or temporal.
 That is the boundary named SEC-M-06 in scripts/mcp_generate_compose.py:12-16,
 and JIT-deployed connectors land on the same network
-(llm-service/src/agents/tool_generator/deployment/service.py:180-188).
+(llm-service/src/agents/tool_generator/deployment/service.py:179-188).
 Admitting connectors under this policy handed them the platform datastores that
 compose withholds - KI-CHART-NO-CONNECTOR-NETWORK-BOUNDARY.
 

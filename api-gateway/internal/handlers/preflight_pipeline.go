@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -270,6 +271,8 @@ func (a *ConnectionAgent) Check(workspaceID, connectorType, role string) (*Resol
 //     whatever source we ended up
 //     with is installed on disk
 //  4. CapabilityAgent (destination)
+//  5. a CDC pipeline into a destination whose metadata declares
+//     record_ids — refused unless its cdc_write_mode is append-only
 //
 // Mutates *sourceConnectionID / *destinationConnectionID in place when
 // ConnectionAgent auto-resolves a single match — the caller's INSERT
@@ -329,6 +332,7 @@ func runPipelinePreflight(
 	}
 
 	// Step 4: CapabilityAgent (destination).
+	destType := ""
 	if strings.TrimSpace(*destinationConnectionID) != "" {
 		ctype, err := LookupConnectorTypeByConnectionID(db, workspaceID, *destinationConnectionID)
 		if err != nil {
@@ -337,9 +341,57 @@ func runPipelinePreflight(
 		if hitl := capability.Check(ctype, "destination"); hitl != nil {
 			return hitl, nil
 		}
+		destType = ctype
+	}
+
+	// Step 5: a CDC pipeline into a destination that addresses each record by
+	// the id its API assigned (KI-API-DEST-CDC-WRITES-BY-SOURCE-ID).
+	if destType != "" && connectorMetadataBool(destType, "record_ids") {
+		mode := resolveEffectiveSyncMode(db, "", *sourceConnectionID, req.SyncMode, req.CDCMode)
+		if mode == "cdc" || mode == "streaming" {
+			cfg, err := decryptedConnectionConfig(db, workspaceID, *destinationConnectionID, nil)
+			if err != nil {
+				return nil, fmt.Errorf("read destination config: %w", err)
+			}
+			if wm, _ := cfg["cdc_write_mode"].(string); !cdcAppendWriteMode(wm) {
+				return cdcIntoRecordIDsRefusal(destType), nil
+			}
+		}
 	}
 
 	return nil, nil
+}
+
+// cdcIntoRecordIDsRefusal refuses a CDC pipeline into an API destination whose
+// records are addressed by the id the API assigned. Only a batch run keeps the
+// source-row → record-id map (kafka-mcp-sink api_dest_rows.go); a CDC run
+// wrote each change by the source row's own id. The orchestrator refuses the
+// same run at start (executor cdcRecordIDsCheck).
+func cdcIntoRecordIDsRefusal(destType string) *PreflightHITLResponse {
+	return &PreflightHITLResponse{
+		Error:         "preflight_hitl_required",
+		Agent:         "CapabilityAgent",
+		ActionNeeded:  "use_batch_sync",
+		Role:          "destination",
+		ConnectorType: destType,
+		Message: fmt.Sprintf(
+			"%s addresses each record by the id its API assigned, and only a batch run keeps the map "+
+				"from a source row to that id. A CDC run would create the record again, or change "+
+				"whichever %s record carries the source row's id. Create this pipeline as a batch sync, "+
+				"or set cdc_write_mode=append on the destination connection to add each change as a new record.",
+			destType, destType,
+		),
+	}
+}
+
+// cdcAppendWriteModes are the destination cdc_write_mode values the
+// kafka-mcp-sink writes as append-only history (main.go cdcAppendMode): every
+// change becomes a new record, so none is addressed by the source row's id.
+// TestCDCAppendWriteModes_MatchTheSink holds the two lists equal.
+var cdcAppendWriteModes = []string{"append", "append_only", "append-only", "history", "insert"}
+
+func cdcAppendWriteMode(v string) bool {
+	return slices.Contains(cdcAppendWriteModes, strings.ToLower(strings.TrimSpace(v)))
 }
 
 // LookupConnectorTypeByConnectionID fetches the connector_type for a

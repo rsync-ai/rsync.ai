@@ -88,7 +88,7 @@ func TestEveryDatabaseConnectorDeclaresANamespaceModel(t *testing.T) {
 	if checked < 14 {
 		t.Fatalf("checked %d database/storage connectors, want at least 14", checked)
 	}
-	if _, problems := Load(repoConnectors); len(problems) > 0 {
+	if _, _, problems := load(repoConnectors); len(problems) > 0 {
 		t.Errorf("namespace_model problems:\n  %s", strings.Join(problems, "\n  "))
 	}
 }
@@ -194,7 +194,7 @@ func TestLoad(t *testing.T) {
 	writeConnector(t, dir, "delta", `{"id":"delta","namespace_model":{"destination_namespace":"folder"}}`)
 	writeConnector(t, dir, "saas", `{"id":"saas","aliases":["saas-api"]}`)
 
-	idx, problems := Load(dir)
+	idx, _, problems := load(dir)
 
 	if got := idx[Key("alpha_db")]; got != (Model{"schema", "database", ""}) {
 		t.Errorf("alpha by alias = %+v; empty fields default, aliases fold spaces and underscores", got)

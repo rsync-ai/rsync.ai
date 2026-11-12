@@ -1261,8 +1261,9 @@ func hashValue(str string, hashFunc string) string {
 	salt := getPIIHashSalt()
 	switch strings.ToLower(strings.TrimSpace(hashFunc)) {
 	case "hmac_sha256", "hmac-sha256", "hmac256":
-		// Keyed hash. The salt is the HMAC key; an empty key still produces a
-		// valid (though unkeyed-equivalent) HMAC so masking never leaks raw values.
+		// Keyed hash; the salt is the HMAC key. parseMaskSpec refuses this
+		// function when no key is set (keyedHashWithoutKey): an empty-key HMAC
+		// is recomputable by anyone, so it only looks keyed.
 		mac := hmac.New(sha256.New, []byte(salt))
 		mac.Write([]byte(str))
 		return "hmac256:" + hex.EncodeToString(mac.Sum(nil))
@@ -1292,6 +1293,20 @@ func getPIIHashSalt() string {
 	})
 	return _piiHashSalt
 }
+
+// PIIHashKeyConfigured reports whether this process has the install's PII hash
+// key. Services log PIIHashKeyUnsetWarning at startup when it does not, because
+// a mask rule using hmac_sha256 then refuses to save and to run.
+func PIIHashKeyConfigured() bool {
+	return getPIIHashSalt() != ""
+}
+
+// PIIHashKeyUnsetWarning is the startup line the api-gateway, orchestrator and
+// kafka-mcp-sink log when PIIHashKeyConfigured is false. It never holds a value.
+const PIIHashKeyUnsetWarning = "RSYNC_PII_HASH_SALT is not set. Mask rules that hash with " +
+	"hmac_sha256 will refuse to save and to run, and sha256/md5 hashes are unsalted. Give the " +
+	"same value to api-gateway, orchestrator and kafka-mcp-sink. Setting it changes every " +
+	"sha256/md5 hash written from then on, so set it before hash rules carry data and never rotate it."
 
 // numericValue reports whether v represents a number and, if so, its float64
 // value. It accepts the numeric Go kinds, json.Number, and numeric strings.

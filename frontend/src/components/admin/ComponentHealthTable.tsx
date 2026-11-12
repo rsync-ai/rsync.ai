@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { cn, formatAbsoluteTime } from "@/lib/utils"
+import { cn, formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
 
 /**
  * What the Sentinel agent last recorded for each worker, one row per component
@@ -149,15 +149,8 @@ export function sortComponents(components: ComponentHealth[], nowMs?: number): C
  * time serialises as year 1).
  */
 export function ageLabel(iso: string, nowMs: number): string {
-  const t = time(iso)
-  if (t <= 0 || new Date(iso).getUTCFullYear() < 2000) return "—"
-  const seconds = Math.max(0, Math.floor((nowMs - t) / 1000))
-  if (seconds < 60) return "just now"
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 48) return `${hours}h ago`
-  return `${Math.floor(hours / 24)}d ago`
+  if (time(iso) <= 0 || new Date(iso).getUTCFullYear() < 2000) return "—"
+  return formatRelativeTime(iso, { now: nowMs })
 }
 
 /** A count the component reported, or "—" when its type never measures it. */

@@ -40,6 +40,22 @@ func TestConnectionScope(t *testing.T) {
 			t.Fatalf("active=%v err=%v, want the scope ignored", active, err)
 		}
 	})
+	// BigQuery discovery lists only dataset_id's tables, so a Scope naming
+	// other datasets could only empty it.
+	t.Run("a named dataset pins a dataset-namespace connection", func(t *testing.T) {
+		cfg := scopeCfg("include", "other_ds")
+		cfg["project_id"], cfg["dataset_id"] = "proj", "rsync_paging_test"
+		_, active, err := connectionScope("bigquery", cfg)
+		if err != nil || active {
+			t.Fatalf("active=%v err=%v, want the scope ignored", active, err)
+		}
+	})
+	t.Run("a dataset-namespace connection naming no dataset is scoped", func(t *testing.T) {
+		_, active, err := connectionScope("bigquery", scopeCfg("include", "other_ds"))
+		if err != nil || !active {
+			t.Fatalf("active=%v err=%v, want active", active, err)
+		}
+	})
 	t.Run("an invalid scope fails closed", func(t *testing.T) {
 		if _, _, err := connectionScope("postgresql", scopeCfg("only", "x")); err == nil {
 			t.Fatal("want an error for an unknown mode, never 'all'")
@@ -168,5 +184,107 @@ func TestScopeEnvelopeInvalidScopeFailsClosed(t *testing.T) {
 	var dfe *DiscoveryFailedError
 	if !errors.As(err, &dfe) {
 		t.Fatalf("err = %v, want a DiscoveryFailedError", err)
+	}
+}
+
+// warningCategories lists the warnings_objects categories of a discover_schema
+// result.
+func warningCategories(result map[string]interface{}) []string {
+	var out []string
+	objs, _ := result["warnings_objects"].([]interface{})
+	for _, o := range objs {
+		if m, ok := o.(map[string]interface{}); ok {
+			out = append(out, m["category"].(string))
+		}
+	}
+	return out
+}
+
+// A table that does not say which namespace it is in cannot be placed by a
+// Scope. BigQuery discovery once sent its tables with no "schema": "Only these:
+// <dataset>" left out every one and the run blamed the patterns ("matched no
+// databases or schemas"), while "All except" let every one through (prod
+// 2026-09-29). Such a table is left out in either mode, and the warning names
+// the connector, not the patterns. The config names no dataset_id (the
+// connector falls back to BIGQUERY_DATASET_ID), so the Scope is not pinned.
+func TestScopeEnvelopeTableWithoutNamespace(t *testing.T) {
+	cases := []struct{ mode, patterns string }{{"include", "rsync_paging_test"}, {"exclude", "pii_*"}}
+	for _, c := range cases {
+		t.Run(c.mode, func(t *testing.T) {
+			cfg := scopeCfg(c.mode, c.patterns)
+			cfg["project_id"] = "proj"
+			result := map[string]interface{}{
+				"tables": []interface{}{
+					map[string]interface{}{"name": "events", "endpoint": "proj.rsync_paging_test.events"},
+					map[string]interface{}{"name": "users", "schema": ""},
+				},
+				"total_tables_available":  float64(2),
+				"total_tables_discovered": float64(2),
+			}
+			if err := scopeEnvelope("bigquery", cfg, result); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(result["tables"].([]interface{})); n != 0 {
+				t.Fatalf("%d table(s) with no namespace kept, want them left out", n)
+			}
+			if got := warningCategories(result); !reflect.DeepEqual(got, []string{scopeUnplacedCategory}) {
+				t.Fatalf("warnings = %v, want only %q", got, scopeUnplacedCategory)
+			}
+			msgs, _ := result["warnings_messages"].([]interface{})
+			if len(msgs) != 1 || !strings.Contains(msgs[0].(string), "dataset") {
+				t.Fatalf("warnings_messages = %v, want one naming the missing dataset", msgs)
+			}
+		})
+	}
+}
+
+// With its dataset named on the table, a BigQuery table is placed like any
+// schema when the connection's Scope is not pinned (no dataset_id in config).
+func TestScopeEnvelopeKeepsABigQueryDatasetsTables(t *testing.T) {
+	cfg := scopeCfg("include", "rsync_paging_*")
+	cfg["project_id"] = "proj"
+	result := envelopeTables("rsync_paging_test", "other_ds")
+	if err := scopeEnvelope("bigquery", cfg, result); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := envelopeSchemas(result), []string{"rsync_paging_test"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("tables = %v, want %v", got, want)
+	}
+	if got := warningCategories(result); len(got) != 0 {
+		t.Fatalf("warnings = %v, want none", got)
+	}
+}
+
+// A connection that names its dataset_id lists only that dataset, so a Scope
+// naming another one is ignored rather than emptying discovery.
+func TestScopeEnvelopeIgnoresScopeOnANamedDataset(t *testing.T) {
+	cfg := scopeCfg("include", "other_ds")
+	cfg["project_id"], cfg["dataset_id"] = "proj", "rsync_paging_test"
+	result := envelopeTables("rsync_paging_test", "rsync_paging_test")
+	if err := scopeEnvelope("bigquery", cfg, result); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := envelopeSchemas(result), []string{"rsync_paging_test", "rsync_paging_test"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("tables = %v, want %v", got, want)
+	}
+	if got := warningCategories(result); len(got) != 0 {
+		t.Fatalf("warnings = %v, want none", got)
+	}
+}
+
+// The task path (scopeTables) leaves such a table out in either mode too, and
+// counts it so the log names the connector.
+func TestScopeTablesLeavesOutATableWithoutNamespace(t *testing.T) {
+	f, err := namespacefilter.Parse(scopeCfg("exclude", "pii_*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []TableMetadata{{Schema: "sales", Name: "orders"}, {Name: "events"}, {Schema: "  ", Name: "users"}}
+	got := scopeTables(in, f)
+	if len(got) != 1 || got[0].Name != "orders" {
+		t.Fatalf("scopeTables = %+v, want only sales.orders", got)
+	}
+	if n := unplacedTables(in); n != 2 {
+		t.Fatalf("unplacedTables = %d, want 2", n)
 	}
 }

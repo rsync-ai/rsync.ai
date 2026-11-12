@@ -33,11 +33,51 @@ from .types import (
     NodeSpec,
     EdgeSpec,
     NodeKind,
-    EdgeType,
-    DAG_PLANNER_TOOLS,
+    MAX_WAIT_SECONDS,
+    RUNNABLE_NODE_KINDS,
+    WAIT_SECONDS_KEY,
 )
 
 logger = logging.getLogger("dag_planner.agent")
+
+# A value the model writes when it has none to give: "your_database_name",
+# "<bucket>", "{{project_id}}". The model sees a connection's id, name and type
+# only, so it cannot know a database or bucket; the connection supplies those and
+# the table-selection step the tables. A placeholder is dropped, never run: the
+# executor forwards a destination's `tables` / `selected_tables` as table names.
+_PLACEHOLDER_VALUE = re.compile(r"^\s*(?:your[\s_-]|<[^<>]+>\s*$|\{\{.*\}\}\s*$)", re.IGNORECASE)
+_DROPPED = object()
+
+
+def _without_placeholders(value: Any) -> Any:
+    """Return value with placeholder strings removed, or _DROPPED when only
+    placeholders were in it. A dict or list that was empty to begin with is kept."""
+    if isinstance(value, str):
+        return _DROPPED if _PLACEHOLDER_VALUE.match(value) else value
+    if isinstance(value, dict):
+        kept = {}
+        for key, item in value.items():
+            item = _without_placeholders(item)
+            if item is not _DROPPED:
+                kept[key] = item
+        return _DROPPED if value and not kept else kept
+    if isinstance(value, list):
+        kept = [item for item in map(_without_placeholders, value) if item is not _DROPPED]
+        return _DROPPED if value and not kept else kept
+    return value
+
+
+def drop_placeholder_config(nodes: List[Any]) -> None:
+    """Remove placeholder values from each planned node's config, in place."""
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("config"), dict):
+            continue
+        cleaned = _without_placeholders(node["config"])
+        cleaned = {} if cleaned is _DROPPED else cleaned
+        if cleaned != node["config"]:
+            dropped = sorted(set(node["config"]) - set(cleaned))
+            logger.info("Dropped placeholder config from node %s (keys emptied: %s)", node.get("id"), dropped)
+            node["config"] = cleaned
 
 
 @dataclass
@@ -254,6 +294,7 @@ class DAGPlannerAgent:
                     state = self._generate_simple_dag(state)
                     return state
 
+                drop_placeholder_config(nodes)
                 state.current_nodes = nodes
                 state.current_edges = edges
                 
@@ -382,19 +423,15 @@ class DAGPlannerAgent:
         }
         nodes.append(dest_node)
         edges.append({"from": last_node, "to": "dest_1", "type": "data"})
-        
-        # Check for notifications
+
+        # No notification node: the pipeline runtime has none, and a graph
+        # holding one is refused before it starts (RUNNABLE_NODE_KINDS).
         if any(kw in user_request for kw in ["slack", "email", "notify", "alert"]):
-            notify_type = "slack" if "slack" in user_request else "email"
-            notify_node = {
-                "id": "notify_1",
-                "kind": "notification",
-                "display_name": f"Send {notify_type.capitalize()} Notification",
-                "config": {"channel": notify_type},
-            }
-            nodes.append(notify_node)
-            edges.append({"from": "dest_1", "to": "notify_1", "type": "data"})
-        
+            state.planning_steps.append({
+                "step_type": "generate",
+                "content": "Notification requested, but a workflow graph cannot run a notification node; left out",
+            })
+
         state.current_nodes = nodes
         state.current_edges = edges
         
@@ -437,30 +474,7 @@ class DAGPlannerAgent:
                     return "postgresql"
                 return dest
         return "storage"
-    
-    def _execute_tools(self, state: PlannerState) -> PlannerState:
-        """Execute tool calls to gather more information"""
-        logger.info("🔧 Executing tool calls...")
-        
-        # For now, we implement basic tool functionality inline
-        # In production, these would call actual APIs
-        
-        tool_results = []
-        
-        # List connections tool
-        if state.available_connections:
-            tool_results.append({
-                "tool": "list_connections",
-                "result": state.available_connections,
-            })
-        
-        state.planning_steps.append({
-            "step_type": "tool_call",
-            "content": f"Executed {len(tool_results)} tool calls",
-        })
-        
-        return state
-    
+
     def _validate_dag(self, state: PlannerState) -> PlannerState:
         """Validate the generated DAG"""
         logger.info("✅ Validating DAG...")
@@ -499,6 +513,26 @@ class DAGPlannerAgent:
             if from_node == to_node:
                 errors.append(f"Self-loop detected: {from_node}")
         
+        # Only kinds the pipeline runtime can run; the model reads these errors
+        # on its retry, so each names what IS allowed.
+        runnable = ", ".join(sorted(RUNNABLE_NODE_KINDS))
+        destinations = 0
+        for node in nodes:
+            kind = node.get("kind")
+            if kind not in RUNNABLE_NODE_KINDS:
+                errors.append(
+                    f"Node {node.get('id')} has kind '{kind}', which the pipeline runtime cannot run; "
+                    f"use only: {runnable}"
+                )
+            elif kind == "destination":
+                destinations += 1
+            elif kind == "wait":
+                problem = self._wait_seconds_problem(node.get("config"))
+                if problem:
+                    errors.append(f"Wait node {node.get('id')}: {problem}")
+        if destinations != 1:
+            errors.append(f"The graph must have exactly one destination node, found {destinations}")
+
         # Check for cycles (simple DFS)
         if not errors:
             has_cycle = self._detect_cycle(nodes, edges)
@@ -532,6 +566,16 @@ class DAGPlannerAgent:
         
         return state
     
+    @staticmethod
+    def _wait_seconds_problem(config: Any) -> Optional[str]:
+        """Why a wait node's config is unusable, or None. Mirrors the adapter's waitDuration."""
+        raw = config.get(WAIT_SECONDS_KEY) if isinstance(config, dict) else None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return f"config.{WAIT_SECONDS_KEY} must be a number of seconds in (0, {MAX_WAIT_SECONDS}], got {raw!r}"
+        if raw != raw or not 0 < raw <= MAX_WAIT_SECONDS:
+            return f"config.{WAIT_SECONDS_KEY} = {raw!r} is outside (0, {MAX_WAIT_SECONDS}]"
+        return None
+
     def _detect_cycle(self, nodes: List[Dict], edges: List[Dict]) -> bool:
         """Detect cycles using DFS"""
         adj = {}

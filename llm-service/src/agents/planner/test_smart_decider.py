@@ -195,28 +195,7 @@ class TestSmartPipelineDecider(unittest.TestCase):
         self.assertEqual(stats.table_count, 3)
         self.assertEqual(stats.largest_table, "orders")
         self.assertEqual(stats.largest_table_rows, 500000)
-    
-    def test_estimate_from_discovery(self):
-        """Should correctly estimate stats from discovery response"""
-        tables = [
-            {"name": "users", "row_count": 100000, "columns": [
-                {"name": "id", "type": "bigint"},
-                {"name": "email", "type": "varchar"},
-                {"name": "created_at", "type": "timestamp"},
-            ]},
-            {"name": "orders", "row_count": 500000, "columns": [
-                {"name": "id", "type": "bigint"},
-                {"name": "user_id", "type": "bigint"},
-                {"name": "total", "type": "decimal"},
-            ]},
-        ]
-        
-        stats = self.decider.estimate_data_size_from_discovery(tables)
-        
-        self.assertEqual(stats.total_rows, 600000)
-        self.assertEqual(stats.table_count, 2)
-        self.assertGreater(stats.estimated_size_mb, 0)
-    
+
     def test_to_dict_serialization(self):
         """SmartStrategyDecision should serialize to dict correctly"""
         stats = self._create_stats(total_rows=50_000_000, size_mb=25000)

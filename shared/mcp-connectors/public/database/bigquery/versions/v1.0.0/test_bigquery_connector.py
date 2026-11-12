@@ -88,6 +88,20 @@ def test_export_delegates_to_adapter_pagination():
     assert out["next_cursor"] == 3, out
 
 
+def test_execute_delegates_to_adapter_and_is_advertised():
+    s = _server()
+    fake = _bq_fakes.FakeClient(dml_affected_rows=2)
+    s._warehouse_adapter._client = lambda config: fake
+    s._warehouse_adapter._bq = lambda: _bq_fakes.FakeBigQueryModule()
+    out = s.execute({"config": {"project_id": "p", "dataset_id": "d"},
+                     "query": "UPDATE t SET a = 1 WHERE TRUE", "timeout_seconds": 10})
+    assert out["success"] is True and out["rows_affected"] == 2, out
+    assert fake.queries == ["UPDATE t SET a = 1 WHERE TRUE"], fake.queries
+    ops = [op["name"] for op in s.get_capabilities()["operations"]]
+    assert "execute" in ops, ops
+    assert "execute" in [op["name"] for op in _load_json("metadata.json")["operations"]]
+
+
 def test_load_delegates_to_adapter_bulk_path():
     """server.load must run the adapter bulk path (load job when flag on)."""
     s = _server()

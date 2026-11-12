@@ -29,14 +29,19 @@ class FakeClient:
         self.commands = []
         self.inserts = []
         self.queries = []
+        # per-call ``settings`` seen by command()/query(), in call order
+        self.command_settings = []
+        self.query_settings = []
         self._router = query_router or (lambda sql, params: FakeResult([], []))
 
     def command(self, sql, settings=None):
         self.commands.append(sql)
+        self.command_settings.append(settings)
         return ""
 
-    def query(self, sql, parameters=None):
+    def query(self, sql, parameters=None, settings=None):
         self.queries.append((sql, parameters))
+        self.query_settings.append(settings)
         return self._router(sql, parameters or {})
 
     def raw_insert(self, table, column_names=None, insert_block=None,
@@ -442,6 +447,81 @@ def test_strip_leading_sql_comments():
     assert s._strip_leading_sql_comments("INSERT INTO t VALUES (1)").startswith("INSERT")
 
 
+# models: timeout_seconds is a server-side deadline (max_execution_time on the
+# call), and the client's HTTP read must outlive it so ClickHouse reports the
+# timeout instead of the socket dropping mid-statement.
+def _capture_connect(srv, client):
+    seen = []
+
+    def _connect(config):
+        seen.append(dict(config))
+        return client
+    srv._connect = _connect
+    return seen
+
+
+def test_execute_timeout_is_max_execution_time_on_command_and_query():
+    client = FakeClient(query_router=lambda sql, p: FakeResult(["n"], [[1]]))
+    srv = _server_with(client)
+    w = srv.execute({"config": CFG, "timeout_seconds": 45,
+                     "query": "CREATE TABLE demo.m AS SELECT 1 AS n"})
+    r = srv.execute({"config": CFG, "timeout_seconds": 45,
+                     "query": "SELECT count() AS n FROM demo.m"})
+    assert w["success"] and r["success"], (w, r)
+    assert client.command_settings == [{"max_execution_time": 45}]
+    assert client.query_settings == [{"max_execution_time": 45}]
+
+
+def test_execute_read_timeout_outlives_the_statement_deadline():
+    srv = ClickHouseMCPServer()
+    seen = _capture_connect(srv, FakeClient())
+    # long deadline: the 300 s default read timeout would cut it off
+    srv.execute({"config": CFG, "timeout_seconds": 600, "query": "OPTIMIZE TABLE demo.m"})
+    assert int(seen[-1]["query_timeout"]) >= 630
+    # short deadline: the default (or a larger configured value) is kept
+    srv.execute({"config": CFG, "timeout_seconds": 10, "query": "OPTIMIZE TABLE demo.m"})
+    assert int(seen[-1]["query_timeout"]) == 300
+    srv.execute({"config": dict(CFG, query_timeout=900), "timeout_seconds": 10,
+                 "query": "OPTIMIZE TABLE demo.m"})
+    assert int(seen[-1]["query_timeout"]) == 900
+
+
+def test_execute_without_timeout_sends_no_settings_and_keeps_the_config():
+    client = FakeClient(query_router=lambda sql, p: FakeResult(["n"], [[1]]))
+    srv = ClickHouseMCPServer()
+    seen = _capture_connect(srv, client)
+    for bad in (None, 0, -5, True, "x"):
+        params = {"config": CFG, "query": "OPTIMIZE TABLE demo.m"}
+        if bad is not None:
+            params["timeout_seconds"] = bad
+        assert srv.execute(params)["success"]
+    assert srv.execute({"config": CFG, "query": "SELECT 1"})["success"]
+    assert client.command_settings == [None] * 5
+    assert client.query_settings == [None]
+    assert all("query_timeout" not in c for c in seen)
+
+
+def test_connect_maps_query_timeout_to_send_receive_timeout(monkeypatch):
+    import types
+    got = {}
+    fake = types.ModuleType("clickhouse_connect")
+    fake.get_client = lambda **kw: got.update(kw) or object()
+    monkeypatch.setitem(sys.modules, "clickhouse_connect", fake)
+    ClickHouseMCPServer()._connect(dict(CFG, query_timeout=630))
+    assert got["send_receive_timeout"] == 630
+    ClickHouseMCPServer()._connect(dict(CFG))
+    assert got["send_receive_timeout"] == 300
+
+
+def test_mcp_route_runs_the_handler_off_the_event_loop():
+    import inspect
+    import connector as mod
+    src = inspect.getsource(mod)
+    route = src[src.index('@app.post("/mcp")'):]
+    route = route[:route.index("@app.", 1)]
+    assert "asyncio.to_thread(server.handle_request" in route, route
+
+
 def test_execute_op_advertised_in_capabilities():
     caps = ClickHouseMCPServer().get_capabilities()
     methods = {op["method"] for op in caps["operations"]}
@@ -460,8 +540,9 @@ def test_export_offset_pagination():
     assert res["paging_mode"] == "offset"
     assert res["total_records"] == 3
     assert res["has_more"] is True            # full page → more
-    assert res["next_cursor"] == "3"
+    assert res["next_cursor"] is None         # the executor steps the offset
     assert res["data"][0] == {"id": 0, "name": "n0"}
+    assert client.queries[-1][0] == "SELECT * FROM `demo`.`orders` LIMIT 3 OFFSET 0"
 
 
 def test_export_last_page():
@@ -473,14 +554,83 @@ def test_export_last_page():
     assert res["next_cursor"] is None
 
 
-def test_export_keyset_builds_where():
-    client = FakeClient(query_router=lambda sql, p: FakeResult(["id"], [[5]]))
+# system.columns for demo.orders: a Map and a MATERIALIZED column are left out
+# of the order (the first cannot be ordered by, SELECT * skips the second).
+CH_COLUMNS = FakeResult(["name", "type", "default_kind"], [
+    ["id", "UInt64", ""],
+    ["attrs", "Map(String, String)", ""],
+    ["total", "Decimal(18, 2)", "MATERIALIZED"],
+    ["name", "LowCardinality(Nullable(String))", ""],
+    ["ts", "DateTime", ""],
+])
+
+
+def _catalog_router(sorting_key, page):
+    def router(sql, p):
+        if "system.columns" in sql:
+            return CH_COLUMNS
+        if "system.tables" in sql:
+            return FakeResult(["sorting_key"], [[sorting_key]])
+        return page
+    return router
+
+
+def test_export_sweep_orders_by_sorting_key_then_every_column():
+    """KI-WAREHOUSE-BATCH-PAGING-UNORDERED: the executor asks for stable paging
+    and never names a column. A ClickHouse sorting key is not unique, so it
+    only leads the order; every other orderable column follows."""
+    page = FakeResult(["id", "name", "ts"], [[1, "a", "t"], [2, "b", "t"]])
+    client = FakeClient(query_router=_catalog_router("ts, id", page))
     srv = _server_with(client)
-    srv.export({"config": CFG, "table": "orders", "cursor_column": "id",
-                "cursor_value": 4, "limit": 1})
-    sql = client.queries[-1][0]
-    assert "`id` > 4" in sql
-    assert "ORDER BY `id` ASC LIMIT 1" in sql
+    res = srv.export({"config": CFG, "table": "orders", "use_keyset_paging": True,
+                      "limit": 2, "offset": 4})
+    assert res["success"], res
+    assert res["paging_mode"] == "offset" and res["next_cursor"] is None, res
+    assert res["has_more"] is True
+    assert res["columns"] == ["id", "name", "ts"]
+    sqls = [q[0] for q in client.queries]
+    assert "database = 'demo' AND table = 'orders'" in sqls[0], sqls   # binds as literals
+    assert sqls[-1] == "SELECT * FROM `demo`.`orders` ORDER BY `ts`, `id`, `name` LIMIT 2 OFFSET 4", sqls
+
+
+def test_export_sweep_names_cursor_column_first():
+    page = FakeResult(["id"], [[1]])
+    client = FakeClient(query_router=_catalog_router("id", page))
+    srv = _server_with(client)
+    srv.export({"config": CFG, "table": "orders", "cursor_column": "NAME", "limit": 10})
+    assert client.queries[-1][0] == "SELECT * FROM `demo`.`orders` ORDER BY `name`, `id`, `ts` LIMIT 10 OFFSET 0"
+
+
+def test_export_sweep_ignores_an_expression_sorting_key():
+    # toDate(ts) is not a column: the key does not lead, the columns still order.
+    page = FakeResult(["id"], [[1]])
+    client = FakeClient(query_router=_catalog_router("toDate(ts), id", page))
+    srv = _server_with(client)
+    srv.export({"config": CFG, "table": "orders", "use_keyset_paging": True, "limit": 10})
+    assert client.queries[-1][0] == "SELECT * FROM `demo`.`orders` ORDER BY `id`, `name`, `ts` LIMIT 10 OFFSET 0"
+
+
+def test_export_unreadable_catalog_pages_by_the_named_column():
+    def router(sql, p):
+        if "system." in sql:
+            raise RuntimeError("Code: 497. Not enough privileges")
+        return FakeResult(["id"], [[5]])
+    client = FakeClient(query_router=router)
+    srv = _server_with(client)
+    res = srv.export({"config": CFG, "table": "orders", "cursor_column": "id",
+                      "cursor_value": "it's", "limit": 1})
+    assert res["success"], res
+    assert res["paging_mode"] == "keyset" and res["next_cursor"] == 5, res
+    assert client.queries[-1][0] == "SELECT * FROM `demo`.`orders` WHERE `id` > 'it\\'s' ORDER BY `id` LIMIT 1"
+
+
+def test_run_query_refuses_a_bind_count_mismatch():
+    srv = _server_with(FakeClient())
+    try:
+        srv._run_query(FakeClient(), "SELECT %s, %s", [1])
+    except ValueError:
+        return
+    raise AssertionError("a short bind list must not run")
 
 
 def test_export_unsafe_cursor_rejected():

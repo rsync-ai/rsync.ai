@@ -74,16 +74,10 @@ func Key(name string) string {
 	return strings.NewReplacer(" ", "", "-", "", "_", "").Replace(k)
 }
 
-// Load reads every connector under toolsDir. Blocks with an unknown value, and
+// load reads every connector under toolsDir. Blocks with an unknown value, and
 // aliases claimed by two connectors, are reported and left out rather than
-// guessed at.
-func Load(toolsDir string) (Index, []string) {
-	idx, _, problems := load(toolsDir)
-	return idx, problems
-}
-
-// load is Load plus the keys whose connector names its table_namespace itself.
-// Only those connectors hold tables in a listable namespace and ship a
+// guessed at. It also returns the keys whose connector names its
+// table_namespace itself. Only those connectors hold tables in a listable namespace and ship a
 // list_namespaces tool (the guard test requires one); an object store that
 // leaves the field out still reads as "schema" through the defaults.
 func load(toolsDir string) (Index, map[string]bool, []string) {

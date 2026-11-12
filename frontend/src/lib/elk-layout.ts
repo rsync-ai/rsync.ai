@@ -35,6 +35,12 @@ export interface GraphLayoutOptions {
   layerGap?: number
   /** Vertical gap between boxes in a column. */
   nodeGap?: number
+  /**
+   * Pins each box to a column band: every box of a lower number sits left of every box of a
+   * higher one, and a link pointing back does not move a box out of its band. Boxes missing
+   * from the map share band 0. Without it, columns follow the links alone.
+   */
+  partitions?: Map<string, number>
 }
 
 /**
@@ -44,7 +50,7 @@ export interface GraphLayoutOptions {
 export async function layoutGraph(
   boxes: LayoutBox[],
   links: LayoutLink[],
-  { layerGap = 80, nodeGap = 24 }: GraphLayoutOptions = {},
+  { layerGap = 80, nodeGap = 24, partitions }: GraphLayoutOptions = {},
 ): Promise<GraphLayout> {
   const index = new Map<string, number>()
   const children: ElkNode[] = []
@@ -52,7 +58,9 @@ export async function layoutGraph(
     if (index.has(box.id)) continue
     // ELK ids are ours, not the caller's: a caller's id may be anything, "graph" included.
     index.set(box.id, children.length)
-    children.push({ id: `n${children.length}`, width: box.width, height: box.height })
+    const child: ElkNode = { id: `n${children.length}`, width: box.width, height: box.height }
+    if (partitions) child.layoutOptions = { "elk.partitioning.partition": String(partitions.get(box.id) ?? 0) }
+    children.push(child)
   }
   if (children.length === 0) return { positions: new Map(), bounds: { x: 0, y: 0, width: 0, height: 0 } }
 
@@ -82,6 +90,9 @@ export async function layoutGraph(
       // Keep the caller's order where it costs no crossings, so the same graph lays out
       // the same way every time.
       "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+      // Bands line up across the whole picture only when it is laid out as one: separate
+      // components would each start their own first column.
+      ...(partitions ? { "elk.partitioning.activate": "true", "elk.separateConnectedComponents": "false" } : {}),
     },
     children,
     edges,

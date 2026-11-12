@@ -43,6 +43,9 @@ import (
 //	                                       <Topic("heartbeat")>.<topic.prefix>, so both halves carry the
 //	                                       namespace -- rsync.heartbeat.rsync.cdc-<id8> by default --
 //	                                       and ownsTopic matches it exactly, not by either-spelling
+//	        __debezium-heartbeat.cdc-<id8> Debezium's own default heartbeat prefix, never namespaced:
+//	                                       MongoDB connectors created under #1098, before #1101 set
+//	                                       topic.heartbeat.prefix, still write here; matched exactly
 //	        signals.<id8>                  executor.go cdcSignalTopicFor, incremental-snapshot signal channel
 //	                                       (the only spelling: connector.py refuses an incremental
 //	                                       snapshot without a named signal topic)
@@ -67,6 +70,11 @@ type pipelineKafkaNames struct {
 	uuid string
 }
 
+// debeziumDefaultHeartbeatPrefix is Debezium's default topic.heartbeat.prefix. It
+// is shared by every connector on the cluster and carries no namespace, so only
+// the exact <prefix>.<topic.prefix> name is ever ours.
+const debeziumDefaultHeartbeatPrefix = "__debezium-heartbeat"
+
 // ownsTopic reports whether a topic belongs to this pipeline.
 //
 // Matching is anchored on the 8-char id with an explicit "." terminator, so
@@ -83,10 +91,13 @@ func (n pipelineKafkaNames) ownsTopic(topic string) bool {
 		return true
 	}
 	// The heartbeat topic is <heartbeat prefix>.<topic.prefix>, both qualified and the
-	// prefix FIRST (executor.go heartbeatTopicFor), so it also matches exactly.
+	// prefix FIRST (executor.go heartbeatTopicFor), so it also matches exactly. A
+	// connector that never received topic.heartbeat.prefix used Debezium's default.
 	for _, base := range []string{"cdc-" + n.id8, kafkaclient.Topic("cdc-" + n.id8)} {
-		if topic == kafkaclient.Topic("heartbeat")+"."+base {
-			return true
+		for _, hb := range []string{kafkaclient.Topic("heartbeat"), debeziumDefaultHeartbeatPrefix} {
+			if topic == hb+"."+base {
+				return true
+			}
 		}
 	}
 	return kafkaclient.InNamespace(topic, "pipeline."+n.id8+".")
@@ -193,17 +204,19 @@ const (
 	mcpStdioFallbackMarker = "mcp stdio fallback"
 )
 
-// stopSinkRequest is the stop_sink call for one consumer group.
-func stopSinkRequest(group string) mcp.ExecuteRequest {
+// stopSinkRequest is the stop_sink call for one consumer group. A non-empty
+// onlyIfExecution makes it conditional: the sink service stops the worker only while
+// that run still owns it (sinkStopOnlyIfExecutionKey).
+func stopSinkRequest(group, onlyIfExecution string) mcp.ExecuteRequest {
+	cfg := map[string]interface{}{"consumer_group": group}
+	if onlyIfExecution != "" {
+		cfg[sinkStopOnlyIfExecutionKey] = onlyIfExecution
+	}
 	return mcp.ExecuteRequest{
 		Connector: "kafka-mcp-sink",
 		Operation: "stop_sink",
 		Config:    map[string]string{},
-		Params: map[string]interface{}{
-			"config": map[string]interface{}{
-				"consumer_group": group,
-			},
-		},
+		Params:    map[string]interface{}{"config": cfg},
 	}
 }
 
@@ -234,6 +247,13 @@ func sinkStopFailure(resp *mcp.ExecuteResponse, err error) string {
 // while it does, so waiting on the call itself would let one stop hold the whole delete.
 // The channel is buffered so an abandoned call can still finish and exit.
 func stopSinkWorker(ctx context.Context, sinks sinkStopExecutor, group string) string {
+	return stopSinkWorkerOwnedBy(ctx, sinks, group, "")
+}
+
+// stopSinkWorkerOwnedBy is stopSinkWorker made conditional on the run that owns the
+// worker (none when onlyIfExecution is ""). A refusal comes back as a failure that
+// contains sinkWorkerNotOwner.
+func stopSinkWorkerOwnedBy(ctx context.Context, sinks sinkStopExecutor, group, onlyIfExecution string) string {
 	if ctx.Err() != nil {
 		return "it was not tried because the time allowed for stopping sink workers ran out"
 	}
@@ -243,7 +263,7 @@ func stopSinkWorker(ctx context.Context, sinks sinkStopExecutor, group string) s
 	}
 	done := make(chan answer, 1)
 	go func() {
-		resp, err := sinks.ExecuteWithContext(ctx, stopSinkRequest(group))
+		resp, err := sinks.ExecuteWithContext(ctx, stopSinkRequest(group, onlyIfExecution))
 		done <- answer{resp: resp, err: err}
 	}()
 	select {

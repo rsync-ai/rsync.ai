@@ -52,10 +52,8 @@ vi.mock("@/components/chat/AgenticPipelineHome", () => ({
 }))
 vi.mock("@/components/chat/ChatMessageItem", () => ({ ChatMessageItem: () => null }))
 vi.mock("@/components/chat/PipelineAccordionView", () => ({ PipelineAccordionView: () => null }))
-vi.mock("@/components/chat/ChatRightPanel", () => ({ ChatRightPanel: () => null }))
 vi.mock("@/components/chat/ActivePipelinesList", () => ({ ActivePipelinesList: () => null }))
 vi.mock("@/components/chat/SuggestionsReviewDialog", () => ({ SuggestionsReviewDialog: () => null }))
-vi.mock("@/components/pipeline/PipelineMonitoringPanel", () => ({ PipelineMonitoringPanel: () => null }))
 vi.mock("@/components/pipeline/PipelineConnectionSelector", () => ({ PipelineConnectionSelector: () => null }))
 vi.mock("@/components/pipeline/PipelineTableSelector", () => ({ PipelineTableSelector: () => null }))
 
@@ -188,5 +186,30 @@ describe("chat /state poll — hidden tab", () => {
     setVisibility("visible")
     await tick(0)
     expect(stateReads()).toBe(reads + 1)
+  })
+})
+
+// A /state read that never answered stopped the poll for good: the loop waits for
+// each read before it schedules the next, and the read had no timeout, so the panel
+// could sit on "Loading pipeline status…" with no outage notice. The mock settles a
+// read only the way the real authFetch does: on its timeout or on an abort; a read
+// sent without either never settles.
+describe("chat /state poll — a read that never answers", () => {
+  it("gives up on it and reads again", async () => {
+    run = { status: "processing", execution_id: "exec-1" }
+    ;(authFetch as Mock).mockImplementation(
+      (url: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}) =>
+        new Promise<Response>((_, reject) => {
+          if (!String(url).endsWith(`/pipelines/${PIPELINE_ID}/state`)) return reject(new Error("unexpected"))
+          if (opts.timeoutMs) setTimeout(() => reject(new DOMException("timed out", "TimeoutError")), opts.timeoutMs)
+          opts.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true })
+        }),
+    )
+    await startPipeline()
+    const reads = stateReads()
+    expect(reads).toBeGreaterThan(0)
+
+    await tick(20_000)
+    expect(stateReads()).toBeGreaterThan(reads)
   })
 })

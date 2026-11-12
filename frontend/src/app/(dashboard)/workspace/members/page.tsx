@@ -62,7 +62,7 @@ export default function WorkspaceMembersPage() {
   useEffect(() => onActiveWorkspaceChange(() => void resolve()), [resolve])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader
         heading="Workspace members"
         description="Manage who has access to your workspace and invite teammates."

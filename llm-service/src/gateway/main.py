@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
@@ -7,7 +7,8 @@ from datetime import datetime
 import re
 import logging
 import asyncio
-from typing import Optional
+from contextvars import ContextVar
+from typing import Literal, Optional
 import sqlglot
 
 # Configure trace-aware logging BEFORE importing any first-party module. This
@@ -20,8 +21,11 @@ import sqlglot
 # therefore sit under this call on purpose (hence the E402 markers), and
 # tests/test_startup_logging_order.py fails if one drifts back above it.
 from src.utils.telemetry import (
-    init_tracer, instrument_fastapi, instrument_requests,
-    start_span, get_current_trace_id, setup_logging
+    init_tracer,
+    instrument_fastapi,
+    instrument_requests,
+    get_current_trace_id,
+    setup_logging,
 )
 
 SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "llm-service")
@@ -41,7 +45,13 @@ from src.text2sql.mysql_sanitize import quote_reserved_identifiers as mysql_quot
 from src.agents.suggestions.api import router as suggestions_router  # noqa: E402
 from src.agents.explorer.api import router as explorer_router  # noqa: E402
 from src.agents.explorer.rank_tables import router as rank_tables_router  # noqa: E402
+from src.gateway.assistant_routes import router as assistant_router  # noqa: E402
+from src.gateway.lineage_routes import router as lineage_router  # noqa: E402
+from src.egress import EgressRefused, guarded_acall, guarded_call, restore_sql_literals, SqlPlaceholderError  # noqa: E402
+from src.egress.assistant_models import resolve_model as resolve_ask_model  # noqa: E402
+from src.agents.tool_generator.deployment.routes import require_internal_secret  # noqa: E402
 from src.utils.ratelimit import get_limiter  # noqa: E402
+from src.utils import rate_limit_waits  # noqa: E402
 from src.utils.openai_client import (  # noqa: E402
     env_bool as _env_bool,
     resolve_explorer_provider as _resolve_explorer_provider,
@@ -61,6 +71,7 @@ from src.utils.openai_client import (  # noqa: E402
     warn_if_cut_off,
 )
 from src.utils.llm_gate import (  # noqa: E402
+    LLMNotConfigured,
     register_llm_gate,
     require_llm,
     require_sql_llm,
@@ -254,79 +265,6 @@ def mock_intent_classification(user_msg: str) -> str:
     
     # Default to general knowledge
     return json.dumps({"intent": "general_knowledge", "requires_execution": False, "parameters": {}})
-
-
-def mock_schema_healer(prompt: str) -> str:
-    """
-    Mock schema healer for analyzing schema changes.
-    Determines if changes are safe to auto-apply.
-    """
-    prompt_lower = prompt.lower()
-    
-    # Detect change type
-    if "add column" in prompt_lower or "add_column" in prompt_lower:
-        result = {
-            "safe_to_auto_migrate": True,
-            "reasoning": "ADD COLUMN is safe - new columns with NULL default don't affect existing data",
-            "suggested_ddl": None,
-            "risks": [],
-            "requires_approval": False,
-            "notify_user": False,
-            "user_message": None
-        }
-    elif "drop column" in prompt_lower or "drop_column" in prompt_lower:
-        result = {
-            "safe_to_auto_migrate": False,
-            "reasoning": "DROP COLUMN may cause data loss - requires user approval",
-            "suggested_ddl": None,
-            "risks": ["Data loss", "Breaking downstream queries"],
-            "requires_approval": True,
-            "notify_user": True,
-            "user_message": "A column drop was detected. Please review before applying."
-        }
-    elif "drop table" in prompt_lower or "drop_table" in prompt_lower:
-        result = {
-            "safe_to_auto_migrate": False,
-            "reasoning": "DROP TABLE will cause complete data loss - requires explicit approval",
-            "suggested_ddl": None,
-            "risks": ["Complete data loss", "Breaking downstream dependencies"],
-            "requires_approval": True,
-            "notify_user": True,
-            "user_message": "A table drop was detected. This is a destructive operation."
-        }
-    elif "modify column" in prompt_lower or "modify_column" in prompt_lower or "alter column" in prompt_lower:
-        result = {
-            "safe_to_auto_migrate": False,
-            "reasoning": "Column type change may cause data truncation",
-            "suggested_ddl": None,
-            "risks": ["Data truncation", "Type conversion errors"],
-            "requires_approval": True,
-            "notify_user": True,
-            "user_message": "A column type change was detected. Please verify data compatibility."
-        }
-    elif "create table" in prompt_lower or "create_table" in prompt_lower:
-        result = {
-            "safe_to_auto_migrate": True,
-            "reasoning": "CREATE TABLE is safe - no existing data affected",
-            "suggested_ddl": None,
-            "risks": [],
-            "requires_approval": False,
-            "notify_user": False,
-            "user_message": None
-        }
-    else:
-        # Unknown change type - be cautious
-        result = {
-            "safe_to_auto_migrate": False,
-            "reasoning": "Unknown schema change type - requiring manual review for safety",
-            "suggested_ddl": None,
-            "risks": ["Unknown impact"],
-            "requires_approval": True,
-            "notify_user": True,
-            "user_message": "A schema change was detected that requires manual review."
-        }
-    
-    return json.dumps(result)
 
 
 def mock_decision_agent(prompt: str) -> str:
@@ -651,6 +589,11 @@ instrument_fastapi(app)
 from src.utils.metrics import mount_metrics
 mount_metrics(app)
 
+# Holds the caller's X-Workspace-ID for the request, so every egress record
+# names its workspace (src/egress/scope.py).
+from src.egress.scope import WorkspaceScopeMiddleware
+app.add_middleware(WorkspaceScopeMiddleware)
+
 # ============================================================================
 # Phase 5: Safety controls (rate limiting + cost caps)
 # ============================================================================
@@ -765,6 +708,8 @@ async def safety_middleware(request: Request, call_next):
 app.include_router(suggestions_router)
 app.include_router(explorer_router)
 app.include_router(rank_tables_router)
+app.include_router(assistant_router)
+app.include_router(lineage_router)
 # LLM-only routes answer 503 llm_not_configured when no LLM is set up (see llm_gate).
 register_llm_gate(app)
 
@@ -1014,6 +959,29 @@ def _pick_time_column(tables: list[dict]) -> str:
                 return c
     return ""
 
+# Engines whose DATE_TRUNC takes PostgreSQL's order: DATE_TRUNC('month', col).
+_PG_ORDER_DATE_TRUNC = ("postgres", "redshift", "snowflake", "databricks", "spark", "duckdb")
+
+
+def _truncates_to(s: str, dialect: str, grain: str, col: str) -> bool:
+    """Whether lower-cased SQL s buckets col (regex-escaped) to grain with the
+    engine's own truncation function."""
+    d = (dialect or "").lower()
+    if "bigquery" in d:
+        # DATE_TRUNC(col, MONTH), TIMESTAMP_TRUNC(DATE(col), MONTH), DATETIME_TRUNC(...)
+        return bool(re.search(
+            rf"\b(?:date|datetime|timestamp)_trunc\s*\(\s*(?:(?:date|datetime|timestamp)\s*\(\s*)?{col}\s*\)?\s*,\s*{grain}\b",
+            s,
+        ))
+    if "clickhouse" in d:
+        return bool(re.search(rf"\btostartof{grain}\s*\(\s*{col}\b", s))
+    if d in ("tsql", "mssql", "sqlserver"):
+        return bool(re.search(rf"\bdatetrunc\s*\(\s*{grain}\s*,\s*{col}\s*\)", s))
+    if any(e in d for e in _PG_ORDER_DATE_TRUNC):
+        return bool(re.search(rf"date_trunc\s*\(\s*'{grain}'\s*,\s*{col}\s*\)", s))
+    return False
+
+
 def _sql_satisfies_time_grain(sql: str, dialect: str, grain: str, time_col: str) -> bool:
     """Best-effort semantic check for requested time grain."""
     if not sql or not grain or not time_col:
@@ -1027,17 +995,16 @@ def _sql_satisfies_time_grain(sql: str, dialect: str, grain: str, time_col: str)
 
     d = (dialect or "").lower()
     is_mysql = "mysql" in d or "mariadb" in d
-    is_pg = "postgres" in d
 
     if grain == "day":
-        return bool(re.search(rf"\bdate\s*\(\s*{col}\s*\)", s)) or (is_pg and bool(re.search(rf"date_trunc\s*\(\s*'day'\s*,\s*{col}\s*\)", s)))
+        return bool(re.search(rf"\bdate\s*\(\s*{col}\s*\)", s)) or _truncates_to(s, d, "day", col)
 
     if grain == "month":
+        if _truncates_to(s, d, "month", col):
+            return True
         # Reject day bucketing when month requested.
         if re.search(rf"\bdate\s*\(\s*{col}\s*\)", s):
             return False
-        if is_pg and re.search(rf"date_trunc\s*\(\s*'month'\s*,\s*{col}\s*\)", s):
-            return True
         if is_mysql and re.search(rf"date_format\s*\(\s*{col}\s*,\s*'%[yY]-%m", s):
             return True
         # Accept year+month extraction (must include year to avoid cross-year collisions).
@@ -1046,7 +1013,7 @@ def _sql_satisfies_time_grain(sql: str, dialect: str, grain: str, time_col: str)
         return has_year and has_month
 
     if grain == "year":
-        if is_pg and re.search(rf"date_trunc\s*\(\s*'year'\s*,\s*{col}\s*\)", s):
+        if _truncates_to(s, d, "year", col):
             return True
         return bool(re.search(rf"extract\s*\(\s*year\s+from\s+{col}\s*\)|year\s*\(\s*{col}\s*\)", s))
 
@@ -1058,11 +1025,13 @@ def _sql_satisfies_time_grain(sql: str, dialect: str, grain: str, time_col: str)
             # Must include year too to avoid collisions
             has_year = bool(re.search(rf"year\s*\(\s*{col}\s*\)|extract\s*\(\s*year\s+from\s+{col}\s*\)", s))
             return has_year
-        if is_pg and re.search(rf"date_trunc\s*\(\s*'week'\s*,\s*{col}\s*\)", s):
+        if _truncates_to(s, d, "week", col):
             return True
         return True  # don't over-reject
 
     if grain == "quarter":
+        if _truncates_to(s, d, "quarter", col):
+            return True
         has_quarter = bool(re.search(rf"quarter\s*\(\s*{col}\s*\)|extract\s*\(\s*quarter\s+from\s+{col}\s*\)", s))
         if not has_quarter:
             return False
@@ -1153,10 +1122,27 @@ def _rewrite_time_bucket_simple(sql: str, dialect: str, grain: str, time_col: st
     return out
 
 
-def _detect_source_dialect(sql: str) -> str:
-    """Heuristic detection of likely source dialect from SQL text."""
+# PostgreSQL's JSON operators, col->'key' and col->>'key'. The key must be quoted:
+# Databricks, ClickHouse and Snowflake write a lambda as x -> ..., no JSON operator.
+_PG_JSON_ARROW = re.compile(r"->>?\s*'")
+# The engines that have these operators themselves.
+_JSON_ARROW_DIALECTS = ("postgres", "mysql", "sqlite", "duckdb")
+
+
+def _detect_source_dialect(sql: str, target: str = "") -> str:
+    """Heuristic detection of likely source dialect from SQL text.
+
+    target is the sqlglot dialect the SQL is for. sqlglot parses ->>, :: and ILIKE
+    in every dialect, so these markers are what catches PostgreSQL written for
+    another engine.
+    """
     s = (sql or "").lower()
-    if "date_trunc(" in s or "ilike" in s or "::" in s:
+    # DATE_TRUNC('month', x) is PostgreSQL's order, the unit first and quoted.
+    # BigQuery writes DATE_TRUNC(x, MONTH); read as PostgreSQL it comes out
+    # TIMESTAMP_TRUNC(MONTH, x), its arguments swapped.
+    if re.search(r"date_trunc\s*\(\s*'", s) or "ilike" in s or "::" in s:
+        return "postgres"
+    if target not in _JSON_ARROW_DIALECTS and _PG_JSON_ARROW.search(s):
         return "postgres"
     if "date_format(" in s or "timestampdiff(" in s or "date_sub(" in s:
         return "mysql"
@@ -1178,7 +1164,7 @@ def _maybe_transpile_sql(sql: str, target_dialect: str) -> str:
         return sql
 
     target_glot = _resolve_sqlglot_dialect(target_dialect)
-    src_hint = _detect_source_dialect(sql)
+    src_hint = _detect_source_dialect(sql, target_glot)
 
     def _parse_ok(d: str) -> bool:
         try:
@@ -1882,40 +1868,34 @@ async def diagnose_pipeline(request: DiagnoseRequest):
             evidence_pointers=list(request.evidence.keys())[:3],
         )
 
-    # Defense-in-depth (H6): scrub the free-text error/log fields in the evidence
-    # before rendering it into the LLM prompt. Metadata (schema, table/column names,
-    # counts) is left intact so diagnosis quality is preserved; the error strings are
-    # the realistic row-value leak vector. The Go producer scrubs at source; this is
-    # the backstop for a field it forgets -- and this endpoint takes an arbitrary
-    # evidence object from any caller that can reach llm-service, so the backstop is
-    # the only thing standing between such a caller and the prompt.
-    from src.utils.masking import scrub_evidence_for_llm
-
+    # The evidence is tagged `evidence` in the prompt's llm_fields: the guard
+    # scrubs its free-text fields and turns counts and sizes into yes/no before
+    # it reaches the prompt. The Go producer does the same at source; this is the
+    # backstop for a field it forgets -- and this endpoint takes an arbitrary
+    # evidence object from any caller that can reach llm-service.
     try:
-        evidence_json = json.dumps(scrub_evidence_for_llm(request.evidence), indent=2, default=str)
-    except (TypeError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=f"evidence not JSON-serializable: {e}")
-
-    try:
-        messages = registry.render_messages(
-            "diagnose/pipeline_failure",
-            {"pipeline_id": request.pipeline_id, "evidence_json": evidence_json},
-        )
         config = registry.get_config("diagnose/pipeline_failure")
         max_tokens = with_reasoning_headroom(config["parameters"].get("max_tokens", 600))
-        response = await default_client.chat.completions.create(
+        response = await guarded_acall(
+            default_client,
+            component="gateway.diagnose",
             model=resolve_model(config),
-            messages=messages,
+            prompt="diagnose/pipeline_failure",
+            variables={"pipeline_id": request.pipeline_id, "evidence_json": request.evidence},
+            registry=registry,
             temperature=config["parameters"].get("temperature", 0.2),
             max_tokens=max_tokens,
         )
-        text = (response.choices[0].message.content or "").strip()
+        text = response.text.strip()
         cut_off = warn_if_cut_off(response, prompt="diagnose/pipeline_failure", max_tokens=max_tokens)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=f"diagnose prompt missing: {e}")
-    except Exception as e:
+    except FileNotFoundError:
+        logger.exception("diagnose: prompt missing")
+        raise HTTPException(status_code=500, detail="The diagnosis prompt is missing. See the llm-service log.")
+    except EgressRefused:
+        raise HTTPException(status_code=503, detail="The diagnosis request was refused: it did not fit what may be sent to a model.")
+    except Exception:
         logger.exception("diagnose: LLM call failed")
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+        raise HTTPException(status_code=502, detail="The diagnosis LLM call failed. See the llm-service log.")
 
     # Strip markdown code fences if the model wrapped its JSON.
     if text.startswith("```"):
@@ -2066,11 +2046,6 @@ async def completion(request: PromptRequest):
                 prompt = request.variables.get("prompt", "")
                 decision_result = mock_decision_agent(prompt)
                 result = decision_result
-            elif request.prompt_name == "chat/schema_healer":
-                # Mock schema healer - analyze schema changes
-                prompt = request.variables.get("prompt", "")
-                healer_result = mock_schema_healer(prompt)
-                result = healer_result
             elif request.prompt_name == "chat/assistant":
                 # Mock chat assistant response
                 user_msg = request.variables.get("user_message", "")
@@ -2094,36 +2069,43 @@ async def completion(request: PromptRequest):
                 }
             }
         else:
-            # 1. Render Messages (only for real OpenAI calls)
-            messages = registry.render_messages(request.prompt_name, request.variables)
+            # An unknown prompt is a 404 here, before the guard sees it.
             config = registry.get_config(request.prompt_name)
             
             model = resolve_model(config, request.model_override)
             max_tokens = with_reasoning_headroom(config["parameters"].get("max_tokens", 1024))
 
-            response = await default_client.chat.completions.create(
+            # The guard renders the prompt field by field (its llm_fields) and
+            # refuses a prompt this endpoint may not send.
+            response = await guarded_acall(
+                default_client,
+                component="gateway.completion",
                 model=model,
-                messages=messages,
+                prompt=request.prompt_name,
+                variables=request.variables,
+                registry=registry,
+                actor=request.user_id,
                 temperature=config["parameters"].get("temperature", 0.7),
                 max_tokens=max_tokens,
             )
             
-            # 3. Return Result
-            result = response.choices[0].message.content
+            result = response.text
             usage = response.usage
             warn_if_cut_off(response, prompt=request.prompt_name, max_tokens=max_tokens)
 
             # Cost tracking + atomic per-user quota charge (best-effort, non-blocking)
             try:
-                from src.utils.llm_cost import record_usage
+                from src.utils.llm_cost import billable_tokens, record_usage
+                # A Gemini model's thinking is billed as output (billable_tokens).
+                billed_prompt, billed_completion = billable_tokens(usage, model)
                 cost_cents = record_usage(
                     user_id=request.user_id,
                     pipeline_id=request.pipeline_id,
                     prompt_name=request.prompt_name,
                     provider=DEFAULT_LLM_PROVIDER,
                     model=model,
-                    prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=usage.completion_tokens,
+                    prompt_tokens=billed_prompt,
+                    completion_tokens=billed_completion,
                 )
             except Exception as _cost_exc:
                 logger.warning("LLM cost tracking failed (non-fatal): %s", _cost_exc)
@@ -2146,8 +2128,14 @@ async def completion(request: PromptRequest):
         raise
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Prompt '{request.prompt_name}' not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except EgressRefused:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The request for prompt '{request.prompt_name}' was refused: it did not fit what may be sent to a model.",
+        )
+    except Exception:
+        logger.exception("completion: prompt %s failed", request.prompt_name)
+        raise HTTPException(status_code=500, detail="The LLM call failed. See the llm-service log.")
 
 # ==============================================================================
 # SQL GENERATION (NL → SQL) ENDPOINT
@@ -2188,6 +2176,12 @@ class ForeignKeyInput(BaseModel):
 
 class SQLGenerateRequest(BaseModel):
     """Request to generate SQL from natural language"""
+    # A key this model does not declare is refused, not dropped: api-gateway
+    # (handlers/explorer.go GenerateSQL) sends only these, and a caller that
+    # passes anything else (row samples, connection settings) learns it went
+    # nowhere instead of trusting that it was used.
+    model_config = ConfigDict(extra="forbid")
+
     question: str
     dialect: str = "postgresql"
     # Legacy string-based schema (backward compatible)
@@ -2199,6 +2193,23 @@ class SQLGenerateRequest(BaseModel):
     # Generation parameters
     max_tokens: int = 512
     temperature: float = 0.1
+    # Ask rsync.ai's generate_sql: the model the question is answered with
+    # writes the SQL. Only api-gateway sends these (handlers/explorer.go
+    # GenerateSQL, set in-process by AssistantSQL.Write), with the internal
+    # secret; the Explorer's own generation sends none and keeps the server's
+    # model. api_key is a key an admin saved in the Ask panel, empty when this
+    # service's own environment key serves the entry.
+    entry: Optional[Literal["claude", "chatgpt", "gemini"]] = None
+    api_key: Optional[str] = Field(default=None, max_length=512, repr=False)
+    model: Optional[str] = Field(default=None, max_length=100)
+    # The user each model call's llm_usage_events row and quota charge are for,
+    # as on /v1/completion. api-gateway sends it; a caller that does not still
+    # gets its rows, charged to no one.
+    user_id: Optional[str] = Field(default=None, max_length=64)
+
+
+# A column in the legacy `table(col, col)` schema string.
+_LEGACY_SCHEMA_COLUMN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class SQLGenerateResponse(BaseModel):
@@ -2260,6 +2271,86 @@ def _typed_schema_from_request(req: SQLGenerateRequest) -> TypedSchema | None:
     return TypedSchema(tables=tables, foreign_keys=fks)
 
 
+# The 429 waits of the /api/v1/sql/generate request being served: its draft and
+# every repair share them, so the writer sleeps at most 25 seconds of the
+# question's 120 (src/utils/rate_limit_waits.py).
+_sql_waits: ContextVar[rate_limit_waits.RateLimitWaits | None] = ContextVar("rsync_sql_waits", default=None)
+# The user that request is for: every model call it makes is a usage row.
+_sql_user: ContextVar[str | None] = ContextVar("rsync_sql_user", default=None)
+
+
+def _record_explorer_usage(prompt_name: str, response) -> None:
+    """One llm_usage_events row for one Explorer model call, priced at the
+    provider and model it went to. Cost tracking never fails the SQL."""
+    try:
+        from src.utils.llm_cost import billable_tokens, record_usage
+
+        ctx = response.context
+        prompt_tokens, completion_tokens = billable_tokens(getattr(response, "usage", None), ctx.model)
+        record_usage(
+            user_id=_sql_user.get(),
+            pipeline_id=None,
+            prompt_name=prompt_name,
+            provider=ctx.provider,
+            model=ctx.model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+    except Exception as exc:
+        logger.warning("Explorer LLM usage tracking failed (non-fatal): %s", type(exc).__name__)
+
+
+async def _guarded_explorer_call(
+    component: str, prompt_name: str, variables: dict, *, dialect: str | None, client=None, sync: bool = False, **kwargs
+):
+    """One Explorer model call through the egress guard.
+
+    sync is a synchronous client (an Ask rsync.ai model), run on a worker thread.
+    A 429 is tried again, within the request's budget of waits.
+    A refusal becomes a 503 that names no value from the request.
+    Each call that answers is a usage row.
+    """
+    call = dict(
+        component=component,
+        prompt=prompt_name,
+        variables=variables,
+        dialect=dialect,
+        registry=registry,
+        **kwargs,
+    )
+
+    def once():
+        if sync:
+            return asyncio.to_thread(guarded_call, client, **call)
+        return guarded_acall(client if client is not None else explorer_client, **call)
+
+    waits = _sql_waits.get() or rate_limit_waits.RateLimitWaits()
+    try:
+        response = await rate_limit_waits.wait_out(once, waits, component)
+    except EgressRefused:
+        raise HTTPException(
+            status_code=503,
+            detail="The SQL request was refused: it did not fit what may be sent to a model.",
+        )
+    _record_explorer_usage(prompt_name, response)
+    return response
+
+
+_SQL_ONLY_SUFFIX = "\n\nReturn ONLY executable SQL starting with SELECT or WITH. No other text."
+
+
+def _restore_literals(sql: str, response, dialect: str | None) -> str:
+    """The model's SQL with the literals the guard took out of its prompt put back.
+
+    SQL that misuses a placeholder is dropped: "" reads as no SQL.
+    """
+    try:
+        return restore_sql_literals(sql, response.placeholders, dialect)
+    except SqlPlaceholderError as exc:
+        logger.warning("[Text2SQL] model SQL misused a literal placeholder: %s", exc)
+        return ""
+
+
 async def _generate_query_spec(question: str, dialect: str, tables: list[dict], relationships: list[str] | None, schema: TypedSchema | None) -> QuerySpec:
     """
     Generate a QuerySpec IR using the explorer offline LLM.
@@ -2281,30 +2372,24 @@ async def _generate_query_spec(question: str, dialect: str, tables: list[dict], 
         "tables": tables,
         "relationships": relationships,
     }
-    messages = registry.render_messages(prompt_name, variables)
     cfg = registry.get_config(prompt_name)
 
     max_parse_attempts = int(os.getenv("TEXT2SQL_QUERY_SPEC_PARSE_ATTEMPTS", "2") or "2")
     last_err: Exception | None = None
     for attempt in range(max_parse_attempts):
         temperature = cfg["parameters"].get("temperature", 0.1) if attempt == 0 else 0.0
-        response = await explorer_client.chat.completions.create(
+        # completion_fallback: some Ollama models answer only on /v1/completions.
+        response = await _guarded_explorer_call(
+            "explorer.query_spec",
+            prompt_name,
+            variables,
+            dialect=dialect,
             model=EXPLORER_QUERY_SPEC_MODEL,
-            messages=messages,
+            completion_fallback=True,
             temperature=temperature,
             max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
-        content = (response.choices[0].message.content or "").strip()
-        if not content:
-            # Fallback to completions for some Ollama models
-            prompt_text = "\n\n".join([m.get("content", "") for m in (messages or []) if m.get("content")])
-            resp2 = await explorer_client.completions.create(
-                model=EXPLORER_QUERY_SPEC_MODEL,
-                prompt=prompt_text,
-                temperature=temperature,
-                max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
-            )
-            content = (getattr(resp2.choices[0], "text", "") or "").strip()
+        content = response.text.strip()
 
         try:
             raw = json.loads(_extract_json_text(content))
@@ -2316,7 +2401,8 @@ async def _generate_query_spec(question: str, dialect: str, tables: list[dict], 
             logger.warning(f"[Text2SQL] Failed to parse QuerySpec JSON (attempt {attempt+1}/{max_parse_attempts}): {e}")
             continue
 
-    raise HTTPException(status_code=500, detail=f"Failed to parse QuerySpec JSON: {last_err}")
+    # The parse error quotes the model's answer; it stays in the log above.
+    raise HTTPException(status_code=500, detail="The model did not return a readable QuerySpec. See the llm-service log.")
 
     # unreachable
 
@@ -2350,25 +2436,19 @@ async def _repair_query_spec(
         "errors": errors,
         "fix_hints": fix_hints,
     }
-    messages = registry.render_messages(prompt_name, variables)
     cfg = registry.get_config(prompt_name)
 
-    response = await explorer_client.chat.completions.create(
+    response = await _guarded_explorer_call(
+        "explorer.query_spec",
+        prompt_name,
+        variables,
+        dialect=dialect,
         model=EXPLORER_QUERY_SPEC_MODEL,
-        messages=messages,
+        completion_fallback=True,
         temperature=cfg["parameters"].get("temperature", 0.0),
         max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
     )
-    content = (response.choices[0].message.content or "").strip()
-    if not content:
-        prompt_text = "\n\n".join([m.get("content", "") for m in (messages or []) if m.get("content")])
-        resp2 = await explorer_client.completions.create(
-            model=EXPLORER_QUERY_SPEC_MODEL,
-            prompt=prompt_text,
-            temperature=cfg["parameters"].get("temperature", 0.0),
-            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
-        )
-        content = (getattr(resp2.choices[0], "text", "") or "").strip()
+    content = response.text.strip()
 
     raw = coerce_query_spec_payload(json.loads(_extract_json_text(content)))
     spec = QuerySpec.model_validate(raw)
@@ -2376,7 +2456,7 @@ async def _repair_query_spec(
 
 
 @app.post("/api/v1/sql/generate", response_model=SQLGenerateResponse)
-async def generate_sql(request: SQLGenerateRequest):
+async def generate_sql(request: SQLGenerateRequest, x_internal_secret: Optional[str] = Header(default=None)):
     """
     Generate SQL from natural language using LLM.
     
@@ -2398,6 +2478,19 @@ async def generate_sql(request: SQLGenerateRequest):
             "confidence": 0.85
         }
     """
+    token = _sql_waits.set(rate_limit_waits.RateLimitWaits())
+    user = _sql_user.set((request.user_id or "").strip() or None)
+    try:
+        return await _write_sql(request, x_internal_secret)
+    finally:
+        _sql_user.reset(user)
+        _sql_waits.reset(token)
+
+
+async def _write_sql(request: SQLGenerateRequest, x_internal_secret: Optional[str]) -> SQLGenerateResponse:
+    # A model and key come from api-gateway only, checked before anything else.
+    if request.entry:
+        require_internal_secret(x_internal_secret)
     try:
         logger.info(
             f"📊 SQL generation request: {request.question[:100]}... "
@@ -2415,16 +2508,28 @@ async def generate_sql(request: SQLGenerateRequest):
                 warnings=["Mock mode enabled"],
             )
 
-        require_sql_llm()
-
-        if sql_client is None:
-            raise HTTPException(status_code=503, detail="SQL LLM client unavailable")
+        # Ask rsync.ai's generate_sql writes with the question's own model: the
+        # entry's saved key, or this service's environment key for it.
+        ask = None
+        if request.entry:
+            ask = resolve_ask_model(request.entry, key=(request.api_key or "").strip(), model=(request.model or "").strip())
+            if ask is None:
+                raise LLMNotConfigured()
+        else:
+            require_sql_llm()
+            if sql_client is None:
+                raise HTTPException(status_code=503, detail="SQL LLM client unavailable")
+        sql_llm = ask.client if ask else sql_client
+        # An Ask model follows the JSON prompts; only Ollama takes completion mode.
+        json_prompts = ask is not None or sql_provider_resolved == "openai"
+        ollama = ask is None and sql_provider_resolved == "ollama"
+        sql_provider = f"ask:{ask.entry}" if ask else sql_provider_resolved
 
         profile = get_engine_profile(request.dialect)
 
         # Use a provider-appropriate prompt template.
         # Offline models are much more reliable when asked for plain SQL (not JSON).
-        prompt_name = "explorer/sql_generate" if sql_provider_resolved == "openai" else "explorer/sql_generate_offline"
+        prompt_name = "explorer/sql_generate" if json_prompts else "explorer/sql_generate_offline"
 
         # Build parsed_tables from typed schema (preferred) or legacy string schema.
         # The typed schema includes column types, enabling proper validation and time-column detection.
@@ -2454,7 +2559,14 @@ async def generate_sql(request: SQLGenerateRequest):
             for m in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)", request.schema):
                 tname = m.group(1).strip()
                 cols_raw = m.group(2)
-                cols = [c.strip() for c in cols_raw.split(",") if c.strip()]
+                # Only a plain name is a column: the string is free text, and a
+                # piece that is not a name ("alice@example.com", "ssn = '…'")
+                # is a value, which must not reach the model.
+                cols = [
+                    c.strip()
+                    for c in cols_raw.split(",")
+                    if _LEGACY_SCHEMA_COLUMN.fullmatch(c.strip())
+                ]
                 parsed_tables.append(
                     {
                         "schema": "public",
@@ -2570,7 +2682,7 @@ async def generate_sql(request: SQLGenerateRequest):
         use_query_spec = _env_bool("TEXT2SQL_USE_QUERY_SPEC", False)
         allow_legacy_fallback = _env_bool("TEXT2SQL_ALLOW_LEGACY_FALLBACK", True)
         typed_schema = _typed_schema_from_request(request)
-        if use_query_spec and parsed_tables:
+        if use_query_spec and parsed_tables and ask is None:
             try:
                 max_attempts = int(os.getenv("TEXT2SQL_REPAIR_MAX_ATTEMPTS", "3") or "3")
                 best = None
@@ -2674,13 +2786,16 @@ async def generate_sql(request: SQLGenerateRequest):
             except Exception as e:
                 if not allow_legacy_fallback:
                     logger.exception(f"[Text2SQL] QuerySpec path failed (legacy fallback disabled): {e}")
-                    raise HTTPException(status_code=500, detail=f"Text2SQL (QuerySpec) failed: {e}")
+                    if isinstance(e, HTTPException):
+                        raise
+                    raise HTTPException(status_code=500, detail="Text2SQL (QuerySpec) failed. See the llm-service log.")
                 logger.warning(f"[Text2SQL] QuerySpec path failed; falling back to legacy SQL generation: {e}")
-        messages = registry.render_messages(prompt_name, variables)
         cfg = registry.get_config(prompt_name)
 
         model = _explorer_model_for_sql(request.dialect)
-        if sql_provider_resolved == "openai":
+        if ask is not None:
+            model = ask.model
+        elif sql_provider_resolved == "openai":
             # The YAML names gpt-4o. Read directly, it beat LLM_MODEL, so Groq-,
             # Vertex- or OpenRouter-style endpoints got a model their catalog lacks.
             model = resolve_model(cfg, os.getenv("EXPLORER_SQL_OPENAI_MODEL"), sql_provider_resolved).strip()
@@ -2689,25 +2804,21 @@ async def generate_sql(request: SQLGenerateRequest):
         max_tokens = with_reasoning_headroom(cfg["parameters"].get("max_tokens", request.max_tokens))
 
         # Some Ollama models (notably sqlcoder) work reliably via /v1/completions rather than chat-completions.
-        response = await sql_client.chat.completions.create(
+        response = await _guarded_explorer_call(
+            "explorer.sql",
+            prompt_name,
+            variables,
+            dialect=request.dialect,
+            client=sql_llm,
+            sync=ask is not None,
             model=model,
-            messages=messages,
+            completion_fallback=ollama,
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        content = (response.choices[0].message.content or "").strip()
-        if not content and sql_provider_resolved == "ollama":
-            prompt_text = "\n\n".join([m.get("content", "") for m in (messages or []) if m.get("content")])
-            resp2 = await sql_client.completions.create(
-                model=model,
-                prompt=prompt_text,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            # Ollama OpenAI-compat returns text completions in choices[].text
-            content = (getattr(resp2.choices[0], "text", "") or "").strip()
+        content = response.text.strip()
         logger.info(
-            f"🧠 SQL model output (provider={sql_provider_resolved}, model={model}) len={len(content)} preview={content[:200]!r}"
+            f"🧠 SQL model output (provider={sql_provider}, model={model}) len={len(content)} preview={content[:200]!r}"
         )
         parsed: dict = {}
         sql_candidate = ""
@@ -2724,10 +2835,10 @@ async def generate_sql(request: SQLGenerateRequest):
         except Exception:
             sql_candidate = content
 
-        sql = _extract_sql_text(sql_candidate)
+        sql = _restore_literals(_extract_sql_text(sql_candidate), response, request.dialect)
         if not sql:
             logger.warning(
-                f"❌ SQL extraction failed (provider={sql_provider_resolved}, model={model}). "
+                f"❌ SQL extraction failed (provider={sql_provider}, model={model}). "
                 f"raw_len={len(sql_candidate)} raw_preview={str(sql_candidate)[:200]!r}"
             )
             raise HTTPException(status_code=500, detail=f"No SQL returned for prompt {prompt_name}")
@@ -2735,27 +2846,29 @@ async def generate_sql(request: SQLGenerateRequest):
         # Enforce SELECT-only at the gateway boundary to prevent unsafe statements from reaching Explorer.
         if re.search(r"^\s*(SELECT|WITH)\b", sql, flags=re.IGNORECASE) is None:
             # If the model returned something else, try one more extraction pass first.
-            sql2 = _extract_sql_text(str(sql_candidate))
+            sql2 = _restore_literals(_extract_sql_text(str(sql_candidate)), response, request.dialect)
             if re.search(r"^\s*(SELECT|WITH)\b", sql2 or "", flags=re.IGNORECASE) is not None:
                 sql = sql2
             else:
                 # Offline models occasionally emit a single token like "Query". Retry once with a stricter prompt.
                 retry_sql = ""
-                if sql_provider_resolved == "ollama":
+                if ollama:
                     try:
-                        prompt_text = "\n\n".join([m.get("content", "") for m in (messages or []) if m.get("content")])
-                        prompt_text = (
-                            prompt_text
-                            + "\n\nReturn ONLY executable SQL starting with SELECT or WITH. No other text."
-                        )
-                        resp_retry = await sql_client.completions.create(
+                        resp_retry = await _guarded_explorer_call(
+                            "explorer.sql",
+                            prompt_name,
+                            variables,
+                            dialect=request.dialect,
+                            client=sql_client,
                             model=model,
-                            prompt=prompt_text,
+                            mode="completion",
+                            append_text=_SQL_ONLY_SUFFIX,
                             temperature=0.0,
                             max_tokens=max_tokens,
                         )
-                        retry_content = (getattr(resp_retry.choices[0], "text", "") or "").strip()
-                        retry_sql = _extract_sql_text(retry_content) or ""
+                        retry_sql = _restore_literals(
+                            _extract_sql_text(resp_retry.text.strip()) or "", resp_retry, request.dialect
+                        )
                     except Exception:
                         retry_sql = ""
 
@@ -2764,7 +2877,7 @@ async def generate_sql(request: SQLGenerateRequest):
                 else:
                     # Final attempt: ask the repair prompt to rewrite into valid SELECT-only SQL.
                     try:
-                        repair_prompt = "explorer/sql_repair" if sql_provider_resolved == "openai" else "explorer/sql_repair_offline"
+                        repair_prompt = "explorer/sql_repair" if json_prompts else "explorer/sql_repair_offline"
                         issues = [
                             {
                                 "type": "not_select",
@@ -2773,30 +2886,26 @@ async def generate_sql(request: SQLGenerateRequest):
                         ]
                         repair_vars = dict(variables)
                         repair_vars.update({"previous_sql": str(sql_candidate), "issues": issues})
-                        repair_messages = registry.render_messages(repair_prompt, repair_vars)
                         repair_cfg = registry.get_config(repair_prompt)
                         repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
                         repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
-                        repair_resp = await sql_client.chat.completions.create(
+                        repair_resp = await _guarded_explorer_call(
+                            "explorer.sql",
+                            repair_prompt,
+                            repair_vars,
+                            dialect=request.dialect,
+                            client=sql_llm,
+                            sync=ask is not None,
                             model=model,
-                            messages=repair_messages,
+                            completion_fallback=ollama,
                             temperature=repair_temperature,
                             max_tokens=repair_max_tokens,
                         )
-                        repair_content = (repair_resp.choices[0].message.content or "").strip()
-                        if not repair_content and sql_provider_resolved == "ollama":
-                            repair_prompt_text = "\n\n".join(
-                                [m.get("content", "") for m in (repair_messages or []) if m.get("content")]
-                            )
-                            repair_resp2 = await sql_client.completions.create(
-                                model=model,
-                                prompt=repair_prompt_text,
-                                temperature=repair_temperature,
-                                max_tokens=repair_max_tokens,
-                            )
-                            repair_content = (getattr(repair_resp2.choices[0], "text", "") or "").strip()
+                        repair_content = repair_resp.text.strip()
 
-                        repaired_sql = _extract_sql_text(repair_content) or ""
+                        repaired_sql = _restore_literals(
+                            _extract_sql_text(repair_content) or "", repair_resp, request.dialect
+                        )
                         if re.search(r"^\s*(SELECT|WITH)\b", repaired_sql, flags=re.IGNORECASE) is not None:
                             sql = repaired_sql
                         else:
@@ -2806,25 +2915,28 @@ async def generate_sql(request: SQLGenerateRequest):
                     except Exception:
                         sql = ""
 
-                # If still not SELECT-only, fall back to a more instruction-following model.
-                if re.search(r"^\s*(SELECT|WITH)\b", sql or "", flags=re.IGNORECASE) is None:
+                # If still not SELECT-only, fall back to a more instruction-following
+                # model. Never for an Ask model: these are the server's Ollama models.
+                if ask is None and re.search(r"^\s*(SELECT|WITH)\b", sql or "", flags=re.IGNORECASE) is None:
                     fallbacks = (os.getenv("EXPLORER_SQL_FALLBACK_MODELS") or "qwen2.5:7b,llama3:latest,codellama:7b-instruct").strip()
                     fallback_models = [m.strip() for m in fallbacks.split(",") if m.strip() and m.strip() != model]
-                    prompt_text = "\n\n".join([m.get("content", "") for m in (messages or []) if m.get("content")])
-                    prompt_text = (
-                        prompt_text
-                        + "\n\nReturn ONLY executable SQL starting with SELECT or WITH. No other text."
-                    )
                     for fm in fallback_models:
                         try:
-                            resp_fb = await sql_client.completions.create(
+                            resp_fb = await _guarded_explorer_call(
+                                "explorer.sql",
+                                prompt_name,
+                                variables,
+                                dialect=request.dialect,
+                                client=sql_client,
                                 model=fm,
-                                prompt=prompt_text,
+                                mode="completion",
+                                append_text=_SQL_ONLY_SUFFIX,
                                 temperature=0.0,
                                 max_tokens=max_tokens,
                             )
-                            fb_content = (getattr(resp_fb.choices[0], "text", "") or "").strip()
-                            fb_sql = _extract_sql_text(fb_content) or ""
+                            fb_sql = _restore_literals(
+                                _extract_sql_text(resp_fb.text.strip()) or "", resp_fb, request.dialect
+                            )
                             if re.search(r"^\s*(SELECT|WITH)\b", fb_sql, flags=re.IGNORECASE) is not None:
                                 logger.warning(
                                     f"[Text2SQL] Fallback model succeeded for non-SQL output: primary={model} fallback={fm}"
@@ -2860,7 +2972,7 @@ async def generate_sql(request: SQLGenerateRequest):
             guardrail_warnings.append(
                 f"Repaired SQL to satisfy requested time grain '{time_grain}' (time column: '{time_column}')."
             )
-            repair_prompt = "explorer/sql_repair" if sql_provider_resolved == "openai" else "explorer/sql_repair_offline"
+            repair_prompt = "explorer/sql_repair" if json_prompts else "explorer/sql_repair_offline"
             repair_vars = dict(variables)
             repair_vars.update(
                 {
@@ -2873,36 +2985,30 @@ async def generate_sql(request: SQLGenerateRequest):
                     ],
                 }
             )
-            repair_messages = registry.render_messages(repair_prompt, repair_vars)
             repair_cfg = registry.get_config(repair_prompt)
             repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
             repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
-            repair_resp = await sql_client.chat.completions.create(
+            repair_resp = await _guarded_explorer_call(
+                "explorer.sql",
+                repair_prompt,
+                repair_vars,
+                dialect=request.dialect,
+                client=sql_llm,
+                sync=ask is not None,
                 model=model,
-                messages=repair_messages,
+                completion_fallback=ollama,
                 temperature=repair_temperature,
                 max_tokens=repair_max_tokens,
             )
 
-            repair_content = (repair_resp.choices[0].message.content or "").strip()
-            if not repair_content and sql_provider_resolved == "ollama":
-                repair_prompt_text = "\n\n".join(
-                    [m.get("content", "") for m in (repair_messages or []) if m.get("content")]
-                )
-                repair_resp2 = await sql_client.completions.create(
-                    model=model,
-                    prompt=repair_prompt_text,
-                    temperature=repair_temperature,
-                    max_tokens=repair_max_tokens,
-                )
-                repair_content = (getattr(repair_resp2.choices[0], "text", "") or "").strip()
+            repair_content = repair_resp.text.strip()
             try:
                 repair_parsed = json.loads(_extract_json_text(repair_content))
                 repaired_sql_candidate = str(repair_parsed.get("sql", "") or "")
             except Exception:
                 repaired_sql_candidate = repair_content
 
-            repaired_sql = _extract_sql_text(repaired_sql_candidate)
+            repaired_sql = _restore_literals(_extract_sql_text(repaired_sql_candidate), repair_resp, request.dialect)
             if repaired_sql:
                 if "mysql" in d or "mariadb" in d:
                     repaired_sql = re.sub(r"\bpublic\.", "", repaired_sql, flags=re.IGNORECASE)
@@ -2948,34 +3054,28 @@ async def generate_sql(request: SQLGenerateRequest):
                     best_validation = v2
 
         if best_validation.errors and sql_repair_max > 0:
-            repair_prompt = "explorer/sql_repair" if sql_provider_resolved == "openai" else "explorer/sql_repair_offline"
+            repair_prompt = "explorer/sql_repair" if json_prompts else "explorer/sql_repair_offline"
             for attempt in range(sql_repair_max):
                 issues = [{"type": e.code, "detail": e.message} for e in (best_validation.errors or [])]
                 repair_vars = dict(variables)
                 repair_vars.update({"previous_sql": best_sql, "issues": issues})
-                repair_messages = registry.render_messages(repair_prompt, repair_vars)
                 repair_cfg = registry.get_config(repair_prompt)
                 repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
                 repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
 
-                repair_resp = await sql_client.chat.completions.create(
+                repair_resp = await _guarded_explorer_call(
+                    "explorer.sql",
+                    repair_prompt,
+                    repair_vars,
+                    dialect=request.dialect,
+                    client=sql_llm,
+                    sync=ask is not None,
                     model=model,
-                    messages=repair_messages,
+                    completion_fallback=ollama,
                     temperature=repair_temperature,
                     max_tokens=repair_max_tokens,
                 )
-                repair_content = (repair_resp.choices[0].message.content or "").strip()
-                if not repair_content and sql_provider_resolved == "ollama":
-                    repair_prompt_text = "\n\n".join(
-                        [m.get("content", "") for m in (repair_messages or []) if m.get("content")]
-                    )
-                    repair_resp2 = await sql_client.completions.create(
-                        model=model,
-                        prompt=repair_prompt_text,
-                        temperature=repair_temperature,
-                        max_tokens=repair_max_tokens,
-                    )
-                    repair_content = (getattr(repair_resp2.choices[0], "text", "") or "").strip()
+                repair_content = repair_resp.text.strip()
 
                 try:
                     repair_parsed = json.loads(_extract_json_text(repair_content))
@@ -2983,7 +3083,9 @@ async def generate_sql(request: SQLGenerateRequest):
                 except Exception:
                     repaired_sql_candidate = repair_content
 
-                repaired_sql = _extract_sql_text(repaired_sql_candidate) or ""
+                repaired_sql = _restore_literals(
+                    _extract_sql_text(repaired_sql_candidate) or "", repair_resp, request.dialect
+                )
                 if not repaired_sql:
                     break
 
@@ -3089,8 +3191,17 @@ async def generate_sql(request: SQLGenerateRequest):
         # Preserve intended HTTP status codes (e.g. 422 validation failures).
         raise
     except Exception as e:
+        if request.entry:
+            # An Ask model's provider can quote part of the key it rejected:
+            # log what failed, never its text.
+            logger.warning(
+                "SQL generation failed: entry=%s error=%s status=%s",
+                request.entry, type(e).__name__, getattr(e, "status_code", None),
+            )
+            raise HTTPException(status_code=500, detail="SQL generation failed. See the llm-service log.")
+        # The exception can quote SQL with its literals restored: log it, never return it.
         logger.exception(f"SQL generation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"SQL generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="SQL generation failed. See the llm-service log.")
 
 
 def _mock_sql_generation(question: str, dialect: str, schema: str | None, tables: str | None) -> str:
@@ -3217,7 +3328,7 @@ async def interpret_hitl_input(request: HITLInterpretRequest):
         logger.exception(f"HITL interpretation failed: {e}")
         return HITLInterpretResponse(
             success=False,
-            error=str(e),
+            error="HITL interpretation failed. See the llm-service log.",
             needs_clarification=True,
             clarification_prompt="Sorry, I had trouble understanding. Could you please try again?",
         )

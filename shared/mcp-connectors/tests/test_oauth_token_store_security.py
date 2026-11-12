@@ -8,14 +8,16 @@ Two classes of bug live here, and they are guarded differently.
    instant `_save_tokens()` returns, so a swallowed encryption error produced an
    error line followed immediately by a success line, with nothing on disk.
 
-2. *Drift* — the generator vendors a copy of `oauth/` into each connector's
-   `versions/<v>/` tree, and that copy is what actually runs in the container.
-   A fix applied only to the canonical file leaves the vendored copies on the
-   old code indefinitely. That is exactly what happened: the fail-closed fix for
-   the missing-crypto fallback landed on the canonical file, while six shipped
-   connectors kept storing OAuth access *and* refresh tokens as reversible
-   base64 in a file named `.enc`. The drift tests below are the mechanism fix --
-   they make that divergence un-mergeable rather than merely fixed once.
+2. *Drift* — the generator used to vendor a copy of `oauth/` into connector
+   `versions/<v>/` trees, and a fix applied only to the canonical file left the
+   copies on the old code: the fail-closed fix for the missing-crypto fallback
+   landed on the canonical file while six shipped connectors kept storing OAuth
+   access *and* refresh tokens as reversible base64 in a file named `.enc`. A
+   byte-equality guard held them in step until the copies were deleted outright
+   (KI-OAUTH-TOKEN-STORE-UNREACHABLE-BY-ITS-ONLY-USERS: no connector stores a
+   token). test_dead_connector_layers_stay_deleted.py now forbids any copy, so
+   there is nothing left to drift; the plaintext-fallback pin below still scans
+   every tracked token_manager.py, so a copy that slipped back in is checked too.
 """
 import base64
 import os
@@ -113,38 +115,25 @@ def test_stored_blob_does_not_contain_the_token_in_the_clear(clean_env):
 # Drift guards -- no crypto backend needed; these read source, not behaviour.
 # ---------------------------------------------------------------------------
 
-def _tracked_vendored_copies():
-    """Files git actually ships. Untracked locally-generated connector dirs are
-    deliberately excluded: they are rebuilt from the canonical file on demand."""
+def _tracked_token_managers():
+    """Every token_manager.py git ships under an oauth/ dir -- the canonical one,
+    plus any copy that slipped back in despite the no-copies guard."""
     out = subprocess.run(
-        ["git", "ls-files", "*/versions/*/oauth/token_manager.py"],
+        ["git", "ls-files", "*oauth/token_manager.py"],
         cwd=REPO, capture_output=True, text=True, check=True,
     ).stdout.split()
     return [REPO / p for p in out]
 
 
-def test_vendored_token_managers_match_the_canonical_source():
-    copies = _tracked_vendored_copies()
-    # A zero-length list would make this test pass without testing anything --
-    # the failure mode that let a connector loader find 0 of 28 connectors for
-    # months while a green test "covered" it.
-    assert copies, "found no tracked vendored oauth/token_manager.py -- guard is vacuous"
-    canonical = CANONICAL.read_bytes()
-    drifted = [str(p.relative_to(REPO)) for p in copies if p.read_bytes() != canonical]
-    assert not drifted, (
-        "vendored oauth/token_manager.py has drifted from "
-        f"{CANONICAL.relative_to(REPO)} in: {drifted}. The vendored copy is what "
-        "runs in the connector container, so a security fix that lands only on "
-        "the canonical file does not ship."
-    )
-
-
 def test_no_shipped_copy_falls_back_to_storing_credentials_as_base64():
-    """Independent of byte-equality: pin the specific plaintext fallback.
-
-    Byte-equality alone would be satisfied by regressing *every* copy together.
-    """
-    suspects = [CANONICAL] + _tracked_vendored_copies()
+    """Pin the specific plaintext fallback in every shipped token store."""
+    suspects = _tracked_token_managers()
+    # An empty list would make this pass without testing anything -- the
+    # failure mode that let a connector loader find 0 of 28 connectors for
+    # months while a green test "covered" it.
+    assert CANONICAL in suspects, (
+        f"git ls-files did not find {CANONICAL.relative_to(REPO)} -- guard is vacuous"
+    )
     offenders = []
     for p in suspects:
         src = p.read_text()

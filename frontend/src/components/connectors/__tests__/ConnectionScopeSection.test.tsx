@@ -14,23 +14,25 @@ function Harness({
   initial,
   load,
   pinned,
+  kind = "database",
   onValue,
 }: {
   initial: ScopeValue
   load: () => Promise<NamespaceListing>
   pinned?: string
+  kind?: string
   onValue?: (v: ScopeValue) => void
 }) {
   const [value, setValue] = useState(initial)
   return (
     <ConnectionScopeSection
-      namespaceKind="database"
+      namespaceKind={kind}
       value={value}
       onChange={(v) => {
         setValue(v)
         onValue?.(v)
       }}
-      pinnedDatabase={pinned}
+      pinnedNamespace={pinned}
       loadNamespaces={load}
     />
   )
@@ -99,6 +101,18 @@ describe("ConnectionScopeSection", () => {
   it("a connection pinned to one database has no Scope to choose", () => {
     render(<Harness initial={{ mode: "all", patterns: "" }} load={listing()} pinned="shop" />)
     expect(screen.getByTestId("connection-scope-pinned")).toHaveTextContent("shop")
+    expect(screen.getByTestId("connection-scope-pinned")).toHaveTextContent(/one database/)
+    expect(screen.queryByRole("radiogroup")).toBeNull()
+  })
+
+  // A BigQuery dataset is required, so "leave it empty" is not an option there.
+  it("a connection pinned to one dataset says dataset, and does not offer leaving it empty", () => {
+    render(<Harness initial={{ mode: "all", patterns: "" }} load={listing()} pinned="analytics" kind="dataset" />)
+    const pinned = screen.getByTestId("connection-scope-pinned")
+    expect(pinned).toHaveTextContent("analytics")
+    expect(pinned).toHaveTextContent(/one dataset/)
+    expect(pinned).not.toHaveTextContent(/database/)
+    expect(pinned).not.toHaveTextContent(/empty/)
     expect(screen.queryByRole("radiogroup")).toBeNull()
   })
 })

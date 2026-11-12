@@ -1,7 +1,7 @@
 """RED gate for DEFECT d10_resource_scoping — resource cap / scoping for huge specs.
 
 Grounded defect (grep-confirmed in freshly-generated artifacts):
-  * ``agents/discoverer.py:1350-1355`` caps the raw endpoint list at 500 but
+  * ``agents/discoverer.py:1341-1355`` caps the raw endpoint list at 500 but
     applies NO resource-level filter.
   * ``agents/architect_rest.py:204-211`` (``_build_resources``) returns
     ``list(kept.values())`` — one ResourceConfig for EVERY GET-bearing grouped

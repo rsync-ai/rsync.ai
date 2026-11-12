@@ -1,0 +1,43 @@
+{
+  "_about": "Shared contract for the destination's CDC batch settings: batch_max_rows, batch_max_mb and batch_interval_seconds. The worker (batchSettings / wholeNumberSetting in cdc_batch_apply.go, cdc_batch_apply_test.go) and the kafka-mcp-sink connector (batch_settings_error in versions/v1.0.0/connector.py, shared/mcp-connectors/tests/test_kafka_sink_batch_settings.py) both run every case, so the connector never lets through a value the worker refuses, or refuses one the worker accepts. expect is the whole number accepted, \"unset\" (keep the batcher's default) or \"refused\". unit is what the refusal prints after 'whole number'.",
+  "settings": [
+    {"key": "batch_max_rows", "unit": "", "lo": 1, "hi": 1000000},
+    {"key": "batch_max_mb", "unit": " of MB", "lo": 1, "hi": 1024},
+    {"key": "batch_interval_seconds", "unit": " of seconds", "lo": 1, "hi": 240}
+  ],
+  "cases": [
+    {"name": "rows number", "key": "batch_max_rows", "value": 5000, "expect": 5000},
+    {"name": "rows at the lower bound", "key": "batch_max_rows", "value": 1, "expect": 1},
+    {"name": "rows at the upper bound", "key": "batch_max_rows", "value": 1000000, "expect": 1000000},
+    {"name": "rows string", "key": "batch_max_rows", "value": "2000", "expect": 2000},
+    {"name": "rows just above the upper bound", "key": "batch_max_rows", "value": 1000001, "expect": "refused"},
+    {"name": "rows zero", "key": "batch_max_rows", "value": 0, "expect": "refused"},
+    {"name": "rows negative string", "key": "batch_max_rows", "value": "-5", "expect": "refused"},
+    {"name": "rows fraction", "key": "batch_max_rows", "value": 10.5, "expect": "refused"},
+    {"name": "rows absurd number", "key": "batch_max_rows", "value": 1e12, "expect": "refused"},
+    {"name": "rows orchestrator's flattened null", "key": "batch_max_rows", "value": "<nil>", "expect": "unset"},
+    {"name": "mb number", "key": "batch_max_mb", "value": 64, "expect": 64},
+    {"name": "mb whole float at the upper bound", "key": "batch_max_mb", "value": 1024.0, "expect": 1024},
+    {"name": "mb string with spaces", "key": "batch_max_mb", "value": " 16 ", "expect": 16},
+    {"name": "mb string with a plus sign", "key": "batch_max_mb", "value": "+8", "expect": 8},
+    {"name": "mb just above the upper bound", "key": "batch_max_mb", "value": 1025, "expect": "refused"},
+    {"name": "mb fraction string", "key": "batch_max_mb", "value": "1.5", "expect": "refused"},
+    {"name": "mb hex string", "key": "batch_max_mb", "value": "0x10", "expect": "refused"},
+    {"name": "mb underscore digits", "key": "batch_max_mb", "value": "1_0", "expect": "refused"},
+    {"name": "mb true", "key": "batch_max_mb", "value": true, "expect": "refused"},
+    {"name": "mb json null", "key": "batch_max_mb", "value": null, "expect": "unset"},
+    {"name": "interval number", "key": "batch_interval_seconds", "value": 30, "expect": 30},
+    {"name": "interval at the upper bound", "key": "batch_interval_seconds", "value": 240, "expect": 240},
+    {"name": "interval leading zero is decimal, not octal", "key": "batch_interval_seconds", "value": "030", "expect": 30},
+    {"name": "interval just above the upper bound", "key": "batch_interval_seconds", "value": 241, "expect": "refused"},
+    {"name": "interval string just above the upper bound", "key": "batch_interval_seconds", "value": "241", "expect": "refused"},
+    {"name": "interval negative zero", "key": "batch_interval_seconds", "value": "-0", "expect": "refused"},
+    {"name": "interval fraction just below the lower bound", "key": "batch_interval_seconds", "value": 0.9999, "expect": "refused"},
+    {"name": "interval not a number", "key": "batch_interval_seconds", "value": "abc", "expect": "refused"},
+    {"name": "interval fullwidth digits", "key": "batch_interval_seconds", "value": "１２０", "expect": "refused"},
+    {"name": "interval list", "key": "batch_interval_seconds", "value": [30], "expect": "refused"},
+    {"name": "interval object", "key": "batch_interval_seconds", "value": {"seconds": 30}, "expect": "refused"},
+    {"name": "interval empty string", "key": "batch_interval_seconds", "value": "", "expect": "unset"},
+    {"name": "interval padded null string", "key": "batch_interval_seconds", "value": " null ", "expect": "unset"}
+  ]
+}

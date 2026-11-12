@@ -1,0 +1,1341 @@
+{
+  "_comment": "The chart type registry (dashboards-design.md § 14.2), shared by api-gateway's internal/charts/registry.go and the frontend's components/charts/chart-registry.ts: each type's roles (fewest and most fields, column kinds, field attributes), query path, caps, whether the server draws it for an email or a PDF, and the sorts it takes. registry_test.go and chart-registry.test.ts each compare their registry to this file, so a type, role or cap added on one side alone fails a test. Rewrite from Go: go test ./internal/charts -run TestRegistryMatchesTheSharedGolden -update-chart-types.",
+  "types": [
+    {
+      "type": "bar",
+      "label": "Bar",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color",
+            "mark",
+            "axis"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": true,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "hbar",
+      "label": "Horizontal bar",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": true,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "line",
+      "label": "Line",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color",
+            "mark",
+            "axis"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "area",
+      "label": "Area",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color",
+            "mark",
+            "axis"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": true,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "pie",
+      "label": "Pie",
+      "roles": [
+        {
+          "name": "series",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "donut",
+      "label": "Donut",
+      "roles": [
+        {
+          "name": "series",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "waterfall",
+      "label": "Waterfall",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "funnel",
+      "label": "Funnel",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "histogram",
+      "label": "Histogram",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "bins",
+            "width"
+          ]
+        }
+      ],
+      "path": "statistics",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": []
+    },
+    {
+      "type": "heatmap",
+      "label": "Heatmap",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "scatter",
+      "label": "Scatter",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "size",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "text"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        }
+      ],
+      "path": "rows",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": []
+    },
+    {
+      "type": "bubble",
+      "label": "Bubble",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "size",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "series",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "text"
+          ],
+          "attrs": [
+            "column",
+            "colors"
+          ]
+        }
+      ],
+      "path": "rows",
+      "cap": {
+        "series": 7,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": []
+    },
+    {
+      "type": "scorecard",
+      "label": "Scorecard",
+      "roles": [
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        },
+        {
+          "name": "date",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "time"
+          ],
+          "attrs": [
+            "column"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": true,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "table",
+      "label": "Table",
+      "roles": [
+        {
+          "name": "columns",
+          "min": 1,
+          "max": 20,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 0,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc",
+        "value_asc",
+        "value_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "pivot",
+      "label": "Pivot table",
+      "roles": [
+        {
+          "name": "rows",
+          "min": 1,
+          "max": 3,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "columns",
+          "min": 0,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 3,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "treemap",
+      "label": "Treemap",
+      "roles": [
+        {
+          "name": "rows",
+          "min": 1,
+          "max": 3,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 3500
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "sunburst",
+      "label": "Sunburst",
+      "roles": [
+        {
+          "name": "rows",
+          "min": 1,
+          "max": 3,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 3500
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "sankey",
+      "label": "Sankey",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "sum"
+      ]
+    },
+    {
+      "type": "calendar",
+      "label": "Calendar heatmap",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "time"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 366
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "bullet",
+      "label": "Bullet",
+      "roles": [
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "boxplot",
+      "label": "Box plot",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "statistics",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc"
+      ],
+      "compare": false,
+      "aggregates": []
+    },
+    {
+      "type": "candlestick",
+      "label": "Candlestick",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "time"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "y",
+          "min": 4,
+          "max": 4,
+          "kinds": [
+            "number"
+          ],
+          "attrs": [
+            "column"
+          ]
+        }
+      ],
+      "path": "statistics",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": []
+    },
+    {
+      "type": "range",
+      "label": "Range bands",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "title",
+            "grain"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 2,
+          "max": 2,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [
+        "x_asc",
+        "x_desc"
+      ],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    },
+    {
+      "type": "map",
+      "label": "Choropleth map",
+      "roles": [
+        {
+          "name": "x",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "text",
+            "number"
+          ],
+          "attrs": [
+            "column",
+            "title"
+          ]
+        },
+        {
+          "name": "measure",
+          "min": 1,
+          "max": 1,
+          "kinds": [
+            "any"
+          ],
+          "attrs": [
+            "column",
+            "aggregate",
+            "title",
+            "format",
+            "color"
+          ]
+        }
+      ],
+      "path": "aggregate",
+      "cap": {
+        "series": 0,
+        "rows": 10000
+      },
+      "static": true,
+      "deprecated": false,
+      "version": 2,
+      "stackable": false,
+      "sorts": [],
+      "compare": false,
+      "aggregates": [
+        "count",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ]
+    }
+  ]
+}

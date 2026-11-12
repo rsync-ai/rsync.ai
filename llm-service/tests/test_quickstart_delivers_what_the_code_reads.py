@@ -60,6 +60,7 @@ import re
 
 import pytest
 import yaml
+from _cut_collection import removed_by_the_cut
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 QUICKSTART = REPO / "docker-compose.quickstart.yml"
@@ -145,21 +146,30 @@ def _direct_imports(path: pathlib.Path) -> frozenset[str]:
     """The ``src.*`` modules this one file imports, at any indentation depth.
 
     Deferred imports inside a function count: a module imported lazily still reads
-    the same environment when the call happens.
+    the same environment when the call happens. So do relative imports:
+    ``from .strategies import X`` resolves against this file's own package.
     """
     try:
         tree = ast.parse(path.read_text())
     except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - not expected
         return frozenset()
+    # The package this file sits in: src/agents/planner/service.py and
+    # src/agents/planner/__init__.py both -> ("src", "agents", "planner").
+    package = path.relative_to(LLM_SRC).parent.parts
     found = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found.update(a.name for a in node.names if a.name.startswith("src."))
         elif isinstance(node, ast.ImportFrom):
-            if node.level == 0 and node.module and node.module.startswith("src."):
-                found.add(node.module)
+            if node.level == 0:
+                module = node.module
+            else:
+                base = package[: len(package) - (node.level - 1)]
+                module = ".".join(base + ((node.module,) if node.module else ()))
+            if module and module.startswith("src."):
+                found.add(module)
                 # ``from src.utils import ratelimit`` names the module in the alias.
-                found.update(f"{node.module}.{a.name}" for a in node.names)
+                found.update(f"{module}.{a.name}" for a in node.names)
     return frozenset(found)
 
 
@@ -224,6 +234,17 @@ def test_the_derivation_is_not_vacuous():
         "every service reaches the rate limiter; expected the connector-lifecycle "
         "entrypoint not to"
     )
+
+
+def test_the_walk_follows_a_relative_import():
+    """``from .strategies import X`` is an edge like any other.
+
+    The planner reaches its strategies only through a relative import; a walk that
+    followed absolute imports alone lost every module behind one, and with them the
+    environment those modules read.
+    """
+    edges = _direct_imports(_module_path("src.agents.planner.service"))
+    assert "src.agents.planner.strategies" in edges
 
 
 @pytest.mark.parametrize("name", sorted(_python_services()))
@@ -646,6 +667,64 @@ def test_every_service_that_sends_the_internal_secret_is_given_it(stack):
         f"passes it; every call they make to an internal route is refused with 401 on a "
         f"production ENVIRONMENT (503 on the gateway when its own copy is empty), and "
         f"nothing surfaces it."
+    )
+
+
+# The stacks whose overlay clears env_file (``env_file: !override []``), so a service
+# there gets only the variables its environment list names.
+CLOUD_STACKS = ("prod", "staging")
+# A call that builds or configures a model client in this process. Reaching
+# openai_client is not enough: the planner reaches it only for telemetry's env_bool
+# and asks llm-service over HTTP.
+_BUILDS_LLM_CLIENT = re.compile(
+    r"\b(make_sync_client|make_async_client|openai_api_key|get_default_model|llm_configured)\("
+)
+
+
+def _builds_llm_client(module: str) -> bool:
+    return any(
+        _BUILDS_LLM_CLIENT.search(_module_path(m).read_text(errors="ignore"))
+        for m in _reachable(module)
+        if m != OPENAI_CLIENT_MODULE
+    )
+
+
+@pytest.mark.parametrize("stack", CLOUD_STACKS)
+def test_a_cloud_service_that_calls_an_llm_is_given_every_llm_setting(stack):
+    files = SECRET_STACKS[stack]
+    for filename in files:
+        if not (REPO / filename).is_file():
+            pytest.skip(f"{filename} is not present")
+    commands, env_files = {}, {}
+    for filename in files:
+        for name, svc in _services(REPO / filename).items():
+            svc = svc or {}
+            if "command" in svc:
+                commands[name] = svc["command"]
+            if "env_file" in svc:
+                env_files[name] = svc["env_file"]
+    env = _merged_env(files)
+    callers = []
+    for name, command in commands.items():
+        module = _entrypoint_module({"command": command})
+        if module and _module_path(module) is not None and _builds_llm_client(module) and not env_files.get(name):
+            callers.append(name)
+    expected = {"llm-service", "tool-generator"}
+    # The public cut strips the connector generator: its compose service runs
+    # src.lifecycle.main there, which builds no model client.
+    if removed_by_the_cut("src/agents/tool_generator/service.py"):
+        expected.discard("tool-generator")
+    assert expected <= set(callers), (
+        f"the census found only {sorted(callers)} building a model client with no env_file "
+        f"in the {stack} stack; a caller moved or the derivation broke"
+    )
+    census = _llm_client_env_vars()
+    missing = {name: sorted(census - set(env[name])) for name in sorted(callers)}
+    missing = {name: names for name, names in missing.items() if names}
+    assert not missing, (
+        f"the {stack} stack ({' + '.join(files)}) clears env_file and never passes {missing}; "
+        f"an operator who sets one in the env file sees no effect. OPENAI_API_KEY_SOURCE "
+        f"missing on llm-service, for one, means Vertex AI gets no token and every call is 401."
     )
 
 

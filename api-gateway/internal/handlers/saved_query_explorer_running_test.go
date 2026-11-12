@@ -250,6 +250,11 @@ func TestTheFourDegradedStatesAreNeverCollapsed(t *testing.T) {
 			t.Errorf("%s → state %q detail %v, want %q %v",
 				tc.name, v.State, v.DetailAvailable, tc.wantState, tc.wantDetail)
 		}
+		// The message is shown on the Models page as written, so it says what the
+		// model is doing, not the name of the workflow behind it.
+		if strings.Contains(strings.ToLower(v.Message), "refresh loop") {
+			t.Errorf("%s → message %q names the refresh loop", tc.name, v.Message)
+		}
 	}
 
 	// And the pairs that must stay apart, stated as the comparison rather than left to
@@ -342,6 +347,43 @@ func TestEveryRowComesBackWithAState(t *testing.T) {
 		if r.State == "" {
 			t.Fatalf("row %d (%s) came back with no state", i, r.SavedQueryID)
 		}
+	}
+}
+
+func TestAnIdleModelThatWaitsForAllItsUpstreamsSaysSo(t *testing.T) {
+	// "It rebuilds when an upstream finishes" is false for a fan-in on 'all': the next
+	// landing does not rebuild it. Bug class: wording that names one upstream for a model
+	// that waits for every one. Both idle paths are covered — never started (NotFound) and
+	// closed (rejected) — and a running row keeps its own message.
+	idle := func(_ context.Context, id string) (*modelRefreshStateView, bool, error) {
+		switch id {
+		case modelRefreshWorkflowID("closed-all"):
+			return nil, true, nil
+		case modelRefreshWorkflowID("busy-all"):
+			return &modelRefreshStateView{Phase: "rebuilding"}, false, nil
+		}
+		return nil, false, &serviceerror.NotFound{}
+	}
+	rows := []runningModelRow{
+		{SavedQueryID: "any"},
+		{SavedQueryID: "never-all", WaitsForAll: true},
+		{SavedQueryID: "closed-all", WaitsForAll: true},
+		{SavedQueryID: "busy-all", WaitsForAll: true},
+	}
+	out := listRunningModelWork(context.Background(), rows, idle)
+	want := []string{modelIdleMessage, modelIdleAllMessage, modelIdleAllMessage, ""}
+	for i, r := range out {
+		if r.Message != want[i] {
+			t.Errorf("%s reads %q, want %q", r.SavedQueryID, r.Message, want[i])
+		}
+	}
+	if strings.Contains(modelIdleAllMessage, "an upstream") {
+		t.Errorf("the 'all' idle reason still names one upstream: %q", modelIdleAllMessage)
+	}
+	// The listing has to carry the flag, or every model reads as 'any'.
+	if q := runningModelWorkQuery(); !strings.Contains(q, "s.upstream_policy = 'all'") ||
+		!strings.Contains(q, "saved_query_schedule_upstreams") {
+		t.Errorf("the listing does not compute WaitsForAll:\n%s", q)
 	}
 }
 

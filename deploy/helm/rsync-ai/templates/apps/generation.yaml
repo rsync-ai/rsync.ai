@@ -152,6 +152,11 @@ spec:
             # hold.
             - name: EXPLORER_OFFLINE_ONLY
               value: {{ $root.Values.generation.llm.explorerOfflineOnly | default false | quote }}
+            # The egress guard's own check that sample rows are off, matching
+            # api-gateway's (src/egress/sample_rows.py). Listed for the same
+            # reason as the line above.
+            - name: RSYNC_LLM_SAMPLE_ROWS_ALLOWED
+              value: {{ $root.Values.generation.llm.sampleRowsAllowed | default false | quote }}
             - name: USE_MOCK_LLM
               value: "false"
             {{- include "rsync-ai.kafkaEnv" $root | nindent 12 }}

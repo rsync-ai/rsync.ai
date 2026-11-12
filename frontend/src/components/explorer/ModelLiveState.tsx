@@ -1,10 +1,11 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import { useCallback, useRef, useState, type ReactNode } from "react"
+import { useVisiblePoll } from "@/lib/hooks/useVisiblePoll"
 import { AlertTriangle, HelpCircle, Loader2 } from "lucide-react"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { Badge } from "@/components/ui/badge"
-import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
+import { formatAbsoluteTime } from "@/lib/utils"
 import {
   describeFreshnessCause,
   describeRefreshFacts,
@@ -14,10 +15,12 @@ import {
   overdueSeconds,
   parseOpenBreaches,
   parseRunningModels,
+  waitsForAll,
   type Fetched,
   type LiveCell,
   type ModelFreshnessBreach,
   type RunningModelsResponse,
+  type FreshnessSchedule,
   type ScheduleUpstream,
 } from "@/components/explorer/liveState"
 
@@ -29,74 +32,6 @@ export const RUNNING_POLL_MS = 15_000
 // The breach list is a Postgres read, and the sweep that writes it runs on a
 // minutes-scale interval, so polling it faster would only re-read the same rows.
 export const FRESHNESS_POLL_MS = 60_000
-
-/**
- * Runs `load` now and then every `intervalMs` — only while the tab is visible, and never
- * two at a time. Returns a manual refresh that does nothing while disabled.
- *
- * A timeout chain rather than setInterval, for the last of those. A workspace at the
- * fifty-model cap can take ~14 s to answer (eight concurrent queries, two seconds each),
- * so a fixed interval would start the next poll on top of the one still running —
- * doubling the load on the rebuild queue exactly when it is slowest. The next poll is
- * scheduled only once the last one has settled.
- */
-export function useVisiblePoll(
-  load: () => Promise<void>,
-  intervalMs: number,
-  enabled: boolean,
-): () => Promise<void> {
-  // The check still out. The timer and Refresh both wait on it rather than start a second
-  // one, so whichever of them meets it, the next check is timed from when it lands.
-  const inFlight = useRef<Promise<void> | null>(null)
-
-  const run = useCallback(() => {
-    if (!inFlight.current) {
-      inFlight.current = load().finally(() => {
-        inFlight.current = null
-      })
-    }
-    return inFlight.current
-  }, [load])
-
-  useEffect(() => {
-    if (!enabled) return
-    let timer: ReturnType<typeof setTimeout> | null = null
-    // Whether this chain is waiting on a check, and so will schedule its own next one.
-    let waiting = false
-    let stopped = false
-
-    const tick = async () => {
-      timer = null
-      // A hidden tab stops the chain outright; the listener below restarts it. A page
-      // left open in a background tab overnight asks nothing.
-      if (document.visibilityState !== "visible") return
-      waiting = true
-      try {
-        await run()
-      } finally {
-        waiting = false
-      }
-      if (!stopped) timer = setTimeout(() => void tick(), intervalMs)
-    }
-    const onVisibility = () => {
-      // Gated on this chain, not on whether a check is out: a check Refresh started
-      // schedules nothing after itself, so deferring to it would stop the page for good.
-      if (document.visibilityState === "visible" && timer === null && !waiting) {
-        void tick()
-      }
-    }
-
-    void tick()
-    document.addEventListener("visibilitychange", onVisibility)
-    return () => {
-      stopped = true
-      if (timer !== null) clearTimeout(timer)
-      document.removeEventListener("visibilitychange", onVisibility)
-    }
-  }, [enabled, intervalMs, run])
-
-  return useCallback(() => (enabled ? run() : Promise.resolve()), [enabled, run])
-}
 
 // One poll plus slack for a late timer. An answer older than that was not refreshed on
 // schedule (the tab was hidden, or polling was off), so it is no longer the page's
@@ -116,7 +51,7 @@ export function useRunningModels(enabled: boolean) {
   const [running, setRunning] = useState<Fetched<RunningModelsResponse>>({ status: "loading" })
   const lastSettledAt = useRef<number | null>(null)
 
-  const load = useCallback(async () => {
+  const ask = useCallback(async (): Promise<Fetched<RunningModelsResponse>> => {
     const last = lastSettledAt.current
     if (last !== null && Date.now() - last > STALE_AFTER_MS) {
       const note = `The last answer is ${formatSpan((Date.now() - last) / 1000)} old, so it is not shown while the page asks again.`
@@ -127,24 +62,22 @@ export function useRunningModels(enabled: boolean) {
       const res = await authFetch("/api/v1/explorer/running", { cache: "no-store" })
       // authFetch does not throw on a non-2xx, and an error body has no models in it —
       // which, unchecked, would read as a workspace where nothing is running.
-      if (!res.ok) {
-        setRunning({ status: "error", message: `The live-state check failed (HTTP ${res.status}).` })
-        return
-      }
+      if (!res.ok) return { status: "error", message: `The live-state check failed (HTTP ${res.status}).` }
       const parsed = parseRunningModels(await res.json())
-      setRunning(
-        parsed
-          ? { status: "ok", data: parsed }
-          : { status: "error", message: "The live-state check returned something this page could not read." },
-      )
+      return parsed
+        ? { status: "ok", data: parsed }
+        : { status: "error", message: "The live-state check returned something this page could not read." }
     } catch {
-      setRunning({ status: "error", message: "Could not reach the server to check live state." })
-    } finally {
-      lastSettledAt.current = Date.now()
+      return { status: "error", message: "Could not reach the server to check live state." }
     }
   }, [])
 
-  const refresh = useVisiblePoll(load, RUNNING_POLL_MS, enabled)
+  const apply = useCallback((answer: Fetched<RunningModelsResponse>) => {
+    setRunning(answer)
+    lastSettledAt.current = Date.now()
+  }, [])
+
+  const refresh = useVisiblePoll(ask, apply, RUNNING_POLL_MS, enabled)
   return { running, refresh }
 }
 
@@ -158,25 +91,20 @@ export function useRunningModels(enabled: boolean) {
 export function useOpenFreshnessBreaches(enabled: boolean) {
   const [freshness, setFreshness] = useState<Fetched<ModelFreshnessBreach[]>>({ status: "loading" })
 
-  const load = useCallback(async () => {
+  const ask = useCallback(async (): Promise<Fetched<ModelFreshnessBreach[]>> => {
     try {
       const res = await authFetch("/api/v1/explorer/freshness", { cache: "no-store" })
-      if (!res.ok) {
-        setFreshness({ status: "error", message: `The freshness check failed (HTTP ${res.status}).` })
-        return
-      }
+      if (!res.ok) return { status: "error", message: `The freshness check failed (HTTP ${res.status}).` }
       const parsed = parseOpenBreaches(await res.json())
-      setFreshness(
-        parsed
-          ? { status: "ok", data: parsed }
-          : { status: "error", message: "The freshness check returned something this page could not read." },
-      )
+      return parsed
+        ? { status: "ok", data: parsed }
+        : { status: "error", message: "The freshness check returned something this page could not read." }
     } catch {
-      setFreshness({ status: "error", message: "Could not reach the server to check freshness." })
+      return { status: "error", message: "Could not reach the server to check freshness." }
     }
   }, [])
 
-  const refresh = useVisiblePoll(load, FRESHNESS_POLL_MS, enabled)
+  const refresh = useVisiblePoll(ask, setFreshness, FRESHNESS_POLL_MS, enabled)
   return { freshness, refresh }
 }
 
@@ -184,14 +112,21 @@ function queuedSuffix(n: number): string {
   return n > 0 ? ` · ${n} queued` : ""
 }
 
-/** The Now cell for one row. */
-export function LiveStateCell({ cell }: { cell: LiveCell }) {
+const WAITING_ANY = "Waiting for the next upstream to finish before it rebuilds again"
+const WAITING_ALL = "Waiting for every upstream to run before it rebuilds again"
+
+/**
+ * The Now cell for one row. waitsForAll is a fan-in on upstream policy "all" (see
+ * waitsForAll in liveState): the next upstream to land does not rebuild it, so its
+ * Waiting must not say so.
+ */
+export function LiveStateCell({ cell, waitsForAll: all = false }: { cell: LiveCell; waitsForAll?: boolean }) {
   switch (cell.kind) {
     case "not_applicable":
       return (
         <span
           className="text-zinc-400"
-          title="Runs on a clock. It has no refresh loop, so there is no live state to show."
+          title="Runs on a clock, so there is nothing to show between runs."
         >
           —
         </span>
@@ -238,7 +173,7 @@ export function LiveStateCell({ cell }: { cell: LiveCell }) {
           <Badge
             variant="secondary"
             className="font-medium whitespace-nowrap"
-            title="The refresh loop is open and waiting for the next upstream completion."
+            title={`${all ? WAITING_ALL : WAITING_ANY}.`}
           >
             {`Waiting${queuedSuffix(cell.detail.queued_completions)}`}
           </Badge>
@@ -280,7 +215,7 @@ function RebuildFailedBadge({ error }: { error?: string }) {
     <Badge
       variant="destructive"
       className="gap-1 font-medium whitespace-nowrap"
-      title={`A rebuild failed during this run of the refresh loop: ${error}. It is not cleared when a later rebuild succeeds.`}
+      title={`An earlier rebuild failed after its retries: ${error}. This stays until the model goes idle, even if a later rebuild succeeded.`}
     >
       <AlertTriangle className="h-3 w-3" aria-hidden />
       Rebuild failed this run
@@ -289,13 +224,13 @@ function RebuildFailedBadge({ error }: { error?: string }) {
 }
 
 /** The marker for a model whose table is past its freshness deadline. */
-export function OverdueBadge({ breach }: { breach: ModelFreshnessBreach }) {
+export function OverdueBadge({ breach, schedule }: { breach: ModelFreshnessBreach; schedule?: FreshnessSchedule }) {
   const by = formatSpan(overdueSeconds(breach))
   return (
     <Badge
       variant="outline"
       className="gap-1 border-amber-500 font-medium whitespace-nowrap text-amber-600 dark:text-amber-400"
-      title={`Past its ${formatSpan(breach.deadline_seconds)} freshness deadline by ${by}: ${describeFreshnessCause(breach.cause)}.`}
+      title={`Past its ${formatSpan(breach.deadline_seconds)} freshness deadline by ${by}: ${describeFreshnessCause(breach.cause, schedule)}.`}
     >
       <AlertTriangle className="h-3 w-3" aria-hidden />
       {`Overdue ${by}`}
@@ -307,11 +242,15 @@ export function OverdueBadge({ breach }: { breach: ModelFreshnessBreach }) {
 export function LiveStateDetail({
   cell,
   breach,
+  scheduleType,
   upstreams,
+  upstreamPolicy,
 }: {
   cell: LiveCell
   breach?: ModelFreshnessBreach
+  scheduleType?: string
   upstreams?: ScheduleUpstream[]
+  upstreamPolicy?: string
 }) {
   let body: ReactNode = null
   switch (cell.kind) {
@@ -321,8 +260,8 @@ export function LiveStateDetail({
         <>
           <p>
             {cur
-              ? `Rebuilding since ${formatAbsoluteTime(cur.started_at)}, woken by ${describeUpstream(cur.upstream_kind, cur.upstream_id, upstreams)}`
-              : "Rebuilding. The refresh loop did not say which upstream woke it."}
+              ? `Rebuilding since ${formatAbsoluteTime(cur.started_at)}, started by ${describeUpstream(cur.upstream_kind, cur.upstream_id, upstreams)}`
+              : "Rebuilding. It did not say which upstream started it."}
           </p>
           <p className="text-zinc-500 dark:text-zinc-400">{describeRefreshFacts(cell.detail).join(" · ")}</p>
         </>
@@ -332,7 +271,7 @@ export function LiveStateDetail({
     case "waiting":
       body = (
         <>
-          <p>Refresh loop open, waiting for the next upstream completion</p>
+          <p>{waitsForAll(upstreamPolicy, upstreams) ? WAITING_ALL : WAITING_ANY}</p>
           <p className="text-zinc-500 dark:text-zinc-400">{describeRefreshFacts(cell.detail).join(" · ")}</p>
         </>
       )
@@ -382,7 +321,7 @@ export function LiveStateDetail({
           {breach.never_succeeded
             ? "it has never rebuilt successfully"
             : `last rebuilt successfully ${formatAbsoluteTime(breach.reference_at)}`}
-          {`; ${describeFreshnessCause(breach.cause)}.`}
+          {`; ${describeFreshnessCause(breach.cause, { scheduleType, upstreams, upstreamPolicy })}.`}
         </p>
       )}
     </div>

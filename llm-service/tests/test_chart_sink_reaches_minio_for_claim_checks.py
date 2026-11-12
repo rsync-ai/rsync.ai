@@ -82,3 +82,16 @@ def test_sink_minio_mcp_url_names_a_rendered_service():
 def test_sink_gets_no_minio_url_when_the_minio_connector_is_off():
     env = _sink_env(_render("--set", "connectors.minio.enabled=false"))
     assert "MINIO_MCP_URL" not in env, "MINIO_MCP_URL points at a Service that is not rendered"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_sink_dials_destinations_under_the_release_stack_prefix():
+    # A pinned destination is dialled only as <STACK_PREFIX>-<id>-vX-Y-Z-mcp
+    # (destinationHostCandidates, kafka-sink-worker main.go). Without the env the
+    # worker defaults to rsync-ai, which names no Service on a release with
+    # another stackPrefix, and every destination write fails.
+    docs = _render("--set", "global.stackPrefix=acme")
+    services = {d["metadata"]["name"] for d in docs if d.get("kind") == "Service"}
+    # Control: the connector Services do carry the release prefix.
+    assert any(s.startswith("acme-") and s.endswith("-mcp") for s in services), services
+    assert _sink_env(docs).get("STACK_PREFIX") == "acme"

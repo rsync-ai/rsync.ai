@@ -1,4 +1,5 @@
-import { authGet, authPost, authFetch } from "./auth-fetch"
+import { authFetch, authPost, redirectToLogout } from "./auth-fetch"
+import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 
 // ============================================================================
 // Types
@@ -12,11 +13,6 @@ export interface AdminUser {
   status: string
   created_at: string
   last_login?: string | null
-}
-
-export interface AdminUserDetail {
-  user: AdminUser
-  audit_logs: AdminAuditLog[]
 }
 
 export interface AdminInvitation {
@@ -75,28 +71,80 @@ export interface InviteValidation {
 }
 
 // ============================================================================
+// Reads
+// ============================================================================
+
+/** Why an admin page's read came back without a body. */
+export interface AdminReadFailure {
+  ok: false
+  /** 0 when the request never got an answer. */
+  status: number
+  /** Seconds, from a 429's Retry-After; null when it named none. */
+  retryAfter: number | null
+  /** The server's reason, or the HTTP status when it gave none. */
+  error: string
+}
+
+export type AdminRead<T> = { ok: true; data: T } | AdminReadFailure
+
+/**
+ * One GET for an admin page, which shows a different state for each way it can
+ * fail: 401 signs out, 403 is "Access denied", 429 is "retry in ~Ns", and any
+ * other status is the server's reason with a Retry. Every admin page carried its
+ * own copy of that ladder, and four of them (users, invitations, audit, health)
+ * stopped at 429: a 500 went on to `res.json()`, which succeeds on the API's
+ * `{"error": …}` body, so the page drew an empty table, read as "there are no
+ * users" when the read had failed. Settings had been fixed for the same reason.
+ */
+export async function adminRead<T>(endpoint: string, init: RequestInit = {}): Promise<AdminRead<T>> {
+  let res: Response
+  try {
+    res = await authFetch(endpoint, { method: "GET", ...init })
+  } catch {
+    return { ok: false, status: 0, retryAfter: null, error: "Network error" }
+  }
+  if (res.status === 401) redirectToLogout()
+  if (!res.ok) {
+    const ra = parseInt(res.headers.get("Retry-After") || "", 10)
+    return {
+      ok: false,
+      status: res.status,
+      retryAfter: res.status === 429 && Number.isFinite(ra) ? ra : null,
+      error: await readResponseErrorMessage(res),
+    }
+  }
+  try {
+    return { ok: true, data: (await res.json()) as T }
+  } catch {
+    return { ok: false, status: res.status, retryAfter: null, error: "The response was not JSON" }
+  }
+}
+
+/** A mutation's JSON body, or its server reason thrown as the Error's message. */
+async function jsonOrThrow<T>(res: Response): Promise<T> {
+  if (!res.ok) throw new Error(await readResponseErrorMessage(res))
+  return res.json()
+}
+
+function query(params: Record<string, string | number | undefined>): string {
+  const sp = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) if (v) sp.set(k, String(v))
+  const qs = sp.toString()
+  return qs ? `?${qs}` : ""
+}
+
+// ============================================================================
 // Users
 // ============================================================================
 
-export async function adminListUsers(params?: {
+export async function adminListUsers(params: {
   q?: string
   role?: string
   status?: string
   limit?: number
   offset?: number
-}): Promise<PaginatedResponse<AdminUser>> {
-  const searchParams = new URLSearchParams()
-  if (params?.q) searchParams.set("q", params.q)
-  if (params?.role) searchParams.set("role", params.role)
-  if (params?.status) searchParams.set("status", params.status)
-  if (params?.limit) searchParams.set("limit", String(params.limit))
-  if (params?.offset) searchParams.set("offset", String(params.offset))
-  const qs = searchParams.toString()
-  return authGet(`/api/v1/admin/users${qs ? `?${qs}` : ""}`)
-}
-
-export async function adminGetUser(id: string): Promise<AdminUserDetail> {
-  return authGet(`/api/v1/admin/users/${id}`)
+} = {}): Promise<AdminRead<PaginatedResponse<AdminUser>>> {
+  return adminRead(`/api/v1/admin/users${query(params)}`)
 }
 
 export async function adminUpdateUserRole(id: string, role: string): Promise<{ message: string; role: string }> {
@@ -104,11 +152,7 @@ export async function adminUpdateUserRole(id: string, role: string): Promise<{ m
     method: "PATCH",
     body: JSON.stringify({ role }),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 /**
@@ -141,11 +185,7 @@ export async function adminSetWorkspacePlan(
     method: "POST",
     body: JSON.stringify({ plan }),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 export async function adminUpdateUserStatus(id: string, status: string): Promise<{ message: string; status: string }> {
@@ -153,20 +193,12 @@ export async function adminUpdateUserStatus(id: string, status: string): Promise
     method: "PATCH",
     body: JSON.stringify({ status }),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 export async function adminDeleteUser(id: string): Promise<{ message: string }> {
   const res = await authFetch(`/api/v1/admin/users/${id}`, { method: "DELETE" })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 // ============================================================================
@@ -180,31 +212,23 @@ export async function adminCreateInvitation(body: {
   return authPost("/api/v1/admin/invitations", body)
 }
 
-export async function adminListInvitations(params?: {
+export async function adminListInvitations(params: {
   limit?: number
   offset?: number
-}): Promise<PaginatedResponse<AdminInvitation>> {
-  const searchParams = new URLSearchParams()
-  if (params?.limit) searchParams.set("limit", String(params.limit))
-  if (params?.offset) searchParams.set("offset", String(params.offset))
-  const qs = searchParams.toString()
-  return authGet(`/api/v1/admin/invitations${qs ? `?${qs}` : ""}`)
+} = {}): Promise<AdminRead<PaginatedResponse<AdminInvitation>>> {
+  return adminRead(`/api/v1/admin/invitations${query(params)}`)
 }
 
 export async function adminRevokeInvitation(id: string): Promise<{ message: string }> {
   const res = await authFetch(`/api/v1/admin/invitations/${id}`, { method: "DELETE" })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 // ============================================================================
 // Audit Logs
 // ============================================================================
 
-export async function adminListAuditLogs(params?: {
+export async function adminListAuditLogs(params: {
   user_id?: string
   action?: string
   resource_type?: string
@@ -213,26 +237,16 @@ export async function adminListAuditLogs(params?: {
   q?: string
   limit?: number
   offset?: number
-}): Promise<PaginatedResponse<AdminAuditLog>> {
-  const searchParams = new URLSearchParams()
-  if (params?.user_id) searchParams.set("user_id", params.user_id)
-  if (params?.action) searchParams.set("action", params.action)
-  if (params?.resource_type) searchParams.set("resource_type", params.resource_type)
-  if (params?.from) searchParams.set("from", params.from)
-  if (params?.to) searchParams.set("to", params.to)
-  if (params?.q) searchParams.set("q", params.q)
-  if (params?.limit) searchParams.set("limit", String(params.limit))
-  if (params?.offset) searchParams.set("offset", String(params.offset))
-  const qs = searchParams.toString()
-  return authGet(`/api/v1/admin/audit-logs${qs ? `?${qs}` : ""}`)
+} = {}): Promise<AdminRead<PaginatedResponse<AdminAuditLog>>> {
+  return adminRead(`/api/v1/admin/audit-logs${query(params)}`)
 }
 
 // ============================================================================
 // Settings
 // ============================================================================
 
-export async function adminGetSettings(): Promise<{ settings: Record<string, string> }> {
-  return authGet("/api/v1/admin/settings")
+export async function adminGetSettings(): Promise<AdminRead<{ settings?: Record<string, string> }>> {
+  return adminRead("/api/v1/admin/settings")
 }
 
 export async function adminUpdateSettings(settings: Record<string, string>): Promise<{ message: string }> {
@@ -240,25 +254,27 @@ export async function adminUpdateSettings(settings: Record<string, string>): Pro
     method: "PATCH",
     body: JSON.stringify(settings),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "Request failed" }))
-    throw new Error(err.error || `HTTP ${res.status}`)
-  }
-  return res.json()
+  return jsonOrThrow(res)
 }
 
 // ============================================================================
 // Health
 // ============================================================================
 
-export async function adminGetHealth(): Promise<{ services: ServiceHealth[] }> {
-  return authGet("/api/v1/admin/health")
+export async function adminGetHealth(): Promise<AdminRead<{ services?: ServiceHealth[] }>> {
+  return adminRead("/api/v1/admin/health")
 }
 
 // ============================================================================
 // Public (no admin required)
 // ============================================================================
 
+/**
+ * Whether a signup link's invitation can still be used. The answer is a 200
+ * with `valid: false` and a `reason` for a used, expired or unknown token, so
+ * only a request that got no such answer throws.
+ */
 export async function validateInvite(token: string): Promise<InviteValidation> {
-  return authGet(`/api/v1/auth/invite/${token}`, { skipAuth: true })
+  const res = await authFetch(`/api/v1/auth/invite/${encodeURIComponent(token)}`, { method: "GET", skipAuth: true })
+  return jsonOrThrow<InviteValidation>(res)
 }

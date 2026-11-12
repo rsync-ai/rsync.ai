@@ -36,9 +36,9 @@ func TestComputeTableConcurrency(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := computeTableConcurrency(tc.numCPU, tc.memBytes, tc.override)
+			got, _ := decideTableConcurrency(tc.numCPU, tc.memBytes, tc.override)
 			if got != tc.want {
-				t.Fatalf("computeTableConcurrency(cpu=%d, mem=%d, override=%d) = %d, want %d",
+				t.Fatalf("decideTableConcurrency(cpu=%d, mem=%d, override=%d) = %d, want %d",
 					tc.numCPU, tc.memBytes, tc.override, got, tc.want)
 			}
 			if got < 1 {

@@ -10,6 +10,7 @@ import {
   generateFromSpec,
   type GenerateFromSpecResponse,
 } from "@/lib/api/discovery"
+import { PinnedConnectionsPrompt } from "./PinnedConnectionsPrompt"
 
 type Source = "file" | "url" | "paste"
 
@@ -140,7 +141,7 @@ export function SpecUploadFlow() {
 
   return (
     <div
-      className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]"
+      className="grid gap-6 @3xl:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]"
       data-testid="spec-upload-flow"
     >
       <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm p-5 space-y-5">
@@ -254,7 +255,7 @@ export function SpecUploadFlow() {
             onChange={(e) => setReplace(e.target.checked)}
             data-testid="spec-replace"
           />
-          Replace an existing connector with this name
+          If a connector with this name exists, save this as a new version of it
         </label>
 
         <Button
@@ -274,7 +275,7 @@ export function SpecUploadFlow() {
       </div>
 
       <aside
-        className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm lg:sticky lg:top-6 self-start"
+        className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm @3xl:sticky @3xl:top-20 self-start"
         data-testid="generation-panel"
       >
         <div className="px-5 pt-5 pb-3 border-b border-zinc-100 dark:border-zinc-800">
@@ -366,8 +367,7 @@ function SpecResult({
         data-testid="spec-already-exists"
       >
         A connector named <code className="font-mono">{result.connector_name}</code> already exists, so nothing
-        was generated. Tick <strong>Replace an existing connector</strong> and generate again to overwrite it, or
-        choose another name.
+        was generated. Tick <strong>save this as a new version</strong> and generate again, or choose another name.
       </div>
     )
   }
@@ -389,6 +389,13 @@ function SpecResult({
             )}
           </div>
         </div>
+        {result.version && result.connector_name && result.pinned_connections && (
+          <PinnedConnectionsPrompt
+            connectorName={result.connector_name}
+            version={result.version}
+            pinned={result.pinned_connections}
+          />
+        )}
         {result.metadata?.managed_connectors === false && (
           <div className="rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 px-3 py-2 text-zinc-600 dark:text-zinc-400">
             This install does not build or start generated connectors. The files were saved

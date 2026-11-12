@@ -31,6 +31,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { cn, formatRelativeTime } from "@/lib/utils"
 
 type Checkpoint = {
@@ -196,16 +198,18 @@ function fmtWhen(iso: string): string {
   return d.toLocaleString()
 }
 
-function fmtAgo(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return "—"
-  return formatRelativeTime(d)
-}
-
 type StateFilter = "all" | "in_progress" | "complete"
 
 // Past this many tables the filter row appears; below it, it is clutter.
 const FILTER_THRESHOLD = 8
+
+// A batch run commits a checkpoint per batch; the card read once and then sat on
+// its first answer for the whole run. Same cadence as Table statistics.
+export const CHECKPOINTS_POLL_MS = 10_000
+
+function isHidden(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden"
+}
 
 export function PipelineCheckpointsCard({
   pipelineId,
@@ -271,14 +275,16 @@ export function PipelineCheckpointsCard({
   // A Refresh clicked while an earlier read is in flight must not let that older
   // response land last and revert the list.
   const requestSeq = useRef(0)
-  const load = useCallback(async () => {
+  // `background` is the poll: it does not spin Refresh, and a failed poll keeps
+  // the last good list instead of swapping it for an error.
+  const load = useCallback(async ({ background = false }: { background?: boolean } = {}) => {
     const seq = ++requestSeq.current
-    setLoading(true)
+    if (!background) setLoading(true)
     try {
       const res = await authFetch(API_ENDPOINTS.PIPELINES.CHECKPOINTS(pipelineId), { cache: "no-store" })
       if (seq !== requestSeq.current) return
       if (!res.ok) {
-        setError(`Could not load checkpoints (HTTP ${res.status})`)
+        if (!background) setError(`Could not load checkpoints (HTTP ${res.status})`)
         return
       }
       const data = (await res.json().catch(() => null)) as { checkpoints?: Checkpoint[] } | null
@@ -286,7 +292,7 @@ export function PipelineCheckpointsCard({
       setCheckpoints(Array.isArray(data?.checkpoints) ? data!.checkpoints : [])
       setError(null)
     } catch {
-      if (seq !== requestSeq.current) return
+      if (seq !== requestSeq.current || background) return
       setError("Could not load checkpoints — the API is unreachable")
     } finally {
       if (seq === requestSeq.current) setLoading(false)
@@ -296,6 +302,46 @@ export function PipelineCheckpointsCard({
   useEffect(() => {
     void load()
   }, [load])
+
+  // A running pipeline re-reads on a tick; a hidden tab skips its ticks and reads
+  // on return.
+  const { status } = usePipelineStatePoll(pipelineId)
+  const live = status === "running"
+  const loadRef = useRef(load)
+  useEffect(() => {
+    loadRef.current = load
+  }, [load])
+  useEffect(() => {
+    if (!live || typeof window === "undefined") return
+    const t = window.setInterval(() => {
+      if (!isHidden()) void loadRef.current({ background: true })
+    }, CHECKPOINTS_POLL_MS)
+    const onVisibility = () => {
+      if (!isHidden()) void loadRef.current({ background: true })
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      window.clearInterval(t)
+      document.removeEventListener("visibilitychange", onVisibility)
+    }
+  }, [live])
+
+  // The last tick lands before the run's last tables commit: read once more on
+  // the way out of running.
+  const wasLive = useRef(live)
+  useEffect(() => {
+    if (wasLive.current && !live) void loadRef.current({ background: true })
+    wasLive.current = live
+  }, [live])
+
+  // Run, Re-snapshot, Pause and Resume announce themselves on the refresh bus.
+  useEffect(
+    () =>
+      onPipelineRefresh((pid) => {
+        if (pid === pipelineId) void load()
+      }),
+    [pipelineId, load]
+  )
 
   return (
     <Card>
@@ -353,7 +399,7 @@ export function PipelineCheckpointsCard({
                 <span
                   data-testid="checkpoints-run-totals"
                   title={`The whole run's running total when a table last committed (${fmtWhen(runTotals.at)}).`}
-                  className="sm:ml-auto"
+                  className="@md:ml-auto"
                 >
                   Run total at last commit:{" "}
                   {runTotals.rows !== null && <>{exactCount.format(runTotals.rows)} rows</>}
@@ -374,7 +420,7 @@ export function PipelineCheckpointsCard({
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Filter tables…"
                   aria-label="Filter checkpoints by table name"
-                  className="h-8 w-full text-xs sm:w-64"
+                  className="h-8 w-full text-xs @md:w-64"
                 />
                 <div role="group" aria-label="Filter by table state" className="flex gap-1">
                   {(
@@ -471,7 +517,7 @@ export function PipelineCheckpointsCard({
                               className="whitespace-nowrap py-2 pr-3 text-xs text-muted-foreground"
                               title={fmtWhen(cp.updated_at)}
                             >
-                              {fmtAgo(cp.updated_at)}
+                              {formatRelativeTime(cp.updated_at)}
                             </td>
                           </tr>
                           {open && (
@@ -483,11 +529,11 @@ export function PipelineCheckpointsCard({
                                     {formatPosition(cp.position)}
                                   </span>
                                 ) : (
-                                  <dl className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-[max-content_1fr]">
+                                  <dl className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-xs @md:grid-cols-[max-content_1fr]">
                                     {positionEntries(cp.position).map(([k, v]) => (
                                       <div key={k} className="contents">
                                         <dt className="text-muted-foreground">{k}</dt>
-                                        <dd className="break-all">{v}</dd>
+                                        <dd className="wrap-anywhere">{v}</dd>
                                       </div>
                                     ))}
                                   </dl>

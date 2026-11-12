@@ -42,7 +42,6 @@ src/agents/tool_generator/discovery_routes.py
 src/agents/tool_generator/field_templates.py
 src/agents/tool_generator/harness
 src/agents/tool_generator/mock_server
-src/agents/tool_generator/prompts
 src/agents/tool_generator/service.py
 src/agents/tool_generator/tests
 src/agents/tool_generator/utils

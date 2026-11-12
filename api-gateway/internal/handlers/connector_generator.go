@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -166,14 +167,15 @@ func mcpConnectorLegacyExists(connectorName string) bool {
 // maintained in this repo that ALL tenants share on the globally-shared
 // registry. The generate endpoint must never overwrite (or plant code under)
 // these ids. When adding a new hand-curated connector, add its canonical
-// kebab-case id here (matches shared/mcp-connectors/public/**/<id>).
+// kebab-case id here (matches shared/mcp-connectors/public/**/<id>); when one is
+// deleted, drop it, or its name can never be generated
+// (TestProtectedConnectorIDsNameAConnectorOnDisk). "notion" is notion-rest's alias.
 var protectedConnectorIDs = map[string]struct{}{
 	"postgresql": {}, "mysql": {}, "oracle": {}, "sqlserver": {}, "mongodb": {},
 	"bigquery": {}, "redshift": {}, "snowflake": {}, "databricks": {}, "clickhouse": {},
 	"aws-s3": {}, "gcs": {}, "azure-blob": {},
-	"stripe": {}, "hubspot": {}, "slack": {}, "notion": {}, "pipedrive": {},
-	"github-rest": {}, "shopify-admin-graphql": {}, "linear": {},
-	"google-sheets": {}, "metabase": {},
+	"stripe": {}, "notion": {},
+	"github-rest": {}, "shopify-admin-graphql": {}, "google-sheets": {},
 	"kafka-mcp-sink": {}, "debezium": {}, "minio": {},
 }
 
@@ -183,6 +185,13 @@ var protectedConnectorIDs = map[string]struct{}{
 func isProtectedCoreConnector(id string) bool {
 	_, ok := protectedConnectorIDs[normalizeConnectorName(id)]
 	return ok
+}
+
+// hiddenNameRefusal is why a name the connector list hides (isDevOnlyConnector)
+// cannot be generated: the connector would be built, then never shown.
+func hiddenNameRefusal(name string) string {
+	return fmt.Sprintf("%s would be hidden from the connector list, which keeps test- names "+
+		"and a few others for rsync.ai's own tests. Pick another name.", name)
 }
 
 // ValidateConnectorRequest represents the request to validate a connector name
@@ -251,6 +260,10 @@ type GenerateConnectorRequest struct {
 	// spec-first GraphQL (inline introspection lacks the endpoint) and lets REST
 	// connectors target the right host. tool-generator's GenerateRequestV1.base_url.
 	BaseURL string `json:"base_url,omitempty"`
+	// Overwrite rewrites the connector's current version in place instead of writing
+	// a new one, and restarts its container (generator-trust P4a). The user's
+	// explicit choice; refused while a run uses that version (connector_overwrite.go).
+	Overwrite bool `json:"overwrite,omitempty"`
 }
 
 // GenerateConnector proxies requests to tool-generator V2 agentic pipeline
@@ -306,7 +319,7 @@ func GenerateConnector(c *gin.Context) {
 	// the discovery flow and has explicitly asked to (re)generate. Skipping
 	// here would silently throw away their work + return a stripped payload
 	// missing protocol/operation_count fields the UI needs.
-	if !req.ForceRegenerate && strings.TrimSpace(req.SessionID) == "" && mcpConnectorIsVersioned(apiName) {
+	if !req.ForceRegenerate && !req.Overwrite && strings.TrimSpace(req.SessionID) == "" && mcpConnectorIsVersioned(apiName) {
 		log.Infof("✅ Connector already exists, skipping generation: %s", apiName)
 		c.JSON(http.StatusOK, gin.H{
 			"success":        true,
@@ -327,12 +340,6 @@ func GenerateConnector(c *gin.Context) {
 	// V2 Agentic Pipeline: Always enabled with chaos engineering for self-healing
 	log.Infof("🤖 [V2 Agentic] Generating connector: %s (chaos: %v, dev: %v)",
 		apiName, req.EnableChaos, req.DeveloperMode)
-
-	// Get tool-generator URL from environment
-	toolGeneratorURL := os.Getenv("TOOL_GENERATOR_URL")
-	if toolGeneratorURL == "" {
-		toolGeneratorURL = "http://tool-generator:5010"
-	}
 
 	// Build request for V2 agentic pipeline
 	saveArtifacts := true
@@ -356,6 +363,26 @@ func GenerateConnector(c *gin.Context) {
 			"error":   "This is a built-in, maintained connector and cannot be generated or overwritten.",
 		})
 		return
+	}
+	if saveArtifacts && isDevOnlyConnector(apiName) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   hiddenNameRefusal(apiName),
+		})
+		return
+	}
+
+	if req.Overwrite {
+		if !saveArtifacts {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   "overwrite saves the connector, so it cannot be combined with dry_run or save_artifacts=false.",
+			})
+			return
+		}
+		if refuseOverwriteWhileInUse(c, apiName) {
+			return
+		}
 	}
 
 	toolGenReq := map[string]interface{}{
@@ -394,124 +421,88 @@ func GenerateConnector(c *gin.Context) {
 	if strings.TrimSpace(req.BaseURL) != "" {
 		toolGenReq["base_url"] = strings.TrimSpace(req.BaseURL)
 	}
+	if req.Overwrite {
+		toolGenReq["overwrite"] = true
+	}
 
 	log.Infof("🤖 [V2 Agentic] Generating connector: %s (force=%v, chaos=%v, session=%v)",
 		apiName, req.ForceRegenerate, req.EnableChaos, req.SessionID != "")
 
-	// Forward request to tool-generator V2 agentic pipeline
-	reqBody, _ := json.Marshal(toolGenReq)
+	// A generation that writes to the registry is recorded like an agent's,
+	// so it cannot run while the same name is being generated elsewhere and
+	// counts toward the workspace's running limit. The rate limit was already
+	// charged by ConnectorGenRateLimitMiddleware. Recording is best effort: a
+	// database error is logged and the page still gets its connector.
+	runID := ""
+	if saveArtifacts {
+		ws := activeWorkspaceID(c)
+		caller := generationCaller{actor: restActor(c, c.GetString("user_id"), ws)}
+		source := firstNonEmpty(docsURL, strings.TrimSpace(req.OpenAPISpecURL), strings.TrimSpace(req.GraphQLEndpoint))
+		run, err := admitGenerationRun(c.Request.Context(), caller, actorKindUI, apiName, source)
+		var refusal *GenerationRefusal
+		switch {
+		case errors.As(err, &refusal):
+			if refusal.RetryAfter > 0 {
+				c.Header("Retry-After", fmt.Sprintf("%d", int(refusal.RetryAfter.Seconds())))
+			}
+			c.JSON(refusal.Status, gin.H{
+				"success":        false,
+				"status":         "failed",
+				"connector_name": apiName,
+				"code":           refusal.Code,
+				"error":          refusal.Message,
+				"error_message":  refusal.Message,
+			})
+			return
+		case err != nil:
+			log.WithError(err).Warn("connector generation: could not record the run; generating anyway")
+		default:
+			runID = run.ID
+		}
+	}
+
 	reqCtx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, toolGeneratorURL+"/v1/generate", bytes.NewBuffer(reqBody))
-	if err != nil {
-		log.Errorf("❌ Failed to build tool-generator request: %v", err)
+	res := postToolGenerator(reqCtx, toolGenReq)
+	finishGenerationRun(runID, res)
+	if res.failure != "" {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success":        false,
 			"status":         "failed",
 			"connector_name": apiName,
-			"error_message":  "Failed to build connector generator request",
+			"error_message":  res.failure,
 			"error_stage":    "api_gateway",
 		})
 		return
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	// SEC-H-03: authenticate this GUARDED outbound generate call with the shared
-	// internal-service secret when configured. tool-generator gates /v1/generate on
-	// X-Internal-Secret (env INTERNAL_SERVICE_SECRET; compose sets it on api-gateway
-	// in prod). No-op when unset. The raw ToolGeneratorProxy deliberately does NOT
-	// send this header, so a proxied /v1/generate|/v1/deploy stays unauthenticated →
-	// rejected upstream (defense in depth). Mirrors backend-orchestrator
-	// server_manager.go tryDeployConnectorContainer.
-	if secret := strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_SECRET")); secret != "" {
-		httpReq.Header.Set("X-Internal-Secret", secret)
-	}
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		log.Errorf("❌ Failed to call tool-generator v2: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success":        false,
-			"status":         "failed",
-			"connector_name": apiName,
-			"error_message":  "Failed to reach connector generator service",
-			"error_stage":    "api_gateway",
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Errorf("Failed to read tool-generator response: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success":        false,
-			"status":         "failed",
-			"connector_name": apiName,
-			"error_message":  "Failed to read generator response",
-			"error_stage":    "api_gateway",
-		})
-		return
-	}
-
-	// Parse tool-generator response as a generic map so we don't drop V2 fields.
-	// Tool-generator may return V1 or V2 shapes (error_message, error_stage, workflow_stages, etc.).
-	var payload map[string]interface{}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Errorf("Failed to parse tool-generator response: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success":        false,
-			"status":         "failed",
-			"connector_name": apiName,
-			"error_message":  "Failed to parse generator response",
-			"error_stage":    "api_gateway",
-		})
-		return
-	}
+	payload := res.payload
 
 	// Ensure connector_name is always present
 	if _, ok := payload["connector_name"]; !ok {
 		payload["connector_name"] = apiName
 	}
 
-	// Determine success flag
-	success, _ := payload["success"].(bool)
-
 	// Normalize error field for UI: always provide error_message on failures
-	if !success {
-		if h, ok := llmNotConfiguredBody(resp.StatusCode, body); ok {
-			// The agentic generator needs a model; say what to set up, not the code.
-			payload["error"] = h["error"]
-			payload["error_message"] = h["message"]
-			payload["error_stage"] = llmNotConfiguredCode
-		}
-		if _, ok := payload["error_message"]; !ok {
-			// Prefer legacy 'error' then 'message'
-			if e, ok := payload["error"].(string); ok && e != "" {
-				payload["error_message"] = e
-			} else if m, ok := payload["message"].(string); ok && m != "" {
-				payload["error_message"] = m
-			} else if d := fastAPIDetail(payload["detail"]); d != "" {
-				// llm-service signals failure by raising HTTPException, whose body
-				// is {"detail": ...} and carries NEITHER "error" NOR "message"
-				// (tool_generator/deployment/routes.go:62, service.py, and every
-				// discovery route). The chain above therefore never matched a
-				// single one of them, and they all reached the wizard as the flat
-				// string "Generation failed" -- so an operator whose
-				// INTERNAL_API_SECRET was unset was told their connector had
-				// failed to generate, rather than that the service was not
-				// configured to generate it.
-				payload["error_message"] = d
-			} else {
-				payload["error_message"] = "Generation failed"
-			}
-		}
+	if success, _ := payload["success"].(bool); !success {
+		res.normalizeFailure()
 		log.Warnf("⚠️ Failed to generate connector: %s - %v", apiName, payload["error_message"])
 	} else {
 		log.Infof("✅ Successfully generated connector: %s", apiName)
+		if saveArtifacts {
+			addPinnedConnections(c, apiName, payload)
+		}
 	}
 
-	c.JSON(browserStatusForUpstream(resp.StatusCode), payload)
+	c.JSON(browserStatusForUpstream(res.status), payload)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // fastAPIDetail flattens a FastAPI error body's `detail` into a single line.
@@ -652,6 +643,7 @@ func ValidateConnector(c *gin.Context) {
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	stampLLMWorkspace(httpReq)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -828,6 +820,7 @@ func ToolGeneratorProxy(c *gin.Context) {
 		httpReq.Header.Set("Content-Type", ct)
 	}
 	httpReq.Header.Set("Accept", "application/json")
+	stampLLMWorkspace(httpReq)
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(httpReq)

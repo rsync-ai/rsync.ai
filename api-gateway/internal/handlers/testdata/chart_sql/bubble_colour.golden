@@ -1,0 +1,123 @@
+# settings: {"version":2,"type":"bubble","roles":{"x":[{"column":"amount"}],"y":[{"column":"quantity"}],"size":[{"column":"discount"}],"series":[{"column":"region"}]}}
+
+-- postgres
+SELECT r."amount" AS "amount", r."quantity" AS "quantity", r."discount" AS "discount", CASE WHEN r."rsync_rank" <= 7 THEN r."region" END AS "region", CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END AS "rsync_other", MAX(MAX(r."rsync_rank")) OVER () AS "rsync_series", COUNT(*) AS "rsync_rows"
+FROM (
+SELECT g."amount", g."quantity", g."discount", g."region", DENSE_RANK() OVER (ORDER BY g."rsync_total" DESC, g."region" ASC) AS "rsync_rank"
+FROM (
+SELECT src."amount" AS "amount", src."quantity" AS "quantity", src."discount" AS "discount", src."region" AS "region", COUNT(*) OVER (PARTITION BY src."region") AS "rsync_total"
+FROM "gold"."orders" src
+WHERE src."amount" IS NOT NULL AND src."quantity" IS NOT NULL AND src."discount" > 0 AND src."day" >= $1 AND src."day" < $2 AND src."region" IN ($3, $4)
+) g
+) r
+GROUP BY r."amount", r."quantity", r."discount", CASE WHEN r."rsync_rank" <= 7 THEN r."region" END, CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r."amount" ASC, r."quantity" ASC, r."discount" ASC, CASE WHEN r."rsync_rank" <= 7 THEN r."region" END ASC, CASE WHEN r."rsync_rank" <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- mysql
+SELECT r.`amount` AS `amount`, r.`quantity` AS `quantity`, r.`discount` AS `discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`, COUNT(*) AS `rsync_rows`
+FROM (
+SELECT g.`amount`, g.`quantity`, g.`discount`, g.`region`, DENSE_RANK() OVER (ORDER BY g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, src.`discount` AS `discount`, src.`region` AS `region`, COUNT(*) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`discount` > 0 AND src.`day` >= ? AND src.`day` < ? AND src.`region` IN (?, ?)
+) g
+) r
+GROUP BY r.`amount`, r.`quantity`, r.`discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r.`amount` ASC, r.`quantity` ASC, r.`discount` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- sqlserver
+SELECT TOP (10001) r.[amount] AS [amount], r.[quantity] AS [quantity], r.[discount] AS [discount], CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END AS [region], CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END AS [rsync_other], MAX(MAX(r.[rsync_rank])) OVER () AS [rsync_series], COUNT_BIG(*) AS [rsync_rows]
+FROM (
+SELECT g.[amount], g.[quantity], g.[discount], g.[region], DENSE_RANK() OVER (ORDER BY g.[rsync_total] DESC, g.[region] ASC) AS [rsync_rank]
+FROM (
+SELECT src.[amount] AS [amount], src.[quantity] AS [quantity], src.[discount] AS [discount], src.[region] AS [region], COUNT_BIG(*) OVER (PARTITION BY src.[region]) AS [rsync_total]
+FROM [gold].[orders] src
+WHERE src.[amount] IS NOT NULL AND src.[quantity] IS NOT NULL AND src.[discount] > 0 AND src.[day] >= @p1 AND src.[day] < @p2 AND src.[region] IN (@p3, @p4)
+) g
+) r
+GROUP BY r.[amount], r.[quantity], r.[discount], CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END, CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT_BIG(*) DESC, r.[amount] ASC, r.[quantity] ASC, r.[discount] ASC, CASE WHEN r.[rsync_rank] <= 7 THEN r.[region] END ASC, CASE WHEN r.[rsync_rank] <= 7 THEN 0 ELSE 1 END ASC
+-- args: ["2026-10-01" "2026-10-06" "US" "EU'); DROP TABLE orders; --"]
+
+-- bigquery
+SELECT r.`amount` AS `amount`, r.`quantity` AS `quantity`, r.`discount` AS `discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`, COUNT(*) AS `rsync_rows`
+FROM (
+SELECT g.`amount`, g.`quantity`, g.`discount`, g.`region`, DENSE_RANK() OVER (ORDER BY g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, src.`discount` AS `discount`, src.`region` AS `region`, COUNT(*) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`discount` > 0
+) g
+) r
+GROUP BY r.`amount`, r.`quantity`, r.`discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r.`amount` ASC, r.`quantity` ASC, r.`discount` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- snowflake
+SELECT r."AMOUNT" AS "AMOUNT", r."QUANTITY" AS "QUANTITY", r."DISCOUNT" AS "DISCOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END AS "REGION", CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END AS "RSYNC_OTHER", MAX(MAX(r."RSYNC_RANK")) OVER () AS "RSYNC_SERIES", COUNT(*) AS "RSYNC_ROWS"
+FROM (
+SELECT g."AMOUNT", g."QUANTITY", g."DISCOUNT", g."REGION", DENSE_RANK() OVER (ORDER BY g."RSYNC_TOTAL" DESC, g."REGION" ASC) AS "RSYNC_RANK"
+FROM (
+SELECT src."AMOUNT" AS "AMOUNT", src."QUANTITY" AS "QUANTITY", src."DISCOUNT" AS "DISCOUNT", src."REGION" AS "REGION", COUNT(*) OVER (PARTITION BY src."REGION") AS "RSYNC_TOTAL"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL AND src."QUANTITY" IS NOT NULL AND src."DISCOUNT" > 0
+) g
+) r
+GROUP BY r."AMOUNT", r."QUANTITY", r."DISCOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r."AMOUNT" ASC, r."QUANTITY" ASC, r."DISCOUNT" ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- databricks
+SELECT r.`amount` AS `amount`, r.`quantity` AS `quantity`, r.`discount` AS `discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`, COUNT(*) AS `rsync_rows`
+FROM (
+SELECT g.`amount`, g.`quantity`, g.`discount`, g.`region`, DENSE_RANK() OVER (ORDER BY g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, src.`discount` AS `discount`, src.`region` AS `region`, COUNT(*) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`discount` > 0 AND src.`day` >= :p1 AND src.`day` < :p2 AND src.`region` IN (:p3, :p4)
+) g
+) r
+GROUP BY r.`amount`, r.`quantity`, r.`discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r.`amount` ASC, r.`quantity` ASC, r.`discount` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- param p1 STRING: "2026-10-01"
+-- param p2 STRING: "2026-10-06"
+-- param p3 STRING: "US"
+-- param p4 STRING: "EU'); DROP TABLE orders; --"
+
+-- clickhouse
+SELECT r.`amount` AS `amount`, r.`quantity` AS `quantity`, r.`discount` AS `discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END AS `region`, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END AS `rsync_other`, MAX(MAX(r.`rsync_rank`)) OVER () AS `rsync_series`, COUNT(*) AS `rsync_rows`
+FROM (
+SELECT g.`amount`, g.`quantity`, g.`discount`, g.`region`, DENSE_RANK() OVER (ORDER BY g.`rsync_total` DESC, g.`region` ASC) AS `rsync_rank`
+FROM (
+SELECT src.`amount` AS `amount`, src.`quantity` AS `quantity`, src.`discount` AS `discount`, src.`region` AS `region`, COUNT(*) OVER (PARTITION BY src.`region`) AS `rsync_total`
+FROM `gold`.`orders` src
+WHERE src.`amount` IS NOT NULL AND src.`quantity` IS NOT NULL AND src.`discount` > 0
+) g
+) r
+GROUP BY r.`amount`, r.`quantity`, r.`discount`, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r.`amount` ASC, r.`quantity` ASC, r.`discount` ASC, CASE WHEN r.`rsync_rank` <= 7 THEN r.`region` END ASC, CASE WHEN r.`rsync_rank` <= 7 THEN 0 ELSE 1 END ASC
+LIMIT 10001
+-- unfiltered: day, region
+
+-- oracle
+SELECT r."AMOUNT" AS "AMOUNT", r."QUANTITY" AS "QUANTITY", r."DISCOUNT" AS "DISCOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END AS "REGION", CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END AS "RSYNC_OTHER", MAX(MAX(r."RSYNC_RANK")) OVER () AS "RSYNC_SERIES", COUNT(*) AS "RSYNC_ROWS"
+FROM (
+SELECT g."AMOUNT", g."QUANTITY", g."DISCOUNT", g."REGION", DENSE_RANK() OVER (ORDER BY g."RSYNC_TOTAL" DESC, g."REGION" ASC) AS "RSYNC_RANK"
+FROM (
+SELECT src."AMOUNT" AS "AMOUNT", src."QUANTITY" AS "QUANTITY", src."DISCOUNT" AS "DISCOUNT", src."REGION" AS "REGION", COUNT(*) OVER (PARTITION BY src."REGION") AS "RSYNC_TOTAL"
+FROM "GOLD"."ORDERS" src
+WHERE src."AMOUNT" IS NOT NULL AND src."QUANTITY" IS NOT NULL AND src."DISCOUNT" > 0
+) g
+) r
+GROUP BY r."AMOUNT", r."QUANTITY", r."DISCOUNT", CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END
+ORDER BY COUNT(*) DESC, r."AMOUNT" ASC, r."QUANTITY" ASC, r."DISCOUNT" ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN r."REGION" END ASC, CASE WHEN r."RSYNC_RANK" <= 7 THEN 0 ELSE 1 END ASC
+FETCH FIRST 10001 ROWS ONLY
+-- unfiltered: day, region

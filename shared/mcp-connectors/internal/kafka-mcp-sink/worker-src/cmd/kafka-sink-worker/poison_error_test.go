@@ -63,7 +63,7 @@ func TestKeylessCDCDeleteIsPoisonNotFatal(t *testing.T) {
 	// pgDB=nil and httpClient=nil: the poison return fires before any DB/network
 	// call, so no infrastructure is needed to exercise it.
 	commit, err := processCDCEvent(
-		context.Background(), hw, nil, nil, cfg, nil, nil, nil, msg, sm, metrics,
+		context.Background(), newCommitGate(nil, hw), nil, nil, cfg, nil, nil, nil, msg, sm, metrics,
 		&im, &um, &dm, &bm, time.Hour,
 	)
 

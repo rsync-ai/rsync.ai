@@ -36,13 +36,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.utils import kafka_security  # noqa: E402
-from src.utils.kafka_security import (  # noqa: E402
+from src.utils.kafka_security import (
     MECHANISM_OAUTHBEARER,
     OAUTHBEARER_LOGIN_CALLBACK_HANDLER,
     KafkaSecurityError,
     _jaas_config,
     debezium_schema_history_security,
-    describe,
     kafka_security_kwargs,
     parse_sasl_extensions,
 )
@@ -217,14 +216,6 @@ def test_username_and_password_are_accepted_as_id_and_secret(monkeypatch):
     monkeypatch.setenv("KAFKA_SASL_USERNAME", "cid")
     monkeypatch.setenv("KAFKA_SASL_PASSWORD", "s3cr3t")
     assert kafka_security_kwargs()["sasl_oauth_token_provider"] is not None
-
-
-def test_describe_never_prints_the_secret(monkeypatch):
-    _configure(monkeypatch)
-    line = describe()
-    assert "s3cr3t" not in line
-    assert "[redacted]" in line
-    assert "cid" in line          # the id is not a secret and aids diagnosis
 
 
 # --------------------------------------------------------------------------

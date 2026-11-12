@@ -7,7 +7,6 @@
 
 import type { 
   ExecutionState, 
-  StageStatus, 
   StageExecution, 
   StageAttempt,
   HITLState,
@@ -19,6 +18,7 @@ import {
   calculateDerivedProgress,
 } from './stageDefinitions'
 import type { NormalizedEvent } from './eventNormalizer'
+import { formatAgeMs } from '@/lib/utils'
 
 /**
  * Complete pipeline UI state
@@ -368,9 +368,5 @@ export function selectIsLoading(state: PipelineUIState): boolean {
 }
 
 export function selectLastUpdate(state: PipelineUIState): string {
-  const seconds = Math.floor((Date.now() - state.metadata.lastUpdate) / 1000)
-  
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  return `${Math.floor(seconds / 3600)}h ago`
+  return formatAgeMs(Date.now() - state.metadata.lastUpdate, { seconds: true })
 }

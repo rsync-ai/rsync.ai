@@ -96,6 +96,8 @@ func maskFixtureRows() []Row {
 }
 
 func TestMaskPII_TopLevelBackCompat_ByteIdentical(t *testing.T) {
+	// The HMAC case needs a key, or the new path refuses it (KI-PII-HASH-KEY-UNSET).
+	setPIIHashKeyForTest(t, "back-compat-key")
 	e := NewSimpleTransformEngine()
 	configs := []map[string]interface{}{
 		{"column": "email"},

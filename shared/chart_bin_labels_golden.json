@@ -1,0 +1,23 @@
+{
+  "_comment": "A histogram bin's label, as the browser (saved-chart.ts binLabel) and a workflow's message (workflow_chart_step.go chartBinLabel) both write it. saved-chart.test.ts and workflow_chart_step_test.go read these same cases, so the two cannot drift apart. An edge keeps the bin width's decimals, to at most the width's third significant digit, and is grouped in thousands: automatic bins are (max − min) / 20 wide, so their edges were written unrounded (KI-CHART-HISTOGRAM-BIN-LABELS-UNROUNDED).",
+  "cases": [
+    { "lo": 0, "width": 10, "label": "0–10" },
+    { "lo": 0.1, "width": 0.2, "label": "0.1–0.3" },
+    { "lo": -2.5, "width": 2.5, "label": "-2.5–0" },
+    { "lo": 5, "width": 0, "label": "5" },
+    { "lo": 1234567.891, "width": 0.001, "label": "1,234,567.891–1,234,567.892" },
+    { "lo": 0.123456789012, "width": 0, "label": "0.123456789" },
+    { "lo": 1e-7, "width": 1e-7, "label": "0.0000001–0.0000002" },
+    { "lo": 1.5e-8, "width": 0, "label": "0.000000015" },
+    { "lo": 1e21, "width": 1e21, "label": "1,000,000,000,000,000,000,000–2,000,000,000,000,000,000,000" },
+    { "lo": 1.5e22, "width": 0, "label": "15,000,000,000,000,000,000,000" },
+    { "lo": 2.4, "width": 8072.2165, "label": "2–8,075" },
+    { "lo": 8074.6165, "width": 8072.2165, "label": "8,075–16,147" },
+    { "lo": 0, "width": 1.25, "label": "0–1.25" },
+    { "lo": 1.25, "width": 1.25, "label": "1.25–2.5" },
+    { "lo": 0.375, "width": 0.125, "label": "0.375–0.5" },
+    { "lo": 0.0123, "width": 0.09996, "label": "0.0123–0.1123" },
+    { "lo": -3.3, "width": 0.45, "label": "-3.3–-2.85" },
+    { "lo": -2.5, "width": 2.4999999999, "label": "-2.5–0" }
+  ]
+}

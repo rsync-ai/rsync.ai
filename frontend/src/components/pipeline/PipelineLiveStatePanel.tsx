@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
-import { AlertTriangle, ExternalLink, Loader2, RefreshCw, StopCircle, Activity } from "lucide-react"
+import { AlertTriangle, ExternalLink, Loader2, RefreshCw, Activity } from "lucide-react"
 import { toast } from "sonner"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch, authFetchOrThrow } from "@/lib/api/auth-fetch"
@@ -32,28 +32,31 @@ import {
 import { HITLPanel } from "@/components/pipeline/HITLPanel"
 import { PipelineTableSelector, normalizeSuggestedTables } from "@/components/pipeline/PipelineTableSelector"
 import { PipelineConnectionSelector } from "@/components/pipeline/PipelineConnectionSelector"
-import { GenericHitlForm, UNSUPPORTED_HITL_TITLE, UNSUPPORTED_HITL_DETAIL } from "@/components/chat/GenericHitlForm"
-import { resumePipelineConnectors, resumePipelineNodeInput, resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
+import { parseConnectionRequirements } from "@/lib/pipeline/connectionRequirements"
+import { GenericHitlForm, UnsupportedHitlNotice } from "@/components/chat/GenericHitlForm"
+import { ResumePausedRun } from "@/components/pipeline/ResumePausedRun"
+import { PAUSED_BY_USER } from "@/lib/pipeline/chatHitlAction"
+import {
+  isStaleHITLAnswer,
+  resumePipelineConnectors,
+  resumePipelineNodeInput,
+  resumePipelineTables,
+  type DestinationConfig,
+} from "@/lib/api/pipelines"
+import { notifyStaleHITLAnswer } from "@/lib/pipeline/staleHitlAnswer"
 import { getPipeline } from "@/lib/api/pipelines"
+import { SuggestionsReviewDialog } from "@/components/chat/SuggestionsReviewDialog"
+import { usePipelineTransformStep } from "@/lib/hooks/usePipelineTransformStep"
+import { transformsReviewTables } from "@/lib/pipeline/transformStep"
 import type { PipelineStateResponse, BlockingReasonDetails } from "@/lib/api/types"
 
-type HitlKind = "table_selection" | "connection_config" | "connector_generation" | "policy_approval" | "generic"
-
-/**
- * Shown when a run is parked on a request this build has no UI for. The raw
- * blocking type is printed because it is the one fact this build genuinely has,
- * and it is what an operator needs to quote in a bug report.
- */
-export function UnsupportedHitlNotice({ blockingType }: { blockingType?: string }) {
-  const t = String(blockingType || "").trim()
-  return (
-    <div role="alert" className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-100">
-      <div className="font-medium">{UNSUPPORTED_HITL_TITLE}</div>
-      <div className="mt-1">{UNSUPPORTED_HITL_DETAIL}</div>
-      {t ? <div className="mt-1 font-mono text-xs">{t}</div> : null}
-    </div>
-  )
-}
+type HitlKind =
+  | "table_selection"
+  | "connection_config"
+  | "connector_generation"
+  | "policy_approval"
+  | "paused_by_user"
+  | "generic"
 
 type PipelineRunEvent = {
   pipeline_id: string
@@ -162,20 +165,55 @@ function stageTries(points: StageTransitionPoint[]): number {
   return tries
 }
 
+/**
+ * The events of the run in state. The events read is the pipeline's latest,
+ * every run's, so a reader that takes them whole shows an earlier run's answer
+ * as this run's (KI-BATCH-UI-STALE-AFTER-RUN). A stream that names no run at
+ * all is read whole.
+ */
+function eventsOfRun(rawEvents: PipelineRunEvent[], executionId?: string): PipelineRunEvent[] {
+  const execId = (executionId || "").trim()
+  if (!execId || !rawEvents.some((e) => String(e.execution_id || "").trim() !== "")) return rawEvents
+  return rawEvents.filter((e) => String(e.execution_id || "").trim() === execId)
+}
+
+/**
+ * The newest blocking_reason the run in state carried: the card that asks which
+ * connection failed or which tables to pick. Every run's reason counted once, so
+ * a new run showed the one an earlier run had blocked on (inbox 2026-10-05).
+ */
+export function latestBlockingReason(
+  rawEvents: PipelineRunEvent[],
+  executionId?: string
+): BlockingReasonDetails | null {
+  if (!rawEvents || rawEvents.length === 0) return null
+  const events = eventsOfRun(rawEvents, executionId)
+  let best: BlockingReasonDetails | null = null
+  let bestTs = 0
+  for (const e of events) {
+    const p = e.payload
+    const br = p?.["blocking_reason"]
+    if (!br || typeof br !== "object") continue
+    const t = new Date(String(e.occurred_at || e.received_at || "")).getTime()
+    const ts = Number.isFinite(t) ? t : 0
+    if (ts >= bestTs) {
+      bestTs = ts
+      best = br as BlockingReasonDetails
+    }
+  }
+  return best
+}
+
 export function buildAgenticStagesFromEvents(
   rawEvents: PipelineRunEvent[],
   state: PipelineStateResponse | null
 ): StageExecution[] {
   if (!rawEvents || rawEvents.length === 0) return []
 
-  const execId = (state?.execution_id || "").trim()
-
-  // Filter to current execution where possible
-  let events = rawEvents
-  if (execId) {
-    const filtered = rawEvents.filter((e) => String(e.execution_id || "").trim() === execId)
-    if (filtered.length > 0) events = filtered
-  }
+  // Only the run in state counts: a run that has not reported yet has no stages
+  // here, instead of the previous run's finished ones ("step 7/7" on a run that
+  // had just started).
+  let events = eventsOfRun(rawEvents, state?.execution_id)
 
   // Exclude DAG node-level events (we show those in Steps/DAG tab)
   events = events.filter((e) => {
@@ -664,18 +702,6 @@ export function terminalStageLine(
   return namesAStage ? `Stopped during: ${stageLabel}` : "Stopped"
 }
 
-/**
- * The step the Overview's stage timeline shows, from the run's events and
- * state, for a header that has no timeline of its own. The Monitoring header
- * read `state.progress` instead and said "Step 1/1" beside an Overview that
- * said "Step 2/2".
- */
-export function stepInfoFromEvents(events: PipelineRunEvent[], state: PipelineStateResponse | null): StepInfo | null {
-  const agentic = buildAgenticStagesFromEvents(events, state)
-  const stages = agentic.length > 0 ? agentic : buildStagesFromExecutionPlan(state)
-  return deriveStepInfo(stages, resolveCurrentStageKey(state), normalizePipelineStatus(state?.status))
-}
-
 /** A reported count is usable only when it is a finite positive integer. */
 function toCount(n?: number): number | undefined {
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined
@@ -765,6 +791,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
   // from the pipeline's seeded destination_config; the user can edit before first write.
   const [destinationConfig, setDestinationConfig] = useState<DestinationConfig | null>(null)
   const [destinationType, setDestinationType] = useState<string | undefined>(undefined)
+  // The pipeline's source connection, for the transform step: undefined while the
+  // pipeline loads, "" when it has none.
+  const [sourceConnectionId, setSourceConnectionId] = useState<string | undefined>(undefined)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [events, setEvents] = useState<PipelineRunEvent[]>([])
@@ -830,6 +859,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
             ? p.config.nodes.find((n) => n.type === "destination")
             : undefined
           setDestinationType(p.destination_connection?.connector_type || destNode?.connector || undefined)
+          setSourceConnectionId(String(p.source_connection_id || "").trim())
         }
         const selected: string[] =
           (Array.isArray(p.selected_tables) ? p.selected_tables : []) ||
@@ -840,6 +870,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
         if (!cancelled) setPersistedSelectedTables(normalized)
       } catch {
         // best-effort; selector still works without prefills
+        if (!cancelled) setSourceConnectionId((prev) => prev ?? "")
       }
     }
     void run()
@@ -1113,23 +1144,10 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     return `__terminal__${normalized}`
   }, [pipelineTerminal.isTerminal, pipelineTerminal.status, currentStageKey])
 
-  const blockingReasonFromEvents = useMemo((): BlockingReasonDetails | null => {
-    if (!events || events.length === 0) return null
-    let best: BlockingReasonDetails | null = null
-    let bestTs = 0
-    for (const e of events) {
-      const p = e.payload
-      const br = p?.["blocking_reason"]
-      if (!br || typeof br !== "object") continue
-      const t = new Date(String(e.occurred_at || e.received_at || "")).getTime()
-      const ts = Number.isFinite(t) ? t : 0
-      if (ts >= bestTs) {
-        bestTs = ts
-        best = br as BlockingReasonDetails
-      }
-    }
-    return best
-  }, [events])
+  const blockingReasonFromEvents = useMemo(
+    () => latestBlockingReason(events, state?.execution_id),
+    [events, state?.execution_id]
+  )
 
   const blockingDetails = useMemo((): BlockingReasonDetails | null => {
     const d = state?.blocking_reason?.details
@@ -1192,6 +1210,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     if (state?.status !== "waiting_for_user") return null
     const t = String(state?.blocking_reason?.type || "").toLowerCase()
     const widget = String(blockingDetails?.ui_hints?.widget || "").toLowerCase()
+
+    // The user's own pause: the run waits for Resume, not for an answer.
+    if (t === PAUSED_BY_USER) return "paused_by_user"
 
     const hasTables =
       availableTables.length > 0 ||
@@ -1283,6 +1304,31 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     return state?.status === "waiting_for_user" && hitlKind === "generic"
   }, [state?.status, hitlKind])
 
+  // Tables already chosen, paused only for the transform step (review_transforms_only).
+  const reviewTables = useMemo(
+    () => (needsTables ? transformsReviewTables(blockingDetails as Record<string, unknown> | null) : null),
+    [needsTables, blockingDetails]
+  )
+
+  // Picker → transform step → resume, as in chat; the step resumes the run itself.
+  const transformStep = usePipelineTransformStep({
+    pipelineId,
+    executionId: state?.execution_id,
+    nodeId: isNodeInputHitl ? tableHitlNodeId : undefined,
+    sourceConnectionId,
+    onResumed: () => void fetchState(),
+  })
+
+  // A review-only pause opens the step on its tables; the picker when there is
+  // no step to show (no source connection).
+  const startTransformStep = transformStep.start
+  const openReview = useCallback(
+    (tables: string[]) => {
+      if (!startTransformStep(tables)) setShowTableModal(true)
+    },
+    [startTransformStep]
+  )
+
   // Auto-open table selector when required (and keep a manual button too).
   useEffect(() => {
     const key = `${state?.execution_id || ""}:${state?.current_stage || ""}:${state?.blocking_reason?.type || ""}`
@@ -1292,7 +1338,13 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     if (autoOpenedKeyRef.current === key) return
 
     if (needsTables) {
-      setShowTableModal(true)
+      if (reviewTables) {
+        // Wait for the pipeline's source connection before choosing step or picker.
+        if (sourceConnectionId === undefined) return
+        openReview(reviewTables)
+      } else {
+        setShowTableModal(true)
+      }
       autoOpenedKeyRef.current = key
       return
     }
@@ -1302,7 +1354,16 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       autoOpenedKeyRef.current = key
       return
     }
-  }, [needsTables, needsConnections, state?.execution_id, state?.current_stage, state?.blocking_reason?.type])
+  }, [
+    needsTables,
+    needsConnections,
+    reviewTables,
+    sourceConnectionId,
+    openReview,
+    state?.execution_id,
+    state?.current_stage,
+    state?.blocking_reason?.type,
+  ])
 
   const hitl: HITLState | null = useMemo(() => {
     if (state?.status !== "waiting_for_user" || !state?.blocking_reason) return null
@@ -1322,47 +1383,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     }
   }, [state?.status, state?.blocking_reason, state?.current_stage, state?.progress?.stage, state?.message, state?.execution_id, blockingDetails, pipelineId])
 
-  const connectionRequirements = useMemo(() => {
-    const missing = Array.isArray(blockingDetails?.missing_connections) ? blockingDetails.missing_connections : []
-    // Backend payloads vary by producer:
-    // - Temporal workflow emits { source_type, destination_type, missing_connections: [{type, direction}] }
-    // - Legacy/orchestrator worker emits { source_connector, destination_connector, missing_connections: [{connector_type, direction}] }
-    let sourceType = String(
-      blockingDetails?.source_type || blockingDetails?.source_connector || blockingDetails?.required_connectors?.source || ""
-    )
-    let destType = String(
-      blockingDetails?.destination_type ||
-        blockingDetails?.destination_connector ||
-        blockingDetails?.required_connectors?.destination ||
-        ""
-    )
-
-    // `missing_connections` lists ONLY unresolved directions; an already-resolved
-    // + auto-assigned direction is intentionally absent. Track which directions
-    // are present so we don't render a bogus "Source: Unknown" picker for a side
-    // the backend already wired up.
-    const dirs: ("source" | "destination")[] = []
-    for (const m of missing) {
-      const dir = String(m?.direction || "").toLowerCase()
-      const typ = String(m?.type || m?.connector_type || "")
-      if (dir === "source") {
-        if (!dirs.includes("source")) dirs.push("source")
-        if (typ && !sourceType) sourceType = typ
-      } else if (dir === "destination") {
-        if (!dirs.includes("destination")) dirs.push("destination")
-        if (typ && !destType) destType = typ
-      }
-    }
-    const missingDirs = dirs.length > 0 ? dirs : undefined
-    const needsSource = !missingDirs || missingDirs.includes("source")
-    const needsDest = !missingDirs || missingDirs.includes("destination")
-
-    return {
-      source: { connector_type: sourceType || (needsSource ? "unknown" : "") },
-      destination: { connector_type: destType || (needsDest ? "unknown" : "") },
-      missing: missingDirs,
-    }
-  }, [blockingDetails])
+  // Shared with the chat (useHITLState): which directions to pick, and for a run
+  // that stopped on a missing setting, which connection and setting to fix.
+  const connectionRequirements = useMemo(() => parseConnectionRequirements(blockingDetails), [blockingDetails])
 
   const connectionSuggestions = useMemo(() => {
     return Array.isArray(blockingDetails?.suggestions) ? blockingDetails.suggestions : []
@@ -1393,6 +1416,10 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       .map((m) => ({
         direction: String((m as Record<string, unknown>)?.["direction"] || "").toLowerCase() || "unknown",
         connector_type: String((m as Record<string, unknown>)?.["connector_type"] || (m as Record<string, unknown>)?.["type"] || "").trim() || "unknown",
+        missing_fields: (Array.isArray((m as Record<string, unknown>)?.["missing_fields"])
+          ? ((m as Record<string, unknown>)["missing_fields"] as unknown[])
+          : []
+        ).map((f) => String(f)),
       }))
       .filter((m) => m.direction && m.connector_type)
   }, [blockingDetails])
@@ -1427,6 +1454,12 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       })
       await fetchState()
     } catch (e: any) {
+      if (isStaleHITLAnswer(e)) {
+        // Answered in another tab, or the run ended: refresh rather than report an error.
+        notifyStaleHITLAnswer(e)
+        void fetchState()
+        return
+      }
       setConnectorError(String(e?.message || e || "Failed to resume pipeline"))
     } finally {
       setConnectorSubmitting(false)
@@ -1504,6 +1537,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
             <CardDescription>
               {state?.execution_id ? (
                 <>
+                  {/* Past the hand-off this is the run that set the stream up; the
+                      gateway reports it running with live_stream, so it reads as the
+                      stream's run everywhere, and the badge says "streaming". */}
                   Execution{" "}
                   <Link className="underline" href={`/executions/${state.execution_id}`}>
                     {state.execution_id.slice(0, 8)}
@@ -1532,12 +1568,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
               <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
               Refresh
             </Button>
-            {(cancelRecommended || state?.status === "processing") && (
-              <Button variant="outline" size="sm" onClick={stopPipeline}>
-                <StopCircle className="h-4 w-4 mr-2" />
-                Stop
-              </Button>
-            )}
+            {/* No Stop here: the page header's actions stop the pipeline. The
+                stuck-run callout below keeps its Stop, next to the reason. */}
           </div>
         </div>
 
@@ -1559,7 +1591,11 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
             </Badge>
           ) : (
             <Badge variant="outline">
-              {statusEscalated ? reconciledStatus : state?.status || (loading ? "loading" : "unknown")}
+              {statusEscalated
+                ? reconciledStatus
+                : isStreamingCdc
+                  ? "streaming"
+                  : state?.status || (loading ? "loading" : "unknown")}
             </Badge>
           )}
           {isStale && !isStreamingCdc ? (
@@ -1610,9 +1646,15 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
                   </div>
                 ) : null}
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" onClick={() => setShowTableModal(true)}>
-                    Select tables
-                  </Button>
+                  {reviewTables ? (
+                    <Button size="sm" onClick={() => openReview(reviewTables)}>
+                      Review transforms
+                    </Button>
+                  ) : (
+                    <Button size="sm" onClick={() => setShowTableModal(true)}>
+                      Select tables
+                    </Button>
+                  )}
                 </div>
               </div>
             ) : needsConnections ? (
@@ -1691,6 +1733,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
                   </Button>
                 </div>
               </div>
+            ) : hitlKind === "paused_by_user" ? (
+              <ResumePausedRun pipelineId={pipelineId} onResumed={() => void fetchState()} />
             ) : needsGenericHitl ? (
               <div className="space-y-3">
                 <div className="text-sm text-zinc-700 dark:text-zinc-300">
@@ -1798,6 +1842,11 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
                         <li key={`${m.direction}-${m.connector_type}-${idx}`}>
                           <span className="font-medium">{m.direction}:</span>{" "}
                           <span className="font-mono text-xs">{m.connector_type}</span>
+                          {m.missing_fields.length > 0 ? (
+                            <>
+                              {" "}— set <span className="font-mono text-xs">{m.missing_fields.join(", ")}</span>
+                            </>
+                          ) : null}
                         </li>
                       ))}
                     </ul>
@@ -1903,6 +1952,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
           onClose={() => setShowTableModal(false)}
           onResolved={() => fetchState()}
           onTablesSelected={async (tables, destCfg) => {
+            // The transform step resumes the run once it is applied or skipped.
+            if (transformStep.start(tables, destCfg)) return
             const execId = state?.execution_id
             if (isNodeInputHitl && tableHitlNodeId) {
               await resumePipelineNodeInput(pipelineId, {
@@ -1936,6 +1987,10 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
           destinationConfig={destinationConfig}
           destinationType={destinationType}
         />
+
+        {transformStep.dialogProps ? (
+          <SuggestionsReviewDialog {...transformStep.dialogProps} destinationType={destinationType} />
+        ) : null}
 
         <PipelineConnectionSelector
           isOpen={showConnectionsModal}

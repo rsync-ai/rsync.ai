@@ -1,9 +1,8 @@
 "use client"
 
-import { useEffect, useState } from "react"
 import Link from "next/link"
 import { AlertTriangle, HelpCircle } from "lucide-react"
-import { listSchemaChanges } from "@/lib/api/schema-changes"
+import { usePipelineSchemaChanges } from "@/lib/hooks/usePipelineSchemaChanges"
 import { cn } from "@/lib/utils"
 
 /**
@@ -13,35 +12,15 @@ import { cn } from "@/lib/utils"
  * This is the discoverability path that complements the healer's notification.
  */
 export function SchemaDriftBadge({ pipelineId, className }: { pipelineId: string; className?: string }) {
-  const [pending, setPending] = useState(0)
+  // Shared with the Steps tab's panel: one read for both, and an approval there
+  // clears this pill at once.
+  const { changes } = usePipelineSchemaChanges(pipelineId)
+  const pending = changes?.filter((c) => c.status === "pending").length ?? 0
   // Rendering nothing is this badge's encoding for "no drift awaits approval".
   // A read that never succeeded must not borrow those pixels — that is the
-  // answer that stops the operator from looking.
-  const [neverLoaded, setNeverLoaded] = useState(true)
-
-  useEffect(() => {
-    let cancelled = false
-
-    const fetchPending = async () => {
-      try {
-        const changes = await listSchemaChanges(pipelineId)
-        if (!cancelled) {
-          setPending(changes.filter((c) => c.status === "pending").length)
-          setNeverLoaded(false)
-        }
-      } catch {
-        // Keep the last known count if we ever had one; `neverLoaded` stays
-        // true only while we have never had an answer at all.
-      }
-    }
-
-    void fetchPending()
-    const interval = window.setInterval(fetchPending, 30_000)
-    return () => {
-      cancelled = true
-      window.clearInterval(interval)
-    }
-  }, [pipelineId])
+  // answer that stops the operator from looking. A failed read after a good one
+  // keeps the last known count.
+  const neverLoaded = changes === null
 
   if (neverLoaded) {
     // Muted, not amber: this is "we could not check", which must not look like

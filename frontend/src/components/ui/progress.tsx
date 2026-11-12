@@ -6,10 +6,12 @@ import { cn } from "@/lib/utils"
 interface ProgressProps extends React.HTMLAttributes<HTMLDivElement> {
   value?: number
   max?: number
+  /** The filled part's colour, when the default violet would not say enough. */
+  indicatorClassName?: string
 }
 
 const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
-  ({ className, value = 0, max = 100, ...props }, ref) => {
+  ({ className, value = 0, max = 100, indicatorClassName, ...props }, ref) => {
     const percentage = Math.min(Math.max((value / max) * 100, 0), 100)
 
     return (
@@ -26,7 +28,10 @@ const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
         {...props}
       >
         <div
-          className="h-full bg-gradient-to-r from-violet-600 to-indigo-600 transition-all duration-300 ease-out"
+          className={cn(
+            "h-full bg-gradient-to-r from-violet-600 to-indigo-600 transition-all duration-300 ease-out",
+            indicatorClassName
+          )}
           style={{ width: `${percentage}%` }}
         />
       </div>

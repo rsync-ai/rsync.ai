@@ -58,7 +58,25 @@
       "access_token": {"type": "string", "description": "Databricks Personal Access Token (PAT)", "secret": true},
       "catalog": {"type": "string", "description": "Unity Catalog catalog (defaults to the warehouse's default catalog)"},
       "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "default"},
-      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30}
+      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["server_hostname", "http_path", "access_token"]
   },
@@ -70,7 +88,25 @@
       "access_token": {"type": "string", "description": "Databricks Personal Access Token (PAT)", "secret": true},
       "catalog": {"type": "string", "description": "Unity Catalog catalog (defaults to the warehouse's default catalog)"},
       "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "default"},
-      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30}
+      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30},
+      "batch_max_rows": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most changed rows written in one batch, a whole number from 1 to 1000000. Leave blank for 10000. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_max_mb": {
+        "type": "integer",
+        "description": "Destination only (CDC): the most data written in one batch, in whole MB from 1 to 1024. Leave blank for 32. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "batch_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as one MERGE per table, in whole seconds from 1 to 240. Leave blank for 60. Any other value stops the pipeline from starting. Batch (non-CDC) loads are not affected.",
+        "applies": "destination",
+        "ui_tier": "advanced"
+      }
     },
     "required": ["server_hostname", "http_path", "access_token"]
   },

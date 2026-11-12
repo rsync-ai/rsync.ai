@@ -13,7 +13,9 @@ Generate secrets with: `openssl rand -base64 32`
 | `JWT_SECRET` | **Yes** | Signs JWT authentication tokens |
 | `INTERNAL_SERVICE_SECRET` | **Yes** | Shared secret authenticating service-to-service calls (api-gateway → orchestrator: connection tests, OAuth refresh; temporal-adapter → api-gateway: scheduled saved-query runs and the model freshness sweep). Must be non-empty and identical across api-gateway, orchestrator, temporal-adapter and frontend — if empty, the api-gateway answers every `/api/v1/internal/...` call with 503 (401 when it is only spaces), the temporal-adapter's scheduled runs fail on every attempt, and the orchestrator (`ENVIRONMENT=production`) fails `requirePrincipal` closed so internal calls return 401. Each of the four services logs an ERROR at startup when it is empty (see [Startup checks](#startup-checks)). Generate with `openssl rand -hex 32`. |
 
-Store all three in AWS Secrets Manager or equivalent. Rotation of `ENCRYPTION_KEY`/`JWT_SECRET` requires re-encrypting all stored connector credentials; rotating `INTERNAL_SERVICE_SECRET` requires recreating api-gateway, orchestrator, temporal-adapter and frontend together (a mismatch 401s in-flight internal calls).
+| `RSYNC_PII_HASH_SALT` | Only for `hmac_sha256` mask rules | The PII hash key: keys `hmac_sha256` mask rules and salts `sha256`/`md5` mask hashes. Without it a rule hashing with `hmac_sha256` is refused when saved and when run, and api-gateway, orchestrator and kafka-mcp-sink each log a `Startup check:` WARN. Must be identical across those three. **Never rotate it:** a new value changes every `sha256`/`md5`/`hmac_sha256` digest written from then on. `install.sh` and `install-k8s.sh` generate it on a first install only. Generate with `openssl rand -hex 32`. |
+
+Store all four in AWS Secrets Manager or equivalent. Rotation of `ENCRYPTION_KEY`/`JWT_SECRET` requires re-encrypting all stored connector credentials; rotating `INTERNAL_SERVICE_SECRET` requires recreating api-gateway, orchestrator, temporal-adapter and frontend together (a mismatch 401s in-flight internal calls).
 
 ### Startup checks
 
@@ -26,12 +28,13 @@ docker logs rsync-ai-api-gateway 2>&1 | grep "Startup check:"   # likewise orche
 | Service | Setting | Logged when | What does not work |
 |---|---|---|---|
 | api-gateway | `INTERNAL_SERVICE_SECRET` | empty or only spaces | every `/api/v1/internal/...` call is refused (503 when empty, 401 when only spaces): scheduled saved-query runs, the model freshness sweep, pipeline re-runs started by the self-healer, pipeline namespace locking, OAuth token refresh requested by the orchestrator |
-| orchestrator | `INTERNAL_SERVICE_SECRET` | empty or only spaces | its calls to other services' internal endpoints are refused (self-healer re-runs, OAuth token refresh, namespace locking — runs go ahead unlocked — and connector deploys in production); with `ENVIRONMENT=production`, internal calls into the orchestrator (the dashboard's pipeline statistics) are refused too |
+| orchestrator | `INTERNAL_SERVICE_SECRET` | empty or only spaces | its calls to other services' internal endpoints are refused (self-healer re-runs, OAuth token refresh, namespace locking — runs go ahead unlocked — and connector deploys in production); with `ENVIRONMENT=production`, internal calls into the orchestrator are refused too |
 | temporal-adapter | `INTERNAL_SERVICE_SECRET` | empty or only spaces | scheduled saved-query runs and the model freshness sweep fail on every attempt, so schedules shown as active never run |
 | temporal-adapter | `ENCRYPTION_KEY` | empty while `ENVIRONMENT` is not `development`/`dev` (unset counts as not development), or shorter than 32 characters | the adapter cannot decrypt stored connection settings, so self-healing cannot look up a connection's OAuth token to refresh it, cannot plan a schema-drift repair and cannot apply the repair to the destination table. These steps read `ENCRYPTION_KEY` only, so `ENCRYPTION_KEYS` alone is not enough. `ENVIRONMENT` must be exactly `development` or `dev` (`Development` does not count) |
 | frontend | `API_GATEWAY_INTERNAL_URL` | empty or only spaces, and `NODE_ENV=production` (the image sets it) | server-side requests to the gateway (explorer queries, SQL generation, sharing, the schema index, the `/api/health` backend check) go to the default `http://localhost:5001`, which fails unless the gateway runs on the same host as the frontend server (in the frontend container it does not) |
-| frontend | `ORCHESTRATOR_INTERNAL_URL` | empty or only spaces, and `NODE_ENV=production` | the dashboard's pipeline statistics are fetched from the default `http://localhost:8081` and stay empty unless the orchestrator runs on the same host as the frontend server |
-| frontend | `INTERNAL_SERVICE_SECRET` | empty or only spaces, and `NODE_ENV=production` | the dashboard's pipeline statistics stay empty whenever the orchestrator runs with `ENVIRONMENT=production` |
+| frontend | `INTERNAL_SERVICE_SECRET` | empty or only spaces, and `NODE_ENV=production` | the frontend refuses api-gateway's requests to draw a chart as a picture or a dashboard as a PDF for a workflow's email, so a chart step fails on a plotted chart and a dashboard step's email goes without its PDF |
+
+api-gateway, orchestrator and the kafka-mcp-sink worker also log one WARN line starting `Startup check:` when `RSYNC_PII_HASH_SALT` is unset. Until it is set, a mask rule hashing with `hmac_sha256` is refused when saved and when run; every other rule runs. The sink worker logs to its connector container (`docker logs rsync-ai-kafka-mcp-sink-v1-0-0-mcp`).
 
 Connector generate, deploy and delete (tool-generator and connector-deployer) need `INTERNAL_SERVICE_SECRET` too. With it empty, both answer 503 `internal_secret_not_configured` unless `ENVIRONMENT` is `development` or `dev` (surrounding spaces and letter case are ignored here). An unset `ENVIRONMENT` counts as not development. The shipped compose files set `ENVIRONMENT` for both services. The Helm chart sets it for tool-generator and does not run connector-deployer.
 
@@ -72,7 +75,7 @@ The settings that already stop a service from starting are unchanged. Examples a
 |---|---|---|
 | `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker list. `KAFKA_BOOTSTRAP_SERVERS` is accepted as an alias when this is unset (`shared/go/kafkaclient/config.go:204-207`). The compose files all set this to `kafka:29092`; the bare code default only applies if you run a service outside compose |
 | `KAFKA_TOPIC_PREFIX` | `rsync.` | Namespace prepended to every topic **and every consumer group id** this product creates, so you can tell them apart from your other applications' on a shared cluster (`shared/go/kafkaclient/topics.go:27`, `llm-service/src/utils/kafka_topics.py:26`). Set to `` (empty) to disable and keep unprefixed names. A prefix not ending in `.`, `_` or `-` gets a `.` appended, and illegal characters are stripped |
-| `KAFKA_GROUP_ID` | `go-orchestrator-group` | **Prefix**, not a literal group id, and it is itself namespaced. The orchestrator qualifies the configured value (`backend-orchestrator/internal/config/config.go:172` → `config/kafka_identity.go:56`) and then appends the topic, so the groups that actually join look like `rsync.go-orchestrator-group-rsync.cdc.abc12345` (`internal/kafka/manager.go:931`) |
+| `KAFKA_GROUP_ID` | `go-orchestrator-group` | **Prefix**, not a literal group id, and it is itself namespaced. The orchestrator qualifies the configured value (`backend-orchestrator/internal/config/config.go:172` → `config/kafka_identity.go:56`) and then appends the topic, so the groups that actually join look like `rsync.go-orchestrator-group-rsync.cdc.abc12345` (`internal/kafka/manager.go:917`) |
 | `KAFKA_CLIENT_ID` | `rsync-<service>` | `client.id` announced on every connection — `rsync-orchestrator`, `rsync-api-gateway`, etc. (`shared/go/kafkaclient/clientid.go:25`). Set it to pin one identity for the whole platform. Not cosmetic on MSK or Confluent Cloud: broker quotas and throttle metrics key off `client.id` |
 | `CONSUMER_GROUP_PREFIX` | `rsync-pipeline` | Group-name prefix for the consumer-scaling agent only (`backend-orchestrator/internal/agents/consumer/config.go:142`, read at `:206`). Also namespaced, so the joined group is `rsync.rsync-pipeline-<topic>` (`consumer/kafka_identity.go:62`) |
 
@@ -96,10 +99,16 @@ The settings that already stop a service from starting are unchanged. Examples a
 
 | Variable | Default | Description |
 |---|---|---|
-| `KAFKA_REPLICATION_FACTOR` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Replication factor requested for topics this platform creates (`backend-orchestrator/internal/kafka/replication.go:31`, derivation at `:131-139`). A **request, not a guarantee**: it is clamped down to the live broker count, so a typo degrades instead of failing every creation. A non-positive or non-numeric value is ignored with a warning and the built-in default applies (`:93-105`). Also feeds the Kafka Connect worker's three internal topics (`docker-compose.yml:359-361`), which the clamp does **not** cover |
+| `KAFKA_REPLICATION_FACTOR` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Replication factor requested for topics this platform creates (`backend-orchestrator/internal/kafka/replication.go:31`, derivation at `:131-139`). A **request, not a guarantee**: it is clamped down to the live broker count, so a typo degrades instead of failing every creation. A non-positive or non-numeric value is ignored with a warning and the built-in default applies (`:93-105`). Also feeds the Kafka Connect worker's three internal topics (`docker-compose.yml:360-362`), which the clamp does **not** cover |
 | `KAFKA_MIN_INSYNC_REPLICAS` | unset ⇒ `min(2, RF)` | Durability floor written explicitly onto every topic this platform creates (`replication.go:40`, `:157-175`). It is pinned even when you set nothing, because unset means the *broker's* default applies — 2 on MSK and most managed clusters — and an RF=1 topic inheriting `misr=2` is born permanently unwritable. Whatever you set is clamped to the topic's final RF, in that order (`:198-204`) |
-| `KAFKA_CDC_TOPIC_PARTITIONS` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Partition count requested for every CDC **data** topic (`backend-orchestrator/internal/kafka/partitions.go:20`, derivation at `:70-78`). One partition is one leader, so a CDC topic left at 1 puts all of its produce and fetch traffic on a single broker however many the cluster has. The number is handed to Kafka Connect as `topic.creation.default.partitions` so Connect creates the topic through the AdminClient **before** it produces — broker auto-create never gets a turn — and rsync.ai's own pre-create asks for the same number as a backstop. Two things override it downward: a pipeline where any selected table has **no primary key** is pinned to 1, because null-keyed records round-robin and a partition offset stops being a total order for that table; and a broker count that cannot be read leaves topic creation exactly as it was. A non-positive or non-numeric value is ignored with a warning (`replication.go:93-105`). **Applies at creation only** — Kafka cannot reduce a partition count, and raising one on a live topic rehashes every key onto a different partition, so rsync.ai never resizes an existing topic |
+| `KAFKA_CDC_TOPIC_PARTITIONS` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Partition count requested for every CDC **data** topic (`backend-orchestrator/internal/kafka/partitions.go:20`, derivation at `:65-73`). One partition is one leader, so a CDC topic left at 1 puts all of its produce and fetch traffic on a single broker however many the cluster has. The number is handed to Kafka Connect as `topic.creation.default.partitions` so Connect creates the topic through the AdminClient **before** it produces — broker auto-create never gets a turn — and rsync.ai's own pre-create asks for the same number as a backstop. Two things override it downward: a pipeline where any selected table has **no primary key** is pinned to 1, because null-keyed records round-robin and a partition offset stops being a total order for that table; and a broker count that cannot be read leaves topic creation exactly as it was. A non-positive or non-numeric value is ignored with a warning (`replication.go:93-105`). **Applies at creation only** — Kafka cannot reduce a partition count, and raising one on a live topic rehashes every key onto a different partition, so rsync.ai never resizes an existing topic |
 | `RSYNC_SINK_FLUSH_LANES` | unset ⇒ `4` | How many destination flushes the CDC sink worker runs at once (`shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/flush_lanes.go:29`, lane pool at `:108`). Partitioning a topic only helps if something drains the partitions concurrently: the worker already *consumes* every assigned partition (kafka-go interleaves them into one `FetchMessage` stream), but before this it decoded, batched and then **blocked** on the destination write inline, so one slow table stalled every other partition — and Debezium gives a 20-table pipeline ~60 assigned partitions. A batch is now handed to a lane chosen by hashing the topic-and-partition prefix of its batcher key, so every batch from one partition lands on one serial lane. That is deliberate: both durability layers (kafka-go's `offsetStash` and the worker's own high-water mark) keep max(offset) per partition with **no gap tracking**, so completing offset 105 before 101 would make a restart silently classify 101-104 as already-written. Serial-per-partition keeps completion ascending inside the space that records it, which is why no offset encoder is needed. Ordering is preserved end to end because Debezium keys each event on the source PK and keyless tables are already pinned to 1 partition. Memory is bounded at `2 x lanes` resident batches. **`0` or `1` is the kill switch** — flushes go back to running inline on the consume goroutine, exactly as before. Clamped to 32; a malformed value warns and falls back to 4. Applies to the **database** sink path only: the object-storage batcher still flushes inline, deliberately — its one-time destination-folder clean is tracked per table rather than per partition, so sharding lanes on the partition cannot make it safe |
+
+### Compression
+
+| Variable | Default | Description |
+|---|---|---|
+| `KAFKA_CONNECT_COMPRESSION_TYPE` | `lz4` | Codec the Kafka Connect worker's producer uses for every CDC topic (`rsync.cdc-*`): `none`, `gzip`, `snappy`, `lz4` or `zstd`. Passed as `CONNECT_PRODUCER_COMPRESSION_TYPE` (`docker-compose.yml`, `docker-compose.quickstart.yml`; Helm `connectors.cdc.kafkaConnect.compressionType`). Before it, CDC topics were stored **uncompressed**: no broker or topic default sets a codec, and Debezium's topic creation sets none, so the topic took the producer's `none`. Both CDC consumers read lz4 (the sink worker's kafka-go and the orchestrator's sarama). Applies to batches written after Connect restarts; records already on a topic stay as written, and a consumer reads both. Platform topics are unaffected (they are created with `snappy`) |
 
 ### Authentication and TLS
 
@@ -143,7 +152,7 @@ services through their own reader. Everything below is unset by default, which m
 
 > **`AWS_MSK_IAM` is not implemented everywhere.** The Go services sign the token
 > (`kafkaclient/tokenauth/msk.go`); the Python tier raises `KafkaSecurityError` for it
-> (`llm-service/src/utils/kafka_security.py:123,422-427`) and the JVM Kafka Connect image
+> (`llm-service/src/utils/kafka_security.py:121,422-427`) and the JVM Kafka Connect image
 > ships no IAM login module. An IAM-only cluster therefore runs the Go data plane and leaves
 > the CDC profile unable to authenticate — use `SCRAM-SHA-512` for a mixed stack. IAM also
 > requires `KAFKA_SECURITY_PROTOCOL=SASL_SSL`; anything else is rejected at startup rather
@@ -154,16 +163,16 @@ services through their own reader. Everything below is unset by default, which m
 
 **Kafka Connect (Debezium) takes its own copies.** The worker reads security settings in three
 independent scopes — worker, `CONNECT_PRODUCER_*`, `CONNECT_CONSUMER_*` — and all three are wired
-from the variables above in `docker-compose.yml:403-420`. Two are deliberately left as bare
+from the variables above in `docker-compose.yml:404-421`. Two are deliberately left as bare
 pass-through keys with **no** default, so an unset variable is omitted from the container
 environment rather than rendered as an empty string:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CONNECT_SSL_TRUSTSTORE_LOCATION` (+ `CONNECT_PRODUCER_…`, `CONNECT_CONSUMER_…`) | omitted | Truststore path for the Connect worker (`docker-compose.yml:446-448`). An empty value is read by Kafka as a real path and the worker exits 2, so it must be absent rather than empty. Confluent Cloud and MSK need no truststore at all |
-| `CONNECT_SSL_TRUSTSTORE_PASSWORD` (+ the two scoped copies) | omitted | Same reasoning (`docker-compose.yml:462-464`); a PEM truststore rejects even an empty password |
-| `KAFKA_SSL_TRUSTSTORE_TYPE` | `JKS` | Set `PEM` to point the three location variables at a `.pem` bundle (`docker-compose.yml:468-470`) |
-| `KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM` | `https` | Set to the empty string to disable hostname verification — note the bare `-` in `${VAR-https}` at `docker-compose.yml:475-477`, which makes an explicitly-empty value stick |
+| `CONNECT_SSL_TRUSTSTORE_LOCATION` (+ `CONNECT_PRODUCER_…`, `CONNECT_CONSUMER_…`) | omitted | Truststore path for the Connect worker (`docker-compose.yml:447-449`). An empty value is read by Kafka as a real path and the worker exits 2, so it must be absent rather than empty. Confluent Cloud and MSK need no truststore at all |
+| `CONNECT_SSL_TRUSTSTORE_PASSWORD` (+ the two scoped copies) | omitted | Same reasoning (`docker-compose.yml:463-465`); a PEM truststore rejects even an empty password |
+| `KAFKA_SSL_TRUSTSTORE_TYPE` | `JKS` | Set `PEM` to point the three location variables at a `.pem` bundle (`docker-compose.yml:469-471`) |
+| `KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM` | `https` | Set to the empty string to disable hostname verification — note the bare `-` in `${VAR-https}` at `docker-compose.yml:476-478`, which makes an explicitly-empty value stick |
 
 ### On Kubernetes: `kafka.external.*` (Helm)
 
@@ -224,11 +233,23 @@ Authorization is separate and is not covered by any of the above: see
 |---|---|---|
 | `KAFKA_OWNED_TOPIC_PREFIXES` | — | Comma-separated extra prefixes the topology API will treat as this platform's own. **Adds** to the built-ins, never replaces them (`backend-orchestrator/internal/handlers/topology.go:91`) |
 | `KAFKA_ALLOW_LEGACY_UNPREFIXED_TOPICS` | `false` | Re-admits the pre-namespace bare topic names (`agent.`, `pipeline.`, `cdc.`, `cdc-`, `schemahistory.`, `pii.`, `task.`) to the topology API's allowlist (`handlers/topology.go:95`). Accepts `1`/`true`/`yes`/`on` and logs once on first use. Off by default because those names are generic enough to collide with a customer's own topics — and the API can delete what it matches. Only turn it on during a migration window |
-| `CDC_STREAMING_SINK_GROUP_PER_EXECUTION` | `false` | Rollback lever restoring the pre-fix, per-execution sink group id (`rsync.sink-<pid8>-<eid8>`) for `streaming_only`/`never` pipelines (`backend-orchestrator/internal/agents/executor/sink_consumer_group.go:17`, `:71`). A changing group name means no committed offsets, so leave it off unless you deliberately want that reset |
+| `CDC_STREAMING_SINK_GROUP_PER_EXECUTION` | `false` | Rollback lever restoring the pre-fix, per-execution sink group id (`rsync.sink-<pid8>-<eid8>`) for `streaming_only`/`never` pipelines (`backend-orchestrator/internal/agents/executor/sink_consumer_group.go:17`, `:71`). A changing group name means no committed offsets, so leave it off unless you deliberately want that reset. No compose file passes it through: set it in a compose override's `environment:` for the orchestrator, or in Helm `extraEnv` |
 
 > **Running rsync.ai against your own Kafka cluster?** If it is authorized, see
 > [kafka-acls.md](kafka-acls.md) for the full list of ACLs the platform needs, and
 > [kafka-topics.md](../architecture/kafka-topics.md) for the topic inventory.
+
+### CDC initial load
+
+Read by the orchestrator only. No compose file passes these through, so set them in a compose
+override's `environment:` for the orchestrator or in Helm `extraEnv`; a line in `.env` alone does
+nothing.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CDC_AUTO_BATCH_INITIAL_LOAD` | on | Kill switch: `false`/`0`/`off`/`no` disables. When on, a CDC pipeline with no explicit `cdc_initial_load`, a PostgreSQL-family source and a non-append-only destination, whose measured load is at or above `CDC_INCREMENTAL_SNAPSHOT_MIN_ROWS` and includes a table with no primary key, gets the resumable hybrid batch initial load instead of a blocking snapshot (`backend-orchestrator/internal/agents/executor/cdc_incremental.go:121`, `:159`; `executor.go:2290`) |
+| `CDC_INCREMENTAL_SNAPSHOT_MIN_ROWS` | `1000000` | Estimated source rows at or above which a PostgreSQL-family CDC pipeline gets the incremental snapshot (every table keyed) or the auto batch load (a table without a key). A non-positive or non-numeric value is ignored (`cdc_incremental.go:37-38`) |
+| `CDC_HYBRID_MIN_BINLOG_RETENTION_SEC` | `86400` | A MySQL hybrid (`cdc_initial_load=batch`) load fails before any data moves when the source's finite binlog retention is below this; `0` disables the guard, and a negative or non-numeric value is ignored (`cdc_incremental.go:56-57`, check at `hybrid_cdc.go:364`) |
 
 ---
 
@@ -248,7 +269,7 @@ Authorization is separate and is not covered by any of the above: see
 | `LLM_PROVIDER` | auto-detect | `openai` · `azure` · `groq` · `ollama`, or `none` (also `disabled`, `off`, `false`, `0`) to run with no LLM. Unset ⇒ Azure endpoint → `azure`, else `OPENAI_API_KEY` → `openai`, else `ollama`. An Ollama reached that way is **not** a configured LLM: the LLM-only features answer `Set up an LLM first` until you set `LLM_PROVIDER=ollama`. Groq is opt-in only. See [Which LLM is used](self-hosting.md#which-llm-is-used). |
 | `OPENAI_API_KEY` | — | Optional. If set, it is preferred: auto-detect selects OpenAI. Unset ⇒ no external LLM, and Ollama is used only if `LLM_PROVIDER=ollama` names it. |
 | `OPENAI_BASE_URL` | OpenAI | Another OpenAI-compatible endpoint (Vertex AI, OpenRouter, a proxy), still with `LLM_PROVIDER=openai`. Set `LLM_MODEL` with it. |
-| `OPENAI_API_KEY_SOURCE` | — (the key is `OPENAI_API_KEY`) | `gcp-metadata`: use an access token for the Google Cloud VM's service account, renewed before it expires, instead of a key. Sent only when `OPENAI_BASE_URL` is an `https://` address on `googleapis.com` (Vertex AI). See [Groq, Azure OpenAI and Vertex AI](self-hosting.md#groq-azure-openai-and-vertex-ai). |
+| `OPENAI_API_KEY_SOURCE` | — (the key is `OPENAI_API_KEY`) | `gcp-metadata`: use an access token for the Google Cloud VM's service account, renewed before it expires, instead of a key. Sent only when `OPENAI_BASE_URL` is an `https://` address on `googleapis.com` (Vertex AI). On Vertex AI, Ask rsync.ai then offers **Gemini (Vertex)** with no key ([assistant.md](../api/assistant.md#gemini-on-vertex-ai-with-no-key)). See [Groq, Azure OpenAI and Vertex AI](self-hosting.md#groq-azure-openai-and-vertex-ai). |
 | `GROQ_API_KEY` | — | Key for `LLM_PROVIDER=groq`. A key alone never selects Groq. |
 | `AZURE_OPENAI_ENDPOINT` | — | `https://<resource>.openai.azure.com`. Set, it makes auto-detect choose `azure`. |
 | `AZURE_OPENAI_API_KEY` | `OPENAI_API_KEY` | Azure OpenAI key |
@@ -325,23 +346,90 @@ called that, the last step is a 404.
 | `API_GATEWAY_PORT` | `5001` | API gateway listen port |
 | `LOG_LEVEL` | `info` | Log level: debug / info / warn / error |
 
-### Run-history retention (opt-in)
+### Run-history retention (on by default)
 
-The api-gateway can prune old rows from `pipeline_run_events`, `pipeline_run_metrics`
-and `pipeline_run_table_stats` once a day
+The api-gateway trims old run history once a day, in cloud and self-host alike
 ([pipeline_run_retention.go](../../api-gateway/internal/retention/pipeline_run_retention.go)).
-It is **off by default** and stays off: `pipeline_run_table_stats` is also where the
-usage page sums transfer totals, so with the sweep on, the "to-date" totals cover only the
-retention window, not the pipeline's lifetime
+With the default window of 90 days it deletes:
+
+- **a finished batch run's events, all of them at once**, once the run ended more than 91
+  days ago — a day past the window, so an event stored just after its run ended goes with
+  it. The Trends page builds a run's start, end and counts from its events, so half a run
+  would read as a different run;
+- **metric ticks that belong to no batch run** — `DATA_PLANE_METRICS`, `TABLE_STATS`,
+  `PROGRESS` and stage heartbeats of a CDC stream, or with no run — older than 90 days. A
+  warning or an error is never a tick;
+- **`pipeline_run_metrics`** rows older than 90 days.
+
+It keeps, at any age: each pipeline's newest run and the run holding its newest
+`PIPELINE_COMPLETED` (a model that runs after a pipeline reads it); a run still going or
+one that ended inside the window; a CDC pipeline's lifecycle events and the self-healer's
+decisions; every `executions` row, so the run list still shows a run whose log is gone.
+
+What a window changes: the Trends page's run count counts runs with events still stored,
+so it drops as runs age out.
+
+`pipeline_run_table_stats` is not touched unless `PIPELINE_RUN_RETENTION_TABLE_STATS=true`.
+It is where the usage page sums "to-date" transfer totals and where a table's run history
+comes from, so with it on both cover only the window
 ([usage.go `pipelineStatsRetentionEnabled`](../../api-gateway/internal/handlers/usage.go)).
-Turn it on when disk matters more than lifetime totals.
+Opted in, only finished batch runs' rows go — never a CDC stream's, whose stored total the
+projector bills each new total against — and each pipeline's newest run that delivered rows
+stays, because the CDC first-data check and the sticky table selection read it.
+
+The window cannot be shorter than 14 days: the run-event topics keep 7 days and the
+projector reads them from the start, so a deleted row younger than that could be stored
+again and fire its model and workflow hooks a second time. A shorter value logs a warning
+and uses 14.
+
+Each sweep works in chunks with `FOR UPDATE SKIP LOCKED` and stops after 5 minutes, so a
+first sweep over months of rows is spread over several days and several gateway replicas
+can run it. Migration 155 adds the indexes it needs; building them blocks writes to
+`pipeline_run_events` and `pipeline_run_metrics` for as long as the build takes, which
+grows with the tables. Deleting rows makes the space reusable; it does not shrink the
+files on disk.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ENABLE_PIPELINE_RUN_RETENTION` | unset (off) | `true` starts the daily sweep |
-| `PIPELINE_RUN_RETENTION_DAYS` | `90` | Rows older than this are deleted |
-| `PIPELINE_RUN_RETENTION_BATCH_SIZE` | `10000` | Rows per DELETE batch |
-| `PIPELINE_RUN_RETENTION_INTERVAL_HOURS` | `24` | Time between sweeps |
+| `ENABLE_PIPELINE_RUN_RETENTION` | `true` | `false` keeps every row. A value that is not a boolean logs a warning and uses the default |
+| `PIPELINE_RUN_RETENTION_DAYS` | `90` | Days kept. Under 14 → 14; not a positive number → 90 (both log a warning) |
+| `PIPELINE_RUN_RETENTION_TABLE_STATS` | `false` | `true` also trims finished batch runs' `pipeline_run_table_stats` rows |
+| `PIPELINE_RUN_RETENTION_BATCH_SIZE` | `10000` | Rows per DELETE chunk |
+| `PIPELINE_RUN_RETENTION_INTERVAL_HOURS` | `24` | Hours between sweeps |
+
+### ACK-ledger janitor (always on)
+
+The api-gateway runs an hourly janitor over `pipeline_batch_acks`
+([batch_ack_janitor.go](../../api-gateway/internal/retention/batch_ack_janitor.go)), in
+cloud and self-host alike. It **folds** per-event CDC ack rows older than an hour — written by
+sinks before migration 146 — into `cdc_counter_totals` and `cdc_offset_floors` and deletes
+them; the UI's CDC totals read those tables, so they do not change. It **prunes** the acks of
+finished batch runs (not a CDC lane, not owned by a resume checkpoint) once the run ended more
+than the retention window ago; only the current or a running run's acks are read after it
+ends. Each half stops after 5 minutes a tick, in 5 000-row chunks with `FOR UPDATE SKIP LOCKED`,
+so several gateway replicas can run it. Deleting rows frees space for reuse, not on disk —
+see the runbook's *Reclaim index bloat on `pipeline_batch_acks`*.
+
+| Variable | Default | Description |
+|---|---|---|
+| `RSYNC_BATCH_ACK_RETENTION_DAYS` | `30` | Days after a batch run ends before its acks are pruned. `0` keeps batch acks forever (the CDC fold still runs); a negative or non-numeric value logs a warning and uses `30` |
+
+### Audit-log retention (always on)
+
+The api-gateway trims `audit_logs` (admin actions, Explorer writes, workflow runs that
+sent anything) and `connection_access_logs` (every credential read) once a day, in cloud
+and self-host alike
+([audit_log_retention.go](../../api-gateway/internal/retention/audit_log_retention.go)).
+A row is deleted once it is older than the retention window, so the admin Audit page
+shows the last year by default. Each sweep works in 5 000-row chunks with
+`FOR UPDATE SKIP LOCKED` and stops after 5 minutes, so a first sweep over years of rows
+is spread over several days and several gateway replicas can run it. Both tables are
+indexed on `created_at`. Deleting rows makes the space reusable; it does not shrink the
+files on disk.
+
+| Variable | Default | Description |
+|---|---|---|
+| `RSYNC_AUDIT_LOG_RETENTION_DAYS` | `365` | Days an audit or credential-access row is kept. `0` keeps every row; a negative or non-numeric value logs a warning and uses `365` |
 
 ### Container log rotation
 
@@ -394,6 +482,20 @@ Used by the blob-passthrough lane, which stages file bytes between two storage c
 | `BLOB_STAGING_ACCESS_KEY` | — (required by the quickstart, where `install.sh` generates it) | Root user of the `blob-staging` MinIO |
 | `BLOB_STAGING_SECRET_KEY` | — (required by the quickstart, where `install.sh` generates it) | Root password of the `blob-staging` MinIO |
 | `BLOB_STAGING_ENDPOINT_URL` | set by the compose files to `http://blob-staging:9000` | Staging endpoint the orchestrator hands to connectors. Unset → the lane falls back to `MINIO_ENDPOINT_URL` (Helm, BYO S3) |
+
+Used by `minio-mcp`, which stores the claim-check object of every batch (the rows of one
+batch, written by the orchestrator and read back by the sink, then deleted):
+
+| Variable | Default | Description |
+|---|---|---|
+| `RSYNC_MINIO_SSE` | `true` | Asks MinIO for SSE-S3 (`ServerSideEncryption="AES256"`) on every claim-check write (`connector.py` `_sse_enabled`). A store that rejects it gets a `MinIO SSE (AES256) rejected … retrying without SSE` warning and the object is written unencrypted, so a BYO store without SSE still works; `false` skips the attempt |
+| `RSYNC_CLAIM_CHECK_GZIP` | `true` | Gzips each claim-check object (`shared/mcp-connectors/internal/minio/versions/v1.0.0/connector.py` `_gzip_enabled`); `false`, `0`, `no` or `off` writes plain JSON. The reader detects gzip by its magic bytes whatever the flag says, so flipping it either way never strands an object already staged. Helm: `connectors.minio.claimCheckGzip`. File copies between storage connectors (the blob lane above) are not touched: their bytes are staged as-is |
+
+The bundled MinIO server itself needs a KMS key for that SSE to succeed:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MINIO_KMS_SECRET_KEY` | base compose: a fixed dev key · prod/quickstart: — (required; `install.sh` and `install-k8s.sh` generate it) · Helm: unset (`secrets.minioKmsSecretKey`) | MinIO's static KMS key, `<name>:<base64 of 32 bytes>` (`echo "MINIO_KMS_SECRET_KEY=rsync-ai-kms:$(openssl rand -base64 32)"`). Without it every SSE-S3 write is rejected (`KMS is not configured`) and claim-check objects are stored unencrypted. A malformed value stops MinIO from starting. **Set it once and never change it** — a removed or different key makes MinIO unable to read what it encrypted |
 
 ---
 

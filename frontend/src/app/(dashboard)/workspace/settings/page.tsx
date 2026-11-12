@@ -10,9 +10,12 @@ import { WorkspaceGeneralSettings } from "@/components/workspace/WorkspaceGenera
 import { WorkspaceMembers } from "@/components/workspace/WorkspaceMembers"
 import { WorkspaceRolesMatrix } from "@/components/workspace/WorkspaceRolesMatrix"
 import { SavedQueryRetentionCard } from "@/components/workspace/SavedQueryRetentionCard"
+import { WorkspaceLLMDataCard } from "@/components/workspace/WorkspaceLLMDataCard"
+import { DeliveryChannelsCard } from "@/components/workflows/DeliveryChannelsCard"
+import { ModelLayersCard } from "@/components/workspace/ModelLayersCard"
 import { ROLE_LABELS, roleBadgeVariant, meetsRole, type WorkspaceRole } from "@/lib/workspace/roles"
 
-const VALID_TABS = ["general", "members", "roles", "data"] as const
+const VALID_TABS = ["general", "members", "roles", "data", "layers", "channels"] as const
 type SettingsTab = (typeof VALID_TABS)[number]
 
 /**
@@ -75,27 +78,33 @@ export default function WorkspaceSettingsPage() {
   const isReadOnly = !meetsRole(role, "member")
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      {/* The caller's role sits beside the title, so they always know their
+          access level without a banner row of its own. */}
       <PageHeader
         heading="Workspace settings"
-        description={`Manage "${activeWorkspace.name}" — members, roles and workspace details.`}
+        badge={
+          <Badge variant={roleBadgeVariant(role)} title="Your role in this workspace">
+            <span className="sr-only">Your role: </span>
+            {roleLabel}
+          </Badge>
+        }
+        description={
+          <>
+            {`Manage "${activeWorkspace.name}" — members, roles and workspace details.`}
+            {isReadOnly && " Your access is read-only; ask an admin for more."}
+          </>
+        }
       />
 
-      {/* Persistent role banner so the caller always knows their access level. */}
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900/50">
-        <span className="text-zinc-500 dark:text-zinc-400">Your role in this workspace:</span>
-        <Badge variant={roleBadgeVariant(role)}>{roleLabel}</Badge>
-        {isReadOnly && (
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">— read-only access; ask an admin for more.</span>
-        )}
-      </div>
-
       <Tabs defaultValue={initialTab} className="space-y-4">
-        <TabsList>
+        <TabsList aria-label="Workspace settings" className="h-auto flex-wrap justify-start">
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members &amp; invitations</TabsTrigger>
           <TabsTrigger value="roles">Roles &amp; permissions</TabsTrigger>
-          <TabsTrigger value="data">Data retention</TabsTrigger>
+          <TabsTrigger value="data">Data</TabsTrigger>
+          <TabsTrigger value="layers">Model layers</TabsTrigger>
+          <TabsTrigger value="channels">Delivery channels</TabsTrigger>
         </TabsList>
 
         <TabsContent value="general">
@@ -121,12 +130,23 @@ export default function WorkspaceSettingsPage() {
           <WorkspaceRolesMatrix currentRole={role} />
         </TabsContent>
 
-        {/* Settings whose effect is deleting data. One card today (saved-query
-            version history); kept as its own tab rather than buried in General
-            because "what does this workspace throw away, and when?" is a
-            question an admin should be able to answer in one place. */}
+        {/* Settings about what happens to the workspace's data: what Ask rsync.ai
+            may send a model, and what version history is thrown away, and
+            when. Kept as its own tab rather than buried in General because an
+            owner should be able to answer both in one place. */}
         <TabsContent value="data" className="space-y-4">
+          <WorkspaceLLMDataCard />
           <SavedQueryRetentionCard currentRole={role} />
+        </TabsContent>
+
+        {/* The workspace's own labels for its models, in their order. */}
+        <TabsContent value="layers">
+          <ModelLayersCard />
+        </TabsContent>
+
+        {/* Where workflows send (Slack channels, email lists). */}
+        <TabsContent value="channels">
+          <DeliveryChannelsCard />
         </TabsContent>
       </Tabs>
     </div>

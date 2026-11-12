@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -236,5 +238,33 @@ func TestCancelExecution_ViewerDenied(t *testing.T) {
 
 	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "insufficient workspace role") {
 		t.Fatalf("a viewer must be denied execution-cancel with a role error; got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A failed read is not "not found": the agent gateway and the run page both
+// tell the person a missing run apart from a database that did not answer.
+func TestGetExecution_DatabaseErrorIsNot404(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"no such run", sql.ErrNoRows, http.StatusNotFound},
+		{"database error", errors.New("pq: connection reset by peer"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, cleanup := wsScopeMockDB(t)
+			defer cleanup()
+			mock.ExpectQuery(`FROM executions e`).WithArgs(wsScopeExecution, wsScopeWS).WillReturnError(tc.err)
+			r := wsScopeRouterAsRole(http.MethodGet, "/executions/:id", GetExecution, "viewer")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/executions/"+wsScopeExecution, nil))
+			if w.Code != tc.want {
+				t.Fatalf("want %d, got %d: %s", tc.want, w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "connection reset") {
+				t.Fatalf("the driver's error reached the caller: %s", w.Body.String())
+			}
+		})
 	}
 }

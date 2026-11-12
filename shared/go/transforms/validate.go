@@ -2,6 +2,7 @@ package transforms
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -185,6 +186,13 @@ func normalizeOne(item map[string]any, idx int) (CanonicalTransform, []string, e
 	}
 
 	// Stored shape: { transform_config: { operation: "..." , ... } }
+	//
+	// The config is copied, never edited where it lies: the rewrites below delete
+	// `operation`, `table` and `requires_full_dataset` and rename aliases. Done on
+	// the caller's map, a chain validated twice failed the second time ("missing
+	// transform type") — and the CDC sink validates its cached chain once per
+	// message, so every message after the first threw the cache away and re-read
+	// transform_definitions.
 	var config map[string]any
 	if tc, ok := item["transform_config"].(map[string]any); ok && tc != nil {
 		if rawType == "" {
@@ -192,9 +200,9 @@ func normalizeOne(item map[string]any, idx int) (CanonicalTransform, []string, e
 				rawType = op
 			}
 		}
-		config = tc
+		config = maps.Clone(tc)
 	} else if c0, ok := item["config"].(map[string]any); ok && c0 != nil {
-		config = c0
+		config = maps.Clone(c0)
 	} else {
 		// Flat shape: all keys except known metadata are config.
 		config = map[string]any{}
@@ -460,7 +468,11 @@ func validateConfig(t CanonicalTransform) error {
 				return fmt.Errorf("mask_pii requires config.column or config.columns (non-empty)")
 			}
 		}
-		return nil
+		// Refused at save, not only at run: otherwise the rule is stored and the
+		// pipeline fails on its first batch or CDC event.
+		mt, _ := cfg["mask_type"].(string)
+		hf, _ := cfg["hash_function"].(string)
+		return keyedHashWithoutKey(mt, hf)
 	case "select_columns":
 		cols, ok := asStringSlice(cfg["columns"])
 		if !ok || len(cols) == 0 {

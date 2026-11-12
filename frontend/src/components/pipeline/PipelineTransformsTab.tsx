@@ -32,6 +32,7 @@ import {
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { TransformExecutionLog, TransformExecutionLogsPanel } from "@/components/transforms/TransformExecutionLogsPanel"
 import { TransformMonitoringPanel } from "@/components/transforms/TransformMonitoringPanel"
+import { TransformPlanEditor } from "@/components/transforms/TransformPlanEditor"
 import {
   ChevronDown,
   ChevronRight,
@@ -40,6 +41,8 @@ import {
   Copy,
   Check,
   Loader2,
+  Pencil,
+  Plus,
   ShieldAlert,
   Trash2,
 } from "lucide-react"
@@ -50,6 +53,8 @@ import {
   transformTypeVerb,
   describeTransform,
 } from "@/lib/transform-display"
+import { pairDefinitions } from "@/lib/pipeline/transformPlan"
+import { RowsSkeleton } from "@/components/kit/PageSkeleton"
 
 type TransformDefinition = {
   id: string
@@ -73,10 +78,9 @@ type ExecutionsResponse = {
 }
 
 // A single user-facing transform after merging the producer (batch) and
-// consumer (CDC) rows. The creation flow persists every transform twice with a
-// byte-identical config (SuggestionsReviewDialog.handleApply), so we collapse
-// the two side-specific rows into one logical entry keyed by config and surface
-// which execution paths it runs on via `appliesTo`.
+// consumer (CDC) rows. Every writer persists a rule twice with an identical
+// config, so the two side-specific rows collapse into one logical entry that
+// surfaces which execution paths it runs on via `appliesTo`.
 type LogicalTransform = {
   key: string
   operation: string
@@ -93,54 +97,33 @@ type TransformGroup = {
   enabledCount: number
 }
 
-// Deterministic JSON stringify (sorted keys) so two configs that differ only in
-// key order still hash identically — the producer/consumer pair must collapse.
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
-  const obj = value as Record<string, unknown>
-  const keys = Object.keys(obj).sort()
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`
-}
-
 function operationOf(t: TransformDefinition): string {
   return (t.transform_config?.operation as string) || "transform"
 }
 
-// Merge producer + consumer rows into one logical list. Rows with an identical
-// config collapse into a single entry whose `appliesTo` records every side it
-// was found on (batch from producer, cdc from consumer).
+// One logical entry per rule, using the same pair-merge as the editor
+// (transformPlan.pairDefinitions), so the list and the editor can never disagree
+// about how many rules a pipeline has. `appliesTo` records which sides it is stored on.
 function mergeTransforms(resp: PipelineTransformsResponse | null): LogicalTransform[] {
-  const byKey = new Map<string, LogicalTransform>()
-
-  const ingest = (rows: TransformDefinition[], side: "batch" | "cdc") => {
-    for (const t of rows) {
-      const operation = operationOf(t)
-      const key = `${operation}::${stableStringify(t.transform_config ?? {})}`
-      const existing = byKey.get(key)
-      if (existing) {
-        if (!existing.appliesTo.includes(side)) existing.appliesTo.push(side)
-        existing.enabled = existing.enabled && t.enabled
-        existing.order = Math.min(existing.order, t.transform_order)
-        existing.ids[side] = t.id
-      } else {
-        byKey.set(key, {
-          key,
-          operation,
-          config: t.transform_config ?? {},
-          appliesTo: [side],
-          enabled: t.enabled,
-          order: t.transform_order,
-          ids: { [side]: t.id },
-        })
-      }
+  return pairDefinitions(resp).map((pair) => {
+    const t = (pair.producer ?? pair.consumer) as TransformDefinition
+    const operation = operationOf(t)
+    const appliesTo: Array<"batch" | "cdc"> = []
+    if (pair.producer) appliesTo.push("batch")
+    if (pair.consumer) appliesTo.push("cdc")
+    return {
+      key: [pair.producer?.id, pair.consumer?.id].filter(Boolean).join("+"),
+      operation,
+      config: t.transform_config ?? {},
+      appliesTo,
+      enabled: t.enabled,
+      order: Math.min(
+        pair.producer?.transform_order ?? Infinity,
+        pair.consumer?.transform_order ?? Infinity
+      ),
+      ids: { batch: pair.producer?.id, cdc: pair.consumer?.id },
     }
-  }
-
-  ingest(resp?.producer_transforms ?? [], "batch")
-  ingest(resp?.consumer_transforms ?? [], "cdc")
-
-  return Array.from(byKey.values()).sort((a, b) => a.order - b.order)
+  })
 }
 
 function appliesToLabel(appliesTo: Array<"batch" | "cdc">): string {
@@ -161,6 +144,10 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
   const [query, setQuery] = useState("")
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [reloadKey, setReloadKey] = useState(0)
+  // The editor opens in place of the list. It used to be a separate page
+  // (/transforms) with its own pipeline picker; the rules are shown here, so
+  // they are added and changed here too.
+  const [editing, setEditing] = useState(false)
 
   // Mirrors requireTransformWorkspaceRole(..., security.WSMember) on both
   // PUT /transforms/:id and DELETE /transforms/:id (transforms.go:551, :614).
@@ -277,9 +264,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
           loading/error is isolated to this block so a hiccup here can't blank the
           self-fetching run-level monitoring panel rendered below. */}
       {loading ? (
-        <div role="status" aria-live="polite" className="text-sm text-zinc-500 dark:text-zinc-400">
-          Loading transforms…
-        </div>
+        <RowsSkeleton rows={4} label="Loading transforms…" />
       ) : error ? (
         <div role="alert" className="rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-950/20 p-4">
           <div className="text-sm text-red-700 dark:text-red-300">Couldn&apos;t load configured transforms.</div>
@@ -290,67 +275,81 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
         </div>
       ) : (
         <>
-          <div className="space-y-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-sm font-semibold text-zinc-900 dark:text-white">Configured transforms</div>
-              {/* This tab shows what is configured and what each run did with it;
-                  the builder is the only place a rule can be authored. Without this
-                  link the two pages had nothing pointing at each other, and an
-                  operator who wanted to add a transform had no route from here. */}
-              {canEdit ? (
-                <Link
-                  href={`/transforms?pipeline=${encodeURIComponent(pipelineId)}`}
-                  className="shrink-0 text-xs text-blue-600 hover:underline dark:text-blue-400"
-                >
-                  Edit in Transform Builder
-                </Link>
-              ) : null}
-            </div>
-
-            {!hasConfigured ? (
-              <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
-                No transforms configured. rsync.ai didn&apos;t detect any columns that need shaping.
-              </div>
-            ) : (
-              <>
-                <SummaryBanner summary={summary} />
-
-                <div className="flex items-center gap-2">
-                  <div className="relative flex-1">
-                    <Search aria-hidden="true" className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
-                    <Input
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                      placeholder="Find a column or transform…"
-                      className="pl-8 h-9"
-                    />
-                  </div>
-                  <Button variant="outline" size="sm" onClick={toggleAll}>
-                    {allCollapsed ? "Expand all" : "Collapse all"}
+          {editing ? (
+            <TransformPlanEditor
+              pipelineId={pipelineId}
+              onClose={(saved) => {
+                setEditing(false)
+                if (saved) refetch()
+              }}
+            />
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-zinc-900 dark:text-white">Configured transforms</div>
+                {canEdit && hasConfigured ? (
+                  <Button variant="outline" size="sm" className="shrink-0" onClick={() => setEditing(true)}>
+                    <Pencil aria-hidden="true" className="mr-1.5 h-3.5 w-3.5" />
+                    Add or edit transforms
                   </Button>
-                </div>
+                ) : null}
+              </div>
 
-                {groups.length === 0 ? (
-                  <div className="text-sm text-zinc-500 dark:text-zinc-400 px-1">No transforms match &ldquo;{query}&rdquo;.</div>
-                ) : (
-                  <div className="space-y-2">
-                    {groups.map((group) => (
-                      <TransformGroupCard
-                        key={group.operation}
-                        group={group}
-                        open={isOpen(group.operation)}
-                        canEdit={canEdit}
-                        onChanged={refetch}
-                        onToggle={() =>
-                          setCollapsed((prev) => ({ ...prev, [group.operation]: !prev[group.operation] }))
-                        }
+              {!hasConfigured ? (
+                // Says what is true: nothing is stored, so rows are written as the
+                // source has them. It used to say rsync.ai "didn't detect any columns
+                // that need shaping", which reads as a check that ran and passed —
+                // on a pipeline where no transform step was ever offered.
+                <div className="rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
+                  <div>No transforms on this pipeline. Rows are written to the destination as the source has them.</div>
+                  {canEdit ? (
+                    <Button size="sm" className="mt-3" onClick={() => setEditing(true)}>
+                      <Plus aria-hidden="true" className="mr-1.5 h-3.5 w-3.5" />
+                      Add transforms
+                    </Button>
+                  ) : null}
+                </div>
+              ) : (
+                <>
+                  <SummaryBanner summary={summary} />
+
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search aria-hidden="true" className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400" />
+                      <Input
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        placeholder="Find a column or transform…"
+                        className="pl-8 h-9"
                       />
-                    ))}
+                    </div>
+                    <Button variant="outline" size="sm" onClick={toggleAll}>
+                      {allCollapsed ? "Expand all" : "Collapse all"}
+                    </Button>
                   </div>
-                )}
-              </>
-            )}
-          </div>
+
+                  {groups.length === 0 ? (
+                    <div className="text-sm text-zinc-500 dark:text-zinc-400 px-1">No transforms match &ldquo;{query}&rdquo;.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {groups.map((group) => (
+                        <TransformGroupCard
+                          key={group.operation}
+                          group={group}
+                          open={isOpen(group.operation)}
+                          canEdit={canEdit}
+                          onChanged={refetch}
+                          onToggle={() =>
+                            setCollapsed((prev) => ({ ...prev, [group.operation]: !prev[group.operation] }))
+                          }
+                        />
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
 
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
@@ -397,12 +396,16 @@ function SummaryBanner({
     <div className="flex flex-wrap items-center gap-3 rounded-lg border border-teal-200 dark:border-teal-900/60 bg-teal-50 dark:bg-teal-950/30 px-4 py-3">
       <CircleCheck className="h-5 w-5 text-teal-600 dark:text-teal-400 shrink-0" />
       <div className="min-w-0 flex-1">
+        {/* Counts and paths only. It used to lead with "Auto-applied on import —
+            no action needed", which was true of none of the ways a rule gets here:
+            each one is picked in the transform step or added in the editor. */}
         <div className="text-sm font-medium text-teal-900 dark:text-teal-100">
-          Auto-applied on import — no action needed
+          {enabled} {enabled === 1 ? "transform" : "transforms"} active
         </div>
         <div className="text-xs text-teal-700 dark:text-teal-300">
-          {enabled} {enabled === 1 ? "transform" : "transforms"} active
-          {summary.batchAndCdc ? " · applied to batch + CDC" : ""}
+          {summary.batchAndCdc
+            ? "Run on batch runs and CDC change events, from the next run on"
+            : "Some run on one path only — see each rule"}
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-1.5">
@@ -466,9 +469,6 @@ function TransformGroupCard({
         </div>
         <Badge variant="secondary" className="font-normal">
           {group.items.length}
-        </Badge>
-        <Badge className="bg-teal-50 text-teal-700 dark:bg-teal-950/40 dark:text-teal-300 font-normal">
-          Auto
         </Badge>
         {groupAppliesTo && (
           <Badge variant="outline" className="font-normal">

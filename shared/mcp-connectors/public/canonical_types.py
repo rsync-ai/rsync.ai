@@ -152,11 +152,28 @@ _CLICKHOUSE_CANONICAL = {
     "array": "json", "tuple": "json", "map": "json", "nested": "json",
     "json": "json", "object": "json",
 }
+# BigQuery SchemaField.field_type: legacy SQL names (INTEGER, FLOAT, RECORD)
+# and standard SQL ones (INT64, FLOAT64, STRUCT). The flat map has neither
+# INT64 nor FLOAT64 nor BYTES, so without this they became "string".
+_BIGQUERY_CANONICAL = {
+    "string": "string", "geography": "string", "interval": "string", "range": "string",
+    "bytes": "binary",
+    "integer": "integer", "int64": "integer",
+    "float": "number", "float64": "number",
+    "numeric": "decimal",
+    # BIGNUMERIC carries up to 76 digits, past NUMERIC(38): string stays lossless.
+    "bignumeric": "string",
+    "boolean": "boolean", "bool": "boolean",
+    "timestamp": "timestamp", "datetime": "timestamp",
+    "date": "date", "time": "time",
+    "json": "json", "record": "json", "struct": "json",
+}
 _DIALECT_CANONICAL_MAPS = {
     "oracle": _ORACLE_CANONICAL,
     "sqlserver": _SQLSERVER_CANONICAL,
     "mssql": _SQLSERVER_CANONICAL,
     "clickhouse": _CLICKHOUSE_CANONICAL,
+    "bigquery": _BIGQUERY_CANONICAL,
 }
 
 # NUMBER(p,0) is emitted as canonical "integer" only when it fits a 64-bit
@@ -322,6 +339,15 @@ _UNBOUNDED_KEY_CANONICALS = {"string", "json", "binary"}
 # Dialects whose decimal DDL preserves source (p,s); the rest use a fixed width.
 _DECIMAL_PRECISION_DIALECTS = {"postgresql", "mysql", "clickhouse", "sqlserver"}
 
+# The type PostgreSQL discovery reports for a NUMERIC declared with no precision
+# and no scale. Such a column has no fixed width, so no fixed-width type holds
+# every value it can hold: a PostgreSQL destination gets plain NUMERIC and every
+# other destination stores the exact value as text. A bare "decimal" keeps its
+# fixed-width meaning, because MySQL and Oracle report constrained columns that
+# way. It is a DDL instruction, not a canonical type: canonicalize_type still
+# folds it to "decimal". Pinned by shared/unconstrained_numeric_golden.json.
+UNCONSTRAINED_NUMERIC = "numeric"
+
 
 def _parse_precision_scale(type_str: Any):
     """Extract (precision, scale) from e.g. 'decimal(12,4)'.
@@ -343,9 +369,11 @@ def canonical_to_ddl(dialect: str, type_str: Any, *,
     """Translate a canonical (or raw-ish) column type into a sink dialect's DDL.
 
     ``type_str`` is normalized through the flat ``canonicalize_type`` first, so
-    stray dialect tokens (numeric/money/double/bigint/…) fold to canonical
-    before mapping. ``is_key``/``single_key`` bound the unbounded text types so
-    a key column is indexable (SQL Server / Oracle). Decimal precision/scale is
+    stray dialect tokens (money/double/bigint/…) fold to canonical before
+    mapping. The bare ``numeric`` is the exception: it is
+    ``UNCONSTRAINED_NUMERIC``, plain NUMERIC on PostgreSQL and text elsewhere.
+    ``is_key``/``single_key`` bound the unbounded text types so a key column is
+    indexable (MySQL / SQL Server / Oracle). Decimal precision/scale is
     preserved for the dialects that support it (parsed from ``type_str``).
 
     Raises ValueError for an unknown sink dialect.
@@ -357,7 +385,12 @@ def canonical_to_ddl(dialect: str, type_str: Any, *,
         raise ValueError("canonical_to_ddl: unknown sink dialect %r" % (dialect,))
 
     raw = type_str if isinstance(type_str, str) else ""
-    canon = canonicalize_type(raw)  # fold raw dialect leftovers -> canonical
+    if raw.strip().lower() == UNCONSTRAINED_NUMERIC:
+        if d == "postgresql":
+            return "NUMERIC"
+        canon = "string"  # the exact value as text; a key column is bounded below
+    else:
+        canon = canonicalize_type(raw)  # fold raw dialect leftovers -> canonical
     if canon not in table:
         canon = "string"  # every sink's unknown-type fallback
 

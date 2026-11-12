@@ -209,13 +209,14 @@ def test_export_keyset_first_page_omits_the_bind_arg():
 
 def test_export_offset_mode_uses_fetch_next_and_no_cursor():
     """Keyless read → OFFSET/FETCH with a no-op ORDER BY (required by SQL Server).
-    Offset paging must NOT emit next_cursor/paging_mode (the executor advances
-    offset itself)."""
+    Offset paging emits no next_cursor and says `paging_mode: offset`, so the
+    executor advances the offset itself and drops any cursor it held
+    (batch_page_cursor.go readPageCursor)."""
     s, conn = _ss_fakes.make_connector(
         ss, columns=["a"], rows=[(1,), (2,)])
     out = s.export({**CFG, "table": "t", "limit": 2, "offset": 4})
     assert out["success"] is True, out
-    assert "next_cursor" not in out and "paging_mode" not in out, out
+    assert "next_cursor" not in out and out.get("paging_mode") == "offset", out
     assert out["has_more"] is True, out                # len(2) >= limit(2)
     sql = conn.all_execs()[-1]["sql"]
     assert sql == ("SELECT * FROM \"t\" ORDER BY (SELECT NULL) "

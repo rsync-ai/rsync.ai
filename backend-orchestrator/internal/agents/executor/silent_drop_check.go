@@ -26,6 +26,7 @@ type landedReconcileDecision struct {
 	SinkErr              string // sink error (defaulted for the zero-ack kafka case)
 	Reason               string // human-readable reason; set for AckEvidencedDrop and for the receipt-shortfall UnverifiedCompletion
 	Status               string // executor status when AckEvidencedDrop (total vs partial)
+	CutShort             bool   // the run's context ended before the sink confirmed the rows; nothing read is evidence
 }
 
 // classifyLandedReconcile decides how a sink-dispatched batch run resolves from
@@ -83,7 +84,7 @@ func classifyLandedReconcile(dispatched, landed, received int64, ackRows, direct
 	case landed == 0 && ackRows > 0:
 		d.LandedRows = 0
 		d.AckEvidencedDrop = true
-		d.Reason = fmt.Sprintf("destination silently dropped all rows: dispatched %d, ack ledger confirmed 0 landed across %d ack batches (execution %s)", dispatched, ackRows, executionID)
+		d.Reason = allLostReason("rows", dispatched, ackRows, executionID, sinkErr)
 	case landed == 0 && ackRows == 0:
 		if dispatchedViaSink {
 			d.LandedRows = 0
@@ -97,12 +98,13 @@ func classifyLandedReconcile(dispatched, landed, received int64, ackRows, direct
 		}
 	case landed < dispatched:
 		if strings.TrimSpace(sinkErr) != "" {
-			// Tier 1: NEGATIVE-ack poison evidence → the sink DLQ'd at least one batch
-			// → those rows are permanently lost. Fail closed.
+			// Tier 1: NEGATIVE- or PARTIAL-ack poison evidence → the sink DLQ'd rows
+			// (a whole batch, or the rows of one an API destination refused) → those
+			// rows are permanently lost. Fail closed.
 			d.LandedRows = landed
 			d.AckEvidencedDrop = true
 			d.Status = "silent_partial_drop_detected"
-			d.Reason = fmt.Sprintf("destination partially dropped rows: dispatched %d, ack ledger confirmed only %d landed after the sink DLQ'd at least one batch (execution %s)", dispatched, landed, executionID)
+			d.Reason = fmt.Sprintf("destination partially dropped rows: dispatched %d, ack ledger confirmed only %d landed after the sink DLQ'd the rows it could not write (execution %s)", dispatched, landed, executionID)
 		} else if received > 0 && received < dispatched {
 			// Tier 2: receipt shortfall, no sink error. SUM(rows_read) shows the sink
 			// received only `received` of `dispatched`, so the missing rows never
@@ -119,6 +121,34 @@ func classifyLandedReconcile(dispatched, landed, received int64, ackRows, direct
 		d.Reason += fmt.Sprintf("; sink error: %s", d.SinkErr)
 	}
 	return d
+}
+
+// allLostReason is the reason for an ack-evidenced total loss: the destination
+// "refused" everything when the sink reported why (its error is appended after
+// "; sink error:"), and "silently dropped" it only when the sink said nothing.
+// The status stays silent_drop_detected either way.
+func allLostReason(unit string, dispatched int64, ackRows int, executionID, sinkErr string) string {
+	verb := "silently dropped"
+	if strings.TrimSpace(sinkErr) != "" {
+		verb = "refused"
+	}
+	return fmt.Sprintf("destination %s all %s: dispatched %d, ack ledger confirmed 0 landed across %d ack batches (execution %s)", verb, unit, dispatched, ackRows, executionID)
+}
+
+// checkLanding waits for the sink to confirm a run's dispatched rows
+// (reconcileLandedRows) and decides what the acks it read mean
+// (classifyLandedReconcile). landed and received are the ledger sums it read.
+// A check the run's context cut short comes back CutShort, with no verdict.
+func (a *Agent) checkLanding(ctx context.Context, pipelineID, executionID string, dispatched int64, directKafkaMessages, minioFilesCreated, outboxBatches int, deadline time.Duration) (d landedReconcileDecision, landed, received int64) {
+	landed, received, ackRows, sinkErr := a.reconcileLandedRows(ctx, pipelineID, executionID, dispatched, deadline)
+	if landingCheckCutShort(ctx, landed, dispatched, sinkErr) {
+		return landedReconcileDecision{
+			CutShort:   true,
+			LandedRows: landed,
+			Reason:     landingCutShortReason(ctx, landed, dispatched, "rows"),
+		}, landed, received
+	}
+	return classifyLandedReconcile(dispatched, landed, received, ackRows, directKafkaMessages, minioFilesCreated, outboxBatches, sinkErr, executionID), landed, received
 }
 
 // reconcileLandedRows returns the number of rows the kafka-mcp-sink actually
@@ -211,10 +241,11 @@ func batchAckReconcileDeadline() time.Duration {
 // destination; received = rows the sink PULLED from Kafka for this run (batch sizes,
 // recorded on BOTH positive and negative acks). COUNT(*)==0 distinguishes "no acks yet /
 // path doesn't use the ledger" from "acks exist but wrote 0 rows". lastErr is the sink's
-// failure reason recorded on a NEGATIVE ack (rows_written=0) when a batch was DLQ'd; it is
-// "" on healthy runs (positive acks leave last_error NULL). The received total is the
-// discriminator that separates a benign upsert/dedup undercount (received==dispatched, dest
-// merged) from a real receipt shortfall (received<dispatched, rows never reached the sink).
+// failure reason recorded on a NEGATIVE ack (rows_written=0) when a batch was DLQ'd, or on
+// a PARTIAL ack when an API destination refused some rows of one; it is "" on healthy runs
+// (positive acks leave last_error NULL). The received total is the discriminator that
+// separates a benign upsert/dedup undercount (received==dispatched, dest merged) from a
+// real receipt shortfall (received<dispatched, rows never reached the sink).
 func sumBatchAcks(ctx context.Context, db *sql.DB, pipelineID, executionID string) (landed, received int64, ackRows int, lastErr string) {
 	var l sql.NullInt64
 	var r sql.NullInt64
@@ -559,13 +590,21 @@ func classifyUndelivered(readRows, undeliveredRows int64, undeliveredBatches int
 	}
 }
 
+// rewindTimeout bounds a checkpoint rewind that runs after the run's context ended.
+const rewindTimeout = 10 * time.Second
+
 // rewindAfterLostBatches puts the checkpoints this run wrote back to where the run
 // started, once the ack ledger proves the sink lost batches. Checkpoints advance
 // when a batch is produced, so without this the lost batches sit behind the
 // checkpoint and a Resume reads nothing (B-RESUME-DLQ). Returns the text appended
 // to the failure reason, telling the user what Resume will now do.
+//
+// It runs outside the run's context: the evidence was read before a Stop or a
+// time limit ended the run, and the rewind must not die with it.
 func rewindAfterLostBatches(ctx context.Context, db *sql.DB, pipelineID, executionID string) string {
-	n, err := cdc.RewindCheckpointsOfExecution(ctx, db, pipelineID, executionID)
+	rewindCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rewindTimeout)
+	defer cancel()
+	n, err := cdc.RewindCheckpointsOfExecution(rewindCtx, db, pipelineID, executionID)
 	if err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).Error("could not rewind the checkpoints of a run that lost batches; a Resume may skip the lost rows — run a Reload")
 		return "; the resume position could not be rewound, so run a Reload to re-read every row"
@@ -574,4 +613,34 @@ func rewindAfterLostBatches(ctx context.Context, db *sql.DB, pipelineID, executi
 		return ""
 	}
 	return fmt.Sprintf("; %d table(s) were rewound to where this run started, so Resume re-reads the lost rows", n)
+}
+
+// landingCheckCutShort reports whether a landing check ended because the run's
+// context did — a user Stop, a time limit — before the sink confirmed every
+// dispatched row, with no negative ack among what it read. Its counts are then
+// no evidence of a drop: a ledger read under the ended context fails and reads
+// as "no acks", and a read from before the end only shows the sink still
+// draining. The rows produced but not yet written stay in Kafka for the next
+// run, so nothing is rewound either (KI-STOP-DURING-LANDING-CHECK-REPORTED-AS-DROP).
+// A negative ack is a lost batch whenever it was read, so it still counts.
+func landingCheckCutShort(ctx context.Context, landed, dispatched int64, sinkErr string) bool {
+	return ctx.Err() != nil && landed < dispatched && strings.TrimSpace(sinkErr) == ""
+}
+
+// landingCutShortReason says how far the sink got before the run ended.
+func landingCutShortReason(ctx context.Context, landed, dispatched int64, unit string) string {
+	return fmt.Sprintf("the run ended before the destination confirmed its %s (%d of %d confirmed): %v", unit, landed, dispatched, context.Cause(ctx))
+}
+
+// landingCutShortResponse ends a run whose landing check was cut short as
+// "cancelled"; the worker settles that into "stopped by user" for a Stop and a
+// failure for any other end of the context.
+func landingCutShortResponse(task ExecutorTask, reason string) ExecutorResponse {
+	log.WithField("pipeline_id", task.PipelineID).Infof("landing check cut short, no verdict: %s", reason)
+	return ExecutorResponse{
+		TaskID:     task.TaskID,
+		PipelineID: task.PipelineID,
+		Status:     "cancelled",
+		Error:      reason,
+	}
 }

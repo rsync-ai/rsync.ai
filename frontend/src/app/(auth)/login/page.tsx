@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { toast } from "sonner"
 import { safeNextPath } from "@/lib/auth/safe-next"
+import { claimSignedInState } from "@/lib/auth/signed-in-state"
 import { API_GATEWAY_URL } from "@/lib/config/api"
 
 // Self-correcting base URL (see @/lib/config/api): on a real origin a mis-baked
@@ -58,6 +59,8 @@ function LoginForm() {
         throw new Error(msg)
       }
 
+      // Another person's /chat, left when their session ran out, is not shown.
+      claimSignedInState(String(data?.user_id ?? ""))
       toast.success("Login successful!")
       router.push(safeNextPath(searchParams.get("next")))
     } catch (error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1095,11 +1096,17 @@ func (h *OAuthHandler) ListTokens(c *gin.Context) {
 // The pg_try_advisory_lock pattern ensures only one concurrent refresh per tokenID
 // across all api-gateway instances. If another goroutine/instance holds the lock
 // this call returns nil immediately — the other refresh will complete and update the DB.
+//
+// The refresh outlives its caller: once the provider has rotated the refresh token,
+// the old one is dead, so a hang-up between the provider call and the write would
+// lose the only token that still works. The provider call is bounded by its client's
+// timeout.
 func (h *OAuthHandler) RefreshTokenByID(ctx context.Context, tokenID string) error {
+	ctx = context.WithoutCancel(ctx)
 	lockKey := int64(crc32Hash(tokenID))
 
-	var lockAcquired bool
-	if err := h.db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, lockKey).Scan(&lockAcquired); err != nil {
+	release, lockAcquired, err := acquireOAuthRefreshLock(ctx, h.db, lockKey)
+	if err != nil {
 		return fmt.Errorf("RefreshTokenByID: failed to acquire lock for %s: %w", tokenID, err)
 	}
 	if !lockAcquired {
@@ -1107,12 +1114,12 @@ func (h *OAuthHandler) RefreshTokenByID(ctx context.Context, tokenID string) err
 		log.Debugf("oauth: RefreshTokenByID skipped %s — lock held by another process", tokenID)
 		return nil
 	}
-	defer h.db.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, lockKey)
+	defer release()
 
 	// Re-fetch under lock — another goroutine may have refreshed already.
 	var provider, encryptedRefresh, encryptedAccess string
 	var expiresAt time.Time
-	err := h.db.QueryRowContext(ctx, `
+	err = h.db.QueryRowContext(ctx, `
 		SELECT provider, access_token, refresh_token, expires_at
 		FROM oauth_tokens
 		WHERE id = $1
@@ -1154,7 +1161,7 @@ func (h *OAuthHandler) RefreshTokenByID(ctx context.Context, tokenID string) err
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	httpClient := safehttp.NewClient(30 * time.Second)
+	httpClient := newOAuthRefreshClient(30 * time.Second)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("RefreshTokenByID: provider call for %s: %w", tokenID, err)
@@ -1386,6 +1393,43 @@ func generateTokenID() string {
 // crc32Hash converts a string to a 32-bit hash suitable for Postgres advisory locks
 func crc32Hash(s string) uint32 {
 	return crc32.ChecksumIEEE([]byte(s))
+}
+
+// newOAuthRefreshClient builds the client for a provider's token endpoint; tests
+// replace it to reach a local one.
+var newOAuthRefreshClient = safehttp.NewClient
+
+// acquireOAuthRefreshLock takes the per-token refresh lock on a dedicated *sql.Conn:
+// an advisory lock belongs to the session that took it, and a pooled *sql.DB hands the
+// unlock to whichever connection is free, which leaves the lock held on the first.
+func acquireOAuthRefreshLock(ctx context.Context, database *sql.DB, key int64) (release func(), acquired bool, err error) {
+	conn, err := database.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var got bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, false, err
+	}
+	if !got {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	return func() {
+		// conn.Close() returns the connection to the pool with its session intact, so
+		// the unlock is what frees the lock; a fresh context lets it run whatever
+		// happened to the refresh's.
+		relCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(relCtx, `SELECT pg_advisory_unlock($1)`, key); err != nil {
+			// Back in the pool, the session would keep the lock and skip this token's
+			// refreshes for its whole life. Closing it releases the lock.
+			log.WithError(err).Warn("oauth: failed to release the refresh lock; dropping its connection")
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}, true, nil
 }
 
 // getRevocationURL returns the token revocation URL for a provider (if supported)

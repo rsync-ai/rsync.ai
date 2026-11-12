@@ -1,10 +1,10 @@
-"""The advisory MongoDB CDC config must not contradict the connector that ships.
+"""The advisory MongoDB and MySQL CDC configs must not contradict the connector that ships.
 
-There are two places that name a MongoDB heartbeat interval, and there has to be:
+There are two places that name a heartbeat interval, and there has to be:
 
   * ``_DEFAULT_HEARTBEAT_INTERVAL_MS`` in the debezium MCP connector -- the LIVE
     path. It runs in its own container and cannot import llm-service.
-  * ``MONGO_HEARTBEAT_INTERVAL_MS`` in ``cdc_config_generator`` -- advisory only;
+  * ``HEARTBEAT_INTERVAL_MS`` in ``cdc_config_generator`` -- advisory only;
     no Go service and no frontend route starts a connector from it.
 
 Because the generator is advisory, a divergence is wrong advice rather than an
@@ -24,7 +24,7 @@ Run: pytest llm-service/tests/test_cdc_config_generator_mongo_heartbeat_parity.p
 import importlib.util
 from pathlib import Path
 
-from src.agents.planner.cdc_config_generator import MONGO_HEARTBEAT_INTERVAL_MS
+from src.agents.planner.cdc_config_generator import HEARTBEAT_INTERVAL_MS
 
 _CONNECTOR = (
     Path(__file__).resolve().parents[2]
@@ -54,9 +54,9 @@ def _load_connector():
 
 def test_advised_heartbeat_interval_matches_the_connector_that_ships():
     live = _load_connector()._DEFAULT_HEARTBEAT_INTERVAL_MS
-    assert MONGO_HEARTBEAT_INTERVAL_MS == live, (
+    assert HEARTBEAT_INTERVAL_MS == live, (
         f"cdc_config_generator advises heartbeat.interval.ms="
-        f"{MONGO_HEARTBEAT_INTERVAL_MS!r} but the connector that actually starts "
+        f"{HEARTBEAT_INTERVAL_MS!r} but the connector that actually starts "
         f"the pipeline uses {live!r}"
     )
 
@@ -66,7 +66,7 @@ def test_both_sides_are_a_positive_integer_of_milliseconds():
     # "" or None together -- equal is not the same as correct.
     live = _load_connector()._DEFAULT_HEARTBEAT_INTERVAL_MS
     for name, value in (
-        ("cdc_config_generator.MONGO_HEARTBEAT_INTERVAL_MS", MONGO_HEARTBEAT_INTERVAL_MS),
+        ("cdc_config_generator.HEARTBEAT_INTERVAL_MS", HEARTBEAT_INTERVAL_MS),
         ("connector._DEFAULT_HEARTBEAT_INTERVAL_MS", live),
     ):
         assert isinstance(value, str) and value.strip() == value, f"{name} = {value!r}"
@@ -89,4 +89,22 @@ def test_the_advisory_mongodb_config_actually_carries_the_heartbeat():
         overrides={},
     )
     assert result.success, f"template generation failed: {result.error}"
-    assert result.config["heartbeat.interval.ms"] == MONGO_HEARTBEAT_INTERVAL_MS
+    assert result.config["heartbeat.interval.ms"] == HEARTBEAT_INTERVAL_MS
+
+
+def test_the_advisory_mysql_config_carries_the_heartbeat_too():
+    """The connector heartbeats MySQL/MariaDB so the Sentinel can tell an idle binlog
+    from a stalled stream; advice without it describes a connector rsync.ai no longer
+    runs."""
+    from src.agents.planner.cdc_config_generator import CDCConfigGenerator
+
+    result = CDCConfigGenerator()._generate_from_template(
+        source_type="mysql",
+        config={"host": "db", "port": 3306, "username": "u", "password": "p", "database": "shop"},
+        tables=["shop.orders"],
+        snapshot_mode="initial",
+        connector_name="cdc-shop",
+        overrides={},
+    )
+    assert result.success, f"template generation failed: {result.error}"
+    assert result.config["heartbeat.interval.ms"] == HEARTBEAT_INTERVAL_MS

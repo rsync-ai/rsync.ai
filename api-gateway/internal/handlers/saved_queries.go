@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -79,6 +80,10 @@ type SavedQuery struct {
 	LastRunStatus   string `json:"last_run_status,omitempty"`
 	LastRunError    string `json:"last_run_error,omitempty"`
 
+	// Layer is the name of the workspace layer the model is in (workspace_layers.go),
+	// or "" when it is in none. A label: it changes nothing about a run.
+	Layer string `json:"layer,omitempty"`
+
 	// ConnectorType is the engine behind ConnectionID, carried on the row so a caller
 	// rendering a list of queries does not have to fetch every connection to name what
 	// each one runs against. "" when the connection has been deleted.
@@ -93,6 +98,11 @@ type SavedQuery struct {
 	// server allows it for every engine, so a model created before this gate existed can
 	// still be turned off.
 	SupportsMaterialization bool `json:"supports_materialization"`
+
+	// QueryLanguage says what SQLText holds: "sql", or "document" — a MongoDB pipeline
+	// stored as JSON {database?, collection, pipeline} (saved_query_documents.go). Same
+	// resolver as SupportsMaterialization, so a client never guesses it from the text.
+	QueryLanguage string `json:"query_language,omitempty"`
 
 	// ScheduleStatus is the live schedule's status, or "" when there is none. It
 	// comes from a LEFT JOIN rather than a per-row lookup so the list stays one
@@ -124,7 +134,9 @@ func (q *SavedQuery) setFreshness(v sql.NullInt64) {
 // answering differently. Mirrors Connection.applyExplorerCapability.
 func (q *SavedQuery) applyModelCapability(connectorType string) {
 	q.ConnectorType = connectorType
-	q.SupportsMaterialization = ResolveExplorerCapability(connectorType).SupportsMaterialization
+	capability := ResolveExplorerCapability(connectorType)
+	q.SupportsMaterialization = capability.SupportsMaterialization
+	q.QueryLanguage = capability.QueryLanguage
 }
 
 // savedQueryNextRun turns the joined schedule columns into a next fire time. Shared by
@@ -213,7 +225,22 @@ func isUniqueViolation(err error) bool {
 // classifyForStorage derives the advisory statement_class and rejects statements
 // no role can ever run via the Explorer. See the package header: this is a
 // usability guard, not an authorization decision.
-func classifyForStorage(c *gin.Context, sqlText string) (string, bool) {
+//
+// On a document connection the text is a stored pipeline, not SQL, so it is validated
+// as one (parseDocumentModelQuery): JSON would otherwise classify as an unknown write
+// and be refused for every role. A pipeline can name no write stage, so it is a read.
+func classifyForStorage(c *gin.Context, sqlText, connectorType string) (string, bool) {
+	if isDocumentConnector(connectorType) {
+		if _, ferr := parseDocumentModelQuery(sqlText); ferr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "this pipeline cannot be saved: " + documentFindErrorText(ferr),
+				"code":  ferr.Code,
+				"path":  ferr.Path,
+			})
+			return "", false
+		}
+		return string(validators.ClassRead), true
+	}
 	class := validators.ClassifyStatementSQL(sqlText)
 	if class == validators.ClassBlocked {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -258,7 +285,7 @@ func ListSavedQueries(c *gin.Context) {
 		       COALESCE(sq.last_run_status, ''), COALESCE(sq.last_run_error, ''),
 		       COALESCE(s.status, ''), COALESCE(s.schedule_type, ''), s.schedule_spec,
 		       COALESCE(cn.connector_type, ''),
-		       sq.freshness_deadline_seconds
+		       sq.freshness_deadline_seconds, COALESCE(wl.name, '')
 		FROM saved_queries sq
 		LEFT JOIN saved_query_schedules s
 		  ON s.saved_query_id = sq.id AND s.status != 'deleted'
@@ -266,6 +293,7 @@ func ListSavedQueries(c *gin.Context) {
 		-- SupportsMaterialization=false, which is the honest answer for a query whose
 		-- engine is gone.
 		LEFT JOIN connections cn ON cn.id = sq.connection_id
+		LEFT JOIN workspace_layers wl ON wl.id = sq.layer_id
 		WHERE sq.workspace_id = $1
 		  AND (sq.visibility = 'workspace' OR sq.created_by = $2)
 		  AND ($3 = '' OR sq.connection_id::text = $3)
@@ -292,7 +320,7 @@ func ListSavedQueries(c *gin.Context) {
 			&q.SQLText, &q.NLPrompt, &q.StatementClass, &q.Visibility,
 			&q.CreatedBy, &q.UpdatedBy, &q.CreatedAt, &q.UpdatedAt, &lastRun,
 			&q.Materialization, &q.TargetTable, &q.LastRunStatus, &q.LastRunError,
-			&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness); err != nil {
+			&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness, &q.Layer); err != nil {
 			log.WithError(err).Error("scan saved query")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list saved queries"})
 			return
@@ -366,10 +394,12 @@ func CreateSavedQuery(c *gin.Context) {
 		return
 	}
 
-	// Classification is pure local computation — do it before the connection
-	// round-trip so a request that is going to 400 never costs a query.
-	statementClass, ok := classifyForStorage(c, sqlText)
-	if !ok {
+	// SQL classification is pure local computation — do it before the connection
+	// round-trip so a statement no role can run never costs a query. It is not the
+	// final answer: what the text IS depends on the connection's engine, read below.
+	// A MongoDB pipeline is JSON, which never classifies as blocked, so this cannot
+	// refuse one.
+	if _, ok := classifyForStorage(c, sqlText, ""); !ok {
 		return
 	}
 
@@ -388,8 +418,26 @@ func CreateSavedQuery(c *gin.Context) {
 		return
 	}
 
-	var id string
+	var connectorType string
 	err := database.QueryRow(`
+		SELECT COALESCE(connector_type, '') FROM connections WHERE id = $1 AND workspace_id = $2
+	`, connectionID, workspaceID).Scan(&connectorType)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	if err != nil {
+		log.WithError(err).Error("load connector type for saved query")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save query"})
+		return
+	}
+	statementClass, ok := classifyForStorage(c, sqlText, connectorType)
+	if !ok {
+		return
+	}
+
+	var id string
+	err = database.QueryRow(`
 		INSERT INTO saved_queries
 			(workspace_id, connection_id, name, description, sql_text, nl_prompt,
 			 statement_class, visibility, created_by, updated_by)
@@ -448,17 +496,18 @@ func loadSavedQuery(c *gin.Context, id, userID string) (*SavedQuery, bool) {
 		       COALESCE(sq.last_run_status, ''), COALESCE(sq.last_run_error, ''),
 		       COALESCE(s.status, ''), COALESCE(s.schedule_type, ''), s.schedule_spec,
 		       COALESCE(cn.connector_type, ''),
-		       sq.freshness_deadline_seconds
+		       sq.freshness_deadline_seconds, COALESCE(wl.name, '')
 		FROM saved_queries sq
 		LEFT JOIN saved_query_schedules s
 		  ON s.saved_query_id = sq.id AND s.status != 'deleted'
 		LEFT JOIN connections cn ON cn.id = sq.connection_id
+		LEFT JOIN workspace_layers wl ON wl.id = sq.layer_id
 		WHERE sq.id = $1
 	`, id).Scan(&q.ID, &q.WorkspaceID, &q.ConnectionID, &q.Name, &q.Description,
 		&q.SQLText, &q.NLPrompt, &q.StatementClass, &q.Visibility,
 		&q.CreatedBy, &q.UpdatedBy, &q.CreatedAt, &q.UpdatedAt, &lastRun,
 		&q.Materialization, &q.TargetTable, &q.LastRunStatus, &q.LastRunError,
-		&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness)
+		&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness, &q.Layer)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return nil, false
@@ -739,7 +788,7 @@ func UpdateSavedQuery(c *gin.Context) {
 		// Classified only when the SQL is actually being replaced. Re-classifying SQL
 		// that is not changing would let a later tightening of the validator turn an
 		// unrelated rename into a 400 on a query that has been saved for months.
-		statementClass, ok = classifyForStorage(c, sqlText)
+		statementClass, ok = classifyForStorage(c, sqlText, existing.ConnectorType)
 		if !ok {
 			return
 		}
@@ -905,22 +954,26 @@ func DeleteSavedQuery(c *gin.Context) {
 		rows.Close()
 	}
 
+	// From here the delete outlives its caller: a tab closed after the commit left the
+	// model's Temporal schedules running with no row behind them.
+	ctx := context.WithoutCancel(c.Request.Context())
+
 	// One transaction with the pause of every trigger this delete orphans: a delete that
 	// failed must not leave downstream schedules paused for an upstream that still exists.
-	tx, err := database.BeginTx(c.Request.Context(), nil)
+	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		log.WithError(err).Error("delete saved query: begin")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	orphaned, err := pauseTriggersOrphanedBy(c.Request.Context(), tx, upstreamKindModel, id)
+	orphaned, err := pauseTriggersOrphanedBy(ctx, tx, upstreamKindModel, id)
 	if err != nil {
 		log.WithError(err).Error("delete saved query: pause orphaned downstream schedules")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
 		return
 	}
-	if _, err := tx.ExecContext(c.Request.Context(), `DELETE FROM saved_queries WHERE id = $1`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM saved_queries WHERE id = $1`, id); err != nil {
 		log.WithError(err).Error("delete saved query")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
 		return
@@ -931,7 +984,7 @@ func DeleteSavedQuery(c *gin.Context) {
 		return
 	}
 
-	deleteTemporalSchedulesBestEffort(c.Request.Context(), temporalScheduleIDs)
+	deleteTemporalSchedulesBestEffort(ctx, temporalScheduleIDs)
 
 	logAudit(c, "saved_query.delete", "saved_query", id, map[string]interface{}{
 		"name":                        existing.Name,
@@ -1160,7 +1213,7 @@ func loadOpenPendingEdit(database *sql.DB, savedQueryID, liveSQL string) (*Saved
 	err := database.QueryRow(`
 		SELECT id, sql_text, statement_class, base_sql_text, note, status, proposed_by, proposed_at
 		FROM saved_query_pending_edits
-		WHERE saved_query_id = $1 AND status = 'pending'
+		WHERE saved_query_id = $1 AND status = 'pending' AND kind = 'sql'
 	`, savedQueryID).Scan(&p.ID, &p.SQLText, &p.StatementClass, &baseSQL, &note, &p.Status, &p.ProposedBy, &p.ProposedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1275,7 +1328,7 @@ func reviewSavedQueryPendingEdit(c *gin.Context, approve bool) {
 	err = tx.QueryRow(`
 		SELECT id, sql_text, proposed_by
 		FROM saved_query_pending_edits
-		WHERE saved_query_id = $1 AND status = 'pending'
+		WHERE saved_query_id = $1 AND status = 'pending' AND kind = 'sql'
 		FOR UPDATE
 	`, id).Scan(&pendingID, &proposedSQL, &proposedBy)
 	if err == sql.ErrNoRows {
@@ -1312,7 +1365,7 @@ func reviewSavedQueryPendingEdit(c *gin.Context, approve bool) {
 		// beside the proposal. The proposal has sat in a table that an edit path wrote;
 		// the class that ends up on saved_queries must be derived from the SQL that is
 		// actually landing, at the moment it lands.
-		cls, ok := classifyForStorage(c, proposedSQL)
+		cls, ok := classifyForStorage(c, proposedSQL, existing.ConnectorType)
 		if !ok {
 			return
 		}

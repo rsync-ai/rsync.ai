@@ -1,8 +1,9 @@
-import { authGet } from "./auth-fetch"
+import { adminRead, type AdminRead } from "./admin"
 
-// Consumption / usage read clients. Mirrors admin.ts: typed interfaces + a
-// relative-path authGet call (authFetch injects the X-Workspace-ID header, so
-// GET /api/v1/usage is automatically scoped to the ACTIVE workspace).
+// Consumption / usage types. The workspace page (/usage) reads GET /api/v1/usage
+// itself, since a 400 there means "no workspace selected", not a failure;
+// authFetch injects the X-Workspace-ID header, so it is scoped to the ACTIVE
+// workspace.
 
 // ── Per-workspace (any member) ──────────────────────────────────────────────
 
@@ -50,10 +51,6 @@ export interface WorkspaceUsage {
   /** When true, "to-date" totals only cover the last retention_days days. */
   retention_enabled: boolean
   retention_days: number
-}
-
-export async function getWorkspaceUsage(): Promise<WorkspaceUsage> {
-  return authGet<WorkspaceUsage>("/api/v1/usage")
 }
 
 // ── Platform admin (cross-workspace / cross-user) ───────────────────────────
@@ -109,6 +106,6 @@ export interface AdminUsageResponse {
   retention_days: number
 }
 
-export async function getAdminUsage(): Promise<AdminUsageResponse> {
-  return authGet<AdminUsageResponse>("/api/v1/admin/usage")
+export async function getAdminUsage(): Promise<AdminRead<AdminUsageResponse>> {
+  return adminRead("/api/v1/admin/usage")
 }

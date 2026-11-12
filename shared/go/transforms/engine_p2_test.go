@@ -214,7 +214,7 @@ func TestSimpleTransformEngine_ArrayExpand_NonArrayUnchanged(t *testing.T) {
 }
 
 func TestApplyMask_HashFunctions(t *testing.T) {
-	t.Setenv("RSYNC_PII_HASH_SALT", "test-salt")
+	setPIIHashKeyForTest(t, "test-salt")
 
 	cases := []struct {
 		hashFunc string

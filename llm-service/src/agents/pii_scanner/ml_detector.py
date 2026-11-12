@@ -259,27 +259,7 @@ class MLPIIDetector:
             model_version="presidio-2.2",
             errors=errors
         )
-    
-    def detect_single(self, text: str, language: str = "en", 
-                      score_threshold: float = 0.5) -> List[PIIEntity]:
-        """Convenience method to detect PII in a single text.
-        
-        Args:
-            text: Text to analyze
-            language: Language code
-            score_threshold: Minimum confidence score
-            
-        Returns:
-            List of detected PII entities
-        """
-        request = PIIDetectionRequest(
-            texts=[text],
-            language=language,
-            score_threshold=score_threshold
-        )
-        response = self.detect(request)
-        return response.results[0] if response.results else []
-    
+
     def get_supported_entities(self) -> List[str]:
         """Get list of supported entity types."""
         if not self._lazy_init():

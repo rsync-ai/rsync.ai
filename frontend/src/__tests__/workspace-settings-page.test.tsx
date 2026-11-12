@@ -9,7 +9,7 @@ import { useWorkspace } from "@/contexts/WorkspaceContext"
 // P0 settings hub: composes the active workspace's General / Members / Roles tabs.
 // The child components are unit-tested independently, so here we stub them and
 // assert the page wires the active workspace + role through, gates on load state,
-// and shows the role banner.
+// and shows the caller's role beside the title.
 
 vi.mock("@/contexts/WorkspaceContext", () => ({ useWorkspace: vi.fn() }))
 vi.mock("@/components/workspace/WorkspaceGeneralSettings", () => ({
@@ -121,7 +121,7 @@ describe("WorkspaceSettingsPage", () => {
     expect(matrix.getAttribute("data-role")).toBe("admin")
   })
 
-  it("shows a role banner reflecting the caller's role", () => {
+  it("shows the caller's role beside the title", () => {
     mockUseWorkspace.mockReturnValue(ctx({ activeWorkspace: { id: "ws-1", name: "Acme", slug: "acme", role: "viewer", is_personal: false }, role: "viewer" }))
     render(<WorkspaceSettingsPage />)
     expect(screen.getByText(/viewer/i)).toBeInTheDocument()

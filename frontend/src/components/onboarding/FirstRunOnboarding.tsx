@@ -4,10 +4,10 @@
 // running" checklist that auto-ticks as the user completes each step and
 // retires itself once they've run a successful sync (activation).
 //
-// It re-verifies counts from the browser on mount: the dashboard's SSR count
-// fetch can silently return zeros when the auth cookie isn't forwarded (same
-// reason DashboardStatsRefresher re-fetches), so we must never keep showing
-// onboarding to a user who has actually activated.
+// It re-verifies counts from the browser on mount and on every workspace
+// change: Home's SSR count fetch can silently return zeros when the auth cookie
+// isn't forwarded, so we must never keep showing onboarding to a user who has
+// actually activated.
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
@@ -15,6 +15,7 @@ import { useRouter } from "next/navigation"
 import { Card } from "@/components/ui/card"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { readStatOrUnknown } from "@/lib/api/read-stat"
+import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
 import { Check, Database, ArrowRightLeft, Sparkles, Search, Wand2, Loader2, LucideIcon } from "lucide-react"
 
 export interface OnboardingCounts {
@@ -73,7 +74,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
 
   const fetchCounts = useCallback(async (): Promise<OnboardingCounts | null> => {
     try {
-      // Through readStatOrUnknown for the same two reasons as the dashboard
+      // Through readStatOrUnknown for the same two reasons as Home's overview
       // cards: a relative fetch goes to the frontend's own origin instead of the
       // api-gateway, and a swallowed 404 became a zero. A zero here un-ticks
       // steps the user has already completed and re-shows onboarding to an
@@ -103,14 +104,24 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
     }
   }, [initial])
 
+  // Both reads below are workspace-scoped (authFetch stamps X-Workspace-ID), so
+  // they re-run whenever the active workspace changes. That includes the
+  // self-heal on first load: an id left over from an earlier install makes every
+  // request here 404 until WorkspaceContext/Header re-point it, and a mount-only
+  // read kept that failure (no demo card, SSR counts) until a full reload.
+  // captureWorkspace drops a response the switch overtook.
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
+    const load = async () => {
+      const isStale = captureWorkspace()
       const fresh = await fetchCounts()
-      if (!cancelled && fresh) setCounts(fresh)
-    })()
+      if (!cancelled && !isStale() && fresh) setCounts(fresh)
+    }
+    void load()
+    const unsubscribe = onActiveWorkspaceChange(() => void load())
     return () => {
       cancelled = true
+      unsubscribe()
     }
   }, [fetchCounts])
 
@@ -119,17 +130,22 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
   // checklist degrades to exactly what it was before.
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
+    const load = async () => {
+      const isStale = captureWorkspace()
       try {
         const res = await authFetch("/api/v1/demo/status")
-        if (cancelled || !res.ok) return
-        setDemo(await res.json())
+        if (cancelled || isStale() || !res.ok) return
+        const body = await res.json()
+        if (!cancelled && !isStale()) setDemo(body)
       } catch {
         /* demo card just doesn't appear */
       }
-    })()
+    }
+    void load()
+    const unsubscribe = onActiveWorkspaceChange(() => void load())
     return () => {
       cancelled = true
+      unsubscribe()
     }
   }, [])
 
@@ -219,7 +235,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
           /demo/status answers available:false, so none of this ever appears —
           there is no edition check here, just the absence of a destination. */}
       {demo?.available && (counts.sourceCount === 0 || counts.destinationCount === 0) && (
-        <Card className="border-violet-200 bg-violet-50/50 p-4 dark:border-violet-900/50 dark:bg-violet-950/20 sm:p-5">
+        <Card className="border-violet-200 bg-violet-50/50 p-4 dark:border-violet-900/50 dark:bg-violet-950/20 @md:p-5">
           <div className="flex flex-wrap items-start gap-3">
             <span className="flex h-9 w-9 flex-none items-center justify-center rounded-lg bg-violet-100 text-violet-600 dark:bg-violet-900/40 dark:text-violet-300">
               <Wand2 className="h-4 w-4" />
@@ -258,7 +274,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
 
       {/* Activation checklist */}
       <Card className="overflow-hidden border-violet-100 dark:border-violet-900/50">
-        <div className="flex items-center justify-between border-b border-zinc-100 bg-zinc-50/70 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40 sm:px-5">
+        <div className="flex items-center justify-between border-b border-zinc-100 bg-zinc-50/70 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40 @md:px-5">
           <div>
             <p className="font-semibold text-zinc-900 dark:text-zinc-100">Get your first sync running</p>
             <div className="mt-1.5 h-1.5 w-40 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
@@ -278,7 +294,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
             const isUpcoming = currentIndex !== -1 && i > currentIndex
             const StepIcon = step.icon
             return (
-              <li key={step.id} className="flex items-center gap-3 px-4 py-3 sm:px-5">
+              <li key={step.id} className="flex items-center gap-3 px-4 py-3 @md:px-5">
                 <span
                   className={
                     "flex h-6 w-6 flex-none items-center justify-center rounded-full " +
@@ -296,13 +312,13 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
                     className={
                       "text-sm font-medium " +
                       (step.done
-                        ? "text-zinc-400 line-through decoration-zinc-300 dark:text-zinc-400 dark:decoration-zinc-700"
+                        ? "text-zinc-500 line-through decoration-zinc-300 dark:text-zinc-400 dark:decoration-zinc-700"
                         : "text-zinc-900 dark:text-zinc-100")
                     }
                   >
                     {step.title}
                   </p>
-                  <p className="truncate text-xs text-zinc-400">{step.desc}</p>
+                  <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">{step.desc}</p>
                 </div>
                 {step.done ? (
                   <span className="flex-none text-xs font-medium text-emerald-600 dark:text-emerald-400">Done</span>
@@ -312,7 +328,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
                     className={
                       "flex-none whitespace-nowrap rounded-md px-1 text-xs font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 " +
                       (isUpcoming
-                        ? "text-zinc-400 hover:text-violet-600 dark:text-zinc-400 dark:hover:text-violet-400"
+                        ? "text-zinc-500 hover:text-violet-600 dark:text-zinc-400 dark:hover:text-violet-400"
                         : "text-violet-600 hover:text-violet-700 dark:text-violet-400")
                     }
                   >

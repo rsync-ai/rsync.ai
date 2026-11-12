@@ -29,7 +29,7 @@ describe("tableStatusBreakdown — the Monitor tab's table counts add up", () =>
     expect(b.total).toBeGreaterThan(0)
     expect(shown(b)).toBe(b.total)
     expect(b.rows).toEqual([
-      { key: "degraded", label: "Tables degraded", count: 1 },
+      { key: "degraded", label: "Tables with rows not written", count: 1 },
       { key: "running", label: "Tables running", count: 1 },
       { key: TABLE_STATUS_WAITING_FOR_DATA, label: "Tables with no data yet", count: 2 },
     ])

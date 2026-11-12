@@ -1,0 +1,51 @@
+{
+  "kind": "echart",
+  "settings": {
+    "type": "map",
+    "description": "Revenue by country",
+    "map": "world",
+    "region": {
+      "label": "Country"
+    },
+    "value": {
+      "label": "Revenue",
+      "format": "integer"
+    },
+    "color": "series-1"
+  },
+  "rows": [
+    {
+      "region": "USA",
+      "value": 1200
+    },
+    {
+      "region": "FRA",
+      "value": 800
+    },
+    {
+      "region": "DEU",
+      "value": 650
+    },
+    {
+      "region": "IND",
+      "value": 500
+    },
+    {
+      "region": "BRA",
+      "value": 300
+    },
+    {
+      "region": "JPN",
+      "value": 150
+    },
+    {
+      "region": "AUS",
+      "value": 40
+    }
+  ],
+  "series": [],
+  "notes": [
+    "1 row names no country by its ISO code, so it is not drawn: United Kingdom.",
+    "1 row names a country a row above it already fills, so it is not drawn."
+  ]
+}

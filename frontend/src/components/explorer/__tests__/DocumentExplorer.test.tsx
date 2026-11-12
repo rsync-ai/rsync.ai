@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { useState } from "react"
-import { render, screen, fireEvent, waitFor } from "@testing-library/react"
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react"
 
 const authFetch = vi.fn()
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: (...args: unknown[]) => authFetch(...args) }))
@@ -216,7 +216,9 @@ describe("DocumentExplorer", () => {
       await waitFor(() => expect(sentBodies()[0]).toMatchObject({ collection: "orders", database: "us" }))
       expect(onPick).not.toHaveBeenCalled()
 
-      const groups = screen.getAllByRole("group").map((g) => g.getAttribute("label"))
+      const groups = within(screen.getByLabelText("Collection"))
+        .getAllByRole("group")
+        .map((g) => g.getAttribute("label"))
       expect(groups).toEqual(["eu", "us"])
 
       // The same collection name in another database is its own pick.
@@ -245,5 +247,108 @@ describe("DocumentExplorer", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/Sort is not valid JSON/)
     expect(screen.getByLabelText("Sort")).toHaveAttribute("aria-invalid", "true")
     expect(authFetch).toHaveBeenCalledTimes(1)
+  })
+
+  // The Pipeline tab previews an aggregation. It is never run on its own — a pipeline
+  // can be expensive, and half-typed it is not one — and its result has no paging
+  // cursor, so it shows no Load more.
+  describe("in Pipeline mode", () => {
+    const FIND_PAGE = {
+      collection: "orders",
+      columns: ["_id", "status"],
+      documents: [{ _id: 1, status: "paid" }],
+      has_more: true,
+      paging_mode: "keyset",
+      next_cursor: "CURSOR-1",
+    }
+    const PIPELINE = `[{"$match":{"n":{"$gte":9007199254740993}}},{"$group":{"_id":"$status","n":{"$sum":1}}}]`
+
+    function PipelineHarness({ mode = "pipeline" as const }: { mode?: "find" | "pipeline" }) {
+      return (
+        <DocumentExplorer
+          connectionId="conn-1"
+          collections={COLLECTIONS}
+          collection="orders"
+          database="shop"
+          onCollectionChange={() => {}}
+          mode={mode}
+        />
+      )
+    }
+
+    it("runs nothing until asked, then posts the pipeline as typed to /aggregate", async () => {
+      authFetch.mockResolvedValueOnce(
+        reply(200, {
+          collection: "orders",
+          columns: ["_id", "n"],
+          documents: [{ _id: "paid", n: 3 }],
+          returned: 1,
+          has_more: true,
+          execution_time_ms: 7,
+          // The gateway sends no cursor for a pipeline. Were one ever to appear, it
+          // would be a find cursor, and paging with it would leave the pipeline behind.
+          paging_mode: "keyset",
+          next_cursor: "CURSOR-1",
+        }),
+      )
+      render(<PipelineHarness />)
+
+      expect(screen.getByTestId("doc-summary")).toHaveTextContent("Write a pipeline and run it to preview its results")
+      expect(authFetch).not.toHaveBeenCalled()
+
+      fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: PIPELINE } })
+      fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }))
+
+      await waitFor(() => expect(screen.getAllByTestId("doc-row")).toHaveLength(1))
+      expect(authFetch.mock.calls[0][0]).toBe("/api/v1/explorer/documents/aggregate")
+      // The 64-bit integer reaches the gateway unrounded.
+      expect((authFetch.mock.calls[0][1] as { body: string }).body).toBe(
+        `{"connection_id":"conn-1","collection":"orders","database":"shop","pipeline":${PIPELINE},"limit":50}`,
+      )
+      expect(screen.getByTestId("doc-summary")).toHaveTextContent("1 document (more available) · 7 ms")
+      // has_more, but a pipeline preview is one page.
+      expect(screen.queryByRole("button", { name: /load more/i })).not.toBeInTheDocument()
+    })
+
+    it("refuses a pipeline that is not an array of stages without sending it", async () => {
+      render(<PipelineHarness />)
+
+      fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: `{"$match":{}}` } })
+      fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }))
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("A pipeline must be a JSON array of stages")
+      expect(screen.getByLabelText("Pipeline")).toHaveAttribute("aria-invalid", "true")
+      expect(authFetch).not.toHaveBeenCalled()
+    })
+
+    it("shows the gateway's refusal with the stage it points at", async () => {
+      authFetch.mockResolvedValueOnce(
+        reply(400, { error: "stage $out is not allowed", error_code: "stage_not_allowed", path: "pipeline[1]" }),
+      )
+      render(<PipelineHarness />)
+
+      fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: `[{"$match":{}},{"$out":"x"}]` } })
+      fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }))
+
+      const alert = await screen.findByRole("alert")
+      expect(alert).toHaveTextContent("stage $out is not allowed")
+      expect(alert).toHaveTextContent("at pipeline[1]")
+    })
+
+    it("drops the other mode's result on a switch, so a find page is never shown as a pipeline's", async () => {
+      authFetch.mockResolvedValueOnce(reply(200, FIND_PAGE))
+      render(<Harness />)
+      await waitFor(() => expect(screen.getAllByTestId("doc-row")).toHaveLength(1))
+      expect(screen.getByRole("button", { name: /load more/i })).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole("button", { name: "Pipeline mode" }))
+
+      expect(screen.getByRole("button", { name: "Pipeline mode" })).toHaveAttribute("aria-pressed", "true")
+      expect(screen.queryAllByTestId("doc-row")).toHaveLength(0)
+      expect(screen.queryByRole("button", { name: /load more/i })).not.toBeInTheDocument()
+      expect(screen.getByTestId("doc-summary")).toHaveTextContent("Write a pipeline and run it to preview its results")
+      // Switching does not run anything.
+      expect(authFetch).toHaveBeenCalledTimes(1)
+    })
   })
 })

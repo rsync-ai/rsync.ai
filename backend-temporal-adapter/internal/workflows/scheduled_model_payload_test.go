@@ -58,3 +58,32 @@ func TestRunModelActivity_AClockRunSendsOnlyItsSchedule(t *testing.T) {
 		t.Errorf("clock payload = %v, want only schedule_id", got)
 	}
 }
+
+// TestRunModelActivity_AskingForTheHopSendsItAndReadsTheRunBack: next_hop reaches the
+// gateway on either door, and the run id and echo the gateway answers with reach the
+// workflow — without both, the workflow has no run to list the models below.
+func TestRunModelActivity_AskingForTheHopSendsItAndReadsTheRunBack(t *testing.T) {
+	for _, in := range []ScheduledModelRunInput{
+		{SavedQueryID: "m1", ScheduleID: "s1", NextHop: ModelNextHopCaller},
+		{SavedQueryID: "m1", ScheduleID: "s1", Trigger: ModelRefreshTrigger, Depth: 1, NextHop: ModelNextHopCaller},
+	} {
+		got := captureModelRunPayload(t, in)
+		if got["next_hop"] != ModelNextHopCaller {
+			t.Errorf("trigger %q: payload %v, want next_hop %q", in.Trigger, got, ModelNextHopCaller)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"succeeded","target_table":"public.t","run_id":"run-9","next_hop":"caller"}`))
+	}))
+	defer srv.Close()
+	t.Setenv("INTERNAL_SERVICE_SECRET", "unit-test-secret")
+	t.Setenv("API_GATEWAY_URL", srv.URL)
+	res, err := RunModelActivity(context.Background(), ScheduledModelRunInput{SavedQueryID: "m1", ScheduleID: "s1", NextHop: ModelNextHopCaller})
+	if err != nil {
+		t.Fatalf("activity failed: %v", err)
+	}
+	if res.RunID != "run-9" || res.NextHop != ModelNextHopCaller {
+		t.Fatalf("result %+v, want run_id run-9 and next_hop %q", res, ModelNextHopCaller)
+	}
+}

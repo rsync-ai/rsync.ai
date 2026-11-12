@@ -101,23 +101,39 @@ func (c *Client) ConfigStatus() string {
 }
 
 type sendRequest struct {
-	From    string   `json:"from"`
-	To      []string `json:"to"`
-	Subject string   `json:"subject"`
-	HTML    string   `json:"html"`
+	From        string       `json:"from"`
+	To          []string     `json:"to"`
+	Subject     string       `json:"subject"`
+	HTML        string       `json:"html"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+// Attachment is a file an email carries. With a ContentID the HTML shows it in
+// place, as <img src="cid:ContentID">. Content goes to Resend as base64.
+type Attachment struct {
+	Filename    string `json:"filename"`
+	Content     []byte `json:"content"`
+	ContentType string `json:"content_type,omitempty"`
+	ContentID   string `json:"content_id,omitempty"`
 }
 
 // Send dispatches a transactional email. It is a no-op when IsConfigured() is false.
 func (c *Client) Send(ctx context.Context, to, subject, html string) error {
+	return c.SendWithAttachments(ctx, to, subject, html, nil)
+}
+
+// SendWithAttachments is Send with files: a workflow's charts as PNGs.
+func (c *Client) SendWithAttachments(ctx context.Context, to, subject, html string, atts []Attachment) error {
 	if !c.IsConfigured() {
 		return nil
 	}
 
 	body, err := json.Marshal(sendRequest{
-		From:    c.fromAddr,
-		To:      []string{to},
-		Subject: subject,
-		HTML:    html,
+		From:        c.fromAddr,
+		To:          []string{to},
+		Subject:     subject,
+		HTML:        html,
+		Attachments: atts,
 	})
 	if err != nil {
 		return fmt.Errorf("resend: marshal request: %w", err)

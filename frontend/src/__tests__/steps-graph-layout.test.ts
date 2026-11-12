@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from "vitest"
 
-import { CHAIN_COLUMNS, NODE_HEIGHT, NODE_WIDTH, buildElements } from "@/components/pipeline/DAGVisualizationV2"
+import { CHAIN_COLUMNS, NODE_HEIGHT, NODE_WIDTH, buildElements, canvasHeight } from "@/components/pipeline/DAGVisualizationV2"
 import type { ExecutionPlanStage } from "@/components/pipeline/dagTypes"
 
 const stage = (id: string, dependencies?: string[]): ExecutionPlanStage =>
@@ -88,5 +88,39 @@ describe("Steps/DAG graph layout", () => {
     expect(y("join")).toBeGreaterThan(y("orders"))
     expect(y("warehouse")).toBeGreaterThan(y("join"))
     for (const e of edges) expect(e).toMatchObject({ sourceHandle: "bottom", targetHandle: "top" })
+  })
+})
+
+// The canvas was a fixed 540 px, so a four-step batch pipeline sat in one row
+// in a mostly empty box. Its height now follows the rows, from 240 to 540 px.
+describe("Steps/DAG canvas height", () => {
+  const chain = (n: number) => buildElements(Array.from({ length: n }, (_, i) => stage(`s${i}`))).nodes
+
+  it("gives one row the 240 px floor, not 540", () => {
+    expect(canvasHeight(chain(4))).toBe(240)
+  })
+
+  it("grows with the rows, and two rows still fit at a readable zoom", () => {
+    const two = canvasHeight(chain(8))
+    expect(two).toBeGreaterThan(240)
+    expect(two).toBeLessThan(540)
+    expect(canvasHeight(chain(12))).toBeGreaterThan(two)
+    expect(fitZoom(bounds(chain(8)), { width: 1148, height: two })).toBeGreaterThan(0.85)
+  })
+
+  it("stops at 540 px for a long chain", () => {
+    expect(canvasHeight(chain(20))).toBe(540)
+  })
+
+  it("measures a branching graph by its ranks", () => {
+    const { nodes } = buildElements([
+      stage("orders"),
+      stage("customers", []),
+      stage("join", ["orders", "customers"]),
+      stage("warehouse", ["join"]),
+    ])
+    // Three ranks: taller than one row, under the cap.
+    expect(canvasHeight(nodes)).toBeGreaterThan(240)
+    expect(canvasHeight(nodes)).toBeLessThan(540)
   })
 })

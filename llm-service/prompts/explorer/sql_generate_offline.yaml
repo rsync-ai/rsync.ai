@@ -16,6 +16,7 @@ user: |
   - Use correct syntax for {{ dialect }}
   - Output MUST be directly executable (no placeholders like '...' or 'TBD')
   - Use COUNT(*) for row counts (never COUNT(t.*))
+  - You see table and column names and types, never the values a column holds. When the question names a category or a state (declined, card, active), prefer a table or a column whose name already holds it (a declined_count, an is_declined, a declined_transactions table) to filtering on a value. When you must filter on a text value you were not given, compare it without case, for example LOWER(t.status) = 'declined'.
   - Use SUM/AVG only on numeric columns (amount, total, balance, cents, weight, etc.). Do NOT sum/avg categorical fields.
   - If the question requests \"top N\" by a metric, ORDER BY that metric DESC.
   - If the question includes a relative time range (e.g. \"last 30 days\", \"last 6 months\"), implement it using the dialect:
@@ -53,3 +54,13 @@ user: |
   {% endif %}
 
   ### SQL
+
+# What each template variable is (src/egress/fields.py). The LLM egress guard
+# refuses to render a variable that is not listed here.
+llm_fields:
+  dialect: enum
+  question: user_text
+  time_grain: enum
+  time_column: identifier
+  tables: catalog
+  relationships: identifier
