@@ -62,7 +62,7 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /ws` (WebSocket; token via `?token=` or `auth_token` cookie)
 - `GET /oauth/callback/:provider`
 - `POST /api/agent/v1/mcp`: the agent gateway, rsync.ai's MCP server. Agent token auth,
-  not a session; only registered when `RSYNC_AGENT_GATEWAY_ENABLED=true`. `GET` answers
+  not a session; not registered when `RSYNC_AGENT_GATEWAY_ENABLED=false`. `GET` answers
   405. See [agent-gateway.md](agent-gateway.md).
 
 ### Auth (public) — `/api/v1/auth`
@@ -85,8 +85,8 @@ session auth → email-verified gate → CSRF → rate limiting
   `NEXT_PUBLIC_*` is inlined at build time and every deployment runs the same image, so
   this endpoint is the only way a flag can differ per deployment. `usage_panel` gates the
   plan/quota UI and defaults to whatever `RSYNC_BILLING_ENFORCED` resolves to.
-  `agent_gateway` is `RSYNC_AGENT_GATEWAY_ENABLED` (default false) and gates Settings →
-  AI apps. `assistant` is `RSYNC_ASSISTANT_ENABLED` (default false) and gates
+  `agent_gateway` is `RSYNC_AGENT_GATEWAY_ENABLED` (default true) and gates Settings →
+  AI apps. `assistant` is `RSYNC_ASSISTANT_ENABLED` (default true) and gates
   the header's Ask rsync.ai panel and Admin → Settings → AI models.
 
 ### Chat (agentic pipeline flow)
@@ -207,7 +207,7 @@ On every error the decision is not saved, and `message` says why.
 - `PATCH /workspaces/:id`
 - `GET /workspaces/:id/members`
 
-### Agent tokens — `/api/v1/agent-tokens` *(only registered when `RSYNC_AGENT_GATEWAY_ENABLED=true`)*
+### Agent tokens — `/api/v1/agent-tokens` *(not registered when `RSYNC_AGENT_GATEWAY_ENABLED=false`)*
 
 Tokens for the agent gateway ([agent-gateway.md](agent-gateway.md)). A member lists and
 revokes their own; a workspace admin sees and revokes every member's.
@@ -216,7 +216,7 @@ revokes their own; a workspace admin sees and revokes every member's.
 - `POST /agent-tokens` (`{"name", "expires_in_days", "scopes"?}`, 1-365, default 30; `scopes` may add `connectors:generate` or `models:write`, owners and admins only; the token is in this response only)
 - `DELETE /agent-tokens/:id`
 
-### Assistant — `/api/v1/assistant` *(only registered when `RSYNC_ASSISTANT_ENABLED=true`)*
+### Assistant — `/api/v1/assistant` *(not registered when `RSYNC_ASSISTANT_ENABLED=false`)*
 
 The in-app assistant, Ask rsync.ai ([assistant.md](assistant.md)). Session auth; it answers
 with the agent gateway's tools run as the caller, metadata only: the read tools, connector
