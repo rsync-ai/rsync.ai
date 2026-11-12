@@ -602,7 +602,10 @@ _SCRUB_PATTERNS = [
     # Everything after a SQL VALUES keyword is row data (multi-tuple included).
     (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
     # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
-    (re.compile(r"(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
+    # The column list stops at the next `Key (`, so a run of `Key (Key (...` is
+    # linear, not quadratic; the output is the same as without the stop, and as
+    # Go's RE2 copy (pkg/llmscrub).
+    (re.compile(r"(\bKey\s*\((?:(?!\bKey\s*\()[^)])*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
     # Credentials embedded in URLs: scheme://user:pass@host. The user name may
     # be empty (redis://:pass@host); requiring one left that password in clear.
     # `(?<!\w)`: without it Python's engine re-read a long word run from each of

@@ -257,6 +257,26 @@ def test_a_keyless_view_pages_in_a_stable_order():
     assert plan == sql_paging.ordered_offset_plan(["name", "amount"]), plan
 
 
+class _RowidInViewCursor(_SqliteCursor):
+    """A SQLite built with SQLITE_ALLOW_ROWID_IN_VIEW (Debian's, the connector
+    base image's) lets a view select a rowid, which is NULL. macOS's refuses it,
+    so the probe is answered here the way Debian's answers it."""
+
+    _PROBE = re.compile(r'SELECT (?:rowid|_rowid_|oid) FROM "big_events" LIMIT 0')
+
+    def execute(self, sql, params=None):
+        if self._PROBE.fullmatch(sql):
+            sql, params = "SELECT NULL LIMIT 0", None
+        return super().execute(sql, params)
+
+
+def test_a_view_never_pages_by_rowid_where_sqlite_lets_it_select_one():
+    db = _keyless_events()
+    db.execute("CREATE VIEW big_events AS SELECT name, amount FROM events WHERE amount > 1")
+    plan = sql_paging.paging_plan(_KeepOpen(db), _RowidInViewCursor(db), sql_paging.SQLITE, "big_events", '"big_events"')
+    assert plan == sql_paging.ordered_offset_plan(["name", "amount"]), plan
+
+
 def test_a_sqlite_key_that_can_hold_null_is_not_paged_by():
     """SQLite lets a non-INTEGER PRIMARY KEY hold NULL, and `code > ?` never
     matches a NULL row: the rowid pages instead."""
@@ -799,6 +819,18 @@ def test_every_connector_image_that_pages_with_sql_paging_ships_it():
         assert _COPY in dockerfile.read_text(encoding="utf-8"), f"{dockerfile} does not ship sql_paging.py"
 
 
+def _removed_by_the_cut(rel_path):
+    """llm-service/tests/_cut_collection.removed_by_the_cut, loaded by path:
+    this suite is not under llm-service/tests, so that module is not on sys.path."""
+    module = sys.modules.get("_cut_collection")
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            "_cut_collection", _REPO / "llm-service" / "tests" / "_cut_collection.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    return module.removed_by_the_cut(rel_path)
+
+
 def test_every_generated_connector_dockerfile_ships_sql_paging():
     """A generated database connector renders connector_database.py.j2, whose
     export needs the module. Every emitter that ships the shared warehouse
@@ -808,8 +840,12 @@ def test_every_generated_connector_dockerfile_ships_sql_paging():
     emitters = [p for p in list(src.rglob("*.py")) + list(src.rglob("Dockerfile*.j2"))
                 if marker in p.read_text(encoding="utf-8")]
     # session_fast_path.py, deployment/service.py and templates/Dockerfile.j2;
-    # the floor keeps a glob that matches nothing from passing.
-    assert len(emitters) >= 3, emitters
+    # the floor keeps a glob that matches nothing from passing. The public cut
+    # strips session_fast_path.py with the rest of the generator's agents.
+    floor = 3
+    if _removed_by_the_cut("src/agents/tool_generator/agents/session_fast_path.py"):
+        floor -= 1
+    assert len(emitters) >= floor, emitters
     for path in emitters:
         text = path.read_text(encoding="utf-8")
         assert text.count(_COPY) == text.count(marker), f"{path}: a Dockerfile emitter lacks sql_paging.py"

@@ -298,7 +298,10 @@ _SCRUB_PATTERNS = [
     # Everything after a SQL VALUES keyword is row data (multi-tuple included).
     (re.compile(r"\bVALUES\b\s*\(.*", re.IGNORECASE | re.DOTALL), f"VALUES ({_SCRUB_REDACTED})"),
     # Postgres duplicate-key detail: Key (email)=(user@x.com) — keep column names.
-    (re.compile(r"(\bKey\s*\([^)]*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
+    # The column list stops at the next `Key (`, so a run of `Key (Key (...` is
+    # linear, not quadratic; the output is the same as without the stop, and as
+    # Go's RE2 copy (pkg/llmscrub).
+    (re.compile(r"(\bKey\s*\((?:(?!\bKey\s*\()[^)])*\)=)\((?:[^()]|\([^)]*\))*\)", re.IGNORECASE), rf"\1({_SCRUB_REDACTED})"),
     *_SECRET_PATTERNS_HEAD,
     # Double-quoted string directly after a colon — Postgres quotes offending
     # VALUES this way ('invalid input syntax for type integer: "jane"') and it

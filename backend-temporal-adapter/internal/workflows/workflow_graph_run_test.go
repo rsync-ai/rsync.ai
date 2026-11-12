@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -49,14 +50,20 @@ type graphProbe struct {
 
 	counts map[string]int
 	calls  []string
+	// scheduled is the activity id of each call's first attempt. The test
+	// environment runs activities on their own goroutines, so the order of calls
+	// is the order they ran in, which can differ from run to run; activity ids
+	// are given out in the order the workflow scheduled them, which cannot.
+	scheduled map[string]int
 }
 
 func newGraphProbe(steps ...WorkflowRunGraphStep) *graphProbe {
 	return &graphProbe{
-		graph:   WorkflowRunGraph{Action: "run", Steps: steps},
-		answers: map[string][]WorkflowRunStepAnswer{},
-		errs:    map[string]error{},
-		counts:  map[string]int{},
+		graph:     WorkflowRunGraph{Action: "run", Steps: steps},
+		answers:   map[string][]WorkflowRunStepAnswer{},
+		errs:      map[string]error{},
+		counts:    map[string]int{},
+		scheduled: map[string]int{},
 	}
 }
 
@@ -75,7 +82,7 @@ func (p *graphProbe) readGraph(_ context.Context, runID string) (*WorkflowRunGra
 	return &out, nil
 }
 
-func (p *graphProbe) step(_ context.Context, in WorkflowRunStepInput) (*WorkflowRunStepAnswer, error) {
+func (p *graphProbe) step(ctx context.Context, in WorkflowRunStepInput) (*WorkflowRunStepAnswer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	call := in.StepID + " " + in.Action
@@ -102,6 +109,11 @@ func (p *graphProbe) step(_ context.Context, in WorkflowRunStepInput) (*Workflow
 		call += " timeout=" + in.CallTimeout.String()
 	}
 	p.calls = append(p.calls, call)
+	if _, seen := p.scheduled[call]; !seen && activity.IsActivity(ctx) {
+		if id, err := strconv.Atoi(activity.GetInfo(ctx).ActivityID); err == nil {
+			p.scheduled[call] = id
+		}
+	}
 
 	key := in.StepID + " " + in.Action
 	if in.Attempt > 0 {
@@ -156,6 +168,16 @@ func (p *graphProbe) snapshot() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.calls...)
+}
+
+// scheduledID is the activity id of call's first attempt, or -1 if it never ran.
+func (p *graphProbe) scheduledID(call string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id, ok := p.scheduled[call]; ok {
+		return id
+	}
+	return -1
 }
 
 func (p *graphProbe) answer(key string, answers ...WorkflowRunStepAnswer) {
@@ -262,10 +284,15 @@ func TestWorkflowGraph_EachStepStartsWhenItsParentsAllowAndTheRunIsCompletedOnce
 	calls := probe.snapshot()
 	wantCalls(t, calls[:2], "graph run-1", "q run")
 	// The condition and the pipeline both wait on the query only, so both start in the
-	// workflow task that learns the query ended.
-	first := append([]string(nil), calls[2:4]...)
-	sort.Strings(first)
-	wantCalls(t, first, "c run", "p start 1")
+	// workflow task that learns the query ended: they are the next two activities it
+	// schedules. Compared by activity id, not by the order of calls, because the two
+	// run on their own goroutines and either may run first.
+	q := probe.scheduledID("q run")
+	first := []int{probe.scheduledID("c run"), probe.scheduledID("p start 1")}
+	sort.Ints(first)
+	if q < 0 || first[0] != q+1 || first[1] != q+2 {
+		t.Fatalf("activity ids: q run %d, c run and p start 1 %v; want %d and %d", q, first, q+1, q+2)
+	}
 	wantCalls(t, stepCalls(calls, "s0"), "s0 plan", "s0 send ch-a", "s0 send ch-b", "s0 finish")
 	wantCalls(t, stepCalls(calls, "s1"), "s1 record skipped: Condition 1 was true, not this one.")
 	wantCalls(t, stepCalls(calls, "p"), "p start 1", "p poll 1")

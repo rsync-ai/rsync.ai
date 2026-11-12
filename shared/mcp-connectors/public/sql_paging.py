@@ -626,7 +626,20 @@ def _sqlite_key(ctx: Catalog) -> Optional[Dict[str, Any]]:
     return key_plan(cols) if cols else None
 
 
+def _sqlite_is_view(ctx: Catalog) -> bool:
+    q = ctx.dialect.ident
+    prefix = f"{q(ctx.schema)}." if ctx.schema else ""
+    rows = ctx.rows(f"SELECT type FROM {prefix}sqlite_master WHERE name = ? COLLATE NOCASE", (ctx.name,))
+    return any(str(r[0]).lower() == "view" for r in rows)
+
+
 def _sqlite_locator(ctx: Catalog) -> Optional[Dict[str, Any]]:
+    # A view has no rowid, but a SQLite built with SQLITE_ALLOW_ROWID_IN_VIEW
+    # (Debian's, so the connector image's) answers the probe below with NULL,
+    # and `rowid > ?` then matches nothing. Ask the schema instead; if that
+    # raises, `first` skips this step and the view pages in column order.
+    if _sqlite_is_view(ctx):
+        return None
     columns = _sqlite_columns(ctx)
     taken = {str(c[1]).lower() for c in columns}
     rowid = next((r for r in ("rowid", "_rowid_", "oid") if r not in taken), None)

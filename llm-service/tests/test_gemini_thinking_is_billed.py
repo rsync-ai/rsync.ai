@@ -33,6 +33,7 @@ repo_root = str(Path(__file__).parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+from _cut_collection import removed_by_the_cut  # noqa: E402
 from src.utils.llm_cost import billable_tokens
 
 VERTEX_MODEL = "google/gemini-2.5-flash"
@@ -120,6 +121,10 @@ def test_the_metrics_wrapper_counts_the_thinking_once(monkeypatch, usage, model)
     assert [(c["model"], c["prompt_tokens"], c["completion_tokens"]) for c in calls] == [(model, 4025, 46)]
 
 
+@pytest.mark.skipif(
+    removed_by_the_cut("src/agents/tool_generator/agents/base.py"),
+    reason="the public cut strips the connector generator's agents",
+)
 def test_the_tool_generator_counts_the_thinking_in_its_metric_and_its_budget(monkeypatch):
     calls = _record_llm_calls(monkeypatch)
     base = importlib.import_module("src.agents.tool_generator.agents.base")

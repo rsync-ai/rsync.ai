@@ -60,6 +60,7 @@ import re
 
 import pytest
 import yaml
+from _cut_collection import removed_by_the_cut
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 QUICKSTART = REPO / "docker-compose.quickstart.yml"
@@ -708,7 +709,12 @@ def test_a_cloud_service_that_calls_an_llm_is_given_every_llm_setting(stack):
         module = _entrypoint_module({"command": command})
         if module and _module_path(module) is not None and _builds_llm_client(module) and not env_files.get(name):
             callers.append(name)
-    assert {"llm-service", "tool-generator"} <= set(callers), (
+    expected = {"llm-service", "tool-generator"}
+    # The public cut strips the connector generator: its compose service runs
+    # src.lifecycle.main there, which builds no model client.
+    if removed_by_the_cut("src/agents/tool_generator/service.py"):
+        expected.discard("tool-generator")
+    assert expected <= set(callers), (
         f"the census found only {sorted(callers)} building a model client with no env_file "
         f"in the {stack} stack; a caller moved or the derivation broke"
     )

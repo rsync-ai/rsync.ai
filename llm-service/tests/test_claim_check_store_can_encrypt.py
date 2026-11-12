@@ -202,7 +202,9 @@ def test_the_key_generator_works_without_openssl(tmp_path):
     bindir.mkdir()
     for d in ("/usr/bin", "/bin"):
         for name in os.listdir(d):
-            if name != "openssl" and not (bindir / name).exists():
+            # lexists, not exists: a dangling link (ubuntu ships some, in both
+            # dirs) "does not exist", and linking it twice raises FileExistsError.
+            if name != "openssl" and not os.path.lexists(bindir / name):
                 (bindir / name).symlink_to(os.path.join(d, name))
     cp = _run_bash(tmp_path, f'source "{_install_lib(tmp_path)}"\nk=$(generate_kms_key)\necho "KEY=$k"\n', path=str(bindir))
     assert cp.returncode == 0, cp.stdout + cp.stderr

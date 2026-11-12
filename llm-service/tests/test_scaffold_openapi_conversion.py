@@ -42,6 +42,7 @@ import pytest
 # suites are collected first and leave `agents` bound to the generation
 # package's own inner `agents/`, under which `agents.tool_generator` does not
 # exist. `_real_agents_package` explains the whole mechanism.
+from _cut_collection import removed_by_the_cut
 from _real_agents_package import make_agents_tool_generator_importable
 
 make_agents_tool_generator_importable()
@@ -531,6 +532,10 @@ def _assigned_literal(path, name):
     raise AssertionError(f"{name} is not assigned in {path}")
 
 
+@pytest.mark.skipif(
+    removed_by_the_cut("src/agents/tool_generator/utils/openapi_discovery.py"),
+    reason="the public cut strips the discovery path; the scaffold copy is all that ships",
+)
 def test_the_scaffold_reads_incremental_filters_like_the_discovery_path():
     """The scaffold cannot import `openapi_discovery` (it is offline, stdlib only),
     so it keeps its own copy of the same rule; the two must not drift."""

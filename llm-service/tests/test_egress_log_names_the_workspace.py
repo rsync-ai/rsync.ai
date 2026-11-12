@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from _cut_collection import removed_by_the_cut
 from src.egress.scope import WORKSPACE_HEADER, normalize_workspace_id
 
 WS = "5b0c3f4e-9a1d-4c1e-8f2a-3d6e7b8c9d01"
@@ -255,7 +256,12 @@ def _compose_entrypoints() -> dict[str, list[str]]:
 
 def test_control_the_compose_scan_finds_the_model_serving_services():
     found = _compose_entrypoints()
-    assert {"src.gateway.main", "src.agents.planner.service", "src.agents.tool_generator.service"} <= set(found)
+    expected = {"src.gateway.main", "src.agents.planner.service", "src.agents.tool_generator.service"}
+    # The public cut strips the connector generator; its compose service runs
+    # src.lifecycle.main there instead, which serves no model call.
+    if removed_by_the_cut("src/agents/tool_generator/service.py"):
+        expected.discard("src.agents.tool_generator.service")
+    assert expected <= set(found)
 
 
 def test_every_service_that_serves_a_model_call_holds_the_workspace():
